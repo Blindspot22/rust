@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
@@ -5,12 +6,59 @@ use std::default::Default;
 use std::ops::Not;
 use std::rc::Rc;
 use std::time::Duration;
+use std::{fmt, iter};
 
 use rustc_abi::Size;
 use rustc_data_structures::fx::FxHashMap;
 
 use super::vector_clock::VClock;
 use crate::*;
+
+/// Indicates which kind of access is being performed.
+#[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
+pub enum AccessKind {
+    Read,
+    Write,
+    Dealloc,
+}
+
+impl fmt::Display for AccessKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AccessKind::Read => write!(f, "read"),
+            AccessKind::Write => write!(f, "write"),
+            AccessKind::Dealloc => write!(f, "deallocation"),
+        }
+    }
+}
+
+/// A trait for the synchronization metadata that can be attached to a memory location.
+pub trait SyncObj: Any {
+    /// Determines whether reads/writes to this object's location are currently permitted.
+    fn on_access<'tcx>(&self, _access_kind: AccessKind) -> InterpResult<'tcx> {
+        interp_ok(())
+    }
+
+    /// Determines whether this object's metadata shall be deleted when a write to its
+    /// location occurs.
+    fn delete_on_write(&self) -> bool {
+        false
+    }
+}
+
+impl dyn SyncObj {
+    #[inline(always)]
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        let x: &dyn Any = self;
+        x.downcast_ref()
+    }
+}
+
+impl fmt::Debug for dyn SyncObj {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SyncObj").finish_non_exhaustive()
+    }
+}
 
 /// The mutex state.
 #[derive(Default, Debug)]
@@ -36,6 +84,10 @@ impl MutexRef {
     /// Get the id of the thread that currently owns this lock, or `None` if it is not locked.
     pub fn owner(&self) -> Option<ThreadId> {
         self.0.borrow().owner
+    }
+
+    pub fn queue_is_empty(&self) -> bool {
+        self.0.borrow().queue.is_empty()
     }
 }
 
@@ -113,6 +165,11 @@ impl RwLockRef {
     pub fn is_write_locked(&self) -> bool {
         self.0.borrow().is_write_locked()
     }
+
+    pub fn queue_is_empty(&self) -> bool {
+        let inner = self.0.borrow();
+        inner.reader_queue.is_empty() && inner.writer_queue.is_empty()
+    }
 }
 
 impl VisitProvenance for RwLockRef {
@@ -140,8 +197,8 @@ impl CondvarRef {
         Self(Default::default())
     }
 
-    pub fn is_awaited(&self) -> bool {
-        !self.0.borrow().waiters.is_empty()
+    pub fn queue_is_empty(&self) -> bool {
+        self.0.borrow().waiters.is_empty()
     }
 }
 
@@ -204,7 +261,7 @@ pub(super) trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
             this.mutex_enqueue_and_block(mutex_ref, Some((retval, dest)));
         } else {
             // We can have it right now!
-            this.mutex_lock(&mutex_ref);
+            this.mutex_lock(&mutex_ref)?;
             // Don't forget to write the return value.
             this.write_scalar(retval, &dest)?;
         }
@@ -214,104 +271,21 @@ pub(super) trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
 impl<'tcx> AllocExtra<'tcx> {
     fn get_sync<T: 'static>(&self, offset: Size) -> Option<&T> {
-        self.sync.get(&offset).and_then(|s| s.downcast_ref::<T>())
+        self.sync_objs.get(&offset).and_then(|s| s.downcast_ref::<T>())
     }
 }
 
-/// We designate an `init`` field in all primitives.
-/// If `init` is set to this, we consider the primitive initialized.
-pub const LAZY_INIT_COOKIE: u32 = 0xcafe_affe;
-
-// Public interface to synchronization primitives. Please note that in most
+// Public interface to synchronization objects. Please note that in most
 // cases, the function calls are infallible and it is the client's (shim
 // implementation's) responsibility to detect and deal with erroneous
 // situations.
 impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
 pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
-    /// Helper for lazily initialized `alloc_extra.sync` data:
-    /// this forces an immediate init.
-    /// Return a reference to the data in the machine state.
-    fn lazy_sync_init<'a, T: 'static>(
-        &'a mut self,
-        primitive: &MPlaceTy<'tcx>,
-        init_offset: Size,
-        data: T,
-    ) -> InterpResult<'tcx, &'a T>
-    where
-        'tcx: 'a,
-    {
-        let this = self.eval_context_mut();
-
-        let (alloc, offset, _) = this.ptr_get_alloc_id(primitive.ptr(), 0)?;
-        let (alloc_extra, _machine) = this.get_alloc_extra_mut(alloc)?;
-        alloc_extra.sync.insert(offset, Box::new(data));
-        // Mark this as "initialized".
-        let init_field = primitive.offset(init_offset, this.machine.layouts.u32, this)?;
-        this.write_scalar_atomic(
-            Scalar::from_u32(LAZY_INIT_COOKIE),
-            &init_field,
-            AtomicWriteOrd::Relaxed,
-        )?;
-        interp_ok(this.get_alloc_extra(alloc)?.get_sync::<T>(offset).unwrap())
-    }
-
-    /// Helper for lazily initialized `alloc_extra.sync` data:
-    /// Checks if the primitive is initialized:
-    /// - If yes, fetches the data from `alloc_extra.sync`, or calls `missing_data` if that fails
-    ///   and stores that in `alloc_extra.sync`.
-    /// - Otherwise, calls `new_data` to initialize the primitive.
-    ///
-    /// Return a reference to the data in the machine state.
-    fn lazy_sync_get_data<'a, T: 'static>(
-        &'a mut self,
-        primitive: &MPlaceTy<'tcx>,
-        init_offset: Size,
-        missing_data: impl FnOnce() -> InterpResult<'tcx, T>,
-        new_data: impl FnOnce(&mut MiriInterpCx<'tcx>) -> InterpResult<'tcx, T>,
-    ) -> InterpResult<'tcx, &'a T>
-    where
-        'tcx: 'a,
-    {
-        let this = self.eval_context_mut();
-
-        // Check if this is already initialized. Needs to be atomic because we can race with another
-        // thread initializing. Needs to be an RMW operation to ensure we read the *latest* value.
-        // So we just try to replace MUTEX_INIT_COOKIE with itself.
-        let init_cookie = Scalar::from_u32(LAZY_INIT_COOKIE);
-        let init_field = primitive.offset(init_offset, this.machine.layouts.u32, this)?;
-        let (_init, success) = this
-            .atomic_compare_exchange_scalar(
-                &init_field,
-                &ImmTy::from_scalar(init_cookie, this.machine.layouts.u32),
-                init_cookie,
-                AtomicRwOrd::Relaxed,
-                AtomicReadOrd::Relaxed,
-                /* can_fail_spuriously */ false,
-            )?
-            .to_scalar_pair();
-
-        if success.to_bool()? {
-            // If it is initialized, it must be found in the "sync primitive" table,
-            // or else it has been moved illegally.
-            let (alloc, offset, _) = this.ptr_get_alloc_id(primitive.ptr(), 0)?;
-            let (alloc_extra, _machine) = this.get_alloc_extra_mut(alloc)?;
-            // Due to borrow checker reasons, we have to do the lookup twice.
-            if alloc_extra.get_sync::<T>(offset).is_none() {
-                let data = missing_data()?;
-                alloc_extra.sync.insert(offset, Box::new(data));
-            }
-            interp_ok(alloc_extra.get_sync::<T>(offset).unwrap())
-        } else {
-            let data = new_data(this)?;
-            this.lazy_sync_init(primitive, init_offset, data)
-        }
-    }
-
-    /// Get the synchronization primitive associated with the given pointer,
+    /// Get the synchronization object associated with the given pointer,
     /// or initialize a new one.
     ///
     /// Return `None` if this pointer does not point to at least 1 byte of mutable memory.
-    fn get_sync_or_init<'a, T: 'static>(
+    fn get_sync_or_init<'a, T: SyncObj>(
         &'a mut self,
         ptr: Pointer,
         new: impl FnOnce(&'a mut MiriMachine<'tcx>) -> T,
@@ -332,13 +306,110 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // Due to borrow checker reasons, we have to do the lookup twice.
         if alloc_extra.get_sync::<T>(offset).is_none() {
             let new = new(machine);
-            alloc_extra.sync.insert(offset, Box::new(new));
+            alloc_extra.sync_objs.insert(offset, Box::new(new));
         }
         Some(alloc_extra.get_sync::<T>(offset).unwrap())
     }
 
+    /// Helper for "immovable" synchronization objects: the expected protocol for these objects is
+    /// that they use a static initializer of `uninit_val`, and we set them to `init_val` upon
+    /// initialization. At that point we also register a synchronization object, which is expected
+    /// to have `delete_on_write() == true`. So in the future, if we still see the object, we know
+    /// the location must still contain `init_val`. If the object is copied somewhere, that will
+    /// show up as a non-`init_val` value without a synchronization object, which we can then use to
+    /// error.
+    ///
+    /// `new_meta_obj` gets invoked when there is not yet an initialization object.
+    /// It has to ensure that the in-memory representation indeed matches `uninit_val`.
+    ///
+    /// The point of storing an `init_val` is so that if this memory gets copied somewhere else,
+    /// it does not look like the static initializer (i.e., `uninit_val`) any more. For some
+    /// objects we could just entirely forbid reading their bytes to ensure they don't get copied,
+    /// but that does not work for objects without a destructor (Windows `InitOnce`, macOS
+    /// `os_unfair_lock`).
+    fn get_immovable_sync_with_static_init<'a, T: SyncObj>(
+        &'a mut self,
+        obj: &MPlaceTy<'tcx>,
+        init_offset: Size,
+        uninit_val: u8,
+        init_val: u8,
+        new_meta_obj: impl FnOnce(&mut MiriInterpCx<'tcx>) -> InterpResult<'tcx, T>,
+    ) -> InterpResult<'tcx, &'a T>
+    where
+        'tcx: 'a,
+    {
+        assert!(init_val != uninit_val);
+        let this = self.eval_context_mut();
+        this.check_ptr_access(obj.ptr(), obj.layout.size, CheckInAllocMsg::Dereferenceable)?;
+        assert!(init_offset < obj.layout.size); // ensure our 1-byte flag fits
+        let init_field = obj.offset(init_offset, this.machine.layouts.u8, this)?;
+
+        let (alloc, offset, _) = this.ptr_get_alloc_id(init_field.ptr(), 0)?;
+        let (alloc_extra, _machine) = this.get_alloc_extra_mut(alloc)?;
+        // Due to borrow checker reasons, we have to do the lookup twice.
+        if alloc_extra.get_sync::<T>(offset).is_some() {
+            let (alloc_extra, _machine) = this.get_alloc_extra_mut(alloc).unwrap();
+            return interp_ok(alloc_extra.get_sync::<T>(offset).unwrap());
+        }
+
+        // There's no sync object there yet. Create one, and try a CAS for uninit_val to init_val.
+        let meta_obj = new_meta_obj(this)?;
+        let (old_init, success) = this
+            .atomic_compare_exchange_scalar(
+                &init_field,
+                &ImmTy::from_scalar(Scalar::from_u8(uninit_val), this.machine.layouts.u8),
+                Scalar::from_u8(init_val),
+                AtomicRwOrd::Relaxed,
+                AtomicReadOrd::Relaxed,
+                /* can_fail_spuriously */ false,
+            )?
+            .to_scalar_pair();
+        if !success.to_bool()? {
+            // This can happen for the macOS lock if it is already marked as initialized.
+            assert_eq!(
+                old_init.to_u8()?,
+                init_val,
+                "`new_meta_obj` should have ensured that this CAS succeeds"
+            );
+        }
+
+        let (alloc_extra, _machine) = this.get_alloc_extra_mut(alloc).unwrap();
+        assert!(meta_obj.delete_on_write());
+        alloc_extra.sync_objs.insert(offset, Box::new(meta_obj));
+        interp_ok(alloc_extra.get_sync::<T>(offset).unwrap())
+    }
+
+    /// Explicitly initializes an object that would usually be implicitly initialized with
+    /// `get_immovable_sync_with_static_init`.
+    fn init_immovable_sync<'a, T: SyncObj>(
+        &'a mut self,
+        obj: &MPlaceTy<'tcx>,
+        init_offset: Size,
+        init_val: u8,
+        new_meta_obj: T,
+    ) -> InterpResult<'tcx, Option<&'a T>>
+    where
+        'tcx: 'a,
+    {
+        let this = self.eval_context_mut();
+        this.check_ptr_access(obj.ptr(), obj.layout.size, CheckInAllocMsg::Dereferenceable)?;
+        assert!(init_offset < obj.layout.size); // ensure our 1-byte flag fits
+        let init_field = obj.offset(init_offset, this.machine.layouts.u8, this)?;
+
+        // Zero the entire object, and then store `init_val` directly.
+        this.write_bytes_ptr(obj.ptr(), iter::repeat_n(0, obj.layout.size.bytes_usize()))?;
+        this.write_scalar(Scalar::from_u8(init_val), &init_field)?;
+
+        // Create meta-level initialization object.
+        let (alloc, offset, _) = this.ptr_get_alloc_id(init_field.ptr(), 0)?;
+        let (alloc_extra, _machine) = this.get_alloc_extra_mut(alloc).unwrap();
+        assert!(new_meta_obj.delete_on_write());
+        alloc_extra.sync_objs.insert(offset, Box::new(new_meta_obj));
+        interp_ok(Some(alloc_extra.get_sync::<T>(offset).unwrap()))
+    }
+
     /// Lock by setting the mutex owner and increasing the lock count.
-    fn mutex_lock(&mut self, mutex_ref: &MutexRef) {
+    fn mutex_lock(&mut self, mutex_ref: &MutexRef) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
         let thread = this.active_thread();
         let mut mutex = mutex_ref.0.borrow_mut();
@@ -352,9 +423,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             mutex.owner = Some(thread);
         }
         mutex.lock_count = mutex.lock_count.strict_add(1);
-        if let Some(data_race) = this.machine.data_race.as_vclocks_ref() {
-            data_race.acquire_clock(&mutex.clock, &this.machine.threads);
-        }
+        this.acquire_clock(&mutex.clock)?;
+        interp_ok(())
     }
 
     /// Try unlocking by decreasing the lock count and returning the old lock
@@ -377,17 +447,13 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 // The mutex is completely unlocked. Try transferring ownership
                 // to another thread.
 
-                if let Some(data_race) = this.machine.data_race.as_vclocks_ref() {
-                    data_race.release_clock(&this.machine.threads, |clock| {
-                        mutex.clock.clone_from(clock)
-                    });
-                }
+                this.release_clock(|clock| mutex.clock.clone_from(clock))?;
                 let thread_id = mutex.queue.pop_front();
                 // We need to drop our mutex borrow before unblock_thread
                 // because it will be borrowed again in the unblock callback.
                 drop(mutex);
-                if thread_id.is_some() {
-                    this.unblock_thread(thread_id.unwrap(), BlockReason::Mutex)?;
+                if let Some(thread_id) = thread_id {
+                    this.unblock_thread(thread_id, BlockReason::Mutex)?;
                 }
             }
             Some(old_lock_count)
@@ -425,7 +491,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     assert_eq!(unblock, UnblockKind::Ready);
 
                     assert!(mutex_ref.owner().is_none());
-                    this.mutex_lock(&mutex_ref);
+                    this.mutex_lock(&mutex_ref)?;
 
                     if let Some((retval, dest)) = retval_dest {
                         this.write_scalar(retval, &dest)?;
@@ -439,7 +505,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
     /// Read-lock the lock by adding the `reader` the list of threads that own
     /// this lock.
-    fn rwlock_reader_lock(&mut self, rwlock_ref: &RwLockRef) {
+    fn rwlock_reader_lock(&mut self, rwlock_ref: &RwLockRef) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
         let thread = this.active_thread();
         trace!("rwlock_reader_lock: now also held (one more time) by {:?}", thread);
@@ -447,9 +513,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         assert!(!rwlock.is_write_locked(), "the lock is write locked");
         let count = rwlock.readers.entry(thread).or_insert(0);
         *count = count.strict_add(1);
-        if let Some(data_race) = this.machine.data_race.as_vclocks_ref() {
-            data_race.acquire_clock(&rwlock.clock_unlocked, &this.machine.threads);
-        }
+        this.acquire_clock(&rwlock.clock_unlocked)?;
+        interp_ok(())
     }
 
     /// Try read-unlock the lock for the current threads and potentially give the lock to a new owner.
@@ -472,12 +537,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
             Entry::Vacant(_) => return interp_ok(false), // we did not even own this lock
         }
-        if let Some(data_race) = this.machine.data_race.as_vclocks_ref() {
-            // Add this to the shared-release clock of all concurrent readers.
-            data_race.release_clock(&this.machine.threads, |clock| {
-                rwlock.clock_current_readers.join(clock)
-            });
-        }
+        // Add this to the shared-release clock of all concurrent readers.
+        this.release_clock(|clock| rwlock.clock_current_readers.join(clock))?;
 
         // The thread was a reader. If the lock is not held any more, give it to a writer.
         if rwlock.is_locked().not() {
@@ -521,7 +582,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 }
                 |this, unblock: UnblockKind| {
                     assert_eq!(unblock, UnblockKind::Ready);
-                    this.rwlock_reader_lock(&rwlock_ref);
+                    this.rwlock_reader_lock(&rwlock_ref)?;
                     this.write_scalar(retval, &dest)?;
                     interp_ok(())
                 }
@@ -531,7 +592,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
     /// Lock by setting the writer that owns the lock.
     #[inline]
-    fn rwlock_writer_lock(&mut self, rwlock_ref: &RwLockRef) {
+    fn rwlock_writer_lock(&mut self, rwlock_ref: &RwLockRef) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
         let thread = this.active_thread();
         trace!("rwlock_writer_lock: now held by {:?}", thread);
@@ -539,9 +600,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let mut rwlock = rwlock_ref.0.borrow_mut();
         assert!(!rwlock.is_locked(), "the rwlock is already locked");
         rwlock.writer = Some(thread);
-        if let Some(data_race) = this.machine.data_race.as_vclocks_ref() {
-            data_race.acquire_clock(&rwlock.clock_unlocked, &this.machine.threads);
-        }
+        this.acquire_clock(&rwlock.clock_unlocked)?;
+        interp_ok(())
     }
 
     /// Try to unlock an rwlock held by the current thread.
@@ -559,11 +619,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             rwlock.writer = None;
             trace!("rwlock_writer_unlock: unlocked by {:?}", thread);
             // Record release clock for next lock holder.
-            if let Some(data_race) = this.machine.data_race.as_vclocks_ref() {
-                data_race.release_clock(&this.machine.threads, |clock| {
-                    rwlock.clock_unlocked.clone_from(clock)
-                });
-            }
+            this.release_clock(|clock| rwlock.clock_unlocked.clone_from(clock))?;
 
             // The thread was a writer.
             //
@@ -613,7 +669,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 }
                 |this, unblock: UnblockKind| {
                     assert_eq!(unblock, UnblockKind::Ready);
-                    this.rwlock_writer_lock(&rwlock_ref);
+                    this.rwlock_writer_lock(&rwlock_ref)?;
                     this.write_scalar(retval, &dest)?;
                     interp_ok(())
                 }
@@ -663,12 +719,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     match unblock {
                         UnblockKind::Ready => {
                             // The condvar was signaled. Make sure we get the clock for that.
-                            if let Some(data_race) = this.machine.data_race.as_vclocks_ref() {
-                                data_race.acquire_clock(
+                            this.acquire_clock(
                                     &condvar_ref.0.borrow().clock,
-                                    &this.machine.threads,
-                                );
-                            }
+                                )?;
                             // Try to acquire the mutex.
                             // The timeout only applies to the first wait (until the signal), not for mutex acquisition.
                             this.condvar_reacquire_mutex(mutex_ref, retval_succ, dest)
@@ -695,9 +748,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let mut condvar = condvar_ref.0.borrow_mut();
 
         // Each condvar signal happens-before the end of the condvar wake
-        if let Some(data_race) = this.machine.data_race.as_vclocks_ref() {
-            data_race.release_clock(&this.machine.threads, |clock| condvar.clock.clone_from(clock));
-        }
+        this.release_clock(|clock| condvar.clock.clone_from(clock))?;
         let Some(waiter) = condvar.waiters.pop_front() else {
             return interp_ok(false);
         };
@@ -736,9 +787,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                         UnblockKind::Ready => {
                             let futex = futex_ref.0.borrow();
                             // Acquire the clock of the futex.
-                            if let Some(data_race) = this.machine.data_race.as_vclocks_ref() {
-                                data_race.acquire_clock(&futex.clock, &this.machine.threads);
-                            }
+                            this.acquire_clock(&futex.clock)?;
                         },
                         UnblockKind::TimedOut => {
                             // Remove the waiter from the futex.
@@ -766,9 +815,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let mut futex = futex_ref.0.borrow_mut();
 
         // Each futex-wake happens-before the end of the futex wait
-        if let Some(data_race) = this.machine.data_race.as_vclocks_ref() {
-            data_race.release_clock(&this.machine.threads, |clock| futex.clock.clone_from(clock));
-        }
+        this.release_clock(|clock| futex.clock.clone_from(clock))?;
 
         // Remove `count` of the threads in the queue that match any of the bits in the bitset.
         // We collect all of them before unblocking because the unblock callback may access the

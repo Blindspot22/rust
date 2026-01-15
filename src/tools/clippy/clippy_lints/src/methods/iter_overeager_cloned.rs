@@ -10,8 +10,7 @@ use rustc_middle::mir::{FakeReadCause, Mutability};
 use rustc_middle::ty::{self, BorrowKind};
 use rustc_span::{Symbol, sym};
 
-use super::ITER_OVEREAGER_CLONED;
-use crate::redundant_clone::REDUNDANT_CLONE;
+use super::{ITER_OVEREAGER_CLONED, REDUNDANT_ITER_CLONED};
 
 #[derive(Clone, Copy)]
 pub(super) enum Op<'a> {
@@ -82,7 +81,8 @@ pub(super) fn check<'tcx>(
                 }
 
                 match it.kind {
-                    PatKind::Binding(BindingMode(_, Mutability::Mut), _, _, _) | PatKind::Ref(_, Mutability::Mut) => {
+                    PatKind::Binding(BindingMode(_, Mutability::Mut), _, _, _)
+                    | PatKind::Ref(_, _, Mutability::Mut) => {
                         to_be_discarded = true;
                         false
                     },
@@ -96,7 +96,7 @@ pub(super) fn check<'tcx>(
         }
 
         let (lint, msg, trailing_clone) = match op {
-            Op::RmCloned | Op::NeedlessMove(_) => (REDUNDANT_CLONE, "unneeded cloning of iterator items", ""),
+            Op::RmCloned | Op::NeedlessMove(_) => (REDUNDANT_ITER_CLONED, "unneeded cloning of iterator items", ""),
             Op::LaterCloned | Op::FixClosure(_, _) => (
                 ITER_OVEREAGER_CLONED,
                 "unnecessarily eager cloning of iterator items",

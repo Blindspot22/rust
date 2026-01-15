@@ -84,13 +84,14 @@ impl TryReserveError {
         reason = "Uncertain how much info should be exposed",
         issue = "48043"
     )]
-    pub fn kind(&self) -> TryReserveErrorKind {
+    #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
+    pub const fn kind(&self) -> TryReserveErrorKind {
         self.kind.clone()
     }
 }
 
 /// Details of the allocation that caused a `TryReserveError`
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 #[unstable(
     feature = "try_reserve_kind",
     reason = "Uncertain how much info should be exposed",
@@ -120,6 +121,24 @@ pub enum TryReserveErrorKind {
     },
 }
 
+#[unstable(
+    feature = "try_reserve_kind",
+    reason = "Uncertain how much info should be exposed",
+    issue = "48043"
+)]
+#[rustc_const_unstable(feature = "const_heap", issue = "79597")]
+#[cfg(not(test))]
+impl const Clone for TryReserveErrorKind {
+    fn clone(&self) -> Self {
+        match self {
+            TryReserveErrorKind::CapacityOverflow => TryReserveErrorKind::CapacityOverflow,
+            TryReserveErrorKind::AllocError { layout, non_exhaustive: () } => {
+                TryReserveErrorKind::AllocError { layout: *layout, non_exhaustive: () }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 pub use realalloc::collections::TryReserveErrorKind;
 
@@ -128,8 +147,9 @@ pub use realalloc::collections::TryReserveErrorKind;
     reason = "Uncertain how much info should be exposed",
     issue = "48043"
 )]
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
 #[cfg(not(test))]
-impl From<TryReserveErrorKind> for TryReserveError {
+impl const From<TryReserveErrorKind> for TryReserveError {
     #[inline]
     fn from(kind: TryReserveErrorKind) -> Self {
         Self { kind }
@@ -137,8 +157,9 @@ impl From<TryReserveErrorKind> for TryReserveError {
 }
 
 #[unstable(feature = "try_reserve_kind", reason = "new API", issue = "48043")]
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
 #[cfg(not(test))]
-impl From<LayoutError> for TryReserveErrorKind {
+impl const From<LayoutError> for TryReserveErrorKind {
     /// Always evaluates to [`TryReserveErrorKind::CapacityOverflow`].
     #[inline]
     fn from(_: LayoutError) -> Self {

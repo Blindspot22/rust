@@ -59,7 +59,7 @@
 #[cold = 1]
 //~^ ERROR malformed
 #[must_use()]
-//~^ ERROR valid forms for the attribute are
+//~^ ERROR malformed
 #[no_mangle = 1]
 //~^ ERROR malformed
 #[unsafe(naked())]
@@ -73,6 +73,7 @@
 //~| ERROR attribute cannot be used on
 #[crate_name]
 //~^ ERROR malformed
+//~| WARN crate-level attribute should be an inner attribute
 #[doc]
 //~^ ERROR valid forms for the attribute are
 //~| WARN this was previously accepted by the compiler
@@ -81,10 +82,13 @@
 #[export_stable = 1]
 //~^ ERROR malformed
 #[link]
-//~^ ERROR valid forms for the attribute are
-//~| WARN this was previously accepted by the compiler
+//~^ ERROR malformed
+//~| WARN attribute should be applied to an `extern` block with non-Rust ABI
+//~| WARN previously accepted
 #[link_name]
 //~^ ERROR malformed
+//~| WARN cannot be used on functions
+//~| WARN previously accepted
 #[link_section]
 //~^ ERROR malformed
 #[coverage]
@@ -96,6 +100,8 @@
 //~| WARN this was previously accepted by the compiler
 #[no_implicit_prelude = 23]
 //~^ ERROR malformed
+//~| WARN cannot be used on functions
+//~| WARN previously accepted
 #[proc_macro = 18]
 //~^ ERROR malformed
 //~| ERROR the `#[proc_macro]` attribute is only usable with crates of the `proc-macro` crate type
@@ -131,7 +137,7 @@ pub fn test3() {}
 //~^ ERROR malformed
 #[must_not_suspend()]
 //~^ ERROR malformed
-#[cfi_encoding]
+#[cfi_encoding = ""]
 //~^ ERROR malformed
 struct Test;
 
@@ -186,10 +192,11 @@ extern "C" {
 #[forbid]
 //~^ ERROR malformed
 #[debugger_visualizer]
-//~^ ERROR invalid argument
-//~| ERROR malformed `debugger_visualizer` attribute input
+//~^ ERROR malformed `debugger_visualizer` attribute input
 #[automatically_derived = 18]
 //~^ ERROR malformed
+//~| WARN cannot be used on modules
+//~| WARN previously accepted
 mod yooo {
 
 }
@@ -207,12 +214,12 @@ static mut TLS: u8 = 42;
 #[no_link()]
 //~^ ERROR malformed
 #[macro_use = 1]
-//~^ ERROR valid forms for the attribute are `#[macro_use(name1, name2, ...)]` and `#[macro_use]`
+//~^ ERROR malformed
 extern crate wloop;
 //~^ ERROR can't find crate for `wloop` [E0463]
 
 #[macro_export = 18]
-//~^ ERROR malformed `macro_export` attribute input
+//~^ ERROR malformed
 #[allow_internal_unsafe = 1]
 //~^ ERROR malformed
 //~| ERROR allow_internal_unsafe side-steps the unsafe_code lint

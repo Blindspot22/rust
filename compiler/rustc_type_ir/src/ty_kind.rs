@@ -8,32 +8,21 @@ use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 #[cfg(feature = "nightly")]
 use rustc_macros::{Decodable_NoContext, Encodable_NoContext, HashStable_NoContext};
 use rustc_type_ir::data_structures::{NoError, UnifyKey, UnifyValue};
-use rustc_type_ir_macros::{Lift_Generic, TypeFoldable_Generic, TypeVisitable_Generic};
+use rustc_type_ir_macros::{
+    GenericTypeVisitable, Lift_Generic, TypeFoldable_Generic, TypeVisitable_Generic,
+};
 
 use self::TyKind::*;
 pub use self::closure::*;
 use crate::inherent::*;
 #[cfg(feature = "nightly")]
 use crate::visit::TypeVisitable;
-use crate::{self as ty, DebruijnIndex, FloatTy, IntTy, Interner, UintTy};
+use crate::{self as ty, BoundVarIndexKind, FloatTy, IntTy, Interner, UintTy};
 
 mod closure;
 
-/// Specifies how a trait object is represented.
-///
-/// This used to have a variant `DynStar`, but that variant has been removed,
-/// and it's likely this whole enum will be removed soon.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-#[cfg_attr(
-    feature = "nightly",
-    derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
-)]
-pub enum DynKind {
-    /// An unsized `dyn Trait` object
-    Dyn,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(GenericTypeVisitable)]
 #[cfg_attr(
     feature = "nightly",
     derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
@@ -70,6 +59,7 @@ impl AliasTyKind {
 /// converted to this representation using `<dyn HirTyLowerer>::lower_ty`.
 #[cfg_attr(feature = "nightly", rustc_diagnostic_item = "IrTyKind")]
 #[derive_where(Clone, Copy, Hash, PartialEq; I: Interner)]
+#[derive(GenericTypeVisitable)]
 #[cfg_attr(
     feature = "nightly",
     derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
@@ -101,7 +91,7 @@ pub enum TyKind<I: Interner> {
     Adt(I::AdtDef, I::GenericArgs),
 
     /// An unsized FFI type that is opaque to Rust. Written as `extern type T`.
-    Foreign(I::DefId),
+    Foreign(I::ForeignId),
 
     /// The pointee of a string slice. Written as `str`.
     Str,
@@ -137,7 +127,7 @@ pub enum TyKind<I: Interner> {
     /// fn foo() -> i32 { 1 }
     /// let bar = foo; // bar: fn() -> i32 {foo}
     /// ```
-    FnDef(I::DefId, I::GenericArgs),
+    FnDef(I::FunctionId, I::GenericArgs),
 
     /// A pointer to a function. Written as `fn() -> i32`.
     ///
@@ -165,28 +155,28 @@ pub enum TyKind<I: Interner> {
     UnsafeBinder(UnsafeBinderInner<I>),
 
     /// A trait object. Written as `dyn for<'b> Trait<'b, Assoc = u32> + Send + 'a`.
-    Dynamic(I::BoundExistentialPredicates, I::Region, DynKind),
+    Dynamic(I::BoundExistentialPredicates, I::Region),
 
     /// The anonymous type of a closure. Used to represent the type of `|a| a`.
     ///
     /// Closure args contain both the - potentially instantiated - generic parameters
     /// of its parent and some synthetic parameters. See the documentation for
     /// `ClosureArgs` for more details.
-    Closure(I::DefId, I::GenericArgs),
+    Closure(I::ClosureId, I::GenericArgs),
 
     /// The anonymous type of a closure. Used to represent the type of `async |a| a`.
     ///
     /// Coroutine-closure args contain both the - potentially instantiated - generic
     /// parameters of its parent and some synthetic parameters. See the documentation
     /// for `CoroutineClosureArgs` for more details.
-    CoroutineClosure(I::DefId, I::GenericArgs),
+    CoroutineClosure(I::CoroutineClosureId, I::GenericArgs),
 
     /// The anonymous type of a coroutine. Used to represent the type of
     /// `|a| yield a`.
     ///
     /// For more info about coroutine args, visit the documentation for
     /// `CoroutineArgs`.
-    Coroutine(I::DefId, I::GenericArgs),
+    Coroutine(I::CoroutineId, I::GenericArgs),
 
     /// A type representing the types stored inside a coroutine.
     /// This should only appear as part of the `CoroutineArgs`.
@@ -211,7 +201,7 @@ pub enum TyKind<I: Interner> {
     /// }
     /// # ;
     /// ```
-    CoroutineWitness(I::DefId, I::GenericArgs),
+    CoroutineWitness(I::CoroutineId, I::GenericArgs),
 
     /// The never type `!`.
     Never,
@@ -243,7 +233,7 @@ pub enum TyKind<I: Interner> {
     ///
     /// [1]: https://rustc-dev-guide.rust-lang.org/traits/hrtb.html
     /// [2]: https://rustc-dev-guide.rust-lang.org/traits/canonical-queries.html
-    Bound(DebruijnIndex, I::BoundTy),
+    Bound(BoundVarIndexKind, I::BoundTy),
 
     /// A placeholder type, used during higher ranked subtyping to instantiate
     /// bound variables.
@@ -314,7 +304,7 @@ impl<I: Interner> TyKind<I> {
             | ty::FnDef(_, _)
             | ty::FnPtr(..)
             | ty::UnsafeBinder(_)
-            | ty::Dynamic(_, _, _)
+            | ty::Dynamic(_, _)
             | ty::Closure(_, _)
             | ty::CoroutineClosure(_, _)
             | ty::Coroutine(_, _)
@@ -367,9 +357,7 @@ impl<I: Interner> fmt::Debug for TyKind<I> {
             FnPtr(sig_tys, hdr) => write!(f, "{:?}", sig_tys.with(*hdr)),
             // FIXME(unsafe_binder): print this like `unsafe<'a> T<'a>`.
             UnsafeBinder(binder) => write!(f, "{:?}", binder),
-            Dynamic(p, r, repr) => match repr {
-                DynKind::Dyn => write!(f, "dyn {p:?} + {r:?}"),
-            },
+            Dynamic(p, r) => write!(f, "dyn {p:?} + {r:?}"),
             Closure(d, s) => f.debug_tuple("Closure").field(d).field(&s).finish(),
             CoroutineClosure(d, s) => f.debug_tuple("CoroutineClosure").field(d).field(&s).finish(),
             Coroutine(d, s) => f.debug_tuple("Coroutine").field(d).field(&s).finish(),
@@ -407,7 +395,7 @@ impl<I: Interner> fmt::Debug for TyKind<I> {
 /// * For an inherent projection, this would be `Ty::N<...>`.
 /// * For an opaque type, there is no explicit syntax.
 #[derive_where(Clone, Copy, Hash, PartialEq, Debug; I: Interner)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic, Lift_Generic)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic, Lift_Generic)]
 #[cfg_attr(
     feature = "nightly",
     derive(Decodable_NoContext, Encodable_NoContext, HashStable_NoContext)
@@ -606,7 +594,7 @@ pub enum InferTy {
 
     /// A [`FreshTy`][Self::FreshTy] is one that is generated as a replacement
     /// for an unbound type variable. This is convenient for caching etc. See
-    /// `rustc_infer::infer::freshen` for more details.
+    /// `TypeFreshener` for more details.
     ///
     /// Compare with [`TyVar`][Self::TyVar].
     FreshTy(u32),
@@ -729,7 +717,7 @@ impl fmt::Debug for InferTy {
     feature = "nightly",
     derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
 )]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic)]
 pub struct TypeAndMut<I: Interner> {
     pub ty: I::Ty,
     pub mutbl: Mutability,
@@ -742,7 +730,7 @@ impl<I: Interner> Eq for TypeAndMut<I> {}
     feature = "nightly",
     derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
 )]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic, Lift_Generic)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic, Lift_Generic)]
 pub struct FnSig<I: Interner> {
     pub inputs_and_output: I::Tys,
     pub c_variadic: bool,
@@ -855,7 +843,7 @@ impl<I: Interner> fmt::Debug for FnSig<I> {
 // impls in this crate for `Binder<I, I::Ty>`.
 #[derive_where(Clone, Copy, PartialEq, Hash; I: Interner)]
 #[cfg_attr(feature = "nightly", derive(HashStable_NoContext))]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic, Lift_Generic)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic, Lift_Generic)]
 pub struct UnsafeBinderInner<I: Interner>(ty::Binder<I, I::Ty>);
 
 impl<I: Interner> Eq for UnsafeBinderInner<I> {}
@@ -921,7 +909,7 @@ where
     feature = "nightly",
     derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
 )]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic, Lift_Generic)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic, Lift_Generic)]
 pub struct FnSigTys<I: Interner> {
     pub inputs_and_output: I::Tys,
 }
@@ -975,7 +963,7 @@ impl<I: Interner> ty::Binder<I, FnSigTys<I>> {
     feature = "nightly",
     derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
 )]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic, Lift_Generic)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic, Lift_Generic)]
 pub struct FnHeader<I: Interner> {
     pub c_variadic: bool,
     pub safety: I::Safety,
@@ -989,7 +977,7 @@ impl<I: Interner> Eq for FnHeader<I> {}
     feature = "nightly",
     derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
 )]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic, Lift_Generic)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic, Lift_Generic)]
 pub struct CoroutineWitnessTypes<I: Interner> {
     pub types: I::Tys,
     pub assumptions: I::RegionAssumptions,

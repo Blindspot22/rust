@@ -1,8 +1,6 @@
 use super::unsupported;
-use crate::error::Error as StdError;
 use crate::ffi::{OsStr, OsString};
 use crate::marker::PhantomData;
-use crate::os::xous::ffi::Error as XousError;
 use crate::path::{self, PathBuf};
 use crate::sync::atomic::{Atomic, AtomicPtr, Ordering};
 use crate::{fmt, io};
@@ -12,7 +10,7 @@ pub(crate) mod params;
 static PARAMS_ADDRESS: Atomic<*mut u8> = AtomicPtr::new(core::ptr::null_mut());
 
 #[cfg(not(test))]
-#[cfg(feature = "panic_unwind")]
+#[cfg(feature = "panic-unwind")]
 mod eh_unwinding {
     pub(crate) struct EhFrameFinder;
     pub(crate) static mut EH_FRAME_ADDRESS: usize = 0;
@@ -46,7 +44,7 @@ mod c_compat {
 
     #[unsafe(no_mangle)]
     pub extern "C" fn _start(eh_frame: usize, params_address: usize) {
-        #[cfg(feature = "panic_unwind")]
+        #[cfg(feature = "panic-unwind")]
         {
             unsafe { super::eh_unwinding::EH_FRAME_ADDRESS = eh_frame };
             unwind::set_custom_eh_frame_finder(&super::eh_unwinding::EH_FRAME_SETTINGS).ok();
@@ -62,14 +60,6 @@ mod c_compat {
         }
         exit(unsafe { main() });
     }
-}
-
-pub fn errno() -> i32 {
-    0
-}
-
-pub fn error_string(errno: i32) -> String {
-    Into::<XousError>::into(errno).to_string()
 }
 
 pub fn getcwd() -> io::Result<PathBuf> {
@@ -110,12 +100,7 @@ impl fmt::Display for JoinPathsError {
     }
 }
 
-impl StdError for JoinPathsError {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        "not supported on this platform yet"
-    }
-}
+impl crate::error::Error for JoinPathsError {}
 
 pub fn current_exe() -> io::Result<PathBuf> {
     unsupported()

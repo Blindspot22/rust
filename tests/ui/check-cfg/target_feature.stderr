@@ -27,7 +27,6 @@ LL |     cfg!(target_feature = "_UNEXPECTED_VALUE");
 `amx-movrs`
 `amx-tf32`
 `amx-tile`
-`amx-transpose`
 `apxf`
 `atomics`
 `avx`
@@ -122,6 +121,7 @@ LL |     cfg!(target_feature = "_UNEXPECTED_VALUE");
 `frecipe`
 `frintts`
 `fxsr`
+`gc`
 `gfni`
 `guarded-storage`
 `hard-float`
@@ -243,6 +243,7 @@ LL |     cfg!(target_feature = "_UNEXPECTED_VALUE");
 `relax`
 `relaxed-simd`
 `rtm`
+`rva23u64`
 `sb`
 `scq`
 `sha`
@@ -304,6 +305,7 @@ LL |     cfg!(target_feature = "_UNEXPECTED_VALUE");
 `ssve-fp8dot2`
 `ssve-fp8dot4`
 `ssve-fp8fma`
+`supm`
 `sve`
 `sve-b16b16`
 `sve2`
@@ -422,6 +424,7 @@ LL |     cfg!(target_feature = "_UNEXPECTED_VALUE");
 `zkn`
 `zknd`
 `zkne`
+`zkne_or_zknd`
 `zknh`
 `zkr`
 `zks`

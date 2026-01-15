@@ -50,10 +50,10 @@ preserves full fidelity information for both IDEs and procedural macros
 The *parser* [translates the token stream from the `lexer` into an Abstract Syntax
 Tree (AST)][parser]. It uses a recursive descent (top-down) approach to syntax
 analysis. The crate entry points for the `parser` are the
-[`Parser::parse_crate_mod()`][parse_crate_mod] and [`Parser::parse_mod()`][parse_mod]
+[`Parser::parse_crate_mod`][parse_crate_mod] and [`Parser::parse_mod`][parse_mod]
 methods found in [`rustc_parse::parser::Parser`]. The external module parsing
 entry point is [`rustc_expand::module::parse_external_mod`][parse_external_mod].
-And the macro-`parser` entry point is [`Parser::parse_nonterminal()`][parse_nonterminal].
+And the macro-`parser` entry point is [`Parser::parse_nonterminal`][parse_nonterminal].
 
 Parsing is performed with a set of [`parser`] utility methods including [`bump`],
 [`check`], [`eat`], [`expect`], [`look_ahead`].
@@ -63,10 +63,10 @@ Parsing is organized by semantic construct. Separate
 directory. The source file name follows the construct name. For example, the
 following files are found in the `parser`:
 
-- [`expr.rs`](https://github.com/rust-lang/rust/blob/master/compiler/rustc_parse/src/parser/expr.rs)
-- [`pat.rs`](https://github.com/rust-lang/rust/blob/master/compiler/rustc_parse/src/parser/pat.rs)
-- [`ty.rs`](https://github.com/rust-lang/rust/blob/master/compiler/rustc_parse/src/parser/ty.rs)
-- [`stmt.rs`](https://github.com/rust-lang/rust/blob/master/compiler/rustc_parse/src/parser/stmt.rs)
+- [`expr.rs`](https://github.com/rust-lang/rust/blob/HEAD/compiler/rustc_parse/src/parser/expr.rs)
+- [`pat.rs`](https://github.com/rust-lang/rust/blob/HEAD/compiler/rustc_parse/src/parser/pat.rs)
+- [`ty.rs`](https://github.com/rust-lang/rust/blob/HEAD/compiler/rustc_parse/src/parser/ty.rs)
+- [`stmt.rs`](https://github.com/rust-lang/rust/blob/HEAD/compiler/rustc_parse/src/parser/stmt.rs)
 
 This naming scheme is used across many compiler stages. You will find either a
 file or directory with the same name across the parsing, lowering, type
@@ -130,7 +130,7 @@ with additional low-level types and annotations added (e.g. an ELF object or
 the final binary.
 
 [*trait solving*]: traits/resolution.md
-[*type checking*]: type-checking.md
+[*type checking*]: hir-typeck/summary.md
 [*type inference*]: type-inference.md
 [`bump`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_parse/parser/struct.Parser.html#method.bump
 [`check`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_parse/parser/struct.Parser.html#method.check
@@ -164,7 +164,7 @@ the final binary.
 [parse_mod]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_parse/parser/struct.Parser.html#method.parse_mod
 [parse_nonterminal]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_parse/parser/struct.Parser.html#method.parse_nonterminal
 [parser]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_parse/index.html
-[rustc_parse_parser_dir]: https://github.com/rust-lang/rust/tree/master/compiler/rustc_parse/src/parser
+[rustc_parse_parser_dir]: https://github.com/rust-lang/rust/tree/HEAD/compiler/rustc_parse/src/parser
 [String interning]: https://en.wikipedia.org/wiki/String_interning
 [thir]: ./thir.md
 

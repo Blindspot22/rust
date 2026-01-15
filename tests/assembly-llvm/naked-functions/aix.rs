@@ -1,5 +1,5 @@
 //@ revisions: elfv1-be aix
-//@ add-core-stubs
+//@ add-minicore
 //@ assembly-output: emit-asm
 //
 //@[elfv1-be] compile-flags: --target powerpc64-unknown-linux-gnu
@@ -9,7 +9,7 @@
 //@[aix] needs-llvm-components: powerpc
 
 #![crate_type = "lib"]
-#![feature(no_core, asm_experimental_arch, f128, linkage, fn_align)]
+#![feature(no_core, asm_experimental_arch)]
 #![no_core]
 
 // tests that naked functions work for the `powerpc64-ibm-aix` target.

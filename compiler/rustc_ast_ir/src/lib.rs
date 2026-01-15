@@ -69,7 +69,7 @@ impl IntTy {
         })
     }
 
-    pub fn normalize(&self, target_width: u32) -> Self {
+    pub fn normalize(&self, target_width: u16) -> Self {
         match self {
             IntTy::Isize => match target_width {
                 16 => IntTy::I16,
@@ -148,7 +148,7 @@ impl UintTy {
         })
     }
 
-    pub fn normalize(&self, target_width: u32) -> Self {
+    pub fn normalize(&self, target_width: u16) -> Self {
         match self {
             UintTy::Usize => match target_width {
                 16 => UintTy::U16,
@@ -310,4 +310,22 @@ impl Mutability {
 pub enum Pinnedness {
     Not,
     Pinned,
+}
+
+impl Pinnedness {
+    /// Return `true` if self is pinned
+    pub fn is_pinned(self) -> bool {
+        matches!(self, Self::Pinned)
+    }
+
+    /// Returns `""` (empty string), "mut", `"pin mut "` or `"pin const "` depending
+    /// on the pinnedness and mutability.
+    pub fn prefix_str(self, mutbl: Mutability) -> &'static str {
+        match (self, mutbl) {
+            (Pinnedness::Pinned, Mutability::Mut) => "pin mut ",
+            (Pinnedness::Pinned, Mutability::Not) => "pin const ",
+            (Pinnedness::Not, Mutability::Mut) => "mut ",
+            (Pinnedness::Not, Mutability::Not) => "",
+        }
+    }
 }

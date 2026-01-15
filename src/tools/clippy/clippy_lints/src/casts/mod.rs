@@ -19,6 +19,7 @@ mod fn_to_numeric_cast;
 mod fn_to_numeric_cast_any;
 mod fn_to_numeric_cast_with_truncation;
 mod manual_dangling_ptr;
+mod needless_type_cast;
 mod ptr_as_ptr;
 mod ptr_cast_constness;
 mod ref_as_ptr;
@@ -813,6 +814,32 @@ declare_clippy_lint! {
     "casting a primitive method pointer to any integer type"
 }
 
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for bindings (constants, statics, or let bindings) that are defined
+    /// with one numeric type but are consistently cast to a different type in all usages.
+    ///
+    /// ### Why is this bad?
+    /// If a binding is always cast to a different type when used, it would be clearer
+    /// and more efficient to define it with the target type from the start.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// const SIZE: u16 = 15;
+    /// let arr: [u8; SIZE as usize] = [0; SIZE as usize];
+    /// ```
+    ///
+    /// Use instead:
+    /// ```no_run
+    /// const SIZE: usize = 15;
+    /// let arr: [u8; SIZE] = [0; SIZE];
+    /// ```
+    #[clippy::version = "1.93.0"]
+    pub NEEDLESS_TYPE_CAST,
+    nursery,
+    "binding defined with one type but always cast to another"
+}
+
 pub struct Casts {
     msrv: Msrv,
 }
@@ -851,6 +878,7 @@ impl_lint_pass!(Casts => [
     AS_POINTER_UNDERSCORE,
     MANUAL_DANGLING_PTR,
     CONFUSING_METHOD_TO_NUMERIC_CAST,
+    NEEDLESS_TYPE_CAST,
 ]);
 
 impl<'tcx> LateLintPass<'tcx> for Casts {
@@ -873,7 +901,9 @@ impl<'tcx> LateLintPass<'tcx> for Casts {
             }
             char_lit_as_u8::check(cx, expr, cast_from_expr, cast_to);
             cast_slice_from_raw_parts::check(cx, expr, cast_from_expr, cast_to, self.msrv);
+            cast_ptr_alignment::check(cx, expr, cast_from, cast_to);
             ptr_cast_constness::check(cx, expr, cast_from_expr, cast_from, cast_to, self.msrv);
+            ptr_as_ptr::check(cx, expr, cast_from_expr, cast_from, cast_to_hir, cast_to, self.msrv);
             as_ptr_cast_mut::check(cx, expr, cast_from_expr, cast_to);
             fn_to_numeric_cast_any::check(cx, expr, cast_from_expr, cast_from, cast_to);
             confusing_method_to_numeric_cast::check(cx, expr, cast_from_expr, cast_from, cast_to);
@@ -888,9 +918,9 @@ impl<'tcx> LateLintPass<'tcx> for Casts {
             if cast_to.is_numeric() {
                 cast_possible_truncation::check(cx, expr, cast_from_expr, cast_from, cast_to, cast_to_hir.span);
                 if cast_from.is_numeric() {
-                    cast_possible_wrap::check(cx, expr, cast_from, cast_to);
+                    cast_possible_wrap::check(cx, expr, cast_from_expr, cast_from, cast_to, self.msrv);
                     cast_precision_loss::check(cx, expr, cast_from, cast_to);
-                    cast_sign_loss::check(cx, expr, cast_from_expr, cast_from, cast_to);
+                    cast_sign_loss::check(cx, expr, cast_from_expr, cast_from, cast_to, self.msrv);
                     cast_abs_to_unsigned::check(cx, expr, cast_from_expr, cast_from, cast_to, self.msrv);
                     cast_nan_to_int::check(cx, expr, cast_from_expr, cast_from, cast_to);
                 }
@@ -911,9 +941,15 @@ impl<'tcx> LateLintPass<'tcx> for Casts {
         if self.msrv.meets(cx, msrvs::RAW_REF_OP) {
             borrow_as_ptr::check_implicit_cast(cx, expr);
         }
-        cast_ptr_alignment::check(cx, expr);
-        ptr_as_ptr::check(cx, expr, self.msrv);
+        if self.msrv.meets(cx, msrvs::PTR_SLICE_RAW_PARTS) {
+            cast_slice_from_raw_parts::check_implicit_cast(cx, expr);
+        }
+        cast_ptr_alignment::check_cast_method(cx, expr);
         cast_slice_different_sizes::check(cx, expr, self.msrv);
         ptr_cast_constness::check_null_ptr_cast_method(cx, expr);
+    }
+
+    fn check_body(&mut self, cx: &LateContext<'tcx>, body: &rustc_hir::Body<'tcx>) {
+        needless_type_cast::check(cx, body);
     }
 }

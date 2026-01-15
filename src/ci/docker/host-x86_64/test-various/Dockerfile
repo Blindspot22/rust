@@ -41,9 +41,9 @@ WORKDIR /
 COPY scripts/sccache.sh /scripts/
 RUN sh /scripts/sccache.sh
 
-RUN curl -L https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-27/wasi-sdk-27.0-x86_64-linux.tar.gz | \
+RUN curl -L https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-29/wasi-sdk-29.0-x86_64-linux.tar.gz | \
   tar -xz
-ENV WASI_SDK_PATH=/wasi-sdk-27.0-x86_64-linux
+ENV WASI_SDK_PATH=/wasi-sdk-29.0-x86_64-linux
 
 ENV RUST_CONFIGURE_ARGS \
   --musl-root-x86_64=/usr/local/x86_64-linux-musl \
@@ -56,13 +56,14 @@ ENV RUST_CONFIGURE_ARGS \
 ENV NO_DEBUG_ASSERTIONS=1
 ENV NO_OVERFLOW_CHECKS=1
 
-RUN curl -L https://github.com/bytecodealliance/wasmtime/releases/download/v19.0.0/wasmtime-v19.0.0-x86_64-linux.tar.xz | \
+RUN curl -L https://github.com/bytecodealliance/wasmtime/releases/download/v38.0.4/wasmtime-v38.0.4-x86_64-linux.tar.xz | \
   tar -xJ
-ENV PATH "$PATH:/wasmtime-v19.0.0-x86_64-linux"
+ENV PATH "$PATH:/wasmtime-v38.0.4-x86_64-linux"
 
-ENV WASM_WASIP_TARGET=wasm32-wasip1 
+ENV WASM_WASIP_TARGET=wasm32-wasip1
 ENV WASM_WASIP_SCRIPT python3 /checkout/x.py --stage 2 test --host='' --target $WASM_WASIP_TARGET \
   tests/run-make \
+  tests/run-make-cargo \
   tests/ui \
   tests/mir-opt \
   tests/codegen-units \
@@ -73,6 +74,7 @@ ENV WASM_WASIP_SCRIPT python3 /checkout/x.py --stage 2 test --host='' --target $
 ENV NVPTX_TARGETS=nvptx64-nvidia-cuda
 ENV NVPTX_SCRIPT python3 /checkout/x.py --stage 2 test --host='' --target $NVPTX_TARGETS \
   tests/run-make \
+  tests/run-make-cargo \
   tests/assembly-llvm
 
 ENV MUSL_TARGETS=x86_64-unknown-linux-musl \
@@ -88,8 +90,8 @@ ENV UEFI_TARGETS=aarch64-unknown-uefi,i686-unknown-uefi,x86_64-unknown-uefi \
     CC_x86_64_unknown_uefi=clang-11 \
     CXX_x86_64_unknown_uefi=clang++-11
 ENV UEFI_SCRIPT python3 /checkout/x.py --stage 2 build --host='' --target $UEFI_TARGETS && \
-  python3 /checkout/x.py --stage 2 test tests/run-make/uefi-qemu/rmake.rs --target aarch64-unknown-uefi && \
-  python3 /checkout/x.py --stage 2 test tests/run-make/uefi-qemu/rmake.rs --target i686-unknown-uefi && \
-  python3 /checkout/x.py --stage 2 test tests/run-make/uefi-qemu/rmake.rs --target x86_64-unknown-uefi
+  python3 /checkout/x.py --stage 2 test tests/run-make-cargo/uefi-qemu/rmake.rs --target aarch64-unknown-uefi && \
+  python3 /checkout/x.py --stage 2 test tests/run-make-cargo/uefi-qemu/rmake.rs --target i686-unknown-uefi && \
+  python3 /checkout/x.py --stage 2 test tests/run-make-cargo/uefi-qemu/rmake.rs --target x86_64-unknown-uefi
 
 ENV SCRIPT $WASM_WASIP_SCRIPT && $NVPTX_SCRIPT && $MUSL_SCRIPT && $UEFI_SCRIPT

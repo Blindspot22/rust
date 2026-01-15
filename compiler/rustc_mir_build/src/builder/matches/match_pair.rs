@@ -1,13 +1,16 @@
 use std::sync::Arc;
 
-use rustc_hir::ByRef;
+use rustc_abi::FieldIdx;
 use rustc_middle::mir::*;
+use rustc_middle::span_bug;
 use rustc_middle::thir::*;
 use rustc_middle::ty::{self, Ty, TypeVisitableExt};
 
 use crate::builder::Builder;
 use crate::builder::expr::as_place::{PlaceBase, PlaceBuilder};
-use crate::builder::matches::{FlatPat, MatchPairTree, PatternExtraData, TestCase};
+use crate::builder::matches::{
+    FlatPat, MatchPairTree, PatConstKind, PatternExtraData, SliceLenOp, TestableCase,
+};
 
 impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// Builds and pushes [`MatchPairTree`] subtrees, one for each pattern in
@@ -43,13 +46,23 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     ) {
         let tcx = self.tcx;
         let (min_length, exact_size) = if let Some(place_resolved) = place.try_to_place(self) {
-            match place_resolved.ty(&self.local_decls, tcx).ty.kind() {
-                ty::Array(_, length) => (
-                    length
-                        .try_to_target_usize(tcx)
-                        .expect("expected len of array pat to be definite"),
-                    true,
-                ),
+            let place_ty = place_resolved.ty(&self.local_decls, tcx).ty;
+            match place_ty.kind() {
+                ty::Array(_, length) => {
+                    if let Some(length) = length.try_to_target_usize(tcx) {
+                        (length, true)
+                    } else {
+                        // This can happen when the array length is a generic const
+                        // expression that couldn't be evaluated (e.g., due to an error).
+                        // Since there's already a compilation error, we use a fallback
+                        // to avoid an ICE.
+                        tcx.dcx().span_delayed_bug(
+                            tcx.def_span(self.def_id),
+                            "array length in pattern couldn't be evaluated",
+                        );
+                        ((prefix.len() + suffix.len()).try_into().unwrap(), false)
+                    }
+                }
                 _ => ((prefix.len() + suffix.len()).try_into().unwrap(), false),
             }
         } else {
@@ -120,8 +133,22 @@ impl<'tcx> MatchPairTree<'tcx> {
         }
 
         let place = place_builder.try_to_place(cx);
+
+        // Apply any type ascriptions to the value at `match_pair.place`.
+        if let Some(place) = place
+            && let Some(extra) = &pattern.extra
+        {
+            for &Ascription { ref annotation, variance } in &extra.ascriptions {
+                extra_data.ascriptions.push(super::Ascription {
+                    source: place,
+                    annotation: annotation.clone(),
+                    variance,
+                });
+            }
+        }
+
         let mut subpairs = Vec::new();
-        let test_case = match pattern.kind {
+        let testable_case = match pattern.kind {
             PatKind::Missing | PatKind::Wild | PatKind::Error(_) => None,
 
             PatKind::Or { ref pats } => {
@@ -135,42 +162,54 @@ impl<'tcx> MatchPairTree<'tcx> {
                     // FIXME(@dianne): this needs updating/removing if we always merge or-patterns
                     extra_data.bindings.push(super::SubpatternBindings::FromOrPattern);
                 }
-                Some(TestCase::Or { pats })
+                Some(TestableCase::Or { pats })
             }
 
             PatKind::Range(ref range) => {
                 if range.is_full_range(cx.tcx) == Some(true) {
                     None
                 } else {
-                    Some(TestCase::Range(Arc::clone(range)))
+                    Some(TestableCase::Range(Arc::clone(range)))
                 }
             }
 
-            PatKind::Constant { value } => Some(TestCase::Constant { value }),
+            PatKind::Constant { value } => {
+                // CAUTION: The type of the pattern node (`pattern.ty`) is
+                // _often_ the same as the type of the const value (`value.ty`),
+                // but there are some cases where those types differ
+                // (e.g. when `deref!(..)` patterns interact with `String`).
 
-            PatKind::AscribeUserType {
-                ascription: Ascription { ref annotation, variance },
-                ref subpattern,
-                ..
-            } => {
-                MatchPairTree::for_pattern(
-                    place_builder,
-                    subpattern,
-                    cx,
-                    &mut subpairs,
-                    extra_data,
-                );
-
-                // Apply the type ascription to the value at `match_pair.place`
-                if let Some(source) = place {
-                    let annotation = annotation.clone();
-                    extra_data.ascriptions.push(super::Ascription { source, annotation, variance });
-                }
-
-                None
+                // Classify the constant-pattern into further kinds, to
+                // reduce the number of ad-hoc type tests needed later on.
+                let pat_ty = pattern.ty;
+                let const_kind = if pat_ty.is_bool() {
+                    PatConstKind::Bool
+                } else if pat_ty.is_integral() || pat_ty.is_char() {
+                    PatConstKind::IntOrChar
+                } else if pat_ty.is_floating_point() {
+                    PatConstKind::Float
+                } else if pat_ty.is_str() {
+                    // Deref-patterns can cause string-literal patterns to have
+                    // type `str` instead of the usual `&str`.
+                    if !cx.tcx.features().deref_patterns() {
+                        span_bug!(
+                            pattern.span,
+                            "const pattern has type `str` but deref_patterns is not enabled"
+                        );
+                    }
+                    PatConstKind::String
+                } else if pat_ty.is_imm_ref_str() {
+                    PatConstKind::String
+                } else {
+                    // FIXME(Zalathar): This still covers several different
+                    // categories (e.g. raw pointer, pattern-type)
+                    // which could be split out into their own kinds.
+                    PatConstKind::Other
+                };
+                Some(TestableCase::Constant { value, kind: const_kind })
             }
 
-            PatKind::Binding { mode, var, ref subpattern, .. } => {
+            PatKind::Binding { mode, var, is_shorthand, ref subpattern, .. } => {
                 // In order to please the borrow checker, when lowering a pattern
                 // like `x @ subpat` we must establish any bindings in `subpat`
                 // before establishing the binding for `x`.
@@ -209,14 +248,10 @@ impl<'tcx> MatchPairTree<'tcx> {
                         source,
                         var_id: var,
                         binding_mode: mode,
+                        is_shorthand,
                     }));
                 }
 
-                None
-            }
-
-            PatKind::ExpandedConstant { subpattern: ref pattern, .. } => {
-                MatchPairTree::for_pattern(place_builder, pattern, cx, &mut subpairs, extra_data);
                 None
             }
 
@@ -242,11 +277,20 @@ impl<'tcx> MatchPairTree<'tcx> {
                 );
 
                 if prefix.is_empty() && slice.is_some() && suffix.is_empty() {
+                    // This pattern is shaped like `[..]`. It can match a slice
+                    // of any length, so no length test is needed.
                     None
                 } else {
-                    Some(TestCase::Slice {
-                        len: prefix.len() + suffix.len(),
-                        variable_length: slice.is_some(),
+                    // Any other shape of slice pattern requires a length test.
+                    // Slice patterns with a `..` subpattern require a minimum
+                    // length; those without `..` require an exact length.
+                    Some(TestableCase::Slice {
+                        len: u64::try_from(prefix.len() + suffix.len()).unwrap(),
+                        op: if slice.is_some() {
+                            SliceLenOp::GreaterOrEqual
+                        } else {
+                            SliceLenOp::Equal
+                        },
                     })
                 }
             }
@@ -263,7 +307,11 @@ impl<'tcx> MatchPairTree<'tcx> {
                             cx.def_id.into(),
                         )
                 }) && !adt_def.variant_list_has_applicable_non_exhaustive();
-                if irrefutable { None } else { Some(TestCase::Variant { adt_def, variant_index }) }
+                if irrefutable {
+                    None
+                } else {
+                    Some(TestableCase::Variant { adt_def, variant_index })
+                }
             }
 
             PatKind::Leaf { ref subpatterns } => {
@@ -271,13 +319,24 @@ impl<'tcx> MatchPairTree<'tcx> {
                 None
             }
 
+            // FIXME: Pin-patterns should probably have their own pattern kind,
+            // instead of overloading `PatKind::Deref` via the pattern type.
             PatKind::Deref { ref subpattern }
-            | PatKind::DerefPattern { ref subpattern, borrow: ByRef::No } => {
-                if cfg!(debug_assertions) && matches!(pattern.kind, PatKind::DerefPattern { .. }) {
-                    // Only deref patterns on boxes can be lowered using a built-in deref.
-                    debug_assert!(pattern.ty.is_box());
-                }
+                if let Some(ref_ty) = pattern.ty.pinned_ty()
+                    && ref_ty.is_ref() =>
+            {
+                MatchPairTree::for_pattern(
+                    place_builder.field(FieldIdx::ZERO, ref_ty).deref(),
+                    subpattern,
+                    cx,
+                    &mut subpairs,
+                    extra_data,
+                );
+                None
+            }
 
+            PatKind::Deref { ref subpattern }
+            | PatKind::DerefPattern { ref subpattern, borrow: DerefPatBorrowMode::Box } => {
                 MatchPairTree::for_pattern(
                     place_builder.deref(),
                     subpattern,
@@ -288,7 +347,10 @@ impl<'tcx> MatchPairTree<'tcx> {
                 None
             }
 
-            PatKind::DerefPattern { ref subpattern, borrow: ByRef::Yes(mutability) } => {
+            PatKind::DerefPattern {
+                ref subpattern,
+                borrow: DerefPatBorrowMode::Borrow(mutability),
+            } => {
                 // Create a new temporary for each deref pattern.
                 // FIXME(deref_patterns): dedup temporaries to avoid multiple `deref()` calls?
                 let temp = cx.temp(
@@ -302,17 +364,23 @@ impl<'tcx> MatchPairTree<'tcx> {
                     &mut subpairs,
                     extra_data,
                 );
-                Some(TestCase::Deref { temp, mutability })
+                Some(TestableCase::Deref { temp, mutability })
             }
 
-            PatKind::Never => Some(TestCase::Never),
+            PatKind::Never => Some(TestableCase::Never),
         };
 
-        if let Some(test_case) = test_case {
+        if let Some(testable_case) = testable_case {
             // This pattern is refutable, so push a new match-pair node.
+            //
+            // Note: unless test_case is TestCase::Or, place must not be None.
+            // This means that the closure capture analysis in
+            // rustc_hir_typeck::upvar, and in particular the pattern handling
+            // code of ExprUseVisitor, must capture all of the places we'll use.
+            // Make sure to keep these two parts in sync!
             match_pairs.push(MatchPairTree {
                 place,
-                test_case,
+                testable_case,
                 subpairs,
                 pattern_ty: pattern.ty,
                 pattern_span: pattern.span,

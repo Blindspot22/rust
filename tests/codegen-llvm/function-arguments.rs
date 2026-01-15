@@ -85,7 +85,7 @@ pub fn option_nonzero_int(x: Option<NonZero<u64>>) -> Option<NonZero<u64>> {
 #[no_mangle]
 pub fn readonly_borrow(_: &i32) {}
 
-// CHECK: noundef align 4 dereferenceable(4) ptr @readonly_borrow_ret()
+// CHECK: noundef nonnull align 4 ptr @readonly_borrow_ret()
 #[no_mangle]
 pub fn readonly_borrow_ret() -> &'static i32 {
     loop {}
@@ -116,7 +116,7 @@ pub fn mutable_unsafe_borrow(_: &mut UnsafeInner) {}
 #[no_mangle]
 pub fn mutable_borrow(_: &mut i32) {}
 
-// CHECK: noundef align 4 dereferenceable(4) ptr @mutable_borrow_ret()
+// CHECK: noundef nonnull align 4 ptr @mutable_borrow_ret()
 #[no_mangle]
 pub fn mutable_borrow_ret() -> &'static mut i32 {
     loop {}
@@ -134,7 +134,7 @@ pub fn mutable_notunpin_borrow(_: &mut NotUnpin) {}
 #[no_mangle]
 pub fn notunpin_borrow(_: &NotUnpin) {}
 
-// CHECK: @indirect_struct(ptr{{( dead_on_return)?}} noalias{{( nocapture)?}} noundef readonly align 4{{( captures\(none\))?}} dereferenceable(32) %_1)
+// CHECK: @indirect_struct(ptr{{( dead_on_return)?}} noalias noundef readonly align 4{{( captures\(none\))?}} dereferenceable(32) %_1)
 #[no_mangle]
 pub fn indirect_struct(_: S) {}
 
@@ -197,7 +197,7 @@ pub fn notunpin_box(x: Box<NotUnpin>) -> Box<NotUnpin> {
     x
 }
 
-// CHECK: @struct_return(ptr{{( dead_on_unwind)?}} noalias{{( nocapture)?}} noundef{{( writable)?}} sret([32 x i8]) align 4{{( captures\(none\))?}} dereferenceable(32){{( %_0)?}})
+// CHECK: @struct_return(ptr{{( dead_on_unwind)?}} noalias noundef{{( writable)?}} sret([32 x i8]) align 4{{( captures\(none\))?}} dereferenceable(32){{( %_0)?}})
 #[no_mangle]
 pub fn struct_return() -> S {
     S { _field: [0, 0, 0, 0, 0, 0, 0, 0] }
@@ -208,17 +208,23 @@ pub fn struct_return() -> S {
 #[no_mangle]
 pub fn helper(_: usize) {}
 
-// CHECK: @slice(ptr noalias noundef nonnull readonly align 1{{( captures\(address, read_provenance\))?}} %_1.0, [[USIZE]] noundef %_1.1)
+// CHECK: @slice(
+// CHECK-SAME: ptr noalias noundef nonnull readonly align 1{{( captures\(address, read_provenance\))?}} %_1.0,
+// CHECK-SAME: [[USIZE]] noundef range({{i32 0, -2147483648|i64 0, -9223372036854775808}}) %_1.1)
 // FIXME #25759 This should also have `nocapture`
 #[no_mangle]
 pub fn slice(_: &[u8]) {}
 
-// CHECK: @mutable_slice(ptr noalias noundef nonnull align 1 %_1.0, [[USIZE]] noundef %_1.1)
+// CHECK: @mutable_slice(
+// CHECK-SAME: ptr noalias noundef nonnull align 1 %_1.0,
+// CHECK-SAME: [[USIZE]] noundef range({{i32 0, -2147483648|i64 0, -9223372036854775808}}) %_1.1)
 // FIXME #25759 This should also have `nocapture`
 #[no_mangle]
 pub fn mutable_slice(_: &mut [u8]) {}
 
-// CHECK: @unsafe_slice(ptr noundef nonnull align 2 %_1.0, [[USIZE]] noundef %_1.1)
+// CHECK: @unsafe_slice(
+// CHECK-SAME: ptr noundef nonnull align 2 %_1.0,
+// CHECK-SAME: [[USIZE]] noundef range({{i32 0, 1073741824|i64 0, 4611686018427387904}}) %_1.1)
 // unsafe interior means this isn't actually readonly and there may be aliases ...
 #[no_mangle]
 pub fn unsafe_slice(_: &[UnsafeInner]) {}
@@ -227,7 +233,9 @@ pub fn unsafe_slice(_: &[UnsafeInner]) {}
 #[no_mangle]
 pub fn raw_slice(_: *const [u8]) {}
 
-// CHECK: @str(ptr noalias noundef nonnull readonly align 1{{( captures\(address, read_provenance\))?}} %_1.0, [[USIZE]] noundef %_1.1)
+// CHECK: @str(
+// CHECK-SAME: ptr noalias noundef nonnull readonly align 1{{( captures\(address, read_provenance\))?}} %_1.0,
+// CHECK-SAME: [[USIZE]] noundef range({{i32 0, -2147483648|i64 0, -9223372036854775808}}) %_1.1)
 // FIXME #25759 This should also have `nocapture`
 #[no_mangle]
 pub fn str(_: &[u8]) {}
@@ -259,7 +267,9 @@ pub fn trait_option(x: Option<Box<dyn Drop + Unpin>>) -> Option<Box<dyn Drop + U
     x
 }
 
-// CHECK: { ptr, [[USIZE]] } @return_slice(ptr noalias noundef nonnull readonly align 2{{( captures\(address, read_provenance\))?}} %x.0, [[USIZE]] noundef %x.1)
+// CHECK: { ptr, [[USIZE]] } @return_slice(
+// CHECK-SAME: ptr noalias noundef nonnull readonly align 2{{( captures\(address, read_provenance\))?}} %x.0,
+// CHECK-SAME: [[USIZE]] noundef range({{i32 0, 1073741824|i64 0, 4611686018427387904}}) %x.1)
 #[no_mangle]
 pub fn return_slice(x: &[u16]) -> &[u16] {
     x

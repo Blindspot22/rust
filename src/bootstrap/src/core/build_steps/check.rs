@@ -4,11 +4,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::core::build_steps::compile::{
-    add_to_sysroot, run_cargo, rustc_cargo, rustc_cargo_env, std_cargo, std_crates_for_run_make,
+    ArtifactKeepMode, add_to_sysroot, run_cargo, rustc_cargo, rustc_cargo_env, std_cargo,
+    std_crates_for_run_make,
 };
 use crate::core::build_steps::tool;
 use crate::core::build_steps::tool::{
-    COMPILETEST_ALLOW_FEATURES, SourceType, ToolTargetBuildMode, get_tool_target_compiler,
+    SourceType, TEST_FLOAT_PARSE_ALLOW_FEATURES, ToolTargetBuildMode, get_tool_target_compiler,
     prepare_tool_cargo,
 };
 use crate::core::builder::{
@@ -37,7 +38,6 @@ impl Std {
 
 impl Step for Std {
     type Output = BuildStamp;
-    const DEFAULT: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         let mut run = run;
@@ -46,6 +46,10 @@ impl Step for Std {
         }
 
         run.path("library")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        true
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -61,6 +65,9 @@ impl Step for Std {
             return;
         }
 
+        // Explicitly pass -p for all dependencies crates -- this will force cargo
+        // to also check the tests/benches/examples for these crates, rather
+        // than just the leaf crate.
         let crates = std_crates_for_run_make(&run);
         run.builder.ensure(Std {
             build_compiler: prepare_compiler_for_check(run.builder, run.target, Mode::Std)
@@ -83,14 +90,10 @@ impl Step for Std {
             Kind::Check,
         );
 
-        std_cargo(builder, target, &mut cargo);
+        std_cargo(builder, target, &mut cargo, &self.crates);
         if matches!(builder.config.cmd, Subcommand::Fix) {
             // By default, cargo tries to fix all targets. Tell it not to fix tests until we've added `test` to the sysroot.
             cargo.arg("--lib");
-        }
-
-        for krate in &*self.crates {
-            cargo.arg("-p").arg(krate);
         }
 
         let _guard = builder.msg(
@@ -109,8 +112,7 @@ impl Step for Std {
             builder.config.free_args.clone(),
             &check_stamp,
             vec![],
-            true,
-            false,
+            ArtifactKeepMode::OnlyRmeta,
         );
 
         drop(_guard);
@@ -135,14 +137,7 @@ impl Step for Std {
             Kind::Check,
         );
 
-        std_cargo(builder, target, &mut cargo);
-
-        // Explicitly pass -p for all dependencies krates -- this will force cargo
-        // to also check the tests/benches/examples for these crates, rather
-        // than just the leaf crate.
-        for krate in &*self.crates {
-            cargo.arg("-p").arg(krate);
-        }
+        std_cargo(builder, target, &mut cargo, &self.crates);
 
         let stamp =
             build_stamp::libstd_stamp(builder, build_compiler, target).with_prefix("check-test");
@@ -153,7 +148,14 @@ impl Step for Std {
             build_compiler,
             target,
         );
-        run_cargo(builder, cargo, builder.config.free_args.clone(), &stamp, vec![], true, false);
+        run_cargo(
+            builder,
+            cargo,
+            builder.config.free_args.clone(),
+            &stamp,
+            vec![],
+            ArtifactKeepMode::OnlyRmeta,
+        );
         check_stamp
     }
 
@@ -318,10 +320,13 @@ impl Rustc {
 impl Step for Rustc {
     type Output = BuildStamp;
     const IS_HOST: bool = true;
-    const DEFAULT: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         run.crate_or_deps("rustc-main").path("compiler")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        true
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -370,7 +375,14 @@ impl Step for Rustc {
         let stamp =
             build_stamp::librustc_stamp(builder, build_compiler, target).with_prefix("check");
 
-        run_cargo(builder, cargo, builder.config.free_args.clone(), &stamp, vec![], true, false);
+        run_cargo(
+            builder,
+            cargo,
+            builder.config.free_args.clone(),
+            &stamp,
+            vec![],
+            ArtifactKeepMode::OnlyRmeta,
+        );
 
         stamp
     }
@@ -389,7 +401,7 @@ impl Step for Rustc {
 
 /// Represents a compiler that can check something.
 ///
-/// If the compiler was created for `Mode::ToolRustc` or `Mode::Codegen`, it will also contain
+/// If the compiler was created for `Mode::ToolRustcPrivate` or `Mode::Codegen`, it will also contain
 /// .rmeta artifacts from rustc that was already checked using `build_compiler`.
 ///
 /// All steps that use this struct in a "general way" (i.e. they don't know exactly what kind of
@@ -469,7 +481,7 @@ pub fn prepare_compiler_for_check(
                 build_compiler
             }
         }
-        Mode::ToolRustc | Mode::Codegen => {
+        Mode::ToolRustcPrivate | Mode::Codegen => {
             // Check Rustc to produce the required rmeta artifacts for rustc_private, and then
             // return the build compiler that was used to check rustc.
             // We do not need to check examples/tests/etc. of Rustc for rustc_private, so we pass
@@ -518,12 +530,14 @@ pub struct CraneliftCodegenBackend {
 
 impl Step for CraneliftCodegenBackend {
     type Output = ();
-
     const IS_HOST: bool = true;
-    const DEFAULT: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         run.alias("rustc_codegen_cranelift").alias("cg_clif")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        true
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -568,7 +582,14 @@ impl Step for CraneliftCodegenBackend {
         )
         .with_prefix("check");
 
-        run_cargo(builder, cargo, builder.config.free_args.clone(), &stamp, vec![], true, false);
+        run_cargo(
+            builder,
+            cargo,
+            builder.config.free_args.clone(),
+            &stamp,
+            vec![],
+            ArtifactKeepMode::OnlyRmeta,
+        );
     }
 
     fn metadata(&self) -> Option<StepMetadata> {
@@ -588,12 +609,14 @@ pub struct GccCodegenBackend {
 
 impl Step for GccCodegenBackend {
     type Output = ();
-
     const IS_HOST: bool = true;
-    const DEFAULT: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         run.alias("rustc_codegen_gcc").alias("cg_gcc")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        true
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -637,7 +660,14 @@ impl Step for GccCodegenBackend {
         )
         .with_prefix("check");
 
-        run_cargo(builder, cargo, builder.config.free_args.clone(), &stamp, vec![], true, false);
+        run_cargo(
+            builder,
+            cargo,
+            builder.config.free_args.clone(),
+            &stamp,
+            vec![],
+            ArtifactKeepMode::OnlyRmeta,
+        );
     }
 
     fn metadata(&self) -> Option<StepMetadata> {
@@ -654,12 +684,13 @@ macro_rules! tool_check_step {
             // The part of this path after the final '/' is also used as a display name.
             path: $path:literal
             $(, alt_path: $alt_path:literal )*
-            // Closure that returns `Mode` based on the passed `&Builder<'_>`
+            // `Mode` to use when checking this tool
             , mode: $mode:expr
             // Subset of nightly features that are allowed to be used when checking
             $(, allow_features: $allow_features:expr )?
             // Features that should be enabled when checking
             $(, enable_features: [$($enable_features:expr),*] )?
+            $(, default_features: $default_features:expr )?
             $(, default: $default:literal )?
             $( , )?
         }
@@ -673,17 +704,19 @@ macro_rules! tool_check_step {
         impl Step for $name {
             type Output = ();
             const IS_HOST: bool = true;
-            /// Most of the tool-checks using this macro are run by default.
-            const DEFAULT: bool = true $( && $default )?;
 
             fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
                 run.paths(&[ $path, $( $alt_path ),* ])
             }
 
+            fn is_default_step(_builder: &Builder<'_>) -> bool {
+                // Most of the tool-checks using this macro are run by default.
+                true $( && const { $default } )?
+            }
+
             fn make_run(run: RunConfig<'_>) {
                 let target = run.target;
-                let builder = run.builder;
-                let mode = $mode(builder);
+                let mode: Mode = $mode;
 
                 let compiler = prepare_compiler_for_check(run.builder, target, mode);
 
@@ -704,8 +737,13 @@ macro_rules! tool_check_step {
                     _value
                 };
                 let extra_features: &[&str] = &[$($($enable_features),*)?];
-                let mode = $mode(builder);
-                run_tool_check_step(builder, compiler, target, $path, mode, allow_features, extra_features);
+                let default_features = {
+                    let mut _value = true;
+                    $( _value = $default_features; )?
+                    _value
+                };
+                let mode: Mode = $mode;
+                run_tool_check_step(builder, compiler, target, $path, mode, allow_features, extra_features, default_features);
             }
 
             fn metadata(&self) -> Option<StepMetadata> {
@@ -716,6 +754,7 @@ macro_rules! tool_check_step {
 }
 
 /// Used by the implementation of `Step::run` in `tool_check_step!`.
+#[allow(clippy::too_many_arguments)]
 fn run_tool_check_step(
     builder: &Builder<'_>,
     compiler: CompilerForCheck,
@@ -724,6 +763,7 @@ fn run_tool_check_step(
     mode: Mode,
     allow_features: &str,
     extra_features: &[&str],
+    default_features: bool,
 ) {
     let display_name = path.rsplit('/').next().unwrap();
 
@@ -757,64 +797,75 @@ fn run_tool_check_step(
         cargo.arg("--all-targets");
     }
 
+    if !default_features {
+        cargo.arg("--no-default-features");
+    }
+
     let stamp = BuildStamp::new(&builder.cargo_out(build_compiler, mode, target))
         .with_prefix(&format!("{display_name}-check"));
 
     let _guard = builder.msg(builder.kind, display_name, mode, build_compiler, target);
-    run_cargo(builder, cargo, builder.config.free_args.clone(), &stamp, vec![], true, false);
+    run_cargo(
+        builder,
+        cargo,
+        builder.config.free_args.clone(),
+        &stamp,
+        vec![],
+        ArtifactKeepMode::OnlyRmeta,
+    );
 }
 
 tool_check_step!(Rustdoc {
     path: "src/tools/rustdoc",
     alt_path: "src/librustdoc",
-    mode: |_builder| Mode::ToolRustc
+    mode: Mode::ToolRustcPrivate
 });
 // Clippy, miri and Rustfmt are hybrids. They are external tools, but use a git subtree instead
 // of a submodule. Since the SourceType only drives the deny-warnings
 // behavior, treat it as in-tree so that any new warnings in clippy will be
 // rejected.
-tool_check_step!(Clippy { path: "src/tools/clippy", mode: |_builder| Mode::ToolRustc });
-tool_check_step!(Miri { path: "src/tools/miri", mode: |_builder| Mode::ToolRustc });
-tool_check_step!(CargoMiri { path: "src/tools/miri/cargo-miri", mode: |_builder| Mode::ToolRustc });
-tool_check_step!(Rustfmt { path: "src/tools/rustfmt", mode: |_builder| Mode::ToolRustc });
+tool_check_step!(Clippy { path: "src/tools/clippy", mode: Mode::ToolRustcPrivate });
+tool_check_step!(Miri {
+    path: "src/tools/miri",
+    mode: Mode::ToolRustcPrivate,
+    enable_features: ["check_only"],
+});
+tool_check_step!(CargoMiri { path: "src/tools/miri/cargo-miri", mode: Mode::ToolRustcPrivate });
+tool_check_step!(Rustfmt { path: "src/tools/rustfmt", mode: Mode::ToolRustcPrivate });
 tool_check_step!(RustAnalyzer {
     path: "src/tools/rust-analyzer",
-    mode: |_builder| Mode::ToolRustc,
+    mode: Mode::ToolRustcPrivate,
     allow_features: tool::RustAnalyzer::ALLOW_FEATURES,
     enable_features: ["in-rust-tree"],
 });
 tool_check_step!(MiroptTestTools {
     path: "src/tools/miropt-test-tools",
-    mode: |_builder| Mode::ToolBootstrap
+    mode: Mode::ToolBootstrap
 });
 // We want to test the local std
 tool_check_step!(TestFloatParse {
     path: "src/tools/test-float-parse",
-    mode: |_builder| Mode::ToolStd,
-    allow_features: tool::TestFloatParse::ALLOW_FEATURES
+    mode: Mode::ToolStd,
+    allow_features: TEST_FLOAT_PARSE_ALLOW_FEATURES
 });
 tool_check_step!(FeaturesStatusDump {
     path: "src/tools/features-status-dump",
-    mode: |_builder| Mode::ToolBootstrap
+    mode: Mode::ToolBootstrap
 });
 
-tool_check_step!(Bootstrap {
-    path: "src/bootstrap",
-    mode: |_builder| Mode::ToolBootstrap,
-    default: false
-});
+tool_check_step!(Bootstrap { path: "src/bootstrap", mode: Mode::ToolBootstrap, default: false });
 
 // `run-make-support` will be built as part of suitable run-make compiletest test steps, but support
 // check to make it easier to work on.
 tool_check_step!(RunMakeSupport {
     path: "src/tools/run-make-support",
-    mode: |_builder| Mode::ToolBootstrap,
+    mode: Mode::ToolBootstrap,
     default: false
 });
 
 tool_check_step!(CoverageDump {
     path: "src/tools/coverage-dump",
-    mode: |_builder| Mode::ToolBootstrap,
+    mode: Mode::ToolBootstrap,
     default: false
 });
 
@@ -822,17 +873,32 @@ tool_check_step!(CoverageDump {
 // so this is mainly for people working on compiletest to run locally.
 tool_check_step!(Compiletest {
     path: "src/tools/compiletest",
-    mode: |builder: &Builder<'_>| if builder.config.compiletest_use_stage0_libtest {
-        Mode::ToolBootstrap
-    } else {
-        Mode::ToolStd
-    },
-    allow_features: COMPILETEST_ALLOW_FEATURES,
+    mode: Mode::ToolBootstrap,
+    default: false,
+});
+
+// As with compiletest, rustdoc-gui-test is automatically built when running
+// relevant tests. So being able to check it is mainly useful for people
+// working on on rustdoc-gui-test itself, or on its compiletest dependency.
+tool_check_step!(RustdocGuiTest {
+    path: "src/tools/rustdoc-gui-test",
+    mode: Mode::ToolBootstrap,
     default: false,
 });
 
 tool_check_step!(Linkchecker {
     path: "src/tools/linkchecker",
-    mode: |_builder| Mode::ToolBootstrap,
+    mode: Mode::ToolBootstrap,
     default: false
 });
+
+tool_check_step!(BumpStage0 {
+    path: "src/tools/bump-stage0",
+    mode: Mode::ToolBootstrap,
+    default: false
+});
+
+// Tidy is implicitly checked when `./x test tidy` is executed
+// (if you set a pre-push hook, the command is called).
+// So this is mainly for people working on tidy.
+tool_check_step!(Tidy { path: "src/tools/tidy", mode: Mode::ToolBootstrap, default: false });

@@ -9,6 +9,16 @@
 //! The `cli` submodule implements some batch-processing analysis, primarily as
 //! a debugging aid.
 
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_driver as _;
+
+extern crate ra_ap_rustc_type_ir as rustc_type_ir;
+
+/*
+    If you bump this, grep for `FIXME(MINIMUM_SUPPORTED_TOOLCHAIN_VERSION)` to check for old support code we can drop
+*/
 /// Any toolchain less than this version will likely not work with rust-analyzer built from this revision.
 pub const MINIMUM_SUPPORTED_TOOLCHAIN_VERSION: semver::Version = semver::Version {
     major: 1,
@@ -80,3 +90,10 @@ macro_rules! try_default_ {
     };
 }
 pub(crate) use try_default_ as try_default;
+
+#[cfg(feature = "dhat")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
+#[cfg(feature = "dhat")]
+static DHAT_PROFILER: std::sync::Mutex<Option<dhat::Profiler>> = std::sync::Mutex::new(None);

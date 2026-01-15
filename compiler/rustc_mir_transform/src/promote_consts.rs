@@ -292,7 +292,6 @@ impl<'tcx> Validator<'_, 'tcx> {
         match elem {
             // Recurse directly.
             ProjectionElem::ConstantIndex { .. }
-            | ProjectionElem::Subtype(_)
             | ProjectionElem::Subslice { .. }
             | ProjectionElem::UnwrapUnsafeBinder(_) => {}
 
@@ -361,6 +360,10 @@ impl<'tcx> Validator<'_, 'tcx> {
         match operand {
             Operand::Copy(place) | Operand::Move(place) => self.validate_place(place.as_ref()),
 
+            // `RuntimeChecks` behaves different in const-eval and runtime MIR,
+            // so we do not promote it.
+            Operand::RuntimeChecks(_) => Err(Unpromotable),
+
             // The qualifs for a constant (e.g. `HasMutInterior`) are checked in
             // `validate_rvalue` upon access.
             Operand::Constant(c) => {
@@ -411,14 +414,8 @@ impl<'tcx> Validator<'_, 'tcx> {
                 // In theory, any zero-sized value could be borrowed
                 // mutably without consequences. However, only &mut []
                 // is allowed right now.
-                if let ty::Array(_, len) = ty.kind() {
-                    match len.try_to_target_usize(self.tcx) {
-                        Some(0) => {}
-                        _ => return Err(Unpromotable),
-                    }
-                } else {
-                    return Err(Unpromotable);
-                }
+                let ty::Array(_, len) = ty.kind() else { return Err(Unpromotable) };
+                let Some(0) = len.try_to_target_usize(self.tcx) else { return Err(Unpromotable) };
             }
         }
 
@@ -437,9 +434,7 @@ impl<'tcx> Validator<'_, 'tcx> {
                 self.validate_operand(op)?
             }
 
-            Rvalue::Discriminant(place) | Rvalue::Len(place) => {
-                self.validate_place(place.as_ref())?
-            }
+            Rvalue::Discriminant(place) => self.validate_place(place.as_ref())?,
 
             Rvalue::ThreadLocalRef(_) => return Err(Unpromotable),
 
@@ -451,14 +446,6 @@ impl<'tcx> Validator<'_, 'tcx> {
             Rvalue::Cast(_, operand, _) => {
                 self.validate_operand(operand)?;
             }
-
-            Rvalue::NullaryOp(op, _) => match op {
-                NullOp::SizeOf => {}
-                NullOp::AlignOf => {}
-                NullOp::OffsetOf(_) => {}
-                NullOp::UbChecks => {}
-                NullOp::ContractChecks => {}
-            },
 
             Rvalue::ShallowInitBox(_, _) => return Err(Unpromotable),
 
@@ -875,7 +862,8 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
             let mut promoted_operand = |ty, span| {
                 promoted.span = span;
                 promoted.local_decls[RETURN_PLACE] = LocalDecl::new(ty, span);
-                let args = tcx.erase_regions(GenericArgs::identity_for_item(tcx, def));
+                let args =
+                    tcx.erase_and_anonymize_regions(GenericArgs::identity_for_item(tcx, def));
                 let uneval =
                     mir::UnevaluatedConst { def, args, promoted: Some(next_promoted_index) };
 
@@ -1051,7 +1039,7 @@ fn promote_candidates<'tcx>(
     // Eliminate assignments to, and drops of promoted temps.
     let promoted = |index: Local| temps[index] == TempState::PromotedOut;
     for block in body.basic_blocks_mut() {
-        block.statements.retain(|statement| match &statement.kind {
+        block.retain_statements(|statement| match &statement.kind {
             StatementKind::Assign(box (place, _)) => {
                 if let Some(index) = place.as_local() {
                     !promoted(index)

@@ -4,6 +4,7 @@ use rustc_ast::util::unicode::TEXT_FLOW_CONTROL_CHARS;
 use rustc_errors::{
     Applicability, Diag, DiagArgValue, LintDiagnostic, elided_lifetime_in_path_suggestion,
 };
+use rustc_hir::lints::AttributeLintKind;
 use rustc_middle::middle::stability;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
@@ -64,17 +65,6 @@ pub fn decorate_builtin_lint(
             }
             .decorate_lint(diag);
         }
-        BuiltinLintDiag::ProcMacroDeriveResolutionFallback {
-            span: macro_span,
-            ns_descr,
-            ident,
-        } => lints::ProcMacroDeriveResolutionFallback { span: macro_span, ns_descr, ident }
-            .decorate_lint(diag),
-        BuiltinLintDiag::MacroExpandedMacroExportsAccessedByAbsolutePaths(span_def) => {
-            lints::MacroExpandedMacroExportsAccessedByAbsolutePaths { definition: span_def }
-                .decorate_lint(diag)
-        }
-
         BuiltinLintDiag::ElidedLifetimesInPaths(n, path_span, incl_angl_brckt, insertion_span) => {
             lints::ElidedLifetimesInPaths {
                 subdiag: elided_lifetime_in_path_suggestion(
@@ -86,10 +76,6 @@ pub fn decorate_builtin_lint(
                 ),
             }
             .decorate_lint(diag);
-        }
-        BuiltinLintDiag::UnknownCrateTypes { span, candidate } => {
-            let sugg = candidate.map(|candidate| lints::UnknownCrateTypesSub { span, candidate });
-            lints::UnknownCrateTypes { sugg }.decorate_lint(diag);
         }
         BuiltinLintDiag::UnusedImports {
             remove_whole_use,
@@ -146,9 +132,6 @@ pub fn decorate_builtin_lint(
             stability::Deprecated { sub, kind: "macro".to_owned(), path, note, since_kind }
                 .decorate_lint(diag);
         }
-        BuiltinLintDiag::UnusedDocComment(attr_span) => {
-            lints::UnusedDocComment { span: attr_span }.decorate_lint(diag);
-        }
         BuiltinLintDiag::PatternsInFnsWithoutBody { span: remove_span, ident, is_foreign } => {
             let sub = lints::PatternsInFnsWithoutBodySub { ident, span: remove_span };
             if is_foreign {
@@ -157,12 +140,6 @@ pub fn decorate_builtin_lint(
                 lints::PatternsInFnsWithoutBody::Bodiless { sub }
             }
             .decorate_lint(diag);
-        }
-        BuiltinLintDiag::LegacyDeriveHelpers(label_span) => {
-            lints::LegacyDeriveHelpers { span: label_span }.decorate_lint(diag);
-        }
-        BuiltinLintDiag::OrPatternsBackCompat(suggestion_span, suggestion) => {
-            lints::OrPatternsBackCompat { span: suggestion_span, suggestion }.decorate_lint(diag);
         }
         BuiltinLintDiag::ReservedPrefix(label_span, prefix) => {
             lints::ReservedPrefix {
@@ -183,18 +160,6 @@ pub fn decorate_builtin_lint(
                 lints::ReservedMultihash { suggestion }.decorate_lint(diag);
             }
         }
-        BuiltinLintDiag::UnusedBuiltinAttribute {
-            attr_name,
-            macro_name,
-            invoc_span,
-            attr_span,
-        } => {
-            lints::UnusedBuiltinAttribute { invoc_span, attr_name, macro_name, attr_span }
-                .decorate_lint(diag);
-        }
-        BuiltinLintDiag::TrailingMacro(is_trailing, name) => {
-            lints::TrailingMacro { is_trailing, name }.decorate_lint(diag);
-        }
         BuiltinLintDiag::BreakWithLabelAndLoop(sugg_span) => {
             lints::BreakWithLabelAndLoop {
                 sub: lints::BreakWithLabelAndLoopSub {
@@ -203,12 +168,6 @@ pub fn decorate_builtin_lint(
                 },
             }
             .decorate_lint(diag);
-        }
-        BuiltinLintDiag::UnexpectedCfgName(name, value) => {
-            check_cfg::unexpected_cfg_name(sess, tcx, name, value).decorate_lint(diag);
-        }
-        BuiltinLintDiag::UnexpectedCfgValue(name, value) => {
-            check_cfg::unexpected_cfg_value(sess, tcx, name, value).decorate_lint(diag);
         }
         BuiltinLintDiag::DeprecatedWhereclauseLocation(left_sp, sugg) => {
             let suggestion = match sugg {
@@ -220,9 +179,6 @@ pub fn decorate_builtin_lint(
                 None => lints::DeprecatedWhereClauseLocationSugg::RemoveWhere { span: left_sp },
             };
             lints::DeprecatedWhereClauseLocation { suggestion }.decorate_lint(diag);
-        }
-        BuiltinLintDiag::MissingUnsafeOnExtern { suggestion } => {
-            lints::MissingUnsafeOnExtern { suggestion }.decorate_lint(diag);
         }
         BuiltinLintDiag::SingleUseLifetime {
             param_span,
@@ -253,7 +209,6 @@ pub fn decorate_builtin_lint(
                 .decorate_lint(diag);
         }
         BuiltinLintDiag::SingleUseLifetime { use_span: None, deletion_span, ident, .. } => {
-            debug!(?deletion_span);
             lints::UnusedLifetime { deletion_span, ident }.decorate_lint(diag);
         }
         BuiltinLintDiag::NamedArgumentUsedPositionally {
@@ -291,21 +246,6 @@ pub fn decorate_builtin_lint(
             }
             .decorate_lint(diag);
         }
-        BuiltinLintDiag::ByteSliceInPackedStructWithDerive { ty } => {
-            lints::ByteSliceInPackedStructWithDerive { ty }.decorate_lint(diag);
-        }
-        BuiltinLintDiag::UnusedExternCrate { span, removal_span } => {
-            lints::UnusedExternCrate { span, removal_span }.decorate_lint(diag);
-        }
-        BuiltinLintDiag::ExternCrateNotIdiomatic { vis_span, ident_span } => {
-            let suggestion_span = vis_span.between(ident_span);
-            let code = if vis_span.is_empty() { "use " } else { " use " };
-
-            lints::ExternCrateNotIdiomatic { span: suggestion_span, code }.decorate_lint(diag);
-        }
-        BuiltinLintDiag::AmbiguousGlobImports { diag: ambiguity } => {
-            lints::AmbiguousGlobImports { ambiguity }.decorate_lint(diag);
-        }
         BuiltinLintDiag::AmbiguousGlobReexports {
             name,
             namespace,
@@ -335,21 +275,8 @@ pub fn decorate_builtin_lint(
             }
             .decorate_lint(diag);
         }
-        BuiltinLintDiag::ReexportPrivateDependency { name, kind, krate } => {
-            lints::ReexportPrivateDependency { name, kind, krate }.decorate_lint(diag);
-        }
         BuiltinLintDiag::UnusedQualifications { removal_span } => {
             lints::UnusedQualifications { removal_span }.decorate_lint(diag);
-        }
-        BuiltinLintDiag::UnsafeAttrOutsideUnsafe {
-            attribute_name_span,
-            sugg_spans: (left, right),
-        } => {
-            lints::UnsafeAttrOutsideUnsafe {
-                span: attribute_name_span,
-                suggestion: lints::UnsafeAttrOutsideUnsafeSuggestion { left, right },
-            }
-            .decorate_lint(diag);
         }
         BuiltinLintDiag::AssociatedConstElidedLifetime {
             elided,
@@ -366,72 +293,27 @@ pub fn decorate_builtin_lint(
             }
             .decorate_lint(diag);
         }
-        BuiltinLintDiag::RedundantImportVisibility { max_vis, span: vis_span, import_vis } => {
-            lints::RedundantImportVisibility { span: vis_span, help: (), max_vis, import_vis }
-                .decorate_lint(diag);
-        }
-        BuiltinLintDiag::UnknownDiagnosticAttribute { span: typo_span, typo_name } => {
-            let typo = typo_name.map(|typo_name| lints::UnknownDiagnosticAttributeTypoSugg {
-                span: typo_span,
-                typo_name,
-            });
-            lints::UnknownDiagnosticAttribute { typo }.decorate_lint(diag);
-        }
-        BuiltinLintDiag::MacroUseDeprecated => {
-            lints::MacroUseDeprecated.decorate_lint(diag);
-        }
-        BuiltinLintDiag::UnusedMacroUse => lints::UnusedMacroUse.decorate_lint(diag),
-        BuiltinLintDiag::PrivateExternCrateReexport { source: ident, extern_crate_span } => {
-            lints::PrivateExternCrateReexport { ident, sugg: extern_crate_span.shrink_to_lo() }
-                .decorate_lint(diag);
-        }
-        BuiltinLintDiag::UnusedLabel => lints::UnusedLabel.decorate_lint(diag),
-        BuiltinLintDiag::MacroIsPrivate(ident) => {
-            lints::MacroIsPrivate { ident }.decorate_lint(diag);
-        }
-        BuiltinLintDiag::UnusedMacroDefinition(name) => {
-            lints::UnusedMacroDefinition { name }.decorate_lint(diag);
-        }
-        BuiltinLintDiag::MacroRuleNeverUsed(n, name) => {
-            lints::MacroRuleNeverUsed { n: n + 1, name }.decorate_lint(diag);
-        }
-        BuiltinLintDiag::UnstableFeature(msg) => {
-            lints::UnstableFeature { msg }.decorate_lint(diag);
-        }
-        BuiltinLintDiag::AvoidUsingIntelSyntax => {
-            lints::AvoidIntelSyntax.decorate_lint(diag);
-        }
-        BuiltinLintDiag::AvoidUsingAttSyntax => {
-            lints::AvoidAttSyntax.decorate_lint(diag);
-        }
-        BuiltinLintDiag::IncompleteInclude => {
-            lints::IncompleteInclude.decorate_lint(diag);
-        }
-        BuiltinLintDiag::UnnameableTestItems => {
-            lints::UnnameableTestItems.decorate_lint(diag);
-        }
-        BuiltinLintDiag::DuplicateMacroAttribute => {
-            lints::DuplicateMacroAttribute.decorate_lint(diag);
-        }
-        BuiltinLintDiag::CfgAttrNoAttributes => {
-            lints::CfgAttrNoAttributes.decorate_lint(diag);
-        }
-        BuiltinLintDiag::MetaVariableStillRepeating(name) => {
-            lints::MetaVariableStillRepeating { name }.decorate_lint(diag);
-        }
-        BuiltinLintDiag::MetaVariableWrongOperator => {
-            lints::MetaVariableWrongOperator.decorate_lint(diag);
-        }
-        BuiltinLintDiag::DuplicateMatcherBinding => {
-            lints::DuplicateMatcherBinding.decorate_lint(diag);
-        }
-        BuiltinLintDiag::UnknownMacroVariable(name) => {
-            lints::UnknownMacroVariable { name }.decorate_lint(diag);
-        }
         BuiltinLintDiag::UnusedCrateDependency { extern_crate, local_crate } => {
             lints::UnusedCrateDependency { extern_crate, local_crate }.decorate_lint(diag)
         }
-        BuiltinLintDiag::IllFormedAttributeInput { suggestions, docs } => {
+        BuiltinLintDiag::UnusedVisibility(span) => {
+            lints::UnusedVisibility { span }.decorate_lint(diag)
+        }
+        BuiltinLintDiag::AttributeLint(kind) => decorate_attribute_lint(sess, tcx, &kind, diag),
+    }
+}
+
+pub fn decorate_attribute_lint(
+    sess: &Session,
+    tcx: Option<TyCtxt<'_>>,
+    kind: &AttributeLintKind,
+    diag: &mut Diag<'_, ()>,
+) {
+    match kind {
+        &AttributeLintKind::UnusedDuplicate { this, other, warning } => {
+            lints::UnusedDuplicate { this, other, warning }.decorate_lint(diag)
+        }
+        AttributeLintKind::IllFormedAttributeInput { suggestions, docs } => {
             lints::IllFormedAttributeInput {
                 num_suggestions: suggestions.len(),
                 suggestions: DiagArgValue::StrListSepByAnd(
@@ -442,8 +324,100 @@ pub fn decorate_builtin_lint(
             }
             .decorate_lint(diag)
         }
-        BuiltinLintDiag::OutOfScopeMacroCalls { span, path, location } => {
-            lints::OutOfScopeMacroCalls { span, path, location }.decorate_lint(diag)
+        AttributeLintKind::EmptyAttribute { first_span, attr_path, valid_without_list } => {
+            lints::EmptyAttributeList {
+                attr_span: *first_span,
+                attr_path: attr_path.clone(),
+                valid_without_list: *valid_without_list,
+            }
+            .decorate_lint(diag)
         }
+        AttributeLintKind::InvalidTarget { name, target, applied, only, attr_span } => {
+            lints::InvalidTargetLint {
+                name: name.clone(),
+                target,
+                applied: DiagArgValue::StrListSepByAnd(
+                    applied.into_iter().map(|i| Cow::Owned(i.to_string())).collect(),
+                ),
+                only,
+                attr_span: *attr_span,
+            }
+            .decorate_lint(diag)
+        }
+        &AttributeLintKind::InvalidStyle { ref name, is_used_as_inner, target, target_span } => {
+            lints::InvalidAttrStyle {
+                name: name.clone(),
+                is_used_as_inner,
+                target_span: (!is_used_as_inner).then_some(target_span),
+                target,
+            }
+            .decorate_lint(diag)
+        }
+        &AttributeLintKind::UnsafeAttrOutsideUnsafe { attribute_name_span, sugg_spans } => {
+            lints::UnsafeAttrOutsideUnsafeLint {
+                span: attribute_name_span,
+                suggestion: sugg_spans
+                    .map(|(left, right)| lints::UnsafeAttrOutsideUnsafeSuggestion { left, right }),
+            }
+            .decorate_lint(diag)
+        }
+        &AttributeLintKind::UnexpectedCfgName(name, value) => {
+            check_cfg::unexpected_cfg_name(sess, tcx, name, value).decorate_lint(diag)
+        }
+        &AttributeLintKind::UnexpectedCfgValue(name, value) => {
+            check_cfg::unexpected_cfg_value(sess, tcx, name, value).decorate_lint(diag)
+        }
+        &AttributeLintKind::DuplicateDocAlias { first_definition } => {
+            lints::DocAliasDuplicated { first_defn: first_definition }.decorate_lint(diag)
+        }
+
+        &AttributeLintKind::DocAutoCfgExpectsHideOrShow => {
+            lints::DocAutoCfgExpectsHideOrShow.decorate_lint(diag)
+        }
+
+        &AttributeLintKind::DocAutoCfgHideShowUnexpectedItem { attr_name } => {
+            lints::DocAutoCfgHideShowUnexpectedItem { attr_name }.decorate_lint(diag)
+        }
+
+        &AttributeLintKind::DocAutoCfgHideShowExpectsList { attr_name } => {
+            lints::DocAutoCfgHideShowExpectsList { attr_name }.decorate_lint(diag)
+        }
+
+        &AttributeLintKind::DocInvalid => { lints::DocInvalid }.decorate_lint(diag),
+
+        &AttributeLintKind::DocUnknownInclude { span, inner, value } => {
+            lints::DocUnknownInclude { inner, value, sugg: (span, Applicability::MaybeIncorrect) }
+        }
+        .decorate_lint(diag),
+
+        &AttributeLintKind::DocUnknownSpotlight { span } => {
+            lints::DocUnknownSpotlight { sugg_span: span }.decorate_lint(diag)
+        }
+
+        &AttributeLintKind::DocUnknownPasses { name, span } => {
+            lints::DocUnknownPasses { name, note_span: span }.decorate_lint(diag)
+        }
+
+        &AttributeLintKind::DocUnknownPlugins { span } => {
+            lints::DocUnknownPlugins { label_span: span }.decorate_lint(diag)
+        }
+
+        &AttributeLintKind::DocUnknownAny { name } => {
+            lints::DocUnknownAny { name }.decorate_lint(diag)
+        }
+
+        &AttributeLintKind::DocAutoCfgWrongLiteral => {
+            lints::DocAutoCfgWrongLiteral.decorate_lint(diag)
+        }
+
+        &AttributeLintKind::DocTestTakesList => lints::DocTestTakesList.decorate_lint(diag),
+
+        &AttributeLintKind::DocTestUnknown { name } => {
+            lints::DocTestUnknown { name }.decorate_lint(diag)
+        }
+
+        &AttributeLintKind::DocTestLiteral => lints::DocTestLiteral.decorate_lint(diag),
+
+        &AttributeLintKind::AttrCrateLevelOnly => lints::AttrCrateLevelOnly.decorate_lint(diag),
     }
 }

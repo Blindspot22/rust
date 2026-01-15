@@ -1,3 +1,4 @@
+use std::assert_matches::assert_matches;
 use std::iter;
 
 use rustc_abi::Primitive::Pointer;
@@ -5,6 +6,7 @@ use rustc_abi::{BackendRepr, ExternAbi, PointerKind, Scalar, Size};
 use rustc_hir as hir;
 use rustc_hir::lang_items::LangItem;
 use rustc_middle::bug;
+use rustc_middle::middle::deduced_param_attrs::DeducedParamAttrs;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::layout::{
     FnAbiError, HasTyCtxt, HasTypingEnv, LayoutCx, LayoutOf, TyAndLayout, fn_can_unwind,
@@ -313,13 +315,18 @@ fn arg_attrs_for_rust_scalar<'tcx>(
             attrs.pointee_align =
                 Some(pointee.align.min(cx.tcx().sess.target.max_reliable_alignment()));
 
-            // `Box` are not necessarily dereferenceable for the entire duration of the function as
-            // they can be deallocated at any time. Same for non-frozen shared references (see
-            // <https://github.com/rust-lang/rust/pull/98017>), and for mutable references to
-            // potentially self-referential types (see
-            // <https://github.com/rust-lang/unsafe-code-guidelines/issues/381>). If LLVM had a way
-            // to say "dereferenceable on entry" we could use it here.
             attrs.pointee_size = match kind {
+                // LLVM dereferenceable attribute has unclear semantics on the return type,
+                // they seem to be "dereferenceable until the end of the program", which is
+                // generally, not valid for references. See
+                // <https://rust-lang.zulipchat.com/#narrow/channel/136281-t-opsem/topic/LLVM.20dereferenceable.20on.20return.20type/with/563001493>
+                _ if is_return => Size::ZERO,
+                // `Box` are not necessarily dereferenceable for the entire duration of the function as
+                // they can be deallocated at any time. Same for non-frozen shared references (see
+                // <https://github.com/rust-lang/rust/pull/98017>), and for mutable references to
+                // potentially self-referential types (see
+                // <https://github.com/rust-lang/unsafe-code-guidelines/issues/381>). If LLVM had a way
+                // to say "dereferenceable on entry" we could use it here.
                 PointerKind::Box { .. }
                 | PointerKind::SharedRef { frozen: false }
                 | PointerKind::MutableRef { unpin: false } => Size::ZERO,
@@ -387,6 +394,12 @@ fn fn_abi_sanity_check<'tcx>(
             if let PassMode::Indirect { on_stack, .. } = arg.mode {
                 assert!(!on_stack, "rust abi shouldn't use on_stack");
             }
+        } else if arg.layout.pass_indirectly_in_non_rustic_abis(cx) {
+            assert_matches!(
+                arg.mode,
+                PassMode::Indirect { on_stack: false, .. },
+                "the {spec_abi} ABI does not implement `#[rustc_pass_indirectly_in_non_rustic_abis]`"
+            );
         }
 
         match &arg.mode {
@@ -399,7 +412,9 @@ fn fn_abi_sanity_check<'tcx>(
                 // `layout.backend_repr` and ignore everything else. We should just reject
                 //`Aggregate` entirely here, but some targets need to be fixed first.
                 match arg.layout.backend_repr {
-                    BackendRepr::Scalar(_) | BackendRepr::SimdVector { .. } => {}
+                    BackendRepr::Scalar(_)
+                    | BackendRepr::SimdVector { .. }
+                    | BackendRepr::ScalableVector { .. } => {}
                     BackendRepr::ScalarPair(..) => {
                         panic!("`PassMode::Direct` used for ScalarPair type {}", arg.layout.ty)
                     }
@@ -534,15 +549,9 @@ fn fn_abi_new_uncached<'tcx>(
             layout
         };
 
-        let mut arg = ArgAbi::new(cx, layout, |layout, scalar, offset| {
-            arg_attrs_for_rust_scalar(*cx, scalar, *layout, offset, is_return, drop_target_pointee)
-        });
-
-        if arg.layout.is_zst() {
-            arg.mode = PassMode::Ignore;
-        }
-
-        Ok(arg)
+        Ok(ArgAbi::new(cx, layout, |scalar, offset| {
+            arg_attrs_for_rust_scalar(*cx, scalar, layout, offset, is_return, drop_target_pointee)
+        }))
     };
 
     let mut fn_abi = FnAbi {
@@ -614,41 +623,51 @@ fn fn_abi_adjust_for_abi<'tcx>(
 
     if abi.is_rustic_abi() {
         fn_abi.adjust_for_rust_abi(cx);
-
         // Look up the deduced parameter attributes for this function, if we have its def ID and
         // we're optimizing in non-incremental mode. We'll tag its parameters with those attributes
         // as appropriate.
-        let deduced_param_attrs =
+        let deduced =
             if tcx.sess.opts.optimize != OptLevel::No && tcx.sess.opts.incremental.is_none() {
                 fn_def_id.map(|fn_def_id| tcx.deduced_param_attrs(fn_def_id)).unwrap_or_default()
             } else {
                 &[]
             };
-
-        for (arg_idx, arg) in fn_abi.args.iter_mut().enumerate() {
-            if arg.is_ignore() {
-                continue;
-            }
-
-            // If we deduced that this parameter was read-only, add that to the attribute list now.
-            //
-            // The `readonly` parameter only applies to pointers, so we can only do this if the
-            // argument was passed indirectly. (If the argument is passed directly, it's an SSA
-            // value, so it's implicitly immutable.)
-            if let &mut PassMode::Indirect { ref mut attrs, .. } = &mut arg.mode {
-                // The `deduced_param_attrs` list could be empty if this is a type of function
-                // we can't deduce any parameters for, so make sure the argument index is in
-                // bounds.
-                if let Some(deduced_param_attrs) = deduced_param_attrs.get(arg_idx)
-                    && deduced_param_attrs.read_only
-                {
-                    attrs.regular.insert(ArgAttribute::ReadOnly);
-                    debug!("added deduced read-only attribute");
-                }
+        if !deduced.is_empty() {
+            apply_deduced_attributes(cx, deduced, 0, &mut fn_abi.ret);
+            for (arg_idx, arg) in fn_abi.args.iter_mut().enumerate() {
+                apply_deduced_attributes(cx, deduced, arg_idx + 1, arg);
             }
         }
     } else {
         fn_abi.adjust_for_foreign_abi(cx, abi);
+    }
+}
+
+/// Apply deduced optimization attributes to a parameter using an indirect pass mode.
+///
+/// `deduced` is a possibly truncated list of deduced attributes for a return place and arguments.
+/// `idx` the index of the parameter on the list (0 for a return place, and 1.. for arguments).
+fn apply_deduced_attributes<'tcx>(
+    cx: &LayoutCx<'tcx>,
+    deduced: &[DeducedParamAttrs],
+    idx: usize,
+    arg: &mut ArgAbi<'tcx, Ty<'tcx>>,
+) {
+    // Deduction is performed under the assumption of the indirection pass mode.
+    let PassMode::Indirect { ref mut attrs, .. } = arg.mode else {
+        return;
+    };
+    // The default values at the tail of the list are not encoded.
+    let Some(deduced) = deduced.get(idx) else {
+        return;
+    };
+    if deduced.read_only(cx.tcx(), cx.typing_env, arg.layout.ty) {
+        debug!("added deduced ReadOnly attribute");
+        attrs.regular.insert(ArgAttribute::ReadOnly);
+    }
+    if deduced.captures_none(cx.tcx(), cx.typing_env, arg.layout.ty) {
+        debug!("added deduced CapturesNone attribute");
+        attrs.regular.insert(ArgAttribute::CapturesNone);
     }
 }
 

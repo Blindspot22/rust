@@ -6,8 +6,10 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
+use crate::clone::TrivialClone;
 use crate::cmp::Ordering::{self, Equal, Greater, Less};
 use crate::intrinsics::{exact_div, unchecked_sub};
+use crate::marker::Destruct;
 use crate::mem::{self, MaybeUninit, SizedTypeProperties};
 use crate::num::NonZero;
 use crate::ops::{OneSidedRange, OneSidedRangeBound, Range, RangeBounds, RangeInclusive};
@@ -50,7 +52,7 @@ pub use ascii::is_ascii_simple;
 pub use index::SliceIndex;
 #[unstable(feature = "slice_range", issue = "76393")]
 pub use index::{range, try_range};
-#[unstable(feature = "array_windows", issue = "75027")]
+#[stable(feature = "array_windows", since = "CURRENT_RUSTC_VERSION")]
 pub use iter::ArrayWindows;
 #[stable(feature = "slice_group_by", since = "1.77.0")]
 pub use iter::{ChunkBy, ChunkByMut};
@@ -841,7 +843,8 @@ impl<T> [T] {
     /// Gets a reference to the underlying array.
     ///
     /// If `N` is not exactly equal to the length of `self`, then this method returns `None`.
-    #[unstable(feature = "slice_as_array", issue = "133508")]
+    #[stable(feature = "core_slice_as_array", since = "1.93.0")]
+    #[rustc_const_stable(feature = "core_slice_as_array", since = "1.93.0")]
     #[inline]
     #[must_use]
     pub const fn as_array<const N: usize>(&self) -> Option<&[T; N]> {
@@ -859,7 +862,8 @@ impl<T> [T] {
     /// Gets a mutable reference to the slice's underlying array.
     ///
     /// If `N` is not exactly equal to the length of `self`, then this method returns `None`.
-    #[unstable(feature = "slice_as_array", issue = "133508")]
+    #[stable(feature = "core_slice_as_array", since = "1.93.0")]
+    #[rustc_const_stable(feature = "core_slice_as_array", since = "1.93.0")]
     #[inline]
     #[must_use]
     pub const fn as_mut_array<const N: usize>(&mut self) -> Option<&mut [T; N]> {
@@ -1617,13 +1621,15 @@ impl<T> [T] {
     ///
     /// # Panics
     ///
-    /// Panics if `N` is zero. This check will most probably get changed to a compile time
-    /// error before this method gets stabilized.
+    /// Panics if `N` is zero.
+    ///
+    /// Note that this check is against a const generic parameter, not a runtime
+    /// value, and thus a particular monomorphization will either always panic
+    /// or it will never panic.
     ///
     /// # Examples
     ///
     /// ```
-    /// #![feature(array_windows)]
     /// let slice = [0, 1, 2, 3];
     /// let mut iter = slice.array_windows();
     /// assert_eq!(iter.next().unwrap(), &[0, 1]);
@@ -1633,7 +1639,7 @@ impl<T> [T] {
     /// ```
     ///
     /// [`windows`]: slice::windows
-    #[unstable(feature = "array_windows", issue = "75027")]
+    #[stable(feature = "array_windows", since = "CURRENT_RUSTC_VERSION")]
     #[rustc_const_unstable(feature = "const_slice_make_iter", issue = "137737")]
     #[inline]
     #[track_caller]
@@ -2725,6 +2731,38 @@ impl<T> [T] {
         None
     }
 
+    /// Returns a subslice with the prefix and suffix removed.
+    ///
+    /// If the slice starts with `prefix` and ends with `suffix`, returns the subslice after the
+    /// prefix and before the suffix, wrapped in `Some`.
+    ///
+    /// If the slice does not start with `prefix` or does not end with `suffix`, returns `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(strip_circumfix)]
+    ///
+    /// let v = &[10, 50, 40, 30];
+    /// assert_eq!(v.strip_circumfix(&[10], &[30]), Some(&[50, 40][..]));
+    /// assert_eq!(v.strip_circumfix(&[10], &[40, 30]), Some(&[50][..]));
+    /// assert_eq!(v.strip_circumfix(&[10, 50], &[40, 30]), Some(&[][..]));
+    /// assert_eq!(v.strip_circumfix(&[50], &[30]), None);
+    /// assert_eq!(v.strip_circumfix(&[10], &[40]), None);
+    /// assert_eq!(v.strip_circumfix(&[], &[40, 30]), Some(&[10, 50][..]));
+    /// assert_eq!(v.strip_circumfix(&[10, 50], &[]), Some(&[40, 30][..]));
+    /// ```
+    #[must_use = "returns the subslice without modifying the original"]
+    #[unstable(feature = "strip_circumfix", issue = "147946")]
+    pub fn strip_circumfix<S, P>(&self, prefix: &P, suffix: &S) -> Option<&[T]>
+    where
+        T: PartialEq,
+        S: SlicePattern<Item = T> + ?Sized,
+        P: SlicePattern<Item = T> + ?Sized,
+    {
+        self.strip_prefix(prefix)?.strip_suffix(suffix)
+    }
+
     /// Returns a subslice with the optional prefix removed.
     ///
     /// If the slice starts with `prefix`, returns the subslice after the prefix.  If `prefix`
@@ -3207,6 +3245,219 @@ impl<T> [T] {
         sort::unstable::sort(self, &mut |a, b| f(a).lt(&f(b)));
     }
 
+    /// Partially sorts the slice in ascending order **without** preserving the initial order of equal elements.
+    ///
+    /// Upon completion, for the specified range `start..end`, it's guaranteed that:
+    ///
+    /// 1. Every element in `self[..start]` is smaller than or equal to
+    /// 2. Every element in `self[start..end]`, which is sorted, and smaller than or equal to
+    /// 3. Every element in `self[end..]`.
+    ///
+    /// This partial sort is unstable, meaning it may reorder equal elements in the specified range.
+    /// It may reorder elements outside the specified range as well, but the guarantees above still hold.
+    ///
+    /// This partial sort is in-place (i.e., does not allocate), and *O*(*n* + *k* \* log(*k*)) worst-case,
+    /// where *n* is the length of the slice and *k* is the length of the specified range.
+    ///
+    /// See the documentation of [`sort_unstable`] for implementation notes.
+    ///
+    /// # Panics
+    ///
+    /// May panic if the implementation of [`Ord`] for `T` does not implement a total order, or if
+    /// the [`Ord`] implementation panics, or if the specified range is out of bounds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(slice_partial_sort_unstable)]
+    ///
+    /// let mut v = [4, -5, 1, -3, 2];
+    ///
+    /// // empty range at the beginning, nothing changed
+    /// v.partial_sort_unstable(0..0);
+    /// assert_eq!(v, [4, -5, 1, -3, 2]);
+    ///
+    /// // empty range in the middle, partitioning the slice
+    /// v.partial_sort_unstable(2..2);
+    /// for i in 0..2 {
+    ///    assert!(v[i] <= v[2]);
+    /// }
+    /// for i in 3..v.len() {
+    ///   assert!(v[2] <= v[i]);
+    /// }
+    ///
+    /// // single element range, same as select_nth_unstable
+    /// v.partial_sort_unstable(2..3);
+    /// for i in 0..2 {
+    ///    assert!(v[i] <= v[2]);
+    /// }
+    /// for i in 3..v.len() {
+    ///   assert!(v[2] <= v[i]);
+    /// }
+    ///
+    /// // partial sort a subrange
+    /// v.partial_sort_unstable(1..4);
+    /// assert_eq!(&v[1..4], [-3, 1, 2]);
+    ///
+    /// // partial sort the whole range, same as sort_unstable
+    /// v.partial_sort_unstable(..);
+    /// assert_eq!(v, [-5, -3, 1, 2, 4]);
+    /// ```
+    ///
+    /// [`sort_unstable`]: slice::sort_unstable
+    #[unstable(feature = "slice_partial_sort_unstable", issue = "149046")]
+    #[inline]
+    pub fn partial_sort_unstable<R>(&mut self, range: R)
+    where
+        T: Ord,
+        R: RangeBounds<usize>,
+    {
+        sort::unstable::partial_sort(self, range, T::lt);
+    }
+
+    /// Partially sorts the slice in ascending order with a comparison function, **without**
+    /// preserving the initial order of equal elements.
+    ///
+    /// Upon completion, for the specified range `start..end`, it's guaranteed that:
+    ///
+    /// 1. Every element in `self[..start]` is smaller than or equal to
+    /// 2. Every element in `self[start..end]`, which is sorted, and smaller than or equal to
+    /// 3. Every element in `self[end..]`.
+    ///
+    /// This partial sort is unstable, meaning it may reorder equal elements in the specified range.
+    /// It may reorder elements outside the specified range as well, but the guarantees above still hold.
+    ///
+    /// This partial sort is in-place (i.e., does not allocate), and *O*(*n* + *k* \* log(*k*)) worst-case,
+    /// where *n* is the length of the slice and *k* is the length of the specified range.
+    ///
+    /// See the documentation of [`sort_unstable_by`] for implementation notes.
+    ///
+    /// # Panics
+    ///
+    /// May panic if the `compare` does not implement a total order, or if
+    /// the `compare` itself panics, or if the specified range is out of bounds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(slice_partial_sort_unstable)]
+    ///
+    /// let mut v = [4, -5, 1, -3, 2];
+    ///
+    /// // empty range at the beginning, nothing changed
+    /// v.partial_sort_unstable_by(0..0, |a, b| b.cmp(a));
+    /// assert_eq!(v, [4, -5, 1, -3, 2]);
+    ///
+    /// // empty range in the middle, partitioning the slice
+    /// v.partial_sort_unstable_by(2..2, |a, b| b.cmp(a));
+    /// for i in 0..2 {
+    ///    assert!(v[i] >= v[2]);
+    /// }
+    /// for i in 3..v.len() {
+    ///   assert!(v[2] >= v[i]);
+    /// }
+    ///
+    /// // single element range, same as select_nth_unstable
+    /// v.partial_sort_unstable_by(2..3, |a, b| b.cmp(a));
+    /// for i in 0..2 {
+    ///    assert!(v[i] >= v[2]);
+    /// }
+    /// for i in 3..v.len() {
+    ///   assert!(v[2] >= v[i]);
+    /// }
+    ///
+    /// // partial sort a subrange
+    /// v.partial_sort_unstable_by(1..4, |a, b| b.cmp(a));
+    /// assert_eq!(&v[1..4], [2, 1, -3]);
+    ///
+    /// // partial sort the whole range, same as sort_unstable
+    /// v.partial_sort_unstable_by(.., |a, b| b.cmp(a));
+    /// assert_eq!(v, [4, 2, 1, -3, -5]);
+    /// ```
+    ///
+    /// [`sort_unstable_by`]: slice::sort_unstable_by
+    #[unstable(feature = "slice_partial_sort_unstable", issue = "149046")]
+    #[inline]
+    pub fn partial_sort_unstable_by<F, R>(&mut self, range: R, mut compare: F)
+    where
+        F: FnMut(&T, &T) -> Ordering,
+        R: RangeBounds<usize>,
+    {
+        sort::unstable::partial_sort(self, range, |a, b| compare(a, b) == Less);
+    }
+
+    /// Partially sorts the slice in ascending order with a key extraction function, **without**
+    /// preserving the initial order of equal elements.
+    ///
+    /// Upon completion, for the specified range `start..end`, it's guaranteed that:
+    ///
+    /// 1. Every element in `self[..start]` is smaller than or equal to
+    /// 2. Every element in `self[start..end]`, which is sorted, and smaller than or equal to
+    /// 3. Every element in `self[end..]`.
+    ///
+    /// This partial sort is unstable, meaning it may reorder equal elements in the specified range.
+    /// It may reorder elements outside the specified range as well, but the guarantees above still hold.
+    ///
+    /// This partial sort is in-place (i.e., does not allocate), and *O*(*n* + *k* \* log(*k*)) worst-case,
+    /// where *n* is the length of the slice and *k* is the length of the specified range.
+    ///
+    /// See the documentation of [`sort_unstable_by_key`] for implementation notes.
+    ///
+    /// # Panics
+    ///
+    /// May panic if the implementation of [`Ord`] for `K` does not implement a total order, or if
+    /// the [`Ord`] implementation panics, or if the specified range is out of bounds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(slice_partial_sort_unstable)]
+    ///
+    /// let mut v = [4i32, -5, 1, -3, 2];
+    ///
+    /// // empty range at the beginning, nothing changed
+    /// v.partial_sort_unstable_by_key(0..0, |k| k.abs());
+    /// assert_eq!(v, [4, -5, 1, -3, 2]);
+    ///
+    /// // empty range in the middle, partitioning the slice
+    /// v.partial_sort_unstable_by_key(2..2, |k| k.abs());
+    /// for i in 0..2 {
+    ///    assert!(v[i].abs() <= v[2].abs());
+    /// }
+    /// for i in 3..v.len() {
+    ///   assert!(v[2].abs() <= v[i].abs());
+    /// }
+    ///
+    /// // single element range, same as select_nth_unstable
+    /// v.partial_sort_unstable_by_key(2..3, |k| k.abs());
+    /// for i in 0..2 {
+    ///    assert!(v[i].abs() <= v[2].abs());
+    /// }
+    /// for i in 3..v.len() {
+    ///   assert!(v[2].abs() <= v[i].abs());
+    /// }
+    ///
+    /// // partial sort a subrange
+    /// v.partial_sort_unstable_by_key(1..4, |k| k.abs());
+    /// assert_eq!(&v[1..4], [2, -3, 4]);
+    ///
+    /// // partial sort the whole range, same as sort_unstable
+    /// v.partial_sort_unstable_by_key(.., |k| k.abs());
+    /// assert_eq!(v, [1, 2, -3, 4, -5]);
+    /// ```
+    ///
+    /// [`sort_unstable_by_key`]: slice::sort_unstable_by_key
+    #[unstable(feature = "slice_partial_sort_unstable", issue = "149046")]
+    #[inline]
+    pub fn partial_sort_unstable_by_key<K, F, R>(&mut self, range: R, mut f: F)
+    where
+        F: FnMut(&T) -> K,
+        K: Ord,
+        R: RangeBounds<usize>,
+    {
+        sort::unstable::partial_sort(self, range, |a, b| f(a).lt(&f(b)));
+    }
+
     /// Reorders the slice such that the element at `index` is at a sort-order position. All
     /// elements before `index` will be `<=` to this value, and all elements after will be `>=` to
     /// it.
@@ -3629,7 +3880,7 @@ impl<T> [T] {
     /// assert_eq!(a, ['a', 'c', 'd', 'e', 'b', 'f']);
     /// ```
     #[stable(feature = "slice_rotate", since = "1.26.0")]
-    #[rustc_const_unstable(feature = "const_slice_rotate", issue = "143812")]
+    #[rustc_const_stable(feature = "const_slice_rotate", since = "1.92.0")]
     pub const fn rotate_left(&mut self, mid: usize) {
         assert!(mid <= self.len());
         let k = self.len() - mid;
@@ -3675,7 +3926,7 @@ impl<T> [T] {
     /// assert_eq!(a, ['a', 'e', 'b', 'c', 'd', 'f']);
     /// ```
     #[stable(feature = "slice_rotate", since = "1.26.0")]
-    #[rustc_const_unstable(feature = "const_slice_rotate", issue = "143812")]
+    #[rustc_const_stable(feature = "const_slice_rotate", since = "1.92.0")]
     pub const fn rotate_right(&mut self, k: usize) {
         assert!(k <= self.len());
         let mid = self.len() - k;
@@ -3786,9 +4037,10 @@ impl<T> [T] {
     /// [`split_at_mut`]: slice::split_at_mut
     #[stable(feature = "clone_from_slice", since = "1.7.0")]
     #[track_caller]
-    pub fn clone_from_slice(&mut self, src: &[T])
+    #[rustc_const_unstable(feature = "const_clone", issue = "142757")]
+    pub const fn clone_from_slice(&mut self, src: &[T])
     where
-        T: Clone,
+        T: [const] Clone + [const] Destruct,
     {
         self.spec_clone_from(src);
     }
@@ -3856,30 +4108,8 @@ impl<T> [T] {
     where
         T: Copy,
     {
-        // The panic code path was put into a cold function to not bloat the
-        // call site.
-        #[cfg_attr(not(feature = "panic_immediate_abort"), inline(never), cold)]
-        #[cfg_attr(feature = "panic_immediate_abort", inline)]
-        #[track_caller]
-        const fn len_mismatch_fail(dst_len: usize, src_len: usize) -> ! {
-            const_panic!(
-                "copy_from_slice: source slice length does not match destination slice length",
-                "copy_from_slice: source slice length ({src_len}) does not match destination slice length ({dst_len})",
-                src_len: usize,
-                dst_len: usize,
-            )
-        }
-
-        if self.len() != src.len() {
-            len_mismatch_fail(self.len(), src.len());
-        }
-
-        // SAFETY: `self` is valid for `self.len()` elements by definition, and `src` was
-        // checked to have the same length. The slices cannot overlap because
-        // mutable references are exclusive.
-        unsafe {
-            ptr::copy_nonoverlapping(src.as_ptr(), self.as_mut_ptr(), self.len());
-        }
+        // SAFETY: `T` implements `Copy`.
+        unsafe { copy_from_slice_impl(self, src) }
     }
 
     /// Copies elements from one part of the slice to another part of itself,
@@ -4794,8 +5024,6 @@ impl<T> [T] {
     /// # Examples
     /// Basic usage:
     /// ```
-    /// #![feature(substr_range)]
-    ///
     /// let nums: &[u32] = &[1, 7, 1, 1];
     /// let num = &nums[2];
     ///
@@ -4804,8 +5032,6 @@ impl<T> [T] {
     /// ```
     /// Returning `None` with an unaligned element:
     /// ```
-    /// #![feature(substr_range)]
-    ///
     /// let arr: &[[u32; 2]] = &[[0, 1], [2, 3]];
     /// let flat_arr: &[u32] = arr.as_flattened();
     ///
@@ -4819,7 +5045,7 @@ impl<T> [T] {
     /// assert_eq!(arr.element_offset(weird_elm), None); // Points between element 0 and 1
     /// ```
     #[must_use]
-    #[unstable(feature = "substr_range", issue = "126769")]
+    #[stable(feature = "element_offset", since = "CURRENT_RUSTC_VERSION")]
     pub fn element_offset(&self, element: &T) -> Option<usize> {
         if T::IS_ZST {
             panic!("elements are zero-sized");
@@ -4892,6 +5118,28 @@ impl<T> [T] {
         let end = start.wrapping_add(subslice.len());
 
         if start <= self.len() && end <= self.len() { Some(start..end) } else { None }
+    }
+
+    /// Returns the same slice `&[T]`.
+    ///
+    /// This method is redundant when used directly on `&[T]`, but
+    /// it helps dereferencing other "container" types to slices,
+    /// for example `Box<[T]>` or `Arc<[T]>`.
+    #[inline]
+    #[unstable(feature = "str_as_str", issue = "130366")]
+    pub const fn as_slice(&self) -> &[T] {
+        self
+    }
+
+    /// Returns the same slice `&mut [T]`.
+    ///
+    /// This method is redundant when used directly on `&mut [T]`, but
+    /// it helps dereferencing other "container" types to slices,
+    /// for example `Box<[T]>` or `MutexGuard<[T]>`.
+    #[inline]
+    #[unstable(feature = "str_as_str", issue = "130366")]
+    pub const fn as_mut_slice(&mut self) -> &mut [T] {
+        self
     }
 }
 
@@ -5089,13 +5337,49 @@ impl [f64] {
     }
 }
 
-trait CloneFromSpec<T> {
-    fn spec_clone_from(&mut self, src: &[T]);
+/// Copies `src` to `dest`.
+///
+/// # Safety
+/// `T` must implement one of `Copy` or `TrivialClone`.
+#[track_caller]
+const unsafe fn copy_from_slice_impl<T: Clone>(dest: &mut [T], src: &[T]) {
+    // The panic code path was put into a cold function to not bloat the
+    // call site.
+    #[cfg_attr(not(panic = "immediate-abort"), inline(never), cold)]
+    #[cfg_attr(panic = "immediate-abort", inline)]
+    #[track_caller]
+    const fn len_mismatch_fail(dst_len: usize, src_len: usize) -> ! {
+        const_panic!(
+            "copy_from_slice: source slice length does not match destination slice length",
+            "copy_from_slice: source slice length ({src_len}) does not match destination slice length ({dst_len})",
+            src_len: usize,
+            dst_len: usize,
+        )
+    }
+
+    if dest.len() != src.len() {
+        len_mismatch_fail(dest.len(), src.len());
+    }
+
+    // SAFETY: `self` is valid for `self.len()` elements by definition, and `src` was
+    // checked to have the same length. The slices cannot overlap because
+    // mutable references are exclusive.
+    unsafe {
+        ptr::copy_nonoverlapping(src.as_ptr(), dest.as_mut_ptr(), dest.len());
+    }
 }
 
-impl<T> CloneFromSpec<T> for [T]
+#[rustc_const_unstable(feature = "const_clone", issue = "142757")]
+const trait CloneFromSpec<T> {
+    fn spec_clone_from(&mut self, src: &[T])
+    where
+        T: [const] Destruct;
+}
+
+#[rustc_const_unstable(feature = "const_clone", issue = "142757")]
+impl<T> const CloneFromSpec<T> for [T]
 where
-    T: Clone,
+    T: [const] Clone + [const] Destruct,
 {
     #[track_caller]
     default fn spec_clone_from(&mut self, src: &[T]) {
@@ -5105,19 +5389,26 @@ where
         // But since it can't be relied on we also have an explicit specialization for T: Copy.
         let len = self.len();
         let src = &src[..len];
-        for i in 0..len {
-            self[i].clone_from(&src[i]);
+        // FIXME(const_hack): make this a `for idx in 0..self.len()` loop.
+        let mut idx = 0;
+        while idx < self.len() {
+            self[idx].clone_from(&src[idx]);
+            idx += 1;
         }
     }
 }
 
-impl<T> CloneFromSpec<T> for [T]
+#[rustc_const_unstable(feature = "const_clone", issue = "142757")]
+impl<T> const CloneFromSpec<T> for [T]
 where
-    T: Copy,
+    T: [const] TrivialClone + [const] Destruct,
 {
     #[track_caller]
     fn spec_clone_from(&mut self, src: &[T]) {
-        self.copy_from_slice(src);
+        // SAFETY: `T` implements `TrivialClone`.
+        unsafe {
+            copy_from_slice_impl(self, src);
+        }
     }
 }
 

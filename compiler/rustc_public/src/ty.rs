@@ -11,10 +11,10 @@ use crate::crate_def::{CrateDef, CrateDefItems, CrateDefType};
 use crate::mir::alloc::{AllocId, read_target_int, read_target_uint};
 use crate::mir::mono::StaticDef;
 use crate::target::MachineInfo;
-use crate::{Filename, IndexedVal, Opaque};
+use crate::{Filename, IndexedVal, Opaque, ThreadLocalIndex};
 
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Serialize)]
-pub struct Ty(usize);
+#[derive(Copy, Clone, Eq, PartialEq, Hash)]
+pub struct Ty(usize, ThreadLocalIndex);
 
 impl Debug for Ty {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -151,8 +151,8 @@ pub enum TyConstKind {
     ZSTValue(Ty),
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize)]
-pub struct TyConstId(usize);
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub struct TyConstId(usize, ThreadLocalIndex);
 
 /// Represents a constant in MIR
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
@@ -212,8 +212,8 @@ impl MirConst {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
-pub struct MirConstId(usize);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MirConstId(usize, ThreadLocalIndex);
 
 type Ident = Opaque;
 
@@ -255,8 +255,8 @@ pub struct Placeholder<T> {
     pub bound: T,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-pub struct Span(usize);
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Span(usize, ThreadLocalIndex);
 
 impl Debug for Span {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -333,7 +333,7 @@ impl TyKind {
 
     #[inline]
     pub fn is_trait(&self) -> bool {
-        matches!(self, TyKind::RigidTy(RigidTy::Dynamic(_, _, DynKind::Dyn)))
+        matches!(self, TyKind::RigidTy(RigidTy::Dynamic(_, _)))
     }
 
     #[inline]
@@ -472,7 +472,7 @@ impl TyKind {
     }
 
     pub fn trait_principal(&self) -> Option<Binder<ExistentialTraitRef>> {
-        if let TyKind::RigidTy(RigidTy::Dynamic(predicates, _, _)) = self {
+        if let TyKind::RigidTy(RigidTy::Dynamic(predicates, _)) = self {
             if let Some(Binder { value: ExistentialPredicate::Trait(trait_ref), bound_vars }) =
                 predicates.first()
             {
@@ -562,7 +562,7 @@ pub enum RigidTy {
     Closure(ClosureDef, GenericArgs),
     Coroutine(CoroutineDef, GenericArgs),
     CoroutineClosure(CoroutineClosureDef, GenericArgs),
-    Dynamic(Vec<Binder<ExistentialPredicate>>, Region, DynKind),
+    Dynamic(Vec<Binder<ExistentialPredicate>>, Region),
     Never,
     Tuple(Vec<Ty>),
     CoroutineWitness(CoroutineWitnessDef, GenericArgs),
@@ -876,6 +876,9 @@ pub struct VariantDef {
 }
 
 impl VariantDef {
+    /// The name of the variant, struct or union.
+    ///
+    /// This will not include the name of the enum or qualified path.
     pub fn name(&self) -> Symbol {
         with(|cx| cx.variant_name(*self))
     }
@@ -1204,11 +1207,6 @@ pub enum BoundRegionKind {
     BrAnon,
     BrNamed(BrNamedDef, String),
     BrEnv,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub enum DynKind {
-    Dyn,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1565,14 +1563,29 @@ macro_rules! index_impl {
     ($name:ident) => {
         impl crate::IndexedVal for $name {
             fn to_val(index: usize) -> Self {
-                $name(index)
+                $name(index, $crate::ThreadLocalIndex)
             }
             fn to_index(&self) -> usize {
                 self.0
             }
         }
+        $crate::ty::serialize_index_impl!($name);
     };
 }
+macro_rules! serialize_index_impl {
+    ($name:ident) => {
+        impl ::serde::Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: ::serde::Serializer,
+            {
+                let n: usize = self.0; // Make sure we're serializing an int.
+                ::serde::Serialize::serialize(&n, serializer)
+            }
+        }
+    };
+}
+pub(crate) use {index_impl, serialize_index_impl};
 
 index_impl!(TyConstId);
 index_impl!(MirConstId);
@@ -1592,8 +1605,8 @@ index_impl!(Span);
 /// `a` is in the variant with the `VariantIdx` of `0`,
 /// `c` is in the variant with the `VariantIdx` of `1`, and
 /// `g` is in the variant with the `VariantIdx` of `0`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
-pub struct VariantIdx(usize);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct VariantIdx(usize, ThreadLocalIndex);
 
 index_impl!(VariantIdx);
 
@@ -1612,11 +1625,7 @@ crate_def! {
 pub struct AssocItem {
     pub def_id: AssocDef,
     pub kind: AssocKind,
-    pub container: AssocItemContainer,
-
-    /// If this is an item in an impl of a trait then this is the `DefId` of
-    /// the associated item on the trait that this implements.
-    pub trait_item_def_id: Option<AssocDef>,
+    pub container: AssocContainer,
 }
 
 #[derive(Clone, PartialEq, Debug, Eq, Serialize)]
@@ -1636,9 +1645,11 @@ pub enum AssocKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub enum AssocItemContainer {
+pub enum AssocContainer {
+    InherentImpl,
+    /// The `AssocDef` points to the trait item being implemented.
+    TraitImpl(AssocDef),
     Trait,
-    Impl,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Serialize)]

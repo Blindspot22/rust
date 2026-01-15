@@ -34,8 +34,9 @@
 //!     eq: sized
 //!     error: fmt
 //!     fmt: option, result, transmute, coerce_unsized, copy, clone, derive
-//!     fmt_before_1_89_0: fmt
-//!     fn: tuple
+//!     fmt_before_1_93_0: fmt
+//!     fmt_before_1_89_0: fmt_before_1_93_0
+//!     fn: sized, tuple
 //!     from: sized, result
 //!     future: pin
 //!     coroutine: pin
@@ -55,7 +56,7 @@
 //!     panic: fmt
 //!     phantom_data:
 //!     pin:
-//!     pointee: copy, send, sync, ord, hash, unpin
+//!     pointee: copy, send, sync, ord, hash, unpin, phantom_data
 //!     range:
 //!     receiver: deref
 //!     result:
@@ -68,8 +69,10 @@
 //!     transmute:
 //!     try: infallible
 //!     tuple:
+//!     unary_ops:
 //!     unpin: sized
 //!     unsize: sized
+//!     write: fmt
 //!     todo: panic
 //!     unimplemented: panic
 //!     column:
@@ -77,6 +80,7 @@
 //!     offset_of:
 
 #![rustc_coherence_is_core]
+#![feature(lang_items)]
 
 pub mod marker {
     // region:sized
@@ -168,6 +172,17 @@ pub mod marker {
     // region:phantom_data
     #[lang = "phantom_data"]
     pub struct PhantomData<T: PointeeSized>;
+
+    // region:clone
+    impl<T: PointeeSized> Clone for PhantomData<T> {
+        fn clone(&self) -> Self { Self }
+    }
+    // endregion:clone
+
+    // region:copy
+    impl<T: PointeeSized> Copy for PhantomData<T> {}
+    // endregion:copy
+
     // endregion:phantom_data
 
     // region:discriminant
@@ -323,6 +338,18 @@ pub mod clone {
     impl Clone for ! {
         fn clone(&self) {
             *self
+        }
+    }
+
+    impl<T: Clone> Clone for [T; 0] {
+        fn clone(&self) -> Self {
+            []
+        }
+    }
+
+    impl<T: Clone> Clone for [T; 1] {
+        fn clone(&self) -> Self {
+            [self[0].clone()]
         }
     }
     // endregion:builtin_impls
@@ -491,6 +518,16 @@ pub mod ptr {
         #[lang = "metadata_type"]
         type Metadata: Copy + Send + Sync + Ord + Hash + Unpin;
     }
+
+    #[lang = "dyn_metadata"]
+    pub struct DynMetadata<Dyn: PointeeSized> {
+        _phantom: crate::marker::PhantomData<Dyn>,
+    }
+
+    pub const fn metadata<T: PointeeSized>(ptr: *const T) -> <T as Pointee>::Metadata {
+        loop {}
+    }
+
     // endregion:pointee
     // region:non_null
     #[rustc_layout_scalar_valid_range_start(1)]
@@ -509,11 +546,11 @@ pub mod ptr {
     // endregion:non_null
 
     // region:addr_of
-    #[rustc_macro_transparency = "semitransparent"]
+    #[rustc_macro_transparency = "semiopaque"]
     pub macro addr_of($place:expr) {
         &raw const $place
     }
-    #[rustc_macro_transparency = "semitransparent"]
+    #[rustc_macro_transparency = "semiopaque"]
     pub macro addr_of_mut($place:expr) {
         &raw mut $place
     }
@@ -557,13 +594,13 @@ pub mod ops {
         impl<T: PointeeSized> Deref for &T {
             type Target = T;
             fn deref(&self) -> &T {
-                loop {}
+                *self
             }
         }
         impl<T: PointeeSized> Deref for &mut T {
             type Target = T;
             fn deref(&self) -> &T {
-                loop {}
+                *self
             }
         }
         // region:deref_mut
@@ -1022,6 +1059,9 @@ pub mod ops {
                 type Output = $t;
                 fn add(self, other: $t) -> $t { self + other }
             }
+            impl AddAssign for $t {
+                fn add_assign(&mut self, other: $t) { *self += other; }
+            }
         )*)
     }
 
@@ -1029,12 +1069,31 @@ pub mod ops {
     // endregion:builtin_impls
     // endregion:add
 
+    // region:unary_ops
+    #[lang = "not"]
+    pub const trait Not {
+        type Output;
+
+        #[must_use]
+        fn not(self) -> Self::Output;
+    }
+
+    #[lang = "neg"]
+    pub const trait Neg {
+        type Output;
+
+        #[must_use = "this returns the result of the operation, without modifying the original"]
+        fn neg(self) -> Self::Output;
+    }
+    // endregion:unary_ops
+
     // region:coroutine
     mod coroutine {
         use crate::pin::Pin;
 
         #[lang = "coroutine"]
         pub trait Coroutine<R = ()> {
+            #[lang = "coroutine_yield"]
             type Yield;
             #[lang = "coroutine_return"]
             type Return;
@@ -1083,6 +1142,12 @@ pub mod cmp {
 
     pub trait Eq: PartialEq<Self> + PointeeSized {}
 
+    // region:builtin_impls
+    impl PartialEq for () {
+        fn eq(&self, other: &()) -> bool { true }
+    }
+    // endregion:builtin_impls
+
     // region:derive
     #[rustc_builtin_macro]
     pub macro PartialEq($item:item) {}
@@ -1123,7 +1188,7 @@ pub mod fmt {
 
     pub struct Error;
     pub type Result = crate::result::Result<(), Error>;
-    pub struct Formatter<'a>;
+    pub struct Formatter<'a>(&'a ());
     pub struct DebugTuple;
     pub struct DebugStruct;
     impl Formatter<'_> {
@@ -1196,6 +1261,7 @@ pub mod fmt {
             Unknown,
         }
 
+        // region:fmt_before_1_93_0
         #[lang = "format_count"]
         pub enum Count {
             Is(usize),
@@ -1225,6 +1291,7 @@ pub mod fmt {
                 Placeholder { position, fill, align, flags, precision, width }
             }
         }
+        // endregion:fmt_before_1_93_0
 
         // region:fmt_before_1_89_0
         #[lang = "format_unsafe_arg"]
@@ -1240,6 +1307,7 @@ pub mod fmt {
         // endregion:fmt_before_1_89_0
     }
 
+    // region:fmt_before_1_93_0
     #[derive(Copy, Clone)]
     #[lang = "format_arguments"]
     pub struct Arguments<'a> {
@@ -1278,6 +1346,14 @@ pub mod fmt {
         }
         // endregion:!fmt_before_1_89_0
 
+        pub fn from_str_nonconst(s: &'static str) -> Arguments<'a> {
+            Self::from_str(s)
+        }
+
+        pub const fn from_str(s: &'static str) -> Arguments<'a> {
+            Arguments { pieces: &[s], fmt: None, args: &[] }
+        }
+
         pub const fn as_str(&self) -> Option<&'static str> {
             match (self.pieces, self.args) {
                 ([], []) => Some(""),
@@ -1286,6 +1362,41 @@ pub mod fmt {
             }
         }
     }
+    // endregion:fmt_before_1_93_0
+
+    // region:!fmt_before_1_93_0
+    #[lang = "format_arguments"]
+    #[derive(Copy, Clone)]
+    pub struct Arguments<'a> {
+        // This is a non-faithful representation of `core::fmt::Arguments`, because the real one
+        // is too complex for minicore.
+        message: Option<&'a str>,
+    }
+
+    impl<'a> Arguments<'a> {
+        pub unsafe fn new<const N: usize, const M: usize>(
+            _template: &'a [u8; N],
+            _args: &'a [rt::Argument<'a>; M],
+        ) -> Arguments<'a> {
+            Arguments { message: None }
+        }
+
+        pub fn from_str_nonconst(s: &'static str) -> Arguments<'a> {
+            Arguments { message: Some(s) }
+        }
+
+        pub const fn from_str(s: &'static str) -> Arguments<'a> {
+            Arguments { message: Some(s) }
+        }
+
+        pub fn as_str(&self) -> Option<&'static str> {
+            match self.message {
+                Some(s) => unsafe { Some(&*(s as *const str)) },
+                None => None,
+            }
+        }
+    }
+    // endregion:!fmt_before_1_93_0
 
     // region:derive
     pub(crate) mod derive {
@@ -1455,6 +1566,12 @@ pub mod pin {
     {
     }
     // endregion:dispatch_from_dyn
+    // region:coerce_unsized
+    impl<Ptr, U> crate::ops::CoerceUnsized<Pin<U>> for Pin<Ptr> where
+        Ptr: crate::ops::CoerceUnsized<U>
+    {
+    }
+    // endregion:coerce_unsized
 }
 // endregion:pin
 
@@ -1596,6 +1713,12 @@ pub mod iter {
                 {
                     loop {}
                 }
+                fn collect<B: FromIterator<Self::Item>>(self) -> B
+                where
+                    Self: Sized,
+                {
+                    loop {}
+                }
                 // endregion:iterators
             }
             impl<I: Iterator + PointeeSized> Iterator for &mut I {
@@ -1665,10 +1788,13 @@ pub mod iter {
                     loop {}
                 }
             }
+            pub trait FromIterator<A>: Sized {
+                fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> Self;
+            }
         }
-        pub use self::collect::IntoIterator;
+        pub use self::collect::{IntoIterator, FromIterator};
     }
-    pub use self::traits::{IntoIterator, Iterator};
+    pub use self::traits::{IntoIterator, FromIterator, Iterator};
 }
 // endregion:iterator
 
@@ -1739,7 +1865,7 @@ mod panicking {
 
     #[lang = "panic"]
     pub const fn panic(expr: &'static str) -> ! {
-        panic_fmt(crate::fmt::Arguments::new_const(&[expr]))
+        panic_fmt(crate::fmt::Arguments::from_str(expr))
     }
 }
 // endregion:panic
@@ -1768,6 +1894,26 @@ mod macros {
         };
     }
     // endregion:panic
+
+    // region:write
+    #[macro_export]
+    macro_rules! write {
+        ($dst:expr, $($arg:tt)*) => {
+            $dst.write_fmt($crate::format_args!($($arg)*))
+        };
+    }
+
+    #[macro_export]
+    #[allow_internal_unstable(format_args_nl)]
+    macro_rules! writeln {
+        ($dst:expr $(,)?) => {
+            $crate::write!($dst, "\n")
+        };
+        ($dst:expr, $($arg:tt)*) => {
+            $dst.write_fmt($crate::format_args_nl!($($arg)*))
+        };
+    }
+    // endregion:write
 
     // region:assert
     #[macro_export]
@@ -1890,6 +2036,10 @@ pub mod num {
 // region:bool_impl
 #[lang = "bool"]
 impl bool {
+    pub fn then_some<T>(self, t: T) -> Option<T> {
+        if self { Some(t) } else { None }
+    }
+
     pub fn then<T, F: FnOnce() -> T>(self, f: F) -> Option<T> {
         if self { Some(f()) } else { None }
     }
@@ -1944,7 +2094,7 @@ pub mod prelude {
             convert::AsRef,                          // :as_ref
             convert::{From, Into, TryFrom, TryInto}, // :from
             default::Default,                        // :default
-            iter::{IntoIterator, Iterator},          // :iterator
+            iter::{IntoIterator, Iterator, FromIterator}, // :iterator
             macros::builtin::{derive, derive_const}, // :derive
             marker::Copy,                            // :copy
             marker::Send,                            // :send

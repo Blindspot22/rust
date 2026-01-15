@@ -52,6 +52,7 @@ pub(crate) fn type_mismatch(ctx: &DiagnosticsContext<'_>, d: &hir::TypeMismatch<
         ),
         display_range,
     )
+    .stable()
     .with_fixes(fixes(ctx, d))
 }
 
@@ -526,8 +527,7 @@ fn main() {
             fn run(_t: Rate<5>) {
             }
             fn main() {
-                run(f()) // FIXME: remove this error
-                  //^^^ error: expected Rate<5>, found Rate<_>
+                run(f())
             }
 "#,
         );
@@ -1171,7 +1171,7 @@ trait B {}
 
 fn test(a: &dyn A) -> &dyn B {
     a
-  //^ error: expected &dyn B, found &dyn A
+  //^ error: expected &(dyn B + 'static), found &(dyn A + 'static)
 }
 "#,
         );

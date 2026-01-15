@@ -1,14 +1,16 @@
 //@ check-pass
 
-#![feature(associated_const_equality)]
+#![feature(min_generic_const_args)]
+#![allow(incomplete_features)]
 
 pub trait Trait {
+    #[type_const]
     const ASSOC: usize;
 }
 
 pub fn foo<
     T: Trait<
-        ASSOC = {
+        ASSOC = const {
                     let a = 10_usize;
                     let b: &'_ usize = &a;
                     *b

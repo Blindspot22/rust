@@ -5,15 +5,17 @@
 
 use std::path::PathBuf;
 
+use build_helper::exit;
+use build_helper::git::get_git_untracked_files;
 use clap_complete::{Generator, shells};
 
 use crate::core::build_steps::dist::distdir;
 use crate::core::build_steps::test;
 use crate::core::build_steps::tool::{self, RustcPrivateCompilers, SourceType, Tool};
 use crate::core::build_steps::vendor::{Vendor, default_paths_to_vendor};
-use crate::core::builder::{Builder, Kind, RunConfig, ShouldRun, Step};
+use crate::core::builder::{Builder, Kind, RunConfig, ShouldRun, Step, StepMetadata};
 use crate::core::config::TargetSelection;
-use crate::core::config::flags::get_completion;
+use crate::core::config::flags::{get_completion, top_level_help};
 use crate::utils::exec::command;
 use crate::{Mode, t};
 
@@ -35,7 +37,9 @@ impl Step for BuildManifest {
     fn run(self, builder: &Builder<'_>) {
         // This gets called by `promote-release`
         // (https://github.com/rust-lang/promote-release).
-        let mut cmd = builder.tool_cmd(Tool::BuildManifest);
+        let mut cmd = command(
+            builder.ensure(tool::BuildManifest::new(builder, builder.config.host_target)).tool_path,
+        );
         let sign = builder.config.dist_sign_folder.as_ref().unwrap_or_else(|| {
             panic!("\n\nfailed to specify `dist.sign-folder` in `bootstrap.toml`\n\n")
         });
@@ -100,8 +104,17 @@ impl Step for ReplaceVersionPlaceholder {
     }
 }
 
+/// Invoke the Miri tool on a specified file.
+///
+/// Note that Miri always executed on the host, as it is an interpreter.
+/// That means that `x run miri --target FOO` will build miri for the host,
+/// prepare a miri sysroot for the target `FOO` and then execute miri with
+/// the target `FOO`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Miri {
+    /// The build compiler that will build miri and the target compiler to which miri links.
+    compilers: RustcPrivateCompilers,
+    /// The target which will miri interpret.
     target: TargetSelection,
 }
 
@@ -113,14 +126,9 @@ impl Step for Miri {
     }
 
     fn make_run(run: RunConfig<'_>) {
-        run.builder.ensure(Miri { target: run.target });
-    }
+        let builder = run.builder;
 
-    fn run(self, builder: &Builder<'_>) {
-        let host = builder.build.host_target;
-        let target = self.target;
-
-        // `x run` uses stage 0 by default but miri does not work well with stage 0.
+        // `x run` uses stage 0 by default, but miri does not work well with stage 0.
         // Change the stage to 1 if it's not set explicitly.
         let stage = if builder.config.is_explicit_stage() || builder.top_stage >= 1 {
             builder.top_stage
@@ -129,14 +137,22 @@ impl Step for Miri {
         };
 
         if stage == 0 {
-            eprintln!("miri cannot be run at stage 0");
-            std::process::exit(1);
+            eprintln!("ERROR: miri cannot be run at stage 0");
+            exit!(1);
         }
 
-        // This compiler runs on the host, we'll just use it for the target.
-        let compilers = RustcPrivateCompilers::new(builder, stage, target);
-        let miri_build = builder.ensure(tool::Miri::from_compilers(compilers));
-        let host_compiler = miri_build.build_compiler;
+        // Miri always runs on the host, because it can interpret code for any target
+        let compilers = RustcPrivateCompilers::new(builder, stage, builder.host_target);
+
+        run.builder.ensure(Miri { compilers, target: run.target });
+    }
+
+    fn run(self, builder: &Builder<'_>) {
+        let host = builder.build.host_target;
+        let compilers = self.compilers;
+        let target = self.target;
+
+        builder.ensure(tool::Miri::from_compilers(compilers));
 
         // Get a target sysroot for Miri.
         let miri_sysroot =
@@ -147,8 +163,8 @@ impl Step for Miri {
         // add_rustc_lib_path does not add the path that contains librustc_driver-<...>.so.
         let mut miri = tool::prepare_tool_cargo(
             builder,
-            host_compiler,
-            Mode::ToolRustc,
+            compilers.build_compiler(),
+            Mode::ToolRustcPrivate,
             host,
             Kind::Run,
             "src/tools/miri",
@@ -166,6 +182,10 @@ impl Step for Miri {
         miri.args(builder.config.args());
 
         miri.into_cmd().run(builder);
+    }
+
+    fn metadata(&self) -> Option<StepMetadata> {
+        Some(StepMetadata::run("miri", self.target).built_by(self.compilers.build_compiler()))
     }
 }
 
@@ -190,6 +210,16 @@ impl Step for CollectLicenseMetadata {
         };
 
         let dest = builder.src.join("license-metadata.json");
+
+        if !builder.config.dry_run() {
+            builder.require_and_update_all_submodules();
+            if let Ok(Some(untracked)) = get_git_untracked_files(None) {
+                eprintln!(
+                    "Warning: {} untracked files may cause the license report to be incorrect.",
+                    untracked.len()
+                );
+            }
+        }
 
         let mut cmd = builder.tool_cmd(Tool::CollectLicenseMetadata);
         cmd.env("REUSE_EXE", reuse);
@@ -245,6 +275,8 @@ impl Step for GenerateCopyright {
             });
             cache_dir
         };
+
+        let _guard = builder.group("generate-copyright");
 
         let mut cmd = builder.tool_cmd(Tool::GenerateCopyright);
         cmd.env("CARGO_MANIFESTS", &cargo_manifests);
@@ -413,12 +445,14 @@ pub struct CoverageDump;
 
 impl Step for CoverageDump {
     type Output = ();
-
-    const DEFAULT: bool = false;
     const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         run.path("src/tools/coverage-dump")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        false
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -470,7 +504,7 @@ impl Step for Rustfmt {
         let mut rustfmt = tool::prepare_tool_cargo(
             builder,
             rustfmt_build.build_compiler,
-            Mode::ToolRustc,
+            Mode::ToolRustcPrivate,
             host,
             Kind::Run,
             "src/tools/rustfmt",
@@ -482,5 +516,32 @@ impl Step for Rustfmt {
         rustfmt.args(builder.config.args());
 
         rustfmt.into_cmd().run(builder);
+    }
+}
+
+/// Return the path of x.py's help.
+pub fn get_help_path(builder: &Builder<'_>) -> PathBuf {
+    builder.src.join("src/etc/xhelp")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GenerateHelp;
+
+impl Step for GenerateHelp {
+    type Output = ();
+
+    fn run(self, builder: &Builder<'_>) {
+        let help = top_level_help();
+        let path = get_help_path(builder);
+        std::fs::write(&path, help)
+            .unwrap_or_else(|e| panic!("writing help into {} failed: {e:?}", path.display()));
+    }
+
+    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
+        run.alias("generate-help")
+    }
+
+    fn make_run(run: RunConfig<'_>) {
+        run.builder.ensure(GenerateHelp)
     }
 }

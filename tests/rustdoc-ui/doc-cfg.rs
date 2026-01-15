@@ -1,11 +1,9 @@
 #![feature(doc_cfg)]
 
 #[doc(cfg(), cfg(foo, bar))]
-//~^ ERROR
-//~^^ ERROR
-#[doc(cfg(foo), cfg(bar))]
-//~^ WARN unexpected `cfg` condition name: `foo`
-//~^^ WARN unexpected `cfg` condition name: `bar`
+//~^ ERROR malformed `doc` attribute input
+//~| ERROR malformed `doc` attribute input
 #[doc(cfg())] //~ ERROR
 #[doc(cfg(foo, bar))] //~ ERROR
+#[doc(auto_cfg(hide(foo::bar)))] //~ ERROR
 pub fn foo() {}

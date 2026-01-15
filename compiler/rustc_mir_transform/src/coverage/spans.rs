@@ -1,23 +1,18 @@
-use rustc_data_structures::fx::FxHashSet;
-use rustc_middle::mir;
 use rustc_middle::mir::coverage::{Mapping, MappingKind, START_BCB};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::source_map::SourceMap;
-use rustc_span::{BytePos, DesugaringKind, ExpnKind, MacroKind, Span};
+use rustc_span::{BytePos, DesugaringKind, ExpnId, ExpnKind, MacroKind, Span};
 use tracing::instrument;
 
+use crate::coverage::expansion::{ExpnTree, SpanWithBcb};
 use crate::coverage::graph::{BasicCoverageBlock, CoverageGraph};
 use crate::coverage::hir_info::ExtractedHirInfo;
-use crate::coverage::spans::from_mir::{Hole, RawSpanFromMir, SpanFromMir};
-use crate::coverage::unexpand;
-
-mod from_mir;
 
 pub(super) fn extract_refined_covspans<'tcx>(
     tcx: TyCtxt<'tcx>,
-    mir_body: &mir::Body<'tcx>,
     hir_info: &ExtractedHirInfo,
     graph: &CoverageGraph,
+    expn_tree: &ExpnTree,
     mappings: &mut Vec<Mapping>,
 ) {
     if hir_info.is_async_fn {
@@ -31,22 +26,48 @@ pub(super) fn extract_refined_covspans<'tcx>(
         return;
     }
 
-    let &ExtractedHirInfo { body_span, .. } = hir_info;
+    // If there somehow isn't an expansion tree node corresponding to the
+    // body span, return now and don't create any mappings.
+    let Some(node) = expn_tree.get(hir_info.body_span.ctxt().outer_expn()) else { return };
 
-    let raw_spans = from_mir::extract_raw_spans_from_mir(mir_body, graph);
-    let mut covspans = raw_spans
-        .into_iter()
-        .filter_map(|RawSpanFromMir { raw_span, bcb }| try {
-            let (span, expn_kind) =
-                unexpand::unexpand_into_body_span_with_expn_kind(raw_span, body_span)?;
-            // Discard any spans that fill the entire body, because they tend
+    let mut covspans = vec![];
+
+    for &SpanWithBcb { span, bcb } in &node.spans {
+        covspans.push(Covspan { span, bcb });
+    }
+
+    // For each expansion with its call-site in the body span, try to
+    // distill a corresponding covspan.
+    for &child_expn_id in &node.child_expn_ids {
+        if let Some(covspan) = single_covspan_for_child_expn(tcx, graph, &expn_tree, child_expn_id)
+        {
+            covspans.push(covspan);
+        }
+    }
+
+    if let Some(body_span) = node.body_span {
+        covspans.retain(|covspan: &Covspan| {
+            let covspan_span = covspan.span;
+            // Discard any spans not contained within the function body span.
+            // Also discard any spans that fill the entire body, because they tend
             // to represent compiler-inserted code, e.g. implicitly returning `()`.
-            if span.source_equal(body_span) {
-                return None;
-            };
-            SpanFromMir { span, expn_kind, bcb }
-        })
-        .collect::<Vec<_>>();
+            if !body_span.contains(covspan_span) || body_span.source_equal(covspan_span) {
+                return false;
+            }
+
+            // Each pushed covspan should have the same context as the body span.
+            // If it somehow doesn't, discard the covspan, or panic in debug builds.
+            if !body_span.eq_ctxt(covspan_span) {
+                debug_assert!(
+                    false,
+                    "span context mismatch: body_span={body_span:?}, covspan.span={covspan_span:?}"
+                );
+                return false;
+            }
+
+            true
+        });
+    }
 
     // Only proceed if we found at least one usable span.
     if covspans.is_empty() {
@@ -57,17 +78,9 @@ pub(super) fn extract_refined_covspans<'tcx>(
     // Otherwise, add a fake span at the start of the body, to avoid an ugly
     // gap between the start of the body and the first real span.
     // FIXME: Find a more principled way to solve this problem.
-    covspans.push(SpanFromMir::for_fn_sig(
-        hir_info.fn_sig_span.unwrap_or_else(|| body_span.shrink_to_lo()),
-    ));
-
-    // First, perform the passes that need macro information.
-    covspans.sort_by(|a, b| graph.cmp_in_dominator_order(a.bcb, b.bcb));
-    remove_unwanted_expansion_spans(&mut covspans);
-    shrink_visible_macro_spans(tcx, &mut covspans);
-
-    // We no longer need the extra information in `SpanFromMir`, so convert to `Covspan`.
-    let mut covspans = covspans.into_iter().map(SpanFromMir::into_covspan).collect::<Vec<_>>();
+    if let Some(span) = node.fn_sig_span.or_else(|| try { node.body_span?.shrink_to_lo() }) {
+        covspans.push(Covspan { span, bcb: START_BCB });
+    }
 
     let compare_covspans = |a: &Covspan, b: &Covspan| {
         compare_spans(a.span, b.span)
@@ -83,14 +96,8 @@ pub(super) fn extract_refined_covspans<'tcx>(
     covspans.dedup_by(|b, a| a.span.source_equal(b.span));
 
     // Sort the holes, and merge overlapping/adjacent holes.
-    let mut holes = hir_info
-        .hole_spans
-        .iter()
-        .copied()
-        // Discard any holes that aren't directly visible within the body span.
-        .filter(|&hole_span| body_span.contains(hole_span) && body_span.eq_ctxt(hole_span))
-        .map(|span| Hole { span })
-        .collect::<Vec<_>>();
+    let mut holes = node.hole_spans.iter().copied().map(|span| Hole { span }).collect::<Vec<_>>();
+
     holes.sort_by(|a, b| compare_spans(a.span, b.span));
     holes.dedup_by(|b, a| a.merge_if_overlapping_or_adjacent(b));
 
@@ -117,43 +124,37 @@ pub(super) fn extract_refined_covspans<'tcx>(
     }));
 }
 
-/// Macros that expand into branches (e.g. `assert!`, `trace!`) tend to generate
-/// multiple condition/consequent blocks that have the span of the whole macro
-/// invocation, which is unhelpful. Keeping only the first such span seems to
-/// give better mappings, so remove the others.
-///
-/// Similarly, `await` expands to a branch on the discriminant of `Poll`, which
-/// leads to incorrect coverage if the `Future` is immediately ready (#98712).
-///
-/// (The input spans should be sorted in BCB dominator order, so that the
-/// retained "first" span is likely to dominate the others.)
-fn remove_unwanted_expansion_spans(covspans: &mut Vec<SpanFromMir>) {
-    let mut deduplicated_spans = FxHashSet::default();
+/// For a single child expansion, try to distill it into a single span+BCB mapping.
+fn single_covspan_for_child_expn(
+    tcx: TyCtxt<'_>,
+    graph: &CoverageGraph,
+    expn_tree: &ExpnTree,
+    expn_id: ExpnId,
+) -> Option<Covspan> {
+    let node = expn_tree.get(expn_id)?;
 
-    covspans.retain(|covspan| {
-        match covspan.expn_kind {
-            // Retain only the first await-related or macro-expanded covspan with this span.
-            Some(ExpnKind::Desugaring(DesugaringKind::Await)) => {
-                deduplicated_spans.insert(covspan.span)
-            }
-            Some(ExpnKind::Macro(MacroKind::Bang, _)) => deduplicated_spans.insert(covspan.span),
-            // Ignore (retain) other spans.
-            _ => true,
+    let bcbs =
+        expn_tree.iter_node_and_descendants(expn_id).flat_map(|n| n.spans.iter().map(|s| s.bcb));
+
+    let bcb = match node.expn_kind {
+        // For bang-macros (e.g. `assert!`, `trace!`) and for `await`, taking
+        // the "first" BCB in dominator order seems to give good results.
+        ExpnKind::Macro(MacroKind::Bang, _) | ExpnKind::Desugaring(DesugaringKind::Await) => {
+            bcbs.min_by(|&a, &b| graph.cmp_in_dominator_order(a, b))?
         }
-    });
-}
+        // For other kinds of expansion, taking the "last" (most-dominated) BCB
+        // seems to give good results.
+        _ => bcbs.max_by(|&a, &b| graph.cmp_in_dominator_order(a, b))?,
+    };
 
-/// When a span corresponds to a macro invocation that is visible from the
-/// function body, truncate it to just the macro name plus `!`.
-/// This seems to give better results for code that uses macros.
-fn shrink_visible_macro_spans(tcx: TyCtxt<'_>, covspans: &mut Vec<SpanFromMir>) {
-    let source_map = tcx.sess.source_map();
-
-    for covspan in covspans {
-        if matches!(covspan.expn_kind, Some(ExpnKind::Macro(MacroKind::Bang, _))) {
-            covspan.span = source_map.span_through_char(covspan.span, '!');
-        }
+    // For bang-macro expansions, limit the call-site span to just the macro
+    // name plus `!`, excluding the macro arguments.
+    let mut span = node.call_site?;
+    if matches!(node.expn_kind, ExpnKind::Macro(MacroKind::Bang, _)) {
+        span = tcx.sess.source_map().span_through_char(span, '!');
     }
+
+    Some(Covspan { span, bcb })
 }
 
 /// Discard all covspans that overlap a hole.
@@ -276,4 +277,20 @@ fn ensure_non_empty_span(source_map: &SourceMap, span: Span) -> Option<Span> {
             }
         })
         .ok()?
+}
+
+#[derive(Debug)]
+struct Hole {
+    span: Span,
+}
+
+impl Hole {
+    fn merge_if_overlapping_or_adjacent(&mut self, other: &mut Self) -> bool {
+        if !self.span.overlaps_or_adjacent(other.span) {
+            return false;
+        }
+
+        self.span = self.span.to(other.span);
+        true
+    }
 }

@@ -485,6 +485,7 @@ pub struct Functions {
     too_many_arguments_threshold: u64,
     too_many_lines_threshold: u64,
     large_error_threshold: u64,
+    large_error_ignored: DefIdSet,
     avoid_breaking_exported_api: bool,
     /// A set of resolved `def_id` of traits that are configured to allow
     /// function params renaming.
@@ -498,6 +499,11 @@ impl Functions {
             too_many_arguments_threshold: conf.too_many_arguments_threshold,
             too_many_lines_threshold: conf.too_many_lines_threshold,
             large_error_threshold: conf.large_error_threshold,
+            large_error_ignored: conf
+                .large_error_ignored
+                .iter()
+                .flat_map(|ignored_ty| lookup_path_str(tcx, PathNS::Type, ignored_ty))
+                .collect(),
             avoid_breaking_exported_api: conf.avoid_breaking_exported_api,
             trait_ids: conf
                 .allow_renamed_params_for
@@ -535,7 +541,7 @@ impl<'tcx> LateLintPass<'tcx> for Functions {
         def_id: LocalDefId,
     ) {
         let hir_id = cx.tcx.local_def_id_to_hir_id(def_id);
-        too_many_arguments::check_fn(cx, kind, decl, span, hir_id, self.too_many_arguments_threshold);
+        too_many_arguments::check_fn(cx, kind, decl, hir_id, def_id, self.too_many_arguments_threshold);
         too_many_lines::check_fn(cx, kind, body, span, def_id, self.too_many_lines_threshold);
         not_unsafe_ptr_arg_deref::check_fn(cx, kind, decl, body, def_id);
         misnamed_getters::check_fn(cx, kind, decl, body, span);
@@ -554,12 +560,24 @@ impl<'tcx> LateLintPass<'tcx> for Functions {
 
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx hir::Item<'_>) {
         must_use::check_item(cx, item);
-        result::check_item(cx, item, self.large_error_threshold, self.msrv);
+        result::check_item(
+            cx,
+            item,
+            self.large_error_threshold,
+            &self.large_error_ignored,
+            self.msrv,
+        );
     }
 
     fn check_impl_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx hir::ImplItem<'_>) {
         must_use::check_impl_item(cx, item);
-        result::check_impl_item(cx, item, self.large_error_threshold, self.msrv);
+        result::check_impl_item(
+            cx,
+            item,
+            self.large_error_threshold,
+            &self.large_error_ignored,
+            self.msrv,
+        );
         impl_trait_in_params::check_impl_item(cx, item);
         renamed_function_params::check_impl_item(cx, item, &self.trait_ids);
     }
@@ -568,8 +586,18 @@ impl<'tcx> LateLintPass<'tcx> for Functions {
         too_many_arguments::check_trait_item(cx, item, self.too_many_arguments_threshold);
         not_unsafe_ptr_arg_deref::check_trait_item(cx, item);
         must_use::check_trait_item(cx, item);
-        result::check_trait_item(cx, item, self.large_error_threshold, self.msrv);
+        result::check_trait_item(
+            cx,
+            item,
+            self.large_error_threshold,
+            &self.large_error_ignored,
+            self.msrv,
+        );
         impl_trait_in_params::check_trait_item(cx, item, self.avoid_breaking_exported_api);
         ref_option::check_trait_item(cx, item, self.avoid_breaking_exported_api);
+    }
+
+    fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx hir::Expr<'tcx>) {
+        result::check_expr(cx, expr, self.large_error_threshold, &self.large_error_ignored);
     }
 }

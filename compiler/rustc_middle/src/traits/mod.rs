@@ -389,10 +389,14 @@ pub enum ObligationCauseCode<'tcx> {
     /// against.
     MatchImpl(ObligationCause<'tcx>, DefId),
 
+    UnOp {
+        hir_id: HirId,
+    },
+
     BinOp {
         lhs_hir_id: HirId,
-        rhs_hir_id: Option<HirId>,
-        rhs_span: Option<Span>,
+        rhs_hir_id: HirId,
+        rhs_span: Span,
         rhs_is_lit: bool,
         output_ty: Option<Ty<'tcx>>,
     },
@@ -416,6 +420,13 @@ pub enum ObligationCauseCode<'tcx> {
     /// Only reachable if the `unsized_fn_params` feature is used. Unsized function arguments must
     /// be place expressions because we can't store them in MIR locals as temporaries.
     UnsizedNonPlaceExpr(Span),
+
+    /// Error derived when checking an impl item is compatible with
+    /// its corresponding trait item's definition
+    CompareEii {
+        external_impl: LocalDefId,
+        declaration: DefId,
+    },
 }
 
 /// Whether a value can be extracted into a const.
@@ -819,6 +830,9 @@ impl DynCompatibilityViolation {
             DynCompatibilityViolation::Method(name, MethodViolationCode::AsyncFn, _) => {
                 format!("method `{name}` is `async`").into()
             }
+            DynCompatibilityViolation::Method(name, MethodViolationCode::CVariadic, _) => {
+                format!("method `{name}` is C-variadic").into()
+            }
             DynCompatibilityViolation::Method(
                 name,
                 MethodViolationCode::WhereClauseReferencesSelf,
@@ -972,6 +986,9 @@ pub enum MethodViolationCode {
 
     /// e.g., `fn foo<A>()`
     Generic,
+
+    /// e.g., `fn (mut ap: ...)`
+    CVariadic,
 
     /// the method's receiver (`self` argument) can't be dispatched on
     UndispatchableReceiver(Option<Span>),

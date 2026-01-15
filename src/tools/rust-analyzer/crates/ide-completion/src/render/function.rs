@@ -93,8 +93,8 @@ fn render(
             has_call_parens,
             ..
         }) => (false, has_call_parens, ctx.completion.config.snippet_cap),
-        FuncKind::Method(&DotAccess { kind: DotAccessKind::Method { has_parens }, .. }, _) => {
-            (true, has_parens, ctx.completion.config.snippet_cap)
+        FuncKind::Method(&DotAccess { kind: DotAccessKind::Method, .. }, _) => {
+            (true, true, ctx.completion.config.snippet_cap)
         }
         FuncKind::Method(DotAccess { kind: DotAccessKind::Field { .. }, .. }, _) => {
             (true, false, ctx.completion.config.snippet_cap)
@@ -883,6 +883,27 @@ fn foo() {}
 fn baz(_: impl FnOnce()) {}
 fn bar() {
     baz(|| foo()$0);
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn no_semicolon_in_arg_list() {
+        check_edit(
+            r#"foo"#,
+            r#"
+fn foo() {}
+fn baz(_: impl FnOnce()) {}
+fn bar() {
+    baz(fo$0);
+}
+"#,
+            r#"
+fn foo() {}
+fn baz(_: impl FnOnce()) {}
+fn bar() {
+    baz(foo()$0);
 }
 "#,
         );

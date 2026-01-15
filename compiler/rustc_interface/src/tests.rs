@@ -8,19 +8,20 @@ use rustc_abi::Align;
 use rustc_data_structures::profiling::TimePassesFormat;
 use rustc_errors::emitter::HumanReadableErrorType;
 use rustc_errors::{ColorConfig, registry};
+use rustc_hir::attrs::{CollapseMacroDebuginfo, NativeLibKind};
 use rustc_session::config::{
-    AutoDiff, BranchProtection, CFGuard, Cfg, CollapseMacroDebuginfo, CoverageLevel,
-    CoverageOptions, DebugInfo, DumpMonoStatsFormat, ErrorOutputType, ExternEntry, ExternLocation,
-    Externs, FmtDebug, FunctionReturn, InliningThreshold, Input, InstrumentCoverage,
-    InstrumentXRay, LinkSelfContained, LinkerPluginLto, LocationDetail, LtoCli, MirIncludeSpans,
-    NextSolverConfig, Offload, OomStrategy, Options, OutFileName, OutputType, OutputTypes,
-    PAuthKey, PacRet, Passes, PatchableFunctionEntry, Polonius, ProcMacroExecutionStrategy, Strip,
-    SwitchWithOptPath, SymbolManglingVersion, WasiExecModel, build_configuration,
-    build_session_options, rustc_optgroups,
+    AnnotateMoves, AutoDiff, BranchProtection, CFGuard, Cfg, CoverageLevel, CoverageOptions,
+    DebugInfo, DumpMonoStatsFormat, ErrorOutputType, ExternEntry, ExternLocation, Externs,
+    FmtDebug, FunctionReturn, InliningThreshold, Input, InstrumentCoverage, InstrumentXRay,
+    LinkSelfContained, LinkerPluginLto, LocationDetail, LtoCli, MirIncludeSpans, NextSolverConfig,
+    Offload, Options, OutFileName, OutputType, OutputTypes, PAuthKey, PacRet, Passes,
+    PatchableFunctionEntry, Polonius, ProcMacroExecutionStrategy, Strip, SwitchWithOptPath,
+    SymbolManglingVersion, WasiExecModel, build_configuration, build_session_options,
+    rustc_optgroups,
 };
 use rustc_session::lint::Level;
 use rustc_session::search_paths::SearchPath;
-use rustc_session::utils::{CanonicalizedPath, NativeLib, NativeLibKind};
+use rustc_session::utils::{CanonicalizedPath, NativeLib};
 use rustc_session::{CompilerIO, EarlyDiagCtxt, Session, build_session, getopts};
 use rustc_span::edition::{DEFAULT_EDITION, Edition};
 use rustc_span::source_map::{RealFileLoader, SourceMapInputs};
@@ -45,6 +46,7 @@ where
         &early_dcx,
         &sessopts.target_triple,
         sessopts.sysroot.path(),
+        sessopts.unstable_opts.unstable_options,
     );
     let hash_kind = sessopts.unstable_opts.src_hash_algorithm(&target);
     let checksum_hash_kind = sessopts.unstable_opts.checksum_hash_algorithm();
@@ -77,7 +79,6 @@ where
             "",
             None,
             &USING_INTERNAL_FEATURES,
-            Default::default(),
         );
         let cfg = parse_cfg(sess.dcx(), matches.opt_strs("cfg"));
         let cfg = build_configuration(&sess, cfg);
@@ -321,7 +322,7 @@ fn test_search_paths_tracking_hash_different_order() {
     let early_dcx = EarlyDiagCtxt::new(JSON);
     const JSON: ErrorOutputType = ErrorOutputType::Json {
         pretty: false,
-        json_rendered: HumanReadableErrorType::Default,
+        json_rendered: HumanReadableErrorType { short: false, unicode: false },
         color_config: ColorConfig::Never,
     };
 
@@ -620,6 +621,7 @@ fn test_codegen_options_tracking_hash() {
     tracked!(force_frame_pointers, FramePointer::Always);
     tracked!(force_unwind_tables, Some(true));
     tracked!(instrument_coverage, InstrumentCoverage::Yes);
+    tracked!(jump_tables, false);
     tracked!(link_dead_code, Some(true));
     tracked!(linker_plugin_lto, LinkerPluginLto::LinkerPluginAuto);
     tracked!(llvm_args, vec![String::from("1"), String::from("2")]);
@@ -763,15 +765,17 @@ fn test_unstable_options_tracking_hash() {
     // tidy-alphabetical-start
     tracked!(allow_features, Some(vec![String::from("lang_items")]));
     tracked!(always_encode_mir, true);
+    tracked!(annotate_moves, AnnotateMoves::Enabled(Some(1234)));
     tracked!(assume_incomplete_release, true);
-    tracked!(autodiff, vec![AutoDiff::Enable]);
+    tracked!(autodiff, vec![AutoDiff::Enable, AutoDiff::NoTT]);
     tracked!(binary_dep_depinfo, true);
     tracked!(box_noalias, false);
     tracked!(
         branch_protection,
         Some(BranchProtection {
             bti: true,
-            pac_ret: Some(PacRet { leaf: true, pc: true, key: PAuthKey::B })
+            pac_ret: Some(PacRet { leaf: true, pc: true, key: PAuthKey::B }),
+            gcs: true,
         })
     );
     tracked!(codegen_backend, Some("abc".to_string()));
@@ -795,7 +799,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(embed_metadata, false);
     tracked!(embed_source, true);
     tracked!(emit_thin_lto, false);
-    tracked!(emscripten_wasm_eh, true);
+    tracked!(emscripten_wasm_eh, false);
     tracked!(export_executable_symbols, true);
     tracked!(fewer_names, Some(true));
     tracked!(fixed_x18, true);
@@ -830,14 +834,12 @@ fn test_unstable_options_tracking_hash() {
     tracked!(mutable_noalias, false);
     tracked!(next_solver, NextSolverConfig { coherence: true, globally: true });
     tracked!(no_generate_arange_section, true);
-    tracked!(no_jump_tables, true);
     tracked!(no_link, true);
     tracked!(no_profiler_runtime, true);
     tracked!(no_trait_vptr, true);
     tracked!(no_unique_section_names, true);
-    tracked!(offload, vec![Offload::Enable]);
+    tracked!(offload, vec![Offload::Device]);
     tracked!(on_broken_pipe, OnBrokenPipe::Kill);
-    tracked!(oom, OomStrategy::Panic);
     tracked!(osx_rpath_install_name, true);
     tracked!(packed_bundled_libs, true);
     tracked!(panic_abort_tests, true);

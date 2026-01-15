@@ -16,7 +16,7 @@ error: layout_of(A) = Layout {
                offsets: [
                    Size(0 bytes),
                ],
-               memory_index: [
+               in_memory_order: [
                    0,
                ],
            },
@@ -52,7 +52,7 @@ error: layout_of(A) = Layout {
                        },
                        fields: Arbitrary {
                            offsets: [],
-                           memory_index: [],
+                           in_memory_order: [],
                        },
                        largest_niche: None,
                        uninhabited: false,
@@ -69,7 +69,7 @@ error: layout_of(A) = Layout {
            unadjusted_abi_align: Align(1 bytes),
            randomization_seed: $SEED,
        }
-  --> $DIR/thumb-enum.rs:18:1
+  --> $DIR/thumb-enum.rs:19:1
    |
 LL | enum A { Apple }
    | ^^^^^^
@@ -92,7 +92,7 @@ error: layout_of(B) = Layout {
                offsets: [
                    Size(0 bytes),
                ],
-               memory_index: [
+               in_memory_order: [
                    0,
                ],
            },
@@ -128,7 +128,7 @@ error: layout_of(B) = Layout {
                        },
                        fields: Arbitrary {
                            offsets: [],
-                           memory_index: [],
+                           in_memory_order: [],
                        },
                        largest_niche: None,
                        uninhabited: false,
@@ -145,7 +145,7 @@ error: layout_of(B) = Layout {
            unadjusted_abi_align: Align(1 bytes),
            randomization_seed: $SEED,
        }
-  --> $DIR/thumb-enum.rs:22:1
+  --> $DIR/thumb-enum.rs:23:1
    |
 LL | enum B { Banana = 255, }
    | ^^^^^^
@@ -168,7 +168,7 @@ error: layout_of(C) = Layout {
                offsets: [
                    Size(0 bytes),
                ],
-               memory_index: [
+               in_memory_order: [
                    0,
                ],
            },
@@ -204,7 +204,7 @@ error: layout_of(C) = Layout {
                        },
                        fields: Arbitrary {
                            offsets: [],
-                           memory_index: [],
+                           in_memory_order: [],
                        },
                        largest_niche: None,
                        uninhabited: false,
@@ -221,7 +221,7 @@ error: layout_of(C) = Layout {
            unadjusted_abi_align: Align(2 bytes),
            randomization_seed: $SEED,
        }
-  --> $DIR/thumb-enum.rs:26:1
+  --> $DIR/thumb-enum.rs:27:1
    |
 LL | enum C { Chaenomeles = 256, }
    | ^^^^^^
@@ -244,7 +244,7 @@ error: layout_of(P) = Layout {
                offsets: [
                    Size(0 bytes),
                ],
-               memory_index: [
+               in_memory_order: [
                    0,
                ],
            },
@@ -280,7 +280,7 @@ error: layout_of(P) = Layout {
                        },
                        fields: Arbitrary {
                            offsets: [],
-                           memory_index: [],
+                           in_memory_order: [],
                        },
                        largest_niche: None,
                        uninhabited: false,
@@ -297,7 +297,7 @@ error: layout_of(P) = Layout {
            unadjusted_abi_align: Align(4 bytes),
            randomization_seed: $SEED,
        }
-  --> $DIR/thumb-enum.rs:30:1
+  --> $DIR/thumb-enum.rs:31:1
    |
 LL | enum P { Peach = 0x1000_0000isize, }
    | ^^^^^^
@@ -320,7 +320,7 @@ error: layout_of(T) = Layout {
                offsets: [
                    Size(0 bytes),
                ],
-               memory_index: [
+               in_memory_order: [
                    0,
                ],
            },
@@ -356,7 +356,7 @@ error: layout_of(T) = Layout {
                        },
                        fields: Arbitrary {
                            offsets: [],
-                           memory_index: [],
+                           in_memory_order: [],
                        },
                        largest_niche: None,
                        uninhabited: false,
@@ -373,7 +373,7 @@ error: layout_of(T) = Layout {
            unadjusted_abi_align: Align(4 bytes),
            randomization_seed: $SEED,
        }
-  --> $DIR/thumb-enum.rs:36:1
+  --> $DIR/thumb-enum.rs:37:1
    |
 LL | enum T { Tangerine = TANGERINE as isize }
    | ^^^^^^

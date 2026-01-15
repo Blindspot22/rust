@@ -6,19 +6,19 @@
 #![feature(ascii_char)]
 #![feature(ascii_char_variants)]
 #![feature(assert_matches)]
+#![feature(box_into_inner)]
 #![feature(box_patterns)]
-#![feature(debug_closure_helpers)]
 #![feature(file_buffered)]
-#![feature(format_args_nl)]
+#![feature(formatting_options)]
 #![feature(if_let_guard)]
+#![feature(iter_advance_by)]
 #![feature(iter_intersperse)]
-#![feature(round_char_boundary)]
+#![feature(iter_order_by)]
 #![feature(rustc_private)]
 #![feature(test)]
+#![feature(trim_prefix_suffix)]
 #![warn(rustc::internal)]
 // tidy-alphabetical-end
-
-extern crate thin_vec;
 
 // N.B. these need `extern crate` even in 2018 edition
 // because they're loaded implicitly from the sysroot.
@@ -28,7 +28,6 @@ extern crate thin_vec;
 //
 // Dependencies listed in Cargo.toml do not need `extern crate`.
 
-extern crate pulldown_cmark;
 extern crate rustc_abi;
 extern crate rustc_ast;
 extern crate rustc_ast_pretty;
@@ -36,7 +35,6 @@ extern crate rustc_attr_parsing;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_errors;
-extern crate rustc_expand;
 extern crate rustc_feature;
 extern crate rustc_hir;
 extern crate rustc_hir_analysis;
@@ -61,10 +59,14 @@ extern crate rustc_target;
 extern crate rustc_trait_selection;
 extern crate test;
 
-// See docs in https://github.com/rust-lang/rust/blob/master/compiler/rustc/src/main.rs
-// about jemalloc.
+/// See docs in https://github.com/rust-lang/rust/blob/HEAD/compiler/rustc/src/main.rs
+/// and https://github.com/rust-lang/rust/pull/146627 for why we need this.
+///
+/// FIXME(madsmtm): This is loaded from the sysroot that was built with the other `rustc` crates
+/// above, instead of via Cargo as you'd normally do. This is currently needed for LTO due to
+/// https://github.com/rust-lang/cc-rs/issues/1613.
 #[cfg(feature = "jemalloc")]
-extern crate tikv_jemalloc_sys as jemalloc_sys;
+extern crate tikv_jemalloc_sys as _;
 
 use std::env::{self, VarError};
 use std::io::{self, IsTerminal};
@@ -73,6 +75,7 @@ use std::process;
 
 use rustc_errors::DiagCtxtHandle;
 use rustc_hir::def_id::LOCAL_CRATE;
+use rustc_hir::lints::DelayedLint;
 use rustc_interface::interface;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{ErrorOutputType, RustcOptGroup, make_crate_type_option};
@@ -124,37 +127,6 @@ mod visit_ast;
 mod visit_lib;
 
 pub fn main() {
-    // See docs in https://github.com/rust-lang/rust/blob/master/compiler/rustc/src/main.rs
-    // about jemalloc.
-    #[cfg(feature = "jemalloc")]
-    {
-        use std::os::raw::{c_int, c_void};
-
-        #[used]
-        static _F1: unsafe extern "C" fn(usize, usize) -> *mut c_void = jemalloc_sys::calloc;
-        #[used]
-        static _F2: unsafe extern "C" fn(*mut *mut c_void, usize, usize) -> c_int =
-            jemalloc_sys::posix_memalign;
-        #[used]
-        static _F3: unsafe extern "C" fn(usize, usize) -> *mut c_void = jemalloc_sys::aligned_alloc;
-        #[used]
-        static _F4: unsafe extern "C" fn(usize) -> *mut c_void = jemalloc_sys::malloc;
-        #[used]
-        static _F5: unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void = jemalloc_sys::realloc;
-        #[used]
-        static _F6: unsafe extern "C" fn(*mut c_void) = jemalloc_sys::free;
-
-        #[cfg(target_os = "macos")]
-        {
-            unsafe extern "C" {
-                fn _rjem_je_zone_register();
-            }
-
-            #[used]
-            static _F7: unsafe extern "C" fn() = _rjem_je_zone_register;
-        }
-    }
-
     let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
 
     rustc_driver::install_ice_hook(
@@ -568,9 +540,17 @@ fn opts() -> Vec<RustcOptGroup> {
             "",
             "emit",
             "Comma separated list of types of output for rustdoc to emit",
-            "[unversioned-shared-resources,toolchain-shared-resources,invocation-specific,dep-info]",
+            "[toolchain-shared-resources,invocation-specific,dep-info]",
         ),
         opt(Unstable, FlagMulti, "", "no-run", "Compile doctests without running them", ""),
+        opt(
+            Unstable,
+            Opt,
+            "",
+            "merge-doctests",
+            "Force all doctests to be compiled as a single binary, instead of one binary per test. If merging fails, rustdoc will emit a hard error.",
+            "yes|no|auto",
+        ),
         opt(
             Unstable,
             Multi,
@@ -587,7 +567,7 @@ fn opts() -> Vec<RustcOptGroup> {
             "Include the memory layout of types in the docs",
             "",
         ),
-        opt(Unstable, Flag, "", "nocapture", "Don't capture stdout and stderr of tests", ""),
+        opt(Unstable, Flag, "", "no-capture", "Don't capture stdout and stderr of tests", ""),
         opt(
             Unstable,
             Flag,
@@ -759,7 +739,9 @@ fn run_renderer<
                 tcx.dcx().struct_fatal(format!("couldn't generate documentation: {}", e.error));
             let file = e.file.display().to_string();
             if !file.is_empty() {
-                msg.note(format!("failed to create or modify \"{file}\""));
+                msg.note(format!("failed to create or modify {e}"));
+            } else {
+                msg.note(format!("failed to create or modify file: {e}"));
             }
             msg.emit();
         }
@@ -833,8 +815,10 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String]) {
         config::InputMode::NoInputMergeFinalize => {
             return wrap_return(
                 dcx,
-                run_merge_finalize(render_options)
-                    .map_err(|e| format!("could not write merged cross-crate info: {e}")),
+                rustc_span::create_session_globals_then(options.edition, &[], None, || {
+                    run_merge_finalize(render_options)
+                        .map_err(|e| format!("could not write merged cross-crate info: {e}"))
+                }),
             );
         }
     };
@@ -845,7 +829,7 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String]) {
         options.should_test || output_format == config::OutputFormat::Doctest,
         config::markdown_input(&input),
     ) {
-        (true, Some(_)) => return wrap_return(dcx, doctest::test_markdown(&input, options)),
+        (true, Some(_)) => return wrap_return(dcx, doctest::test_markdown(&input, options, dcx)),
         (true, None) => return doctest::run(dcx, input, options),
         (false, Some(md_input)) => {
             let md_input = md_input.to_owned();
@@ -893,7 +877,7 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String]) {
         // Register the loaded external files in the source map so they show up in depinfo.
         // We can't load them via the source map because it gets created after we process the options.
         for external_path in &loaded_paths {
-            let _ = sess.source_map().load_file(external_path);
+            let _ = sess.source_map().load_binary_file(external_path);
         }
 
         if sess.opts.describe_lints {
@@ -923,6 +907,30 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String]) {
                 // if we ran coverage, bail early, we don't need to also generate docs at this point
                 // (also we didn't load in any of the useful passes)
                 return;
+            }
+
+            for owner_id in tcx.hir_crate_items(()).delayed_lint_items() {
+                if let Some(delayed_lints) = tcx.opt_ast_lowering_delayed_lints(owner_id) {
+                    for lint in &delayed_lints.lints {
+                        match lint {
+                            DelayedLint::AttributeParsing(attribute_lint) => {
+                                tcx.node_span_lint(
+                                    attribute_lint.lint_id.lint,
+                                    attribute_lint.id,
+                                    attribute_lint.span,
+                                    |diag| {
+                                        rustc_lint::decorate_attribute_lint(
+                                            tcx.sess,
+                                            Some(tcx),
+                                            &attribute_lint.kind,
+                                            diag,
+                                        );
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
             }
 
             if render_opts.dep_info().is_some() {

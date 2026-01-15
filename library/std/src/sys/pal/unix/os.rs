@@ -7,145 +7,14 @@ mod tests;
 
 use libc::{c_char, c_int, c_void};
 
-use crate::error::Error as StdError;
 use crate::ffi::{CStr, OsStr, OsString};
 use crate::os::unix::prelude::*;
 use crate::path::{self, PathBuf};
-use crate::sys::common::small_c_string::run_path_with_cstr;
 use crate::sys::cvt;
+use crate::sys::helpers::run_path_with_cstr;
 use crate::{fmt, io, iter, mem, ptr, slice, str};
 
-const TMPBUF_SZ: usize = 128;
-
-const PATH_SEPARATOR: u8 = cfg_select! {
-    target_os = "redox" => b';',
-    _ => b':',
-};
-
-unsafe extern "C" {
-    #[cfg(not(any(target_os = "dragonfly", target_os = "vxworks", target_os = "rtems")))]
-    #[cfg_attr(
-        any(
-            target_os = "linux",
-            target_os = "emscripten",
-            target_os = "fuchsia",
-            target_os = "l4re",
-            target_os = "hurd",
-        ),
-        link_name = "__errno_location"
-    )]
-    #[cfg_attr(
-        any(
-            target_os = "netbsd",
-            target_os = "openbsd",
-            target_os = "cygwin",
-            target_os = "android",
-            target_os = "redox",
-            target_os = "nuttx",
-            target_env = "newlib"
-        ),
-        link_name = "__errno"
-    )]
-    #[cfg_attr(any(target_os = "solaris", target_os = "illumos"), link_name = "___errno")]
-    #[cfg_attr(target_os = "nto", link_name = "__get_errno_ptr")]
-    #[cfg_attr(any(target_os = "freebsd", target_vendor = "apple"), link_name = "__error")]
-    #[cfg_attr(target_os = "haiku", link_name = "_errnop")]
-    #[cfg_attr(target_os = "aix", link_name = "_Errno")]
-    // SAFETY: this will always return the same pointer on a given thread.
-    #[unsafe(ffi_const)]
-    pub safe fn errno_location() -> *mut c_int;
-}
-
-/// Returns the platform-specific value of errno
-#[cfg(not(any(target_os = "dragonfly", target_os = "vxworks", target_os = "rtems")))]
-#[inline]
-pub fn errno() -> i32 {
-    unsafe { (*errno_location()) as i32 }
-}
-
-/// Sets the platform-specific value of errno
-// needed for readdir and syscall!
-#[cfg(all(not(target_os = "dragonfly"), not(target_os = "vxworks"), not(target_os = "rtems")))]
-#[allow(dead_code)] // but not all target cfgs actually end up using it
-#[inline]
-pub fn set_errno(e: i32) {
-    unsafe { *errno_location() = e as c_int }
-}
-
-#[cfg(target_os = "vxworks")]
-#[inline]
-pub fn errno() -> i32 {
-    unsafe { libc::errnoGet() }
-}
-
-#[cfg(target_os = "rtems")]
-#[inline]
-pub fn errno() -> i32 {
-    unsafe extern "C" {
-        #[thread_local]
-        static _tls_errno: c_int;
-    }
-
-    unsafe { _tls_errno as i32 }
-}
-
-#[cfg(target_os = "dragonfly")]
-#[inline]
-pub fn errno() -> i32 {
-    unsafe extern "C" {
-        #[thread_local]
-        static errno: c_int;
-    }
-
-    unsafe { errno as i32 }
-}
-
-#[cfg(target_os = "dragonfly")]
-#[allow(dead_code)]
-#[inline]
-pub fn set_errno(e: i32) {
-    unsafe extern "C" {
-        #[thread_local]
-        static mut errno: c_int;
-    }
-
-    unsafe {
-        errno = e;
-    }
-}
-
-/// Gets a detailed string description for the given error number.
-pub fn error_string(errno: i32) -> String {
-    unsafe extern "C" {
-        #[cfg_attr(
-            all(
-                any(
-                    target_os = "linux",
-                    target_os = "hurd",
-                    target_env = "newlib",
-                    target_os = "cygwin"
-                ),
-                not(target_env = "ohos")
-            ),
-            link_name = "__xpg_strerror_r"
-        )]
-        fn strerror_r(errnum: c_int, buf: *mut c_char, buflen: libc::size_t) -> c_int;
-    }
-
-    let mut buf = [0 as c_char; TMPBUF_SZ];
-
-    let p = buf.as_mut_ptr();
-    unsafe {
-        if strerror_r(errno as c_int, p, buf.len()) < 0 {
-            panic!("strerror_r failure");
-        }
-
-        let p = p as *const _;
-        // We can't always expect a UTF-8 environment. When we don't get that luxury,
-        // it's better to give a low-quality error message than none at all.
-        String::from_utf8_lossy(CStr::from_ptr(p).to_bytes()).into()
-    }
-}
+const PATH_SEPARATOR: u8 = b':';
 
 #[cfg(target_os = "espidf")]
 pub fn getcwd() -> io::Result<PathBuf> {
@@ -190,33 +59,24 @@ pub fn chdir(p: &path::Path) -> io::Result<()> {
     if result == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
-pub struct SplitPaths<'a> {
-    iter: iter::Map<slice::Split<'a, u8, fn(&u8) -> bool>, fn(&'a [u8]) -> PathBuf>,
-}
+// This can't just be `impl Iterator` because that requires `'a` to be live on
+// drop (see #146045).
+pub type SplitPaths<'a> = iter::Map<
+    slice::Split<'a, u8, impl FnMut(&u8) -> bool + 'static>,
+    impl FnMut(&[u8]) -> PathBuf + 'static,
+>;
 
+#[define_opaque(SplitPaths)]
 pub fn split_paths(unparsed: &OsStr) -> SplitPaths<'_> {
-    fn bytes_to_path(b: &[u8]) -> PathBuf {
-        PathBuf::from(<OsStr as OsStrExt>::from_bytes(b))
+    fn is_separator(&b: &u8) -> bool {
+        b == PATH_SEPARATOR
     }
-    fn is_separator(b: &u8) -> bool {
-        *b == PATH_SEPARATOR
-    }
-    let unparsed = unparsed.as_bytes();
-    SplitPaths {
-        iter: unparsed
-            .split(is_separator as fn(&u8) -> bool)
-            .map(bytes_to_path as fn(&[u8]) -> PathBuf),
-    }
-}
 
-impl<'a> Iterator for SplitPaths<'a> {
-    type Item = PathBuf;
-    fn next(&mut self) -> Option<PathBuf> {
-        self.iter.next()
+    fn into_pathbuf(part: &[u8]) -> PathBuf {
+        PathBuf::from(OsStr::from_bytes(part))
     }
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.iter.size_hint()
-    }
+
+    unparsed.as_bytes().split(is_separator).map(into_pathbuf)
 }
 
 #[derive(Debug)]
@@ -248,12 +108,7 @@ impl fmt::Display for JoinPathsError {
     }
 }
 
-impl StdError for JoinPathsError {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        "failed to join paths"
-    }
-}
+impl crate::error::Error for JoinPathsError {}
 
 #[cfg(target_os = "aix")]
 pub fn current_exe() -> io::Result<PathBuf> {
@@ -262,10 +117,10 @@ pub fn current_exe() -> io::Result<PathBuf> {
 
     #[cfg(not(test))]
     use crate::env;
-    use crate::io::ErrorKind;
+    use crate::io;
 
     let exe_path = env::args().next().ok_or(io::const_error!(
-        ErrorKind::NotFound,
+        io::ErrorKind::NotFound,
         "an executable path was not found because no arguments were provided through argv",
     ))?;
     let path = PathBuf::from(exe_path);
@@ -290,7 +145,7 @@ pub fn current_exe() -> io::Result<PathBuf> {
             }
         }
     }
-    Err(io::const_error!(ErrorKind::NotFound, "an executable path was not found"))
+    Err(io::const_error!(io::ErrorKind::NotFound, "an executable path was not found"))
 }
 
 #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
@@ -475,14 +330,13 @@ pub fn current_exe() -> io::Result<PathBuf> {
     unsafe {
         let result = libc::find_path(
             crate::ptr::null_mut(),
-            libc::path_base_directory::B_FIND_PATH_IMAGE_PATH,
+            libc::B_FIND_PATH_IMAGE_PATH,
             crate::ptr::null_mut(),
             name.as_mut_ptr(),
             name.len(),
         );
         if result != libc::B_OK {
-            use crate::io::ErrorKind;
-            Err(io::const_error!(ErrorKind::Uncategorized, "error getting executable path"))
+            Err(io::const_error!(io::ErrorKind::Uncategorized, "error getting executable path"))
         } else {
             // find_path adds the null terminator.
             let name = CStr::from_ptr(name.as_ptr()).to_bytes();
@@ -503,8 +357,7 @@ pub fn current_exe() -> io::Result<PathBuf> {
 
 #[cfg(target_os = "l4re")]
 pub fn current_exe() -> io::Result<PathBuf> {
-    use crate::io::ErrorKind;
-    Err(io::const_error!(ErrorKind::Unsupported, "not yet implemented!"))
+    Err(io::const_error!(io::ErrorKind::Unsupported, "not yet implemented!"))
 }
 
 #[cfg(target_os = "vxworks")]
@@ -532,10 +385,9 @@ pub fn current_exe() -> io::Result<PathBuf> {
 
     #[cfg(not(test))]
     use crate::env;
-    use crate::io::ErrorKind;
 
     let exe_path = env::args().next().ok_or(io::const_error!(
-        ErrorKind::Uncategorized,
+        io::ErrorKind::Uncategorized,
         "an executable path was not found because no arguments were provided through argv",
     ))?;
     let path = PathBuf::from(exe_path);

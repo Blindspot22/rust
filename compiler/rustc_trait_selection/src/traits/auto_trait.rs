@@ -13,6 +13,7 @@ use tracing::debug;
 
 use super::*;
 use crate::errors::UnableToConstructConstantValue;
+use crate::infer::TypeFreshener;
 use crate::infer::region_constraints::{ConstraintKind, RegionConstraintData};
 use crate::regions::OutlivesEnvironmentBuildExt;
 use crate::traits::project::ProjectAndUnifyResult;
@@ -155,7 +156,7 @@ impl<'tcx> AutoTraitFinder<'tcx> {
         // an additional sanity check.
         let ocx = ObligationCtxt::new(&infcx);
         ocx.register_bound(ObligationCause::dummy(), full_env, ty, trait_did);
-        let errors = ocx.select_all_or_error();
+        let errors = ocx.evaluate_obligations_error_on_ambiguity();
         if !errors.is_empty() {
             panic!("Unable to fulfill trait {trait_did:?} for '{ty:?}': {errors:?}");
         }
@@ -817,6 +818,6 @@ impl<'tcx> AutoTraitFinder<'tcx> {
         infcx: &InferCtxt<'tcx>,
         p: ty::Predicate<'tcx>,
     ) -> ty::Predicate<'tcx> {
-        infcx.freshen(p)
+        p.fold_with(&mut TypeFreshener::new(infcx))
     }
 }

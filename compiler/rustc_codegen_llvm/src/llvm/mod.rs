@@ -6,18 +6,21 @@ use std::ptr;
 use std::string::FromUtf8Error;
 
 use libc::c_uint;
-use rustc_abi::{Align, Size, WrappingRange};
+use rustc_abi::{AddressSpace, Align, Size, WrappingRange};
 use rustc_llvm::RustString;
 
 pub(crate) use self::CallConv::*;
 pub(crate) use self::CodeGenOptSize::*;
-pub(crate) use self::MetadataType::*;
+pub(crate) use self::conversions::*;
 pub(crate) use self::ffi::*;
+pub(crate) use self::metadata_kind::*;
 use crate::common::AsCCharPtr;
 
+mod conversions;
 pub(crate) mod diagnostic;
 pub(crate) mod enzyme_ffi;
 mod ffi;
+mod metadata_kind;
 
 pub(crate) use self::enzyme_ffi::*;
 
@@ -38,6 +41,14 @@ pub(crate) fn AddFunctionAttributes<'ll>(
     unsafe {
         LLVMRustAddFunctionAttributes(llfn, idx.as_uint(), attrs.as_ptr(), attrs.len());
     }
+}
+
+pub(crate) fn HasStringAttribute<'ll>(llfn: &'ll Value, name: &str) -> bool {
+    unsafe { LLVMRustHasFnAttribute(llfn, name.as_c_char_ptr(), name.len()) }
+}
+
+pub(crate) fn RemoveStringAttrFromFn<'ll>(llfn: &'ll Value, name: &str) {
+    unsafe { LLVMRustRemoveFnAttribute(llfn, name.as_c_char_ptr(), name.len()) }
 }
 
 pub(crate) fn AddCallSiteAttributes<'ll>(
@@ -112,16 +123,26 @@ pub(crate) fn CreateAllocKindAttr(llcx: &Context, kind_arg: AllocKindFlags) -> &
 
 pub(crate) fn CreateRangeAttr(llcx: &Context, size: Size, range: WrappingRange) -> &Attribute {
     let lower = range.start;
+    // LLVM treats the upper bound as exclusive, but allows wrapping.
     let upper = range.end.wrapping_add(1);
-    let lower_words = [lower as u64, (lower >> 64) as u64];
-    let upper_words = [upper as u64, (upper >> 64) as u64];
+
+    // Pass each `u128` endpoint value as a `[u64; 2]` array, least-significant part first.
+    let as_u64_array = |x: u128| [x as u64, (x >> 64) as u64];
+    let lower_words: [u64; 2] = as_u64_array(lower);
+    let upper_words: [u64; 2] = as_u64_array(upper);
+
+    // To ensure that LLVM doesn't try to read beyond the `[u64; 2]` arrays,
+    // we must explicitly check that `size_bits` does not exceed 128.
+    let size_bits = size.bits();
+    assert!(size_bits <= 128);
+    // More robust assertions that are redundant with `size_bits <= 128` and
+    // should be optimized away.
+    assert!(size_bits.div_ceil(64) <= u64::try_from(lower_words.len()).unwrap());
+    assert!(size_bits.div_ceil(64) <= u64::try_from(upper_words.len()).unwrap());
+    let size_bits = c_uint::try_from(size_bits).unwrap();
+
     unsafe {
-        LLVMRustCreateRangeAttribute(
-            llcx,
-            size.bits().try_into().unwrap(),
-            lower_words.as_ptr(),
-            upper_words.as_ptr(),
-        )
+        LLVMRustCreateRangeAttribute(llcx, size_bits, lower_words.as_ptr(), upper_words.as_ptr())
     }
 }
 
@@ -246,6 +267,10 @@ pub(crate) fn set_alignment(llglobal: &Value, align: Align) {
     unsafe {
         ffi::LLVMSetAlignment(llglobal, align.bytes() as c_uint);
     }
+}
+
+pub(crate) fn set_externally_initialized(llglobal: &Value, is_ext_init: bool) {
+    LLVMSetExternallyInitialized(llglobal, is_ext_init.to_llvm_bool());
 }
 
 /// Get the `name`d comdat from `llmod` and assign it to `llglobal`.
@@ -426,4 +451,15 @@ pub(crate) fn append_module_inline_asm<'ll>(llmod: &'ll Module, asm: &[u8]) {
     unsafe {
         LLVMAppendModuleInlineAsm(llmod, asm.as_ptr(), asm.len());
     }
+}
+
+/// Safe wrapper for `LLVMAddAlias2`
+pub(crate) fn add_alias<'ll>(
+    module: &'ll Module,
+    ty: &Type,
+    address_space: AddressSpace,
+    aliasee: &Value,
+    name: &CStr,
+) -> &'ll Value {
+    unsafe { LLVMAddAlias2(module, ty, address_space.0, aliasee, name.as_ptr()) }
 }

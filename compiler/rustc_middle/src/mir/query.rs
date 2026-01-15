@@ -3,21 +3,19 @@
 use std::fmt::{self, Debug};
 
 use rustc_abi::{FieldIdx, VariantIdx};
-use rustc_data_structures::fx::FxIndexMap;
 use rustc_errors::ErrorGuaranteed;
-use rustc_hir::def_id::LocalDefId;
 use rustc_index::IndexVec;
 use rustc_index::bit_set::BitMatrix;
 use rustc_macros::{HashStable, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
 use rustc_span::{Span, Symbol};
 
 use super::{ConstValue, SourceInfo};
-use crate::ty::{self, CoroutineArgsExt, OpaqueHiddenType, Ty};
+use crate::ty::{self, CoroutineArgsExt, Ty};
 
 rustc_index::newtype_index! {
     #[derive(HashStable)]
     #[encodable]
-    #[debug_format = "_{}"]
+    #[debug_format = "_s{}"]
     pub struct CoroutineSavedLocal {}
 }
 
@@ -84,12 +82,6 @@ impl Debug for CoroutineLayout<'_> {
     }
 }
 
-/// All the opaque types that are restricted to concrete types
-/// by this function. Unlike the value in `TypeckResults`, this has
-/// unerased regions.
-#[derive(Default, Debug, TyEncodable, TyDecodable, HashStable)]
-pub struct ConcreteOpaqueTypes<'tcx>(pub FxIndexMap<LocalDefId, OpaqueHiddenType<'tcx>>);
-
 /// The result of the `mir_const_qualif` query.
 ///
 /// Each field (except `tainted_by_errors`) corresponds to an implementer of the `Qualif` trait in
@@ -116,6 +108,7 @@ pub enum ConstraintCategory<'tcx> {
     UseAsStatic,
     TypeAnnotation(AnnotationSource),
     Cast {
+        is_raw_ptr_dyn_type_cast: bool,
         /// Whether this cast is a coercion that was automatically inserted by the compiler.
         is_implicit_coercion: bool,
         /// Whether this is an unsizing coercion and if yes, this contains the target type.
@@ -149,8 +142,15 @@ pub enum ConstraintCategory<'tcx> {
     /// A constraint that doesn't correspond to anything the user sees.
     Internal,
 
-    /// An internal constraint derived from an illegal universe relation.
-    IllegalUniverse,
+    /// An internal constraint added when a region outlives a placeholder
+    /// it cannot name and therefore has to outlive `'static`. The argument
+    /// is the unnameable placeholder and the constraint is always between
+    /// an SCC representative and `'static`.
+    OutlivesUnnameablePlaceholder(
+        #[type_foldable(identity)]
+        #[type_visitable(ignore)]
+        ty::RegionVid,
+    ),
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]

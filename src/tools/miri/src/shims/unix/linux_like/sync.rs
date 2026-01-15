@@ -1,10 +1,12 @@
-use crate::concurrency::sync::FutexRef;
+use crate::concurrency::sync::{FutexRef, SyncObj};
 use crate::shims::sig::check_min_vararg_count;
 use crate::*;
 
 struct LinuxFutex {
     futex: FutexRef,
 }
+
+impl SyncObj for LinuxFutex {}
 
 /// Implementation of the SYS_futex syscall.
 /// `args` is the arguments *including* the syscall number.
@@ -69,11 +71,8 @@ pub fn futex<'tcx>(
             let timeout = if ecx.ptr_is_null(timeout.ptr())? {
                 None
             } else {
-                let duration = match ecx.read_timespec(&timeout)? {
-                    Some(duration) => duration,
-                    None => {
-                        return ecx.set_last_error_and_return(LibcError("EINVAL"), dest);
-                    }
+                let Some(duration) = ecx.read_timespec(&timeout)? else {
+                    return ecx.set_last_error_and_return(LibcError("EINVAL"), dest);
                 };
                 let timeout_clock = if op & futex_realtime == futex_realtime {
                     ecx.check_no_isolation(

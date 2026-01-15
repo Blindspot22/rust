@@ -1,7 +1,7 @@
 use std::ops::ControlFlow;
 
 use clippy_utils::diagnostics::span_lint;
-use clippy_utils::ty::is_type_diagnostic_item;
+use clippy_utils::res::MaybeDef;
 use clippy_utils::visitors::for_each_expr;
 use clippy_utils::{SpanlessEq, higher, peel_hir_expr_while, sym};
 use rustc_hir::{Expr, ExprKind, UnOp};
@@ -103,13 +103,23 @@ fn try_parse_op_call<'tcx>(
         let receiver_ty = cx.typeck_results().expr_ty(receiver).peel_refs();
         if value.span.eq_ctxt(expr.span) && path.ident.name == symbol {
             for sym in &[sym::HashSet, sym::BTreeSet] {
-                if is_type_diagnostic_item(cx, receiver_ty, *sym) {
+                if receiver_ty.is_diag_item(cx, *sym) {
                     return Some((OpExpr { receiver, value, span }, *sym));
                 }
             }
         }
     }
     None
+}
+
+fn is_set_mutated<'tcx>(cx: &LateContext<'tcx>, contains_expr: &OpExpr<'tcx>, expr: &'tcx Expr<'_>) -> bool {
+    // Guard on type to avoid useless potentially expansive `SpanlessEq` checks
+    cx.typeck_results().expr_ty_adjusted(expr).is_mutable_ptr()
+        && matches!(
+            cx.typeck_results().expr_ty(expr).peel_refs().opt_diag_name(cx),
+            Some(sym::HashSet | sym::BTreeSet)
+        )
+        && SpanlessEq::new(cx).eq_expr(contains_expr.receiver, expr.peel_borrows())
 }
 
 fn find_insert_calls<'tcx>(
@@ -122,9 +132,14 @@ fn find_insert_calls<'tcx>(
             && SpanlessEq::new(cx).eq_expr(contains_expr.receiver, insert_expr.receiver)
             && SpanlessEq::new(cx).eq_expr(contains_expr.value, insert_expr.value)
         {
-            ControlFlow::Break(insert_expr)
-        } else {
-            ControlFlow::Continue(())
+            return ControlFlow::Break(Some(insert_expr));
         }
+
+        if is_set_mutated(cx, contains_expr, e) {
+            return ControlFlow::Break(None);
+        }
+
+        ControlFlow::Continue(())
     })
+    .flatten()
 }

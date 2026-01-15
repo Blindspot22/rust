@@ -1,12 +1,13 @@
 use std::borrow::Cow;
 
 use rustc_abi::Align;
-use rustc_hir::attrs::{InlineAttr, InstructionSetAttr, Linkage, OptimizeAttr};
+use rustc_hir::attrs::{InlineAttr, InstructionSetAttr, Linkage, OptimizeAttr, RtsanSetting};
 use rustc_hir::def_id::DefId;
 use rustc_macros::{HashStable, TyDecodable, TyEncodable};
 use rustc_span::Symbol;
 use rustc_target::spec::SanitizerSet;
 
+use crate::mir::mono::Visibility;
 use crate::ty::{InstanceKind, TyCtxt};
 
 impl<'tcx> TyCtxt<'tcx> {
@@ -14,6 +15,8 @@ impl<'tcx> TyCtxt<'tcx> {
         self,
         instance_kind: InstanceKind<'_>,
     ) -> Cow<'tcx, CodegenFnAttrs> {
+        // NOTE: we try to not clone the `CodegenFnAttrs` when that is not needed.
+        // The `to_mut` method used below clones the inner value.
         let mut attrs = Cow::Borrowed(self.codegen_fn_attrs(instance_kind.def_id()));
 
         // Drop the `#[naked]` attribute on non-item `InstanceKind`s, like the shims that
@@ -21,6 +24,32 @@ impl<'tcx> TyCtxt<'tcx> {
         if !matches!(instance_kind, InstanceKind::Item(_)) {
             if attrs.flags.contains(CodegenFnAttrFlags::NAKED) {
                 attrs.to_mut().flags.remove(CodegenFnAttrFlags::NAKED);
+            }
+        }
+
+        // A shim created by `#[track_caller]` should not inherit any attributes
+        // that modify the symbol name. Failing to remove these attributes from
+        // the shim leads to errors like `symbol `foo` is already defined`.
+        //
+        // A `ClosureOnceShim` with the track_caller attribute does not have a symbol,
+        // and therefore can be skipped here.
+        if let InstanceKind::ReifyShim(_, _) = instance_kind
+            && attrs.flags.contains(CodegenFnAttrFlags::TRACK_CALLER)
+        {
+            if attrs.flags.contains(CodegenFnAttrFlags::NO_MANGLE) {
+                attrs.to_mut().flags.remove(CodegenFnAttrFlags::NO_MANGLE);
+            }
+
+            if attrs.flags.contains(CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL) {
+                attrs.to_mut().flags.remove(CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL);
+            }
+
+            if attrs.flags.contains(CodegenFnAttrFlags::EXTERNALLY_IMPLEMENTABLE_ITEM) {
+                attrs.to_mut().flags.remove(CodegenFnAttrFlags::EXTERNALLY_IMPLEMENTABLE_ITEM);
+            }
+
+            if attrs.symbol_name.is_some() {
+                attrs.to_mut().symbol_name = None;
             }
         }
 
@@ -39,6 +68,12 @@ pub struct CodegenFnAttrs {
     /// using the `#[export_name = "..."]` or `#[link_name = "..."]` attribute
     /// depending on if this is a function definition or foreign function.
     pub symbol_name: Option<Symbol>,
+    /// Defids of foreign items somewhere that this function should "satisfy".
+    /// i.e., if a foreign function has some symbol foo,
+    /// generate this function under its real name,
+    /// but *also* under the same name as this foreign function so that the foreign function has an implementation.
+    // FIXME: make "SymbolName<'tcx>"
+    pub foreign_item_symbol_aliases: Vec<(DefId, Linkage, Visibility)>,
     /// The `#[link_ordinal = "..."]` attribute, indicating an ordinal an
     /// imported function has in the dynamic library. Note that this must not
     /// be set when `link_name` is set. This is for foreign items with the
@@ -57,9 +92,9 @@ pub struct CodegenFnAttrs {
     /// The `#[link_section = "..."]` attribute, or what executable section this
     /// should be placed in.
     pub link_section: Option<Symbol>,
-    /// The `#[sanitize(xyz = "off")]` attribute. Indicates sanitizers for which
-    /// instrumentation should be disabled inside the function.
-    pub no_sanitize: SanitizerSet,
+    /// The `#[sanitize(xyz = "off")]` attribute. Indicates the settings for each
+    /// sanitizer for this function.
+    pub sanitizers: SanitizerFnAttrs,
     /// The `#[instruction_set(set)]` attribute. Indicates if the generated code should
     /// be generated against a specific instruction set. Only usable on architectures which allow
     /// switching between multiple instruction sets.
@@ -70,6 +105,10 @@ pub struct CodegenFnAttrs {
     /// The `#[patchable_function_entry(...)]` attribute. Indicates how many nops should be around
     /// the function entry.
     pub patchable_function_entry: Option<PatchableFunctionEntry>,
+    /// The `#[rustc_objc_class = "..."]` attribute.
+    pub objc_class: Option<Symbol>,
+    /// The `#[rustc_objc_selector = "..."]` attribute.
+    pub objc_selector: Option<Symbol>,
 }
 
 #[derive(Copy, Clone, Debug, TyEncodable, TyDecodable, HashStable, PartialEq, Eq)]
@@ -83,7 +122,7 @@ pub enum TargetFeatureKind {
     Forced,
 }
 
-#[derive(Copy, Clone, Debug, TyEncodable, TyDecodable, HashStable)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, TyEncodable, TyDecodable, HashStable)]
 pub struct TargetFeature {
     /// The name of the target feature (e.g. "avx")
     pub name: Symbol,
@@ -161,6 +200,16 @@ bitflags::bitflags! {
         const ALLOCATOR_ZEROED          = 1 << 14;
         /// `#[no_builtins]`: indicates that disable implicit builtin knowledge of functions for the function.
         const NO_BUILTINS               = 1 << 15;
+        /// Marks foreign items, to make `contains_extern_indicator` cheaper.
+        const FOREIGN_ITEM              = 1 << 16;
+        /// `#[rustc_offload_kernel]`: indicates that this is an offload kernel, an extra ptr arg will be added.
+        const OFFLOAD_KERNEL = 1 << 17;
+        /// Externally implementable item symbols act a little like `RUSTC_STD_INTERNAL_SYMBOL`.
+        /// When a crate declares an EII and dependencies expect the symbol to exist,
+        /// they will refer to this symbol name before a definition is given.
+        /// As such, we must make sure these symbols really do exist in the final binary/library.
+        /// This flag is put on both the implementations of EIIs and the foreign item they implement.
+        const EXTERNALLY_IMPLEMENTABLE_ITEM = 1 << 18;
     }
 }
 rustc_data_structures::external_bitflags_debug! { CodegenFnAttrFlags }
@@ -176,14 +225,17 @@ impl CodegenFnAttrs {
             symbol_name: None,
             link_ordinal: None,
             target_features: vec![],
+            foreign_item_symbol_aliases: vec![],
             safe_target_features: false,
             linkage: None,
             import_linkage: None,
             link_section: None,
-            no_sanitize: SanitizerSet::empty(),
+            sanitizers: SanitizerFnAttrs::default(),
             instruction_set: None,
             alignment: None,
             patchable_function_entry: None,
+            objc_class: None,
+            objc_selector: None,
         }
     }
 
@@ -194,13 +246,16 @@ impl CodegenFnAttrs {
     /// * `#[linkage]` is present
     ///
     /// Keep this in sync with the logic for the unused_attributes for `#[inline]` lint.
-    pub fn contains_extern_indicator(&self, tcx: TyCtxt<'_>, did: DefId) -> bool {
-        if tcx.is_foreign_item(did) {
+    pub fn contains_extern_indicator(&self) -> bool {
+        if self.flags.contains(CodegenFnAttrFlags::FOREIGN_ITEM) {
             return false;
         }
 
         self.flags.contains(CodegenFnAttrFlags::NO_MANGLE)
             || self.flags.contains(CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL)
+            // note: for these we do also set a symbol name so technically also handled by the
+            // condition below. However, I think that regardless these should be treated as extern.
+            || self.flags.contains(CodegenFnAttrFlags::EXTERNALLY_IMPLEMENTABLE_ITEM)
             || self.symbol_name.is_some()
             || match self.linkage {
                 // These are private, so make sure we don't try to consider
@@ -208,5 +263,17 @@ impl CodegenFnAttrs {
                 None | Some(Linkage::Internal) => false,
                 Some(_) => true,
             }
+    }
+}
+
+#[derive(Clone, Copy, Debug, HashStable, TyEncodable, TyDecodable, Eq, PartialEq)]
+pub struct SanitizerFnAttrs {
+    pub disabled: SanitizerSet,
+    pub rtsan_setting: RtsanSetting,
+}
+
+impl const Default for SanitizerFnAttrs {
+    fn default() -> Self {
+        Self { disabled: SanitizerSet::empty(), rtsan_setting: RtsanSetting::default() }
     }
 }

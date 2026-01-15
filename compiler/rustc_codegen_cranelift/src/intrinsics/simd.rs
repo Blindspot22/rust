@@ -2,6 +2,7 @@
 
 use cranelift_codegen::ir::immediates::Offset32;
 use rustc_abi::Endian;
+use rustc_middle::ty::SimdAlign;
 
 use super::*;
 use crate::prelude::*;
@@ -129,7 +130,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 return;
             }
 
-            let idx = generic_args[2].expect_const().to_value().valtree.unwrap_branch();
+            let idx = generic_args[2].expect_const().to_branch();
 
             assert_eq!(x.layout(), y.layout());
             let layout = x.layout();
@@ -142,7 +143,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
 
             let total_len = lane_count * 2;
 
-            let indexes = idx.iter().map(|idx| idx.unwrap_leaf().to_u32()).collect::<Vec<u32>>();
+            let indexes = idx.iter().map(|idx| idx.to_leaf().to_u32()).collect::<Vec<u32>>();
 
             for &idx in &indexes {
                 assert!(u64::from(idx) < total_len, "idx {} out of range 0..{}", idx, total_len);
@@ -812,7 +813,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                     Endian::Big => lane_count - 1 - lane,
                     Endian::Little => lane,
                 };
-                let m_lane = fx.bcx.ins().ushr_imm(m, u64::from(mask_lane) as i64);
+                let m_lane = fx.bcx.ins().ushr_imm(m, mask_lane.cast_signed());
                 let m_lane = fx.bcx.ins().band_imm(m_lane, 1);
                 let a_lane = a.value_lane(fx, lane).load_scalar(fx);
                 let b_lane = b.value_lane(fx, lane).load_scalar(fx);
@@ -960,6 +961,14 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
             let lane_clif_ty = fx.clif_type(val_lane_ty).unwrap();
             let ptr_val = ptr.load_scalar(fx);
 
+            let alignment =
+                generic_args[3].expect_const().to_branch()[0].to_leaf().to_simd_alignment();
+
+            let memflags = match alignment {
+                SimdAlign::Unaligned => MemFlags::new().with_notrap(),
+                _ => MemFlags::trusted(),
+            };
+
             for lane_idx in 0..val_lane_count {
                 let val_lane = val.value_lane(fx, lane_idx).load_scalar(fx);
                 let mask_lane = mask.value_lane(fx, lane_idx).load_scalar(fx);
@@ -972,7 +981,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
 
                 fx.bcx.switch_to_block(if_enabled);
                 let offset = lane_idx as i32 * lane_clif_ty.bytes() as i32;
-                fx.bcx.ins().store(MemFlags::trusted(), val_lane, ptr_val, Offset32::new(offset));
+                fx.bcx.ins().store(memflags, val_lane, ptr_val, Offset32::new(offset));
                 fx.bcx.ins().jump(next, &[]);
 
                 fx.bcx.seal_block(next);
@@ -1040,6 +1049,14 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
             let ret_lane_layout = fx.layout_of(ret_lane_ty);
             let ptr_val = ptr.load_scalar(fx);
 
+            let alignment =
+                generic_args[3].expect_const().to_branch()[0].to_leaf().to_simd_alignment();
+
+            let memflags = match alignment {
+                SimdAlign::Unaligned => MemFlags::new().with_notrap(),
+                _ => MemFlags::trusted(),
+            };
+
             for lane_idx in 0..ret_lane_count {
                 let val_lane = val.value_lane(fx, lane_idx).load_scalar(fx);
                 let mask_lane = mask.value_lane(fx, lane_idx).load_scalar(fx);
@@ -1055,12 +1072,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
 
                 fx.bcx.switch_to_block(if_enabled);
                 let offset = lane_idx as i32 * lane_clif_ty.bytes() as i32;
-                let res = fx.bcx.ins().load(
-                    lane_clif_ty,
-                    MemFlags::trusted(),
-                    ptr_val,
-                    Offset32::new(offset),
-                );
+                let res = fx.bcx.ins().load(lane_clif_ty, memflags, ptr_val, Offset32::new(offset));
                 fx.bcx.ins().jump(next, &[res.into()]);
 
                 fx.bcx.switch_to_block(if_disabled);

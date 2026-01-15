@@ -5,18 +5,13 @@
 //! This API is completely unstable and subject to change.
 
 // tidy-alphabetical-start
-#![allow(internal_features)]
-#![doc(
-    html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/",
-    test(attr(deny(warnings)))
-)]
-#![doc(rust_logo)]
-#![feature(array_windows)]
+#![cfg_attr(bootstrap, feature(array_windows))]
+#![doc(test(attr(deny(warnings), allow(internal_features))))]
 #![feature(associated_type_defaults)]
 #![feature(box_patterns)]
 #![feature(if_let_guard)]
+#![feature(iter_order_by)]
 #![feature(macro_metavar_expr)]
-#![feature(rustdoc_internals)]
 #![recursion_limit = "256"]
 // tidy-alphabetical-end
 

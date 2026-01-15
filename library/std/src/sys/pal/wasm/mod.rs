@@ -18,23 +18,12 @@
 
 #[path = "../unsupported/os.rs"]
 pub mod os;
-#[path = "../unsupported/pipe.rs"]
-pub mod pipe;
 #[path = "../unsupported/time.rs"]
 pub mod time;
 
-cfg_select! {
-    target_feature = "atomics" => {
-        #[path = "atomics/futex.rs"]
-        pub mod futex;
-        #[path = "atomics/thread.rs"]
-        pub mod thread;
-    }
-    _ => {
-        #[path = "../unsupported/thread.rs"]
-        pub mod thread;
-    }
-}
+#[cfg(target_feature = "atomics")]
+#[path = "atomics/futex.rs"]
+pub mod futex;
 
 #[path = "../unsupported/common.rs"]
 #[deny(unsafe_op_in_unsafe_fn)]

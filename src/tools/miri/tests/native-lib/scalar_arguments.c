@@ -30,6 +30,14 @@ EXPORT int64_t add_short_to_long(int16_t x, int64_t y) {
   return x + y;
 }
 
+EXPORT float add_float(float x) {
+  return x + 1.5f;
+}
+
+EXPORT uint8_t u8_id(uint8_t x) {
+  return x;
+}
+
 // To test that functions not marked with EXPORT cannot be called by Miri.
 int32_t not_exported(void) {
   return 0;

@@ -109,7 +109,31 @@ impl<'a> Parser<'a> {
 
         self.expect_keyword(exp!(Const))?;
         let ident = self.parse_ident()?;
-        self.expect(exp!(Colon))?;
+        if let Err(mut err) = self.expect(exp!(Colon)) {
+            return if self.token.kind == token::Comma || self.token.kind == token::Gt {
+                // Recover parse from `<const N>` where the type is missing.
+                let span = const_span.to(ident.span);
+                err.span_suggestion_verbose(
+                    ident.span.shrink_to_hi(),
+                    "you likely meant to write the type of the const parameter here",
+                    ": /* Type */".to_string(),
+                    Applicability::HasPlaceholders,
+                );
+                let kind = TyKind::Err(err.emit());
+                let ty = self.mk_ty(span, kind);
+                Ok(GenericParam {
+                    ident,
+                    id: ast::DUMMY_NODE_ID,
+                    attrs: preceding_attrs,
+                    bounds: Vec::new(),
+                    kind: GenericParamKind::Const { ty, span, default: None },
+                    is_placeholder: false,
+                    colon_span: None,
+                })
+            } else {
+                Err(err)
+            };
+        }
         let ty = self.parse_ty()?;
 
         // Parse optional const generics default value.
@@ -312,25 +336,48 @@ impl<'a> Parser<'a> {
     /// Parses an experimental fn contract
     /// (`contract_requires(WWW) contract_ensures(ZZZ)`)
     pub(super) fn parse_contract(&mut self) -> PResult<'a, Option<Box<ast::FnContract>>> {
-        let requires = if self.eat_keyword_noexpect(exp!(ContractRequires).kw) {
-            self.psess.gated_spans.gate(sym::contracts_internals, self.prev_token.span);
-            let precond = self.parse_expr()?;
-            Some(precond)
+        let (declarations, requires) = self.parse_contract_requires()?;
+        let ensures = self.parse_contract_ensures()?;
+
+        if requires.is_none() && ensures.is_none() {
+            Ok(None)
         } else {
-            None
-        };
-        let ensures = if self.eat_keyword_noexpect(exp!(ContractEnsures).kw) {
+            Ok(Some(Box::new(ast::FnContract { declarations, requires, ensures })))
+        }
+    }
+
+    fn parse_contract_requires(
+        &mut self,
+    ) -> PResult<'a, (ThinVec<rustc_ast::Stmt>, Option<Box<rustc_ast::Expr>>)> {
+        Ok(if self.eat_keyword_noexpect(exp!(ContractRequires).kw) {
+            self.psess.gated_spans.gate(sym::contracts_internals, self.prev_token.span);
+            let mut decls_and_precond = self.parse_block()?;
+
+            let precond = match decls_and_precond.stmts.pop() {
+                Some(precond) => match precond.kind {
+                    rustc_ast::StmtKind::Expr(expr) => expr,
+                    // Insert dummy node that will be rejected by typechecker to
+                    // avoid reinventing an error
+                    _ => self.mk_unit_expr(decls_and_precond.span),
+                },
+                None => self.mk_unit_expr(decls_and_precond.span),
+            };
+            let precond = self.mk_closure_expr(precond.span, precond);
+            let decls = decls_and_precond.stmts;
+            (decls, Some(precond))
+        } else {
+            (Default::default(), None)
+        })
+    }
+
+    fn parse_contract_ensures(&mut self) -> PResult<'a, Option<Box<rustc_ast::Expr>>> {
+        Ok(if self.eat_keyword_noexpect(exp!(ContractEnsures).kw) {
             self.psess.gated_spans.gate(sym::contracts_internals, self.prev_token.span);
             let postcond = self.parse_expr()?;
             Some(postcond)
         } else {
             None
-        };
-        if requires.is_none() && ensures.is_none() {
-            Ok(None)
-        } else {
-            Ok(Some(Box::new(ast::FnContract { requires, ensures })))
-        }
+        })
     }
 
     /// Parses an optional where-clause.

@@ -400,6 +400,10 @@ span.keyword, a.keyword {
 	color: var(--keyword-link-color);
 }
 
+span.attribute, a.attribute {
+	color: var(--attribute-link-color);
+}
+
 a {
 	color: var(--link-color);
 	text-decoration: none;
@@ -993,7 +997,7 @@ rustdoc-topbar {
 .example-wrap [data-nosnippet] {
 	width: calc(var(--example-wrap-digits-count) + var(--line-number-padding) * 2);
 }
-.example-wrap pre > code {
+.example-wrap:not(.hide-lines) pre > code {
 	padding-left: calc(
 		var(--example-wrap-digits-count) + var(--line-number-padding) * 2
 		+ var(--line-number-right-margin));
@@ -1154,6 +1158,12 @@ div.where {
 	margin-left: calc(var(--docblock-indent) + var(--impl-items-indent));
 }
 
+#synthetic-implementors-list:not(.loaded), #implementors-list:not(.loaded) {
+	/* To prevent layout shift when loading the page with extra implementors being loaded
+	   from JS, we hide the list until it's complete. */
+	display: none;
+}
+
 .item-info code {
 	font-size: 0.875rem;
 }
@@ -1190,9 +1200,11 @@ nav.sub {
 	display: initial;
 }
 .anchor {
+	--anchor-link-shift: 0.5em;
 	display: none;
 	position: absolute;
-	left: -0.5em;
+	left: calc(var(--anchor-link-shift) * -1);
+	padding-right: var(--anchor-link-shift);
 	background: none !important;
 }
 .anchor.field {
@@ -1983,12 +1995,10 @@ a.tooltip:hover::after {
 	color: inherit;
 }
 #search-tabs button:not(.selected) {
-	--search-tab-button-background: var(--search-tab-button-not-selected-background);
 	background-color: var(--search-tab-button-not-selected-background);
 	border-top-color: var(--search-tab-button-not-selected-border-top-color);
 }
 #search-tabs button:hover, #search-tabs button.selected {
-	--search-tab-button-background: var(--search-tab-button-selected-background);
 	background-color: var(--search-tab-button-selected-background);
 	border-top-color: var(--search-tab-button-selected-border-top-color);
 }
@@ -2004,66 +2014,27 @@ a.tooltip:hover::after {
 	color: transparent;
 }
 
-.search-form.loading {
-	--search-tab-button-background: var(--button-background-color);
-}
-
-#search-tabs .count.loading::before,
-.search-form.loading::before
-{
-	width: 16px;
-	height: 16px;
-	border-radius: 16px;
-	background: radial-gradient(
-		var(--search-tab-button-background) 0 50%,
-		transparent 50% 100%
-	), conic-gradient(
-		var(--code-highlight-kw-color) 0deg 30deg,
-		var(--code-highlight-prelude-color) 30deg 60deg,
-		var(--code-highlight-number-color) 90deg 120deg,
-		var(--code-highlight-lifetime-color ) 120deg 150deg,
-		var(--code-highlight-comment-color) 150deg 180deg,
-		var(--code-highlight-self-color) 180deg 210deg,
-		var(--code-highlight-attribute-color) 210deg 240deg,
-		var(--code-highlight-literal-color) 210deg 240deg,
-		var(--code-highlight-macro-color) 240deg 270deg,
-		var(--code-highlight-question-mark-color) 270deg 300deg,
-		var(--code-highlight-prelude-val-color) 300deg 330deg,
-		var(--code-highlight-doc-comment-color) 330deg 360deg
-	);
-	content: "";
-	position: absolute;
-	left: 2px;
-	top: 2px;
-	animation: rotating 1.25s linear infinite;
-}
-#search-tabs .count.loading::after,
 .search-form.loading::after
 {
 	width: 18px;
 	height: 18px;
 	border-radius: 18px;
-	background: conic-gradient(
-		var(--search-tab-button-background) 0deg 180deg,
-		transparent 270deg 360deg
-	);
-	content: "";
+	/* hourglass */
+	content: url('data:image/svg+xml,\
+	<svg width="16" height="16" viewBox="0 0 8 8" xmlns="http://www.w3.org/2000/svg">\
+		<g fill="none">\
+			<path d="m3.019 1.496v1.496l0.5878 1.018-0.5751 0.996v1.494" stroke="%233f3f3f"/>\
+			<path d="m5.003 1.496v1.496l-0.5878 1.018 0.5751 0.996v1.494" stroke="%233f3f3f"/>\
+			<path d="m2.006 1.5h3.978" stroke="%23000"/>\
+			<path d="m2.006 6.49h3.993" stroke="%23000"/>\
+		</g>\
+		<path d="m4.005 5.301-0.3987 0.6905h0.7977z" fill="%237f7f7f"/>\
+		<path d="m4.011 3.712-0.3987-0.6905h0.7977z" fill="%237f7f7f"/>\
+	</svg>');
 	position: absolute;
-	left: 1px;
-	top: 1px;
-	animation: rotating 0.66s linear infinite;
-}
-
-.search-form.loading::before {
-	left: auto;
-	right: 9px;
-	top: 8px;
-}
-
-.search-form.loading::after {
-	left: auto;
 	right: 8px;
 	top: 8px;
+	filter: var(--settings-menu-filter);
 }
 
 #search .error code {
@@ -3013,6 +2984,9 @@ in src-script.js and main.js
 {
 	margin-bottom: 0.75em;
 }
+.negative-marker {
+	display: none;
+}
 
 .variants > .docblock,
 .implementors-toggle > .docblock,
@@ -3190,6 +3164,7 @@ by default.
 	--function-link-color: #ad7c37;
 	--macro-link-color: #068000;
 	--keyword-link-color: #3873ad;
+	--attribute-link-color: #3873ad;
 	--mod-link-color: #3873ad;
 	--link-color: #3873ad;
 	--sidebar-link-color: #356da4;
@@ -3294,6 +3269,7 @@ by default.
 	--function-link-color: #2bab63;
 	--macro-link-color: #09bd00;
 	--keyword-link-color: #d2991d;
+	--attribute-link-color: #d2991d;
 	--mod-link-color:  #d2991d;
 	--link-color: #d2991d;
 	--sidebar-link-color: #fdbf35;
@@ -3407,6 +3383,7 @@ Original by Dempfi (https://github.com/dempfi/ayu)
 	--function-link-color: #fdd687;
 	--macro-link-color: #a37acc;
 	--keyword-link-color: #39afd7;
+	--attribute-link-color: #39afd7;
 	--mod-link-color: #39afd7;
 	--link-color: #39afd7;
 	--sidebar-link-color: #53b1db;

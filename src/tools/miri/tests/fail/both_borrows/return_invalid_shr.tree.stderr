@@ -12,19 +12,17 @@ help: the accessed tag <TAG> was created here, in the initial state Frozen
    |
 LL |     let ret = unsafe { &(*xraw).1 };
    |                        ^^^^^^^^^^
-help: the accessed tag <TAG> later transitioned to Disabled due to a foreign write access at offsets [0x0..0x8]
+help: the accessed tag <TAG> later transitioned to Disabled due to a foreign write access at offsets [0x4..0x8]
   --> tests/fail/both_borrows/return_invalid_shr.rs:LL:CC
    |
 LL |     unsafe { *xraw = (42, 23) }; // unfreeze
    |              ^^^^^^^^^^^^^^^^
    = help: this transition corresponds to a loss of read permissions
-   = note: BACKTRACE (of the first span):
-   = note: inside `foo` at tests/fail/both_borrows/return_invalid_shr.rs:LL:CC
-note: inside `main`
-  --> tests/fail/both_borrows/return_invalid_shr.rs:LL:CC
-   |
-LL |     foo(&mut (1, 2));
-   |     ^^^^^^^^^^^^^^^^
+   = note: stack backtrace:
+           0: foo
+               at tests/fail/both_borrows/return_invalid_shr.rs:LL:CC
+           1: main
+               at tests/fail/both_borrows/return_invalid_shr.rs:LL:CC
 
 note: some details are omitted, run with `MIRIFLAGS=-Zmiri-backtrace=full` for a verbose backtrace
 

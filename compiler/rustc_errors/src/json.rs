@@ -11,24 +11,25 @@
 
 use std::error::Report;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::vec;
 
+use anstream::{AutoStream, ColorChoice};
 use derive_setters::Setters;
 use rustc_data_structures::sync::IntoDynSyncSend;
 use rustc_error_messages::FluentArgs;
 use rustc_lint_defs::Applicability;
-use rustc_span::Span;
 use rustc_span::hygiene::ExpnData;
 use rustc_span::source_map::{FilePathMapping, SourceMap};
+use rustc_span::{FileName, RealFileName, Span};
 use serde::Serialize;
-use termcolor::{ColorSpec, WriteColor};
 
+use crate::annotate_snippet_emitter_writer::AnnotateSnippetEmitter;
 use crate::diagnostic::IsLint;
 use crate::emitter::{
-    ColorConfig, Destination, Emitter, HumanEmitter, HumanReadableErrorType, OutputTheme,
-    TimingEvent, should_show_source_code,
+    ColorConfig, Destination, Emitter, HumanReadableErrorType, OutputTheme, TimingEvent,
+    should_show_source_code,
 };
 use crate::registry::Registry;
 use crate::timings::{TimingRecord, TimingSection};
@@ -333,7 +334,7 @@ impl Diagnostic {
         // generate regular command line output and store it in the json
 
         // A threadsafe buffer for writing.
-        #[derive(Default, Clone)]
+        #[derive(Clone)]
         struct BufWriter(Arc<Mutex<Vec<u8>>>);
 
         impl Write for BufWriter {
@@ -342,19 +343,6 @@ impl Diagnostic {
             }
             fn flush(&mut self) -> io::Result<()> {
                 self.0.lock().unwrap().flush()
-            }
-        }
-        impl WriteColor for BufWriter {
-            fn supports_color(&self) -> bool {
-                false
-            }
-
-            fn set_color(&mut self, _spec: &ColorSpec) -> io::Result<()> {
-                Ok(())
-            }
-
-            fn reset(&mut self) -> io::Result<()> {
-                Ok(())
             }
         }
 
@@ -382,15 +370,16 @@ impl Diagnostic {
             children
                 .insert(0, Diagnostic::from_sub_diagnostic(&diag.emitted_at_sub_diag(), &args, je));
         }
-        let buf = BufWriter::default();
-        let mut dst: Destination = Box::new(buf.clone());
-        let short = je.json_rendered.short();
-        match je.color_config {
-            ColorConfig::Always | ColorConfig::Auto => dst = Box::new(termcolor::Ansi::new(dst)),
-            ColorConfig::Never => {}
-        }
-        HumanEmitter::new(dst, je.translator.clone())
-            .short_message(short)
+        let buf = BufWriter(Arc::new(Mutex::new(Vec::new())));
+        let dst: Destination = AutoStream::new(
+            Box::new(buf.clone()),
+            match je.color_config.to_color_choice() {
+                ColorChoice::Auto => ColorChoice::Always,
+                choice => choice,
+            },
+        );
+        AnnotateSnippetEmitter::new(dst, je.translator.clone())
+            .short_message(je.json_rendered.short)
             .sm(je.sm.clone())
             .diagnostic_width(je.diagnostic_width)
             .macro_backtrace(je.macro_backtrace)
@@ -398,12 +387,9 @@ impl Diagnostic {
             .terminal_url(je.terminal_url)
             .ui_testing(je.ui_testing)
             .ignored_directories_in_source_blocks(je.ignored_directories_in_source_blocks.clone())
-            .theme(if let HumanReadableErrorType::Unicode = je.json_rendered {
-                OutputTheme::Unicode
-            } else {
-                OutputTheme::Ascii
-            })
+            .theme(if je.json_rendered.unicode { OutputTheme::Unicode } else { OutputTheme::Ascii })
             .emit_diagnostic(diag, registry);
+
         let buf = Arc::try_unwrap(buf.0).unwrap().into_inner().unwrap();
         let buf = String::from_utf8(buf).unwrap();
 
@@ -483,8 +469,14 @@ impl DiagnosticSpan {
             None => {
                 span = rustc_span::DUMMY_SP;
                 empty_source_map = Arc::new(SourceMap::new(FilePathMapping::empty()));
-                empty_source_map
-                    .new_source_file(std::path::PathBuf::from("empty.rs").into(), String::new());
+                empty_source_map.new_source_file(
+                    FileName::Real(
+                        empty_source_map
+                            .path_mapping()
+                            .to_real_filename(&RealFileName::empty(), PathBuf::from("empty.rs")),
+                    ),
+                    String::new(),
+                );
                 &empty_source_map
             }
         };

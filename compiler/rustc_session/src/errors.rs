@@ -83,6 +83,13 @@ pub(crate) struct CliFeatureDiagnosticHelp {
 }
 
 #[derive(Diagnostic)]
+#[diag(session_must_be_name_of_associated_function)]
+pub struct MustBeNameOfAssociatedFunction {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
 #[diag(session_not_circumvent_feature)]
 pub(crate) struct NotCircumventFeature;
 
@@ -238,8 +245,6 @@ pub(crate) struct InvalidCharacterInCrateName {
     pub(crate) span: Option<Span>,
     pub(crate) character: char,
     pub(crate) crate_name: Symbol,
-    #[help]
-    pub(crate) help: Option<()>,
 }
 
 #[derive(Subdiagnostic)]
@@ -372,6 +377,13 @@ struct BinaryFloatLiteralNotSupported {
 }
 
 #[derive(Diagnostic)]
+#[diag(session_unsupported_crate_type_for_codegen_backend)]
+pub(crate) struct UnsupportedCrateTypeForCodegenBackend {
+    pub(crate) crate_type: CrateType,
+    pub(crate) codegen_backend: &'static str,
+}
+
+#[derive(Diagnostic)]
 #[diag(session_unsupported_crate_type_for_target)]
 pub(crate) struct UnsupportedCrateTypeForTarget<'a> {
     pub(crate) crate_type: CrateType,
@@ -384,6 +396,10 @@ pub fn report_lit_error(
     lit: token::Lit,
     span: Span,
 ) -> ErrorGuaranteed {
+    create_lit_error(psess, err, lit, span).emit()
+}
+
+pub fn create_lit_error(psess: &ParseSess, err: LitError, lit: token::Lit, span: Span) -> Diag<'_> {
     // Checks if `s` looks like i32 or u1234 etc.
     fn looks_like_width_suffix(first_chars: &[char], s: &str) -> bool {
         s.len() > 1 && s.starts_with(first_chars) && s[1..].chars().all(|c| c.is_ascii_digit())
@@ -414,32 +430,32 @@ pub fn report_lit_error(
     let dcx = psess.dcx();
     match err {
         LitError::InvalidSuffix(suffix) => {
-            dcx.emit_err(InvalidLiteralSuffix { span, kind: lit.kind.descr(), suffix })
+            dcx.create_err(InvalidLiteralSuffix { span, kind: lit.kind.descr(), suffix })
         }
         LitError::InvalidIntSuffix(suffix) => {
             let suf = suffix.as_str();
             if looks_like_width_suffix(&['i', 'u'], suf) {
                 // If it looks like a width, try to be helpful.
-                dcx.emit_err(InvalidIntLiteralWidth { span, width: suf[1..].into() })
+                dcx.create_err(InvalidIntLiteralWidth { span, width: suf[1..].into() })
             } else if let Some(fixed) = fix_base_capitalisation(lit.symbol.as_str(), suf) {
-                dcx.emit_err(InvalidNumLiteralBasePrefix { span, fixed })
+                dcx.create_err(InvalidNumLiteralBasePrefix { span, fixed })
             } else {
-                dcx.emit_err(InvalidNumLiteralSuffix { span, suffix: suf.to_string() })
+                dcx.create_err(InvalidNumLiteralSuffix { span, suffix: suf.to_string() })
             }
         }
         LitError::InvalidFloatSuffix(suffix) => {
             let suf = suffix.as_str();
             if looks_like_width_suffix(&['f'], suf) {
                 // If it looks like a width, try to be helpful.
-                dcx.emit_err(InvalidFloatLiteralWidth { span, width: suf[1..].to_string() })
+                dcx.create_err(InvalidFloatLiteralWidth { span, width: suf[1..].to_string() })
             } else {
-                dcx.emit_err(InvalidFloatLiteralSuffix { span, suffix: suf.to_string() })
+                dcx.create_err(InvalidFloatLiteralSuffix { span, suffix: suf.to_string() })
             }
         }
         LitError::NonDecimalFloat(base) => match base {
-            16 => dcx.emit_err(HexadecimalFloatLiteralNotSupported { span }),
-            8 => dcx.emit_err(OctalFloatLiteralNotSupported { span }),
-            2 => dcx.emit_err(BinaryFloatLiteralNotSupported { span }),
+            16 => dcx.create_err(HexadecimalFloatLiteralNotSupported { span }),
+            8 => dcx.create_err(OctalFloatLiteralNotSupported { span }),
+            2 => dcx.create_err(BinaryFloatLiteralNotSupported { span }),
             _ => unreachable!(),
         },
         LitError::IntTooLarge(base) => {
@@ -450,7 +466,7 @@ pub fn report_lit_error(
                 16 => format!("{max:#x}"),
                 _ => format!("{max}"),
             };
-            dcx.emit_err(IntLiteralTooLarge { span, limit })
+            dcx.create_err(IntLiteralTooLarge { span, limit })
         }
     }
 }

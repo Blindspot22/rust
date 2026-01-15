@@ -4,10 +4,10 @@ mod aarch64;
 mod alloc;
 mod backtrace;
 mod files;
+mod math;
 #[cfg(all(unix, feature = "native-lib"))]
-mod native_lib;
+pub mod native_lib;
 mod unix;
-mod wasi;
 mod windows;
 mod x86;
 

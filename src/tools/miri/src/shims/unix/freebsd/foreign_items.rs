@@ -140,26 +140,24 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // since freebsd 12 the former form can be expected.
             "stat" | "stat@FBSD_1.0" => {
                 let [path, buf] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
-                let result = this.macos_fbsd_solarish_stat(path, buf)?;
+                let result = this.stat(path, buf)?;
                 this.write_scalar(result, dest)?;
             }
             "lstat" | "lstat@FBSD_1.0" => {
                 let [path, buf] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
-                let result = this.macos_fbsd_solarish_lstat(path, buf)?;
+                let result = this.lstat(path, buf)?;
                 this.write_scalar(result, dest)?;
             }
-            "fstat" | "fstat@FBSD_1.0" => {
+            "fstat@FBSD_1.0" => {
                 let [fd, buf] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
-                let result = this.macos_fbsd_solarish_fstat(fd, buf)?;
+                let result = this.fstat(fd, buf)?;
                 this.write_scalar(result, dest)?;
             }
-            "readdir_r" | "readdir_r@FBSD_1.0" => {
-                let [dirp, entry, result] =
-                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
-                let result = this.macos_fbsd_readdir_r(dirp, entry, result)?;
+            "readdir" | "readdir@FBSD_1.0" => {
+                let [dirp] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                let result = this.readdir64("dirent", dirp)?;
                 this.write_scalar(result, dest)?;
             }
-
             // Miscellaneous
             "__error" => {
                 let [] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;

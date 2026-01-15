@@ -17,69 +17,6 @@ LL | #![deny(unused_attributes)]
    |         ^^^^^^^^^^^^^^^^^
 
 error: unused attribute
-  --> $DIR/unused-attr-duplicate.rs:37:1
-   |
-LL | #[no_link]
-   | ^^^^^^^^^^ help: remove this attribute
-   |
-note: attribute also specified here
-  --> $DIR/unused-attr-duplicate.rs:36:1
-   |
-LL | #[no_link]
-   | ^^^^^^^^^^
-
-error: unused attribute
-  --> $DIR/unused-attr-duplicate.rs:21:1
-   |
-LL | #![recursion_limit = "256"]
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: remove this attribute
-   |
-note: attribute also specified here
-  --> $DIR/unused-attr-duplicate.rs:20:1
-   |
-LL | #![recursion_limit = "128"]
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
-
-error: unused attribute
-  --> $DIR/unused-attr-duplicate.rs:24:1
-   |
-LL | #![type_length_limit = "1"]
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: remove this attribute
-   |
-note: attribute also specified here
-  --> $DIR/unused-attr-duplicate.rs:23:1
-   |
-LL | #![type_length_limit = "1048576"]
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
-
-error: unused attribute
-  --> $DIR/unused-attr-duplicate.rs:27:1
-   |
-LL | #![no_std]
-   | ^^^^^^^^^^ help: remove this attribute
-   |
-note: attribute also specified here
-  --> $DIR/unused-attr-duplicate.rs:26:1
-   |
-LL | #![no_std]
-   | ^^^^^^^^^^
-
-error: unused attribute
-  --> $DIR/unused-attr-duplicate.rs:31:1
-   |
-LL | #![windows_subsystem = "windows"]
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: remove this attribute
-   |
-note: attribute also specified here
-  --> $DIR/unused-attr-duplicate.rs:30:1
-   |
-LL | #![windows_subsystem = "console"]
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
-
-error: unused attribute
   --> $DIR/unused-attr-duplicate.rs:34:1
    |
 LL | #![no_builtins]
@@ -92,16 +29,16 @@ LL | #![no_builtins]
    | ^^^^^^^^^^^^^^^
 
 error: unused attribute
-  --> $DIR/unused-attr-duplicate.rs:44:5
+  --> $DIR/unused-attr-duplicate.rs:37:1
    |
-LL |     #[macro_export]
-   |     ^^^^^^^^^^^^^^^ help: remove this attribute
+LL | #[no_link]
+   | ^^^^^^^^^^ help: remove this attribute
    |
 note: attribute also specified here
-  --> $DIR/unused-attr-duplicate.rs:43:5
+  --> $DIR/unused-attr-duplicate.rs:36:1
    |
-LL |     #[macro_export]
-   |     ^^^^^^^^^^^^^^^
+LL | #[no_link]
+   | ^^^^^^^^^^
 
 error: unused attribute
   --> $DIR/unused-attr-duplicate.rs:41:1
@@ -114,6 +51,18 @@ note: attribute also specified here
    |
 LL | #[macro_use]
    | ^^^^^^^^^^^^
+
+error: unused attribute
+  --> $DIR/unused-attr-duplicate.rs:44:5
+   |
+LL |     #[macro_export]
+   |     ^^^^^^^^^^^^^^^ help: remove this attribute
+   |
+note: attribute also specified here
+  --> $DIR/unused-attr-duplicate.rs:43:5
+   |
+LL |     #[macro_export]
+   |     ^^^^^^^^^^^^^^^
 
 error: unused attribute
   --> $DIR/unused-attr-duplicate.rs:51:1
@@ -305,6 +254,44 @@ LL | #![crate_name = "unused_attr_duplicate"]
    = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
 
 error: unused attribute
+  --> $DIR/unused-attr-duplicate.rs:21:1
+   |
+LL | #![recursion_limit = "256"]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: remove this attribute
+   |
+note: attribute also specified here
+  --> $DIR/unused-attr-duplicate.rs:20:1
+   |
+LL | #![recursion_limit = "128"]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+
+error: unused attribute
+  --> $DIR/unused-attr-duplicate.rs:24:1
+   |
+LL | #![type_length_limit = "1"]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: remove this attribute
+   |
+note: attribute also specified here
+  --> $DIR/unused-attr-duplicate.rs:23:1
+   |
+LL | #![type_length_limit = "1048576"]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+
+error: unused attribute
+  --> $DIR/unused-attr-duplicate.rs:27:1
+   |
+LL | #![no_std]
+   | ^^^^^^^^^^ help: remove this attribute
+   |
+note: attribute also specified here
+  --> $DIR/unused-attr-duplicate.rs:26:1
+   |
+LL | #![no_std]
+   | ^^^^^^^^^^
+
+error: unused attribute
   --> $DIR/unused-attr-duplicate.rs:29:1
    |
 LL | #![no_implicit_prelude]
@@ -315,6 +302,19 @@ note: attribute also specified here
    |
 LL | #![no_implicit_prelude]
    | ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: unused attribute
+  --> $DIR/unused-attr-duplicate.rs:31:1
+   |
+LL | #![windows_subsystem = "windows"]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: remove this attribute
+   |
+note: attribute also specified here
+  --> $DIR/unused-attr-duplicate.rs:30:1
+   |
+LL | #![windows_subsystem = "console"]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
 
 error: aborting due to 25 previous errors
 

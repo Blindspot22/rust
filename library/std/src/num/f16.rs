@@ -19,6 +19,11 @@ use crate::sys::cmath;
 impl f16 {
     /// Raises a number to a floating point power.
     ///
+    /// Note that this function is special in that it can return non-NaN results for NaN inputs. For
+    /// example, `f16::powf(f16::NAN, 0.0)` returns `1.0`. However, if an input is a *signaling*
+    /// NaN, then the result is non-deterministically either a NaN or the result that the
+    /// corresponding quiet NaN would produce.
+    ///
     /// # Unspecified precision
     ///
     /// The precision of this function is non-deterministic. This means it varies by platform,
@@ -37,6 +42,7 @@ impl f16 {
     ///
     /// assert_eq!(f16::powf(1.0, f16::NAN), 1.0);
     /// assert_eq!(f16::powf(f16::NAN, 0.0), 1.0);
+    /// assert_eq!(f16::powf(0.0, 0.0), 1.0);
     /// # }
     /// ```
     #[inline]
@@ -44,7 +50,7 @@ impl f16 {
     #[unstable(feature = "f16", issue = "116909")]
     #[must_use = "method returns a new number and does not mutate the original value"]
     pub fn powf(self, n: f16) -> f16 {
-        unsafe { intrinsics::powf16(self, n) }
+        intrinsics::powf16(self, n)
     }
 
     /// Returns `e^(self)`, (the exponential function).
@@ -76,7 +82,7 @@ impl f16 {
     #[unstable(feature = "f16", issue = "116909")]
     #[must_use = "method returns a new number and does not mutate the original value"]
     pub fn exp(self) -> f16 {
-        unsafe { intrinsics::expf16(self) }
+        intrinsics::expf16(self)
     }
 
     /// Returns `2^(self)`.
@@ -106,7 +112,7 @@ impl f16 {
     #[unstable(feature = "f16", issue = "116909")]
     #[must_use = "method returns a new number and does not mutate the original value"]
     pub fn exp2(self) -> f16 {
-        unsafe { intrinsics::exp2f16(self) }
+        intrinsics::exp2f16(self)
     }
 
     /// Returns the natural logarithm of the number.
@@ -151,7 +157,7 @@ impl f16 {
     #[unstable(feature = "f16", issue = "116909")]
     #[must_use = "method returns a new number and does not mutate the original value"]
     pub fn ln(self) -> f16 {
-        unsafe { intrinsics::logf16(self) }
+        intrinsics::logf16(self)
     }
 
     /// Returns the logarithm of the number with respect to an arbitrary base.
@@ -241,7 +247,7 @@ impl f16 {
     #[unstable(feature = "f16", issue = "116909")]
     #[must_use = "method returns a new number and does not mutate the original value"]
     pub fn log2(self) -> f16 {
-        unsafe { intrinsics::log2f16(self) }
+        intrinsics::log2f16(self)
     }
 
     /// Returns the base 10 logarithm of the number.
@@ -284,7 +290,7 @@ impl f16 {
     #[unstable(feature = "f16", issue = "116909")]
     #[must_use = "method returns a new number and does not mutate the original value"]
     pub fn log10(self) -> f16 {
-        unsafe { intrinsics::log10f16(self) }
+        intrinsics::log10f16(self)
     }
 
     /// Compute the distance between the origin and a point (`x`, `y`) on the
@@ -350,7 +356,7 @@ impl f16 {
     #[unstable(feature = "f16", issue = "116909")]
     #[must_use = "method returns a new number and does not mutate the original value"]
     pub fn sin(self) -> f16 {
-        unsafe { intrinsics::sinf16(self) }
+        intrinsics::sinf16(self)
     }
 
     /// Computes the cosine of a number (in radians).
@@ -379,7 +385,7 @@ impl f16 {
     #[unstable(feature = "f16", issue = "116909")]
     #[must_use = "method returns a new number and does not mutate the original value"]
     pub fn cos(self) -> f16 {
-        unsafe { intrinsics::cosf16(self) }
+        intrinsics::cosf16(self)
     }
 
     /// Computes the tangent of a number (in radians).
@@ -432,10 +438,10 @@ impl f16 {
     /// # #[cfg(not(miri))]
     /// # #[cfg(target_has_reliable_f16_math)] {
     ///
-    /// let f = std::f16::consts::FRAC_PI_2;
+    /// let f = std::f16::consts::FRAC_PI_4;
     ///
     /// // asin(sin(pi/2))
-    /// let abs_difference = (f.sin().asin() - std::f16::consts::FRAC_PI_2).abs();
+    /// let abs_difference = (f.sin().asin() - f).abs();
     ///
     /// assert!(abs_difference <= f16::EPSILON);
     /// # }
@@ -522,10 +528,12 @@ impl f16 {
 
     /// Computes the four quadrant arctangent of `self` (`y`) and `other` (`x`) in radians.
     ///
-    /// * `x = 0`, `y = 0`: `0`
-    /// * `x >= 0`: `arctan(y/x)` -> `[-pi/2, pi/2]`
-    /// * `y >= 0`: `arctan(y/x) + pi` -> `(pi/2, pi]`
-    /// * `y < 0`: `arctan(y/x) - pi` -> `(-pi, -pi/2)`
+    ///  | `x`     | `y`     | Piecewise Definition | Range         |
+    ///  |---------|---------|----------------------|---------------|
+    ///  | `>= +0` | `>= +0` | `arctan(y/x)`        | `[+0, +pi/2]` |
+    ///  | `>= +0` | `<= -0` | `arctan(y/x)`        | `[-pi/2, -0]` |
+    ///  | `<= -0` | `>= +0` | `arctan(y/x) + pi`   | `[+pi/2, +pi]`|
+    ///  | `<= -0` | `<= -0` | `arctan(y/x) - pi`   | `[-pi, -pi/2]`|
     ///
     /// # Unspecified precision
     ///
@@ -877,10 +885,10 @@ impl f16 {
     /// # #[cfg(not(miri))]
     /// # #[cfg(target_has_reliable_f16_math)] {
     ///
-    /// let e = std::f16::consts::E;
-    /// let f = e.tanh().atanh();
+    /// let x = std::f16::consts::FRAC_PI_6;
+    /// let f = x.tanh().atanh();
     ///
-    /// let abs_difference = (f - e).abs();
+    /// let abs_difference = (f - x).abs();
     ///
     /// assert!(abs_difference <= 0.01);
     /// # }

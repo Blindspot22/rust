@@ -190,6 +190,7 @@ fn ty_from_text(text: &str) -> ast::Type {
 }
 
 pub fn ty_alias(
+    attrs: impl IntoIterator<Item = ast::Attr>,
     ident: &str,
     generic_param_list: Option<ast::GenericParamList>,
     type_param_bounds: Option<ast::TypeParam>,
@@ -200,6 +201,7 @@ pub fn ty_alias(
     let assignment_where = assignment_where.flatten();
     quote! {
         TypeAlias {
+            #(#attrs "\n")*
             [type] " "
                 Name { [IDENT ident] }
                 #generic_param_list
@@ -227,6 +229,23 @@ pub fn ty_fn_ptr<I: Iterator<Item = Param>>(
                 #(" " #ret_type)*
         }
     }
+}
+
+pub fn item_list(body: Option<Vec<ast::Item>>) -> ast::ItemList {
+    let is_break_braces = body.is_some();
+    let body_newline = if is_break_braces { "\n" } else { "" };
+    let body_indent = if is_break_braces { "    " } else { "" };
+
+    let body = match body {
+        Some(bd) => bd.iter().map(|elem| elem.to_string()).join("\n\n    "),
+        None => String::new(),
+    };
+    ast_from_text(&format!("mod C {{{body_newline}{body_indent}{body}{body_newline}}}"))
+}
+
+pub fn mod_(name: ast::Name, body: Option<ast::ItemList>) -> ast::Module {
+    let body = body.map_or(";".to_owned(), |body| format!(" {body}"));
+    ast_from_text(&format!("mod {name}{body}"))
 }
 
 pub fn assoc_item_list(body: Option<Vec<ast::AssocItem>>) -> ast::AssocItemList {
@@ -277,12 +296,16 @@ fn merge_where_clause(
 }
 
 pub fn impl_(
+    attrs: impl IntoIterator<Item = ast::Attr>,
     generic_params: Option<ast::GenericParamList>,
     generic_args: Option<ast::GenericArgList>,
     path_type: ast::Type,
     where_clause: Option<ast::WhereClause>,
     body: Option<ast::AssocItemList>,
 ) -> ast::Impl {
+    let attrs =
+        attrs.into_iter().fold(String::new(), |mut acc, attr| format_to_acc!(acc, "{}\n", attr));
+
     let gen_args = generic_args.map_or_else(String::new, |it| it.to_string());
 
     let gen_params = generic_params.map_or_else(String::new, |it| it.to_string());
@@ -295,10 +318,11 @@ pub fn impl_(
     };
 
     let body = body.map_or_else(|| format!("{{{body_newline}}}"), |it| it.to_string());
-    ast_from_text(&format!("impl{gen_params} {path_type}{gen_args}{where_clause}{body}"))
+    ast_from_text(&format!("{attrs}impl{gen_params} {path_type}{gen_args}{where_clause}{body}"))
 }
 
 pub fn impl_trait(
+    attrs: impl IntoIterator<Item = ast::Attr>,
     is_unsafe: bool,
     trait_gen_params: Option<ast::GenericParamList>,
     trait_gen_args: Option<ast::GenericArgList>,
@@ -311,6 +335,8 @@ pub fn impl_trait(
     ty_where_clause: Option<ast::WhereClause>,
     body: Option<ast::AssocItemList>,
 ) -> ast::Impl {
+    let attrs =
+        attrs.into_iter().fold(String::new(), |mut acc, attr| format_to_acc!(acc, "{}\n", attr));
     let is_unsafe = if is_unsafe { "unsafe " } else { "" };
 
     let trait_gen_args = trait_gen_args.map(|args| args.to_string()).unwrap_or_default();
@@ -334,7 +360,7 @@ pub fn impl_trait(
     let body = body.map_or_else(|| format!("{{{body_newline}}}"), |it| it.to_string());
 
     ast_from_text(&format!(
-        "{is_unsafe}impl{gen_params} {is_negative}{path_type}{trait_gen_args} for {ty}{type_gen_args}{where_clause}{body}"
+        "{attrs}{is_unsafe}impl{gen_params} {is_negative}{path_type}{trait_gen_args} for {ty}{type_gen_args}{where_clause}{body}"
     ))
 }
 
@@ -452,12 +478,18 @@ pub fn use_tree_list(use_trees: impl IntoIterator<Item = ast::UseTree>) -> ast::
     ast_from_text(&format!("use {{{use_trees}}};"))
 }
 
-pub fn use_(visibility: Option<ast::Visibility>, use_tree: ast::UseTree) -> ast::Use {
+pub fn use_(
+    attrs: impl IntoIterator<Item = ast::Attr>,
+    visibility: Option<ast::Visibility>,
+    use_tree: ast::UseTree,
+) -> ast::Use {
+    let attrs =
+        attrs.into_iter().fold(String::new(), |mut acc, attr| format_to_acc!(acc, "{}\n", attr));
     let visibility = match visibility {
         None => String::new(),
         Some(it) => format!("{it} "),
     };
-    ast_from_text(&format!("{visibility}use {use_tree};"))
+    ast_from_text(&format!("{attrs}{visibility}use {use_tree};"))
 }
 
 pub fn record_expr(path: ast::Path, fields: ast::RecordExprFieldList) -> ast::RecordExpr {
@@ -626,7 +658,7 @@ pub fn expr_if(
     };
     expr_from_text(&format!("if {condition} {then_branch} {else_branch}"))
 }
-pub fn expr_for_loop(pat: ast::Pat, expr: ast::Expr, block: ast::BlockExpr) -> ast::Expr {
+pub fn expr_for_loop(pat: ast::Pat, expr: ast::Expr, block: ast::BlockExpr) -> ast::ForExpr {
     expr_from_text(&format!("for {pat} in {expr} {block}"))
 }
 
@@ -657,6 +689,13 @@ pub fn expr_macro(path: ast::Path, tt: ast::TokenTree) -> ast::MacroExpr {
 }
 pub fn expr_ref(expr: ast::Expr, exclusive: bool) -> ast::Expr {
     expr_from_text(&if exclusive { format!("&mut {expr}") } else { format!("&{expr}") })
+}
+pub fn expr_raw_ref(expr: ast::Expr, exclusive: bool) -> ast::Expr {
+    expr_from_text(&if exclusive {
+        format!("&raw mut {expr}")
+    } else {
+        format!("&raw const {expr}")
+    })
 }
 pub fn expr_reborrow(expr: ast::Expr) -> ast::Expr {
     expr_from_text(&format!("&mut *{expr}"))
@@ -946,16 +985,19 @@ pub fn expr_stmt(expr: ast::Expr) -> ast::ExprStmt {
 }
 
 pub fn item_const(
+    attrs: impl IntoIterator<Item = ast::Attr>,
     visibility: Option<ast::Visibility>,
     name: ast::Name,
     ty: ast::Type,
     expr: ast::Expr,
 ) -> ast::Const {
+    let attrs =
+        attrs.into_iter().fold(String::new(), |mut acc, attr| format_to_acc!(acc, "{}\n", attr));
     let visibility = match visibility {
         None => String::new(),
         Some(it) => format!("{it} "),
     };
-    ast_from_text(&format!("{visibility}const {name}: {ty} = {expr};"))
+    ast_from_text(&format!("{attrs}{visibility}const {name}: {ty} = {expr};"))
 }
 
 pub fn item_static(
@@ -981,7 +1023,19 @@ pub fn item_static(
 }
 
 pub fn unnamed_param(ty: ast::Type) -> ast::Param {
-    ast_from_text(&format!("fn f({ty}) {{ }}"))
+    quote! {
+        Param {
+            #ty
+        }
+    }
+}
+
+pub fn untyped_param(pat: ast::Pat) -> ast::Param {
+    quote! {
+        Param {
+            #pat
+        }
+    }
 }
 
 pub fn param(pat: ast::Pat, ty: ast::Type) -> ast::Param {
@@ -1162,6 +1216,7 @@ pub fn variant(
 }
 
 pub fn fn_(
+    attrs: impl IntoIterator<Item = ast::Attr>,
     visibility: Option<ast::Visibility>,
     fn_name: ast::Name,
     type_params: Option<ast::GenericParamList>,
@@ -1174,6 +1229,8 @@ pub fn fn_(
     is_unsafe: bool,
     is_gen: bool,
 ) -> ast::Fn {
+    let attrs =
+        attrs.into_iter().fold(String::new(), |mut acc, attr| format_to_acc!(acc, "{}\n", attr));
     let type_params = match type_params {
         Some(type_params) => format!("{type_params}"),
         None => "".into(),
@@ -1197,7 +1254,7 @@ pub fn fn_(
     let gen_literal = if is_gen { "gen " } else { "" };
 
     ast_from_text(&format!(
-        "{visibility}{const_literal}{async_literal}{gen_literal}{unsafe_literal}fn {fn_name}{type_params}{params} {ret_type}{where_clause}{body}",
+        "{attrs}{visibility}{const_literal}{async_literal}{gen_literal}{unsafe_literal}fn {fn_name}{type_params}{params} {ret_type}{where_clause}{body}",
     ))
 }
 pub fn struct_(
@@ -1206,23 +1263,29 @@ pub fn struct_(
     generic_param_list: Option<ast::GenericParamList>,
     field_list: ast::FieldList,
 ) -> ast::Struct {
-    let semicolon = if matches!(field_list, ast::FieldList::TupleFieldList(_)) { ";" } else { "" };
+    let (semicolon, ws) =
+        if matches!(field_list, ast::FieldList::TupleFieldList(_)) { (";", "") } else { ("", " ") };
     let type_params = generic_param_list.map_or_else(String::new, |it| it.to_string());
     let visibility = match visibility {
         None => String::new(),
         Some(it) => format!("{it} "),
     };
 
-    ast_from_text(&format!("{visibility}struct {strukt_name}{type_params}{field_list}{semicolon}",))
+    ast_from_text(&format!(
+        "{visibility}struct {strukt_name}{type_params}{ws}{field_list}{semicolon}"
+    ))
 }
 
 pub fn enum_(
+    attrs: impl IntoIterator<Item = ast::Attr>,
     visibility: Option<ast::Visibility>,
     enum_name: ast::Name,
     generic_param_list: Option<ast::GenericParamList>,
     where_clause: Option<ast::WhereClause>,
     variant_list: ast::VariantList,
 ) -> ast::Enum {
+    let attrs =
+        attrs.into_iter().fold(String::new(), |mut acc, attr| format_to_acc!(acc, "{}\n", attr));
     let visibility = match visibility {
         None => String::new(),
         Some(it) => format!("{it} "),
@@ -1232,7 +1295,7 @@ pub fn enum_(
     let where_clause = where_clause.map(|it| format!(" {it}")).unwrap_or_default();
 
     ast_from_text(&format!(
-        "{visibility}enum {enum_name}{generic_params}{where_clause} {variant_list}"
+        "{attrs}{visibility}enum {enum_name}{generic_params}{where_clause} {variant_list}"
     ))
 }
 
@@ -1311,7 +1374,7 @@ pub mod tokens {
 
     pub(super) static SOURCE_FILE: LazyLock<Parse<SourceFile>> = LazyLock::new(|| {
         SourceFile::parse(
-            "use crate::foo; const C: <()>::Item = ( true && true , true || true , 1 != 1, 2 == 2, 3 < 3, 4 <= 4, 5 > 5, 6 >= 6, !true, *p, &p , &mut p, async { let _ @ [] })\n;\n\nunsafe impl A for B where: {}",
+            "use crate::foo; const C: <()>::Item = ( true && true , true || true , 1 != 1, 2 == 2, 3 < 3, 4 <= 4, 5 > 5, 6 >= 6, !true, *p, &p , &mut p, async { let _ @ [] }, while loop {} {})\n;\n\nunsafe impl A for B where: {}",
             Edition::CURRENT,
         )
     });
@@ -1410,5 +1473,88 @@ pub mod tokens {
         pub fn ws(&self) -> SyntaxToken {
             self.0.syntax().first_child_or_token().unwrap().into_token().unwrap()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use expect_test::expect;
+
+    use super::*;
+
+    #[track_caller]
+    fn check(node: impl AstNode, expect: expect_test::Expect) {
+        let node_debug = format!("{:#?}", node.syntax());
+        expect.assert_eq(&node_debug);
+    }
+
+    #[test]
+    fn test_unnamed_param() {
+        check(
+            unnamed_param(ty("Vec")),
+            expect![[r#"
+                PARAM@0..3
+                  PATH_TYPE@0..3
+                    PATH@0..3
+                      PATH_SEGMENT@0..3
+                        NAME_REF@0..3
+                          IDENT@0..3 "Vec"
+            "#]],
+        );
+
+        check(
+            unnamed_param(ty("Vec<T>")),
+            expect![[r#"
+                PARAM@0..6
+                  PATH_TYPE@0..6
+                    PATH@0..6
+                      PATH_SEGMENT@0..6
+                        NAME_REF@0..3
+                          IDENT@0..3 "Vec"
+                        GENERIC_ARG_LIST@3..6
+                          L_ANGLE@3..4 "<"
+                          TYPE_ARG@4..5
+                            PATH_TYPE@4..5
+                              PATH@4..5
+                                PATH_SEGMENT@4..5
+                                  NAME_REF@4..5
+                                    IDENT@4..5 "T"
+                          R_ANGLE@5..6 ">"
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_untyped_param() {
+        check(
+            untyped_param(path_pat(ext::ident_path("name"))),
+            expect![[r#"
+                PARAM@0..4
+                  IDENT_PAT@0..4
+                    NAME@0..4
+                      IDENT@0..4 "name"
+            "#]],
+        );
+
+        check(
+            untyped_param(
+                range_pat(
+                    Some(path_pat(ext::ident_path("start"))),
+                    Some(path_pat(ext::ident_path("end"))),
+                )
+                .into(),
+            ),
+            expect![[r#"
+                PARAM@0..10
+                  RANGE_PAT@0..10
+                    IDENT_PAT@0..5
+                      NAME@0..5
+                        IDENT@0..5 "start"
+                    DOT2@5..7 ".."
+                    IDENT_PAT@7..10
+                      NAME@7..10
+                        IDENT@7..10 "end"
+            "#]],
+        );
     }
 }

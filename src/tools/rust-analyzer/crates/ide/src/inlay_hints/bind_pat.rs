@@ -20,7 +20,7 @@ use crate::{
 pub(super) fn hints(
     acc: &mut Vec<InlayHint>,
     famous_defs @ FamousDefs(sema, _): &FamousDefs<'_, '_>,
-    config: &InlayHintsConfig,
+    config: &InlayHintsConfig<'_>,
     display_target: DisplayTarget,
     pat: &ast::IdentPat,
 ) -> Option<()> {
@@ -183,7 +183,8 @@ mod tests {
     use crate::{ClosureReturnTypeHints, fixture, inlay_hints::InlayHintsConfig};
 
     use crate::inlay_hints::tests::{
-        DISABLED_CONFIG, TEST_CONFIG, check, check_edit, check_no_edit, check_with_config,
+        DISABLED_CONFIG, TEST_CONFIG, check, check_edit, check_expect, check_no_edit,
+        check_with_config,
     };
 
     #[track_caller]
@@ -339,14 +340,14 @@ fn main(a: SliceIter<'_, Container>) {
     fn lt_hints() {
         check_types(
             r#"
-struct S<'lt>;
+struct S<'lt>(*mut &'lt ());
 
 fn f<'a>() {
-    let x = S::<'static>;
+    let x = S::<'static>(loop {});
       //^ S<'static>
-    let y = S::<'_>;
+    let y = S::<'_>(loop {});
       //^ S<'_>
-    let z = S::<'a>;
+    let z = S::<'a>(loop {});
       //^ S<'a>
 
 }
@@ -378,9 +379,9 @@ fn main() {
     let foo = foo3();
      // ^^^ impl Fn(f64, f64) -> u32
     let foo = foo4();
-     // ^^^ &'static dyn Fn(f64, f64) -> u32
+     // ^^^ &dyn Fn(f64, f64) -> u32
     let foo = foo5();
-     // ^^^ &'static dyn Fn(&dyn Fn(f64, f64) -> u32, f64) -> u32
+     // ^^^ &dyn Fn(&(dyn Fn(f64, f64) -> u32 + 'static), f64) -> u32
     let foo = foo6();
      // ^^^ impl Fn(f64, f64) -> u32
     let foo = foo7();
@@ -411,7 +412,7 @@ fn main() {
     let foo = foo3();
      // ^^^ impl Fn(f64, f64) -> u32
     let foo = foo4();
-     // ^^^ &'static dyn Fn(f64, f64) -> u32
+     // ^^^ &dyn Fn(f64, f64) -> u32
     let foo = foo5();
     let foo = foo6();
     let foo = foo7();
@@ -526,7 +527,7 @@ fn main() {
           //^^^^ i32
     let _ = 22;
     let test = "test";
-      //^^^^ &'static str
+      //^^^^ &str
     let test = InnerStruct {};
       //^^^^ InnerStruct
 
@@ -616,12 +617,12 @@ impl<T> Iterator for IntoIter<T> {
 
 fn main() {
     let mut data = Vec::new();
-          //^^^^ Vec<&'static str>
+          //^^^^ Vec<&str>
     data.push("foo");
     for i in data {
-      //^ &'static str
+      //^ &str
       let z = i;
-        //^ &'static str
+        //^ &str
     }
 }
 "#,
@@ -632,10 +633,10 @@ fn main() {
     fn multi_dyn_trait_bounds() {
         check_types(
             r#"
-pub struct Vec<T> {}
+pub struct Vec<T>(*mut T);
 
 impl<T> Vec<T> {
-    pub fn new() -> Self { Vec {} }
+    pub fn new() -> Self { Vec(0 as *mut T) }
 }
 
 pub struct Box<T> {}
@@ -646,9 +647,9 @@ auto trait Sync {}
 fn main() {
     // The block expression wrapping disables the constructor hint hiding logic
     let _v = { Vec::<Box<&(dyn Display + Sync)>>::new() };
-      //^^ Vec<Box<&(dyn Display + Sync)>>
+      //^^ Vec<Box<&(dyn Display + Sync + 'static)>>
     let _v = { Vec::<Box<*const (dyn Display + Sync)>>::new() };
-      //^^ Vec<Box<*const (dyn Display + Sync)>>
+      //^^ Vec<Box<*const (dyn Display + Sync + 'static)>>
     let _v = { Vec::<Box<dyn Display + Sync + 'static>>::new() };
       //^^ Vec<Box<dyn Display + Sync + 'static>>
 }
@@ -909,7 +910,7 @@ fn main() {
     foo(plus_one);
 
     let add_mul = bar(|x: u8| { x + 1 });
-    //  ^^^^^^^ impl FnOnce(u8) -> u8 + ?Sized
+    //  ^^^^^^^ impl FnOnce(u8) -> u8
 
     let closure = if let Some(6) = add_mul(2).checked_sub(1) {
     //  ^^^^^^^ fn(i32) -> i32
@@ -1015,7 +1016,7 @@ fn test<T>(t: T) {
 "#,
             expect![[r#"
                 fn test<T>(t: T) {
-                    let f = |a: i32, b: &'static str, c: T| {};
+                    let f = |a: i32, b: &str, c: T| {};
                     let result: () = f(42, "", t);
                 }
             "#]],
@@ -1253,6 +1254,132 @@ where
     }
 }
 "#,
+        );
+    }
+
+    #[test]
+    fn type_param_inlay_hint_has_location_link() {
+        check_expect(
+            InlayHintsConfig { type_hints: true, ..DISABLED_CONFIG },
+            r#"
+fn identity<T>(t: T) -> T {
+    let x = t;
+    x
+}
+"#,
+            expect![[r#"
+                [
+                    (
+                        36..37,
+                        [
+                            InlayHintLabelPart {
+                                text: "T",
+                                linked_location: Some(
+                                    Computed(
+                                        FileRangeWrapper {
+                                            file_id: FileId(
+                                                0,
+                                            ),
+                                            range: 12..13,
+                                        },
+                                    ),
+                                ),
+                                tooltip: "",
+                            },
+                        ],
+                    ),
+                ]
+            "#]],
+        );
+    }
+
+    #[test]
+    fn const_param_inlay_hint_has_location_link() {
+        check_expect(
+            InlayHintsConfig { type_hints: true, ..DISABLED_CONFIG },
+            r#"
+fn f<const N: usize>() {
+    let x = [0; N];
+}
+"#,
+            expect![[r#"
+                [
+                    (
+                        33..34,
+                        [
+                            "[i32; ",
+                            InlayHintLabelPart {
+                                text: "N",
+                                linked_location: Some(
+                                    Computed(
+                                        FileRangeWrapper {
+                                            file_id: FileId(
+                                                0,
+                                            ),
+                                            range: 11..12,
+                                        },
+                                    ),
+                                ),
+                                tooltip: "",
+                            },
+                            "]",
+                        ],
+                    ),
+                ]
+            "#]],
+        );
+    }
+
+    #[test]
+    fn lifetime_param_inlay_hint_has_location_link() {
+        check_expect(
+            InlayHintsConfig { type_hints: true, ..DISABLED_CONFIG },
+            r#"
+struct S<'lt>(*mut &'lt ());
+
+fn f<'a>() {
+    let x = S::<'a>(loop {});
+}
+"#,
+            expect![[r#"
+                [
+                    (
+                        51..52,
+                        [
+                            InlayHintLabelPart {
+                                text: "S",
+                                linked_location: Some(
+                                    Computed(
+                                        FileRangeWrapper {
+                                            file_id: FileId(
+                                                0,
+                                            ),
+                                            range: 7..8,
+                                        },
+                                    ),
+                                ),
+                                tooltip: "",
+                            },
+                            "<",
+                            InlayHintLabelPart {
+                                text: "'a",
+                                linked_location: Some(
+                                    Computed(
+                                        FileRangeWrapper {
+                                            file_id: FileId(
+                                                0,
+                                            ),
+                                            range: 35..37,
+                                        },
+                                    ),
+                                ),
+                                tooltip: "",
+                            },
+                            ">",
+                        ],
+                    ),
+                ]
+            "#]],
         );
     }
 }

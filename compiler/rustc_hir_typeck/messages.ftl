@@ -133,6 +133,10 @@ hir_typeck_fru_suggestion =
 hir_typeck_functional_record_update_on_non_struct =
     functional record update syntax requires a struct
 
+hir_typeck_gpu_kernel_abi_cannot_be_called =
+    functions with the "gpu-kernel" ABI cannot be called
+    .note = an `extern "gpu-kernel"` function must be launched on the GPU by the runtime
+
 hir_typeck_help_set_edition_cargo = set `edition = "{$edition}"` in `Cargo.toml`
 hir_typeck_help_set_edition_standalone = pass `--edition {$edition}` to `rustc`
 
@@ -227,6 +231,10 @@ hir_typeck_pass_to_variadic_function = can't pass `{$ty}` to variadic function
     .suggestion = cast the value to `{$cast_ty}`
     .teach_help = certain types, like `{$ty}`, must be cast before passing them to a variadic function to match the implicit cast that a C compiler would perform as part of C's numeric promotion rules
 
+hir_typeck_project_on_non_pin_project_type = cannot project on type that is not `#[pin_v2]`
+    .note = type defined here
+    .suggestion = add `#[pin_v2]` here
+
 hir_typeck_ptr_cast_add_auto_to_object = cannot add {$traits_len ->
     [1] auto trait {$traits}
     *[other] auto traits {$traits}
@@ -261,6 +269,8 @@ hir_typeck_rustcall_incorrect_args =
 hir_typeck_self_ctor_from_outer_item = can't reference `Self` constructor from outer item
     .label = the inner item doesn't inherit generics from this impl, so `Self` is invalid to reference
     .suggestion = replace `Self` with the actual type
+
+hir_typeck_self_ctor_from_outer_item_inner_item = `Self` used in this inner item
 
 hir_typeck_slicing_suggestion = consider slicing here
 

@@ -1,7 +1,8 @@
-//@ add-core-stubs
+//@ add-minicore
 //@ compile-flags: --target x86_64-pc-windows-msvc
 //@ compile-flags: --crate-type lib --emit link
 //@ needs-llvm-components: x86
+//@ ignore-backends: gcc
 #![no_core]
 #![feature(no_core)]
 extern crate minicore;

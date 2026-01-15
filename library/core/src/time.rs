@@ -308,6 +308,41 @@ impl Duration {
         Duration { secs, nanos: subsec_nanos }
     }
 
+    /// Creates a new `Duration` from the specified number of nanoseconds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the given number of nanoseconds is greater than [`Duration::MAX`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// let nanos = 10_u128.pow(24) + 321;
+    /// let duration = Duration::from_nanos_u128(nanos);
+    ///
+    /// assert_eq!(10_u64.pow(15), duration.as_secs());
+    /// assert_eq!(321, duration.subsec_nanos());
+    /// ```
+    #[stable(feature = "duration_from_nanos_u128", since = "1.93.0")]
+    #[rustc_const_stable(feature = "duration_from_nanos_u128", since = "1.93.0")]
+    #[must_use]
+    #[inline]
+    #[track_caller]
+    #[rustc_allow_const_fn_unstable(const_trait_impl, const_convert)] // for `u64::try_from`
+    pub const fn from_nanos_u128(nanos: u128) -> Duration {
+        const NANOS_PER_SEC: u128 = self::NANOS_PER_SEC as u128;
+        let Ok(secs) = u64::try_from(nanos / NANOS_PER_SEC) else {
+            panic!("overflow in `Duration::from_nanos_u128`");
+        };
+        let subsec_nanos = (nanos % NANOS_PER_SEC) as u32;
+        // SAFETY: x % 1_000_000_000 < 1_000_000_000 also, subsec_nanos >= 0 since u128 >=0 and u32 >=0
+        let subsec_nanos = unsafe { Nanoseconds::new_unchecked(subsec_nanos) };
+
+        Duration { secs: secs as u64, nanos: subsec_nanos }
+    }
+
     /// Creates a new `Duration` from the specified number of weeks.
     ///
     /// # Panics
@@ -380,8 +415,8 @@ impl Duration {
     /// assert_eq!(6 * 60 * 60, duration.as_secs());
     /// assert_eq!(0, duration.subsec_nanos());
     /// ```
-    #[stable(feature = "duration_constructors_lite", since = "CURRENT_RUSTC_VERSION")]
-    #[rustc_const_stable(feature = "duration_constructors_lite", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "duration_constructors_lite", since = "1.91.0")]
+    #[rustc_const_stable(feature = "duration_constructors_lite", since = "1.91.0")]
     #[must_use]
     #[inline]
     pub const fn from_hours(hours: u64) -> Duration {
@@ -408,8 +443,8 @@ impl Duration {
     /// assert_eq!(10 * 60, duration.as_secs());
     /// assert_eq!(0, duration.subsec_nanos());
     /// ```
-    #[stable(feature = "duration_constructors_lite", since = "CURRENT_RUSTC_VERSION")]
-    #[rustc_const_stable(feature = "duration_constructors_lite", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "duration_constructors_lite", since = "1.91.0")]
+    #[rustc_const_stable(feature = "duration_constructors_lite", since = "1.91.0")]
     #[must_use]
     #[inline]
     pub const fn from_mins(mins: u64) -> Duration {
@@ -637,11 +672,10 @@ impl Duration {
             let mut nanos = self.nanos.as_inner() + rhs.nanos.as_inner();
             if nanos >= NANOS_PER_SEC {
                 nanos -= NANOS_PER_SEC;
-                if let Some(new_secs) = secs.checked_add(1) {
-                    secs = new_secs;
-                } else {
+                let Some(new_secs) = secs.checked_add(1) else {
                     return None;
-                }
+                };
+                secs = new_secs;
             }
             debug_assert!(nanos < NANOS_PER_SEC);
             Some(Duration::new(secs, nanos))
@@ -927,7 +961,7 @@ impl Duration {
     pub fn from_secs_f64(secs: f64) -> Duration {
         match Duration::try_from_secs_f64(secs) {
             Ok(v) => v,
-            Err(e) => panic!("{}", e.description()),
+            Err(e) => panic!("{e}"),
         }
     }
 
@@ -964,7 +998,7 @@ impl Duration {
     pub fn from_secs_f32(secs: f32) -> Duration {
         match Duration::try_from_secs_f32(secs) {
             Ok(v) => v,
-            Err(e) => panic!("{}", e.description()),
+            Err(e) => panic!("{e}"),
         }
     }
 
@@ -1096,6 +1130,46 @@ impl Duration {
             (self.secs as f32) * (NANOS_PER_SEC as f32) + (self.nanos.as_inner() as f32);
         let rhs_nanos = (rhs.secs as f32) * (NANOS_PER_SEC as f32) + (rhs.nanos.as_inner() as f32);
         self_nanos / rhs_nanos
+    }
+
+    /// Divides `Duration` by `Duration` and returns `u128`, rounding the result towards zero.
+    ///
+    /// # Examples
+    /// ```
+    /// #![feature(duration_integer_division)]
+    /// use std::time::Duration;
+    ///
+    /// let dur = Duration::new(2, 0);
+    /// assert_eq!(dur.div_duration_floor(Duration::new(1, 000_000_001)), 1);
+    /// assert_eq!(dur.div_duration_floor(Duration::new(1, 000_000_000)), 2);
+    /// assert_eq!(dur.div_duration_floor(Duration::new(0, 999_999_999)), 2);
+    /// ```
+    #[unstable(feature = "duration_integer_division", issue = "149573")]
+    #[must_use = "this returns the result of the operation, \
+                  without modifying the original"]
+    #[inline]
+    pub const fn div_duration_floor(self, rhs: Duration) -> u128 {
+        self.as_nanos().div_floor(rhs.as_nanos())
+    }
+
+    /// Divides `Duration` by `Duration` and returns `u128`, rounding the result towards positive infinity.
+    ///
+    /// # Examples
+    /// ```
+    /// #![feature(duration_integer_division)]
+    /// use std::time::Duration;
+    ///
+    /// let dur = Duration::new(2, 0);
+    /// assert_eq!(dur.div_duration_ceil(Duration::new(1, 000_000_001)), 2);
+    /// assert_eq!(dur.div_duration_ceil(Duration::new(1, 000_000_000)), 2);
+    /// assert_eq!(dur.div_duration_ceil(Duration::new(0, 999_999_999)), 3);
+    /// ```
+    #[unstable(feature = "duration_integer_division", issue = "149573")]
+    #[must_use = "this returns the result of the operation, \
+                  without modifying the original"]
+    #[inline]
+    pub const fn div_duration_ceil(self, rhs: Duration) -> u128 {
+        self.as_nanos().div_ceil(rhs.as_nanos())
     }
 }
 
@@ -1281,39 +1355,54 @@ impl fmt::Debug for Duration {
             // need to perform rounding to match the semantics of printing
             // normal floating point numbers. However, we only need to do work
             // when rounding up. This happens if the first digit of the
-            // remaining ones is >= 5.
+            // remaining ones is >= 5. When the first digit is exactly 5, rounding
+            // follows IEEE-754 round-ties-to-even semantics: we only round up
+            // if the last written digit is odd.
             let integer_part = if fractional_part > 0 && fractional_part >= divisor * 5 {
-                // Round up the number contained in the buffer. We go through
-                // the buffer backwards and keep track of the carry.
-                let mut rev_pos = pos;
-                let mut carry = true;
-                while carry && rev_pos > 0 {
-                    rev_pos -= 1;
-
-                    // If the digit in the buffer is not '9', we just need to
-                    // increment it and can stop then (since we don't have a
-                    // carry anymore). Otherwise, we set it to '0' (overflow)
-                    // and continue.
-                    if buf[rev_pos] < b'9' {
-                        buf[rev_pos] += 1;
-                        carry = false;
-                    } else {
-                        buf[rev_pos] = b'0';
-                    }
-                }
-
-                // If we still have the carry bit set, that means that we set
-                // the whole buffer to '0's and need to increment the integer
-                // part.
-                if carry {
-                    // If `integer_part == u64::MAX` and precision < 9, any
-                    // carry of the overflow during rounding of the
-                    // `fractional_part` into the `integer_part` will cause the
-                    // `integer_part` itself to overflow. Avoid this by using an
-                    // `Option<u64>`, with `None` representing `u64::MAX + 1`.
-                    integer_part.checked_add(1)
+                // For ties (fractional_part == divisor * 5), only round up if last digit is odd
+                let is_tie = fractional_part == divisor * 5;
+                let last_digit_is_odd = if pos > 0 {
+                    (buf[pos - 1] - b'0') % 2 == 1
                 } else {
+                    // No fractional digits - check the integer part
+                    (integer_part % 2) == 1
+                };
+
+                if is_tie && !last_digit_is_odd {
                     Some(integer_part)
+                } else {
+                    // Round up the number contained in the buffer. We go through
+                    // the buffer backwards and keep track of the carry.
+                    let mut rev_pos = pos;
+                    let mut carry = true;
+                    while carry && rev_pos > 0 {
+                        rev_pos -= 1;
+
+                        // If the digit in the buffer is not '9', we just need to
+                        // increment it and can stop then (since we don't have a
+                        // carry anymore). Otherwise, we set it to '0' (overflow)
+                        // and continue.
+                        if buf[rev_pos] < b'9' {
+                            buf[rev_pos] += 1;
+                            carry = false;
+                        } else {
+                            buf[rev_pos] = b'0';
+                        }
+                    }
+
+                    // If we still have the carry bit set, that means that we set
+                    // the whole buffer to '0's and need to increment the integer
+                    // part.
+                    if carry {
+                        // If `integer_part == u64::MAX` and precision < 9, any
+                        // carry of the overflow during rounding of the
+                        // `fractional_part` into the `integer_part` will cause the
+                        // `integer_part` itself to overflow. Avoid this by using an
+                        // `Option<u64>`, with `None` representing `u64::MAX + 1`.
+                        integer_part.checked_add(1)
+                    } else {
+                        Some(integer_part)
+                    }
                 }
             } else {
                 Some(integer_part)
@@ -1445,8 +1534,9 @@ pub struct TryFromFloatSecsError {
     kind: TryFromFloatSecsErrorKind,
 }
 
-impl TryFromFloatSecsError {
-    const fn description(&self) -> &'static str {
+#[stable(feature = "duration_checked_float", since = "1.66.0")]
+impl fmt::Display for TryFromFloatSecsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {
             TryFromFloatSecsErrorKind::Negative => {
                 "cannot convert float seconds to Duration: value is negative"
@@ -1455,13 +1545,7 @@ impl TryFromFloatSecsError {
                 "cannot convert float seconds to Duration: value is either too big or NaN"
             }
         }
-    }
-}
-
-#[stable(feature = "duration_checked_float", since = "1.66.0")]
-impl fmt::Display for TryFromFloatSecsError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.description().fmt(f)
+        .fmt(f)
     }
 }
 

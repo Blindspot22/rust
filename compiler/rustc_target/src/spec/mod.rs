@@ -52,7 +52,7 @@ use rustc_abi::{
 use rustc_data_structures::fx::{FxHashSet, FxIndexSet};
 use rustc_error_messages::{DiagArgValue, IntoDiagArg, into_diag_arg_using_display};
 use rustc_fs_util::try_canonicalize;
-use rustc_macros::{Decodable, Encodable, HashStable_Generic};
+use rustc_macros::{BlobDecodable, Decodable, Encodable, HashStable_Generic};
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use rustc_span::{Symbol, kw, sym};
 use serde_json::Value;
@@ -70,6 +70,7 @@ mod json;
 pub use abi_map::{AbiMap, AbiMapping};
 pub use base::apple;
 pub use base::avr::ef_avr_arch;
+pub use json::json_schema;
 
 /// Linker is called through a C/C++ compiler.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -183,50 +184,15 @@ impl LinkerFlavorCli {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum LldFlavor {
-    Wasm,
-    Ld64,
-    Ld,
-    Link,
-}
-
-impl LldFlavor {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            LldFlavor::Wasm => "wasm",
-            LldFlavor::Ld64 => "darwin",
-            LldFlavor::Ld => "gnu",
-            LldFlavor::Link => "link",
-        }
+crate::target_spec_enum! {
+    pub enum LldFlavor {
+        Wasm = "wasm",
+        Ld64 = "darwin",
+        Ld = "gnu",
+        Link = "link",
     }
-}
 
-impl FromStr for LldFlavor {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "darwin" => LldFlavor::Ld64,
-            "gnu" => LldFlavor::Ld,
-            "link" => LldFlavor::Link,
-            "wasm" => LldFlavor::Wasm,
-            _ => {
-                return Err(
-                    "invalid value for lld flavor: '{s}', expected one of 'darwin', 'gnu', 'link', 'wasm'"
-                        .into(),
-                );
-            }
-        })
-    }
-}
-
-crate::json::serde_deserialize_from_str!(LldFlavor);
-
-impl ToJson for LldFlavor {
-    fn to_json(&self) -> Json {
-        self.as_str().to_json()
-    }
+    parse_error_type = "LLD flavor";
 }
 
 impl LinkerFlavor {
@@ -558,6 +524,20 @@ linker_flavor_cli_impls! {
 }
 
 crate::json::serde_deserialize_from_str!(LinkerFlavorCli);
+impl schemars::JsonSchema for LinkerFlavorCli {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "LinkerFlavor".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let all: Vec<&'static str> =
+            Self::all().iter().map(|flavor| flavor.desc()).collect::<Vec<_>>();
+        schemars::json_schema! ({
+            "type": "string",
+            "enum": all
+        })
+        .into()
+    }
+}
 
 impl ToJson for LinkerFlavorCli {
     fn to_json(&self) -> Json {
@@ -611,6 +591,18 @@ impl FromStr for LinkSelfContainedDefault {
 }
 
 crate::json::serde_deserialize_from_str!(LinkSelfContainedDefault);
+impl schemars::JsonSchema for LinkSelfContainedDefault {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "LinkSelfContainedDefault".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema! ({
+            "type": "string",
+            "enum": ["false", "true", "wasm", "musl", "mingw"]
+        })
+        .into()
+    }
+}
 
 impl ToJson for LinkSelfContainedDefault {
     fn to_json(&self) -> Json {
@@ -743,6 +735,20 @@ impl FromStr for LinkSelfContainedComponents {
 }
 
 crate::json::serde_deserialize_from_str!(LinkSelfContainedComponents);
+impl schemars::JsonSchema for LinkSelfContainedComponents {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "LinkSelfContainedComponents".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let all =
+            Self::all_components().iter().map(|component| component.as_str()).collect::<Vec<_>>();
+        schemars::json_schema! ({
+            "type": "string",
+            "enum": all,
+        })
+        .into()
+    }
+}
 
 impl ToJson for LinkSelfContainedComponents {
     fn to_json(&self) -> Json {
@@ -823,13 +829,18 @@ impl LinkerFeatures {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Hash, Encodable, Decodable, HashStable_Generic)]
-pub enum PanicStrategy {
-    Unwind,
-    Abort,
+crate::target_spec_enum! {
+    #[derive(Encodable, BlobDecodable, HashStable_Generic)]
+    pub enum PanicStrategy {
+        Unwind = "unwind",
+        Abort = "abort",
+        ImmediateAbort = "immediate-abort",
+    }
+
+    parse_error_type = "panic strategy";
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Hash, Encodable, Decodable, HashStable_Generic)]
+#[derive(Clone, Copy, Debug, PartialEq, Hash, Encodable, BlobDecodable, HashStable_Generic)]
 pub enum OnBrokenPipe {
     Default,
     Kill,
@@ -838,43 +849,29 @@ pub enum OnBrokenPipe {
 }
 
 impl PanicStrategy {
-    pub fn desc(&self) -> &str {
-        match *self {
-            PanicStrategy::Unwind => "unwind",
-            PanicStrategy::Abort => "abort",
-        }
-    }
-
     pub const fn desc_symbol(&self) -> Symbol {
         match *self {
             PanicStrategy::Unwind => sym::unwind,
             PanicStrategy::Abort => sym::abort,
+            PanicStrategy::ImmediateAbort => sym::immediate_abort,
         }
     }
 
-    pub const fn all() -> [Symbol; 2] {
-        [Self::Abort.desc_symbol(), Self::Unwind.desc_symbol()]
+    pub fn unwinds(self) -> bool {
+        matches!(self, PanicStrategy::Unwind)
     }
 }
 
-impl FromStr for PanicStrategy {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "unwind" => PanicStrategy::Unwind,
-            "abort" => PanicStrategy::Abort,
-            _ => {
-                return Err(format!(
-                    "'{}' is not a valid value for \
-                    panic-strategy. Use 'unwind' or 'abort'.",
-                    s
-                ));
-            }
-        })
+crate::target_spec_enum! {
+    pub enum RelroLevel {
+        Full = "full",
+        Partial = "partial",
+        Off = "off",
+        None = "none",
     }
-}
 
-crate::json::serde_deserialize_from_str!(PanicStrategy);
+    parse_error_type = "relro level";
+}
 
 impl IntoDiagArg for PanicStrategy {
     fn into_diag_arg(self, _: &mut Option<std::path::PathBuf>) -> DiagArgValue {
@@ -882,109 +879,14 @@ impl IntoDiagArg for PanicStrategy {
     }
 }
 
-impl ToJson for PanicStrategy {
-    fn to_json(&self) -> Json {
-        match *self {
-            PanicStrategy::Abort => "abort".to_json(),
-            PanicStrategy::Unwind => "unwind".to_json(),
-        }
+crate::target_spec_enum! {
+    pub enum SymbolVisibility {
+        Hidden = "hidden",
+        Protected = "protected",
+        Interposable = "interposable",
     }
-}
 
-#[derive(Clone, Copy, Debug, PartialEq, Hash)]
-pub enum RelroLevel {
-    Full,
-    Partial,
-    Off,
-    None,
-}
-
-impl RelroLevel {
-    pub fn desc(&self) -> &str {
-        match *self {
-            RelroLevel::Full => "full",
-            RelroLevel::Partial => "partial",
-            RelroLevel::Off => "off",
-            RelroLevel::None => "none",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Hash)]
-pub enum SymbolVisibility {
-    Hidden,
-    Protected,
-    Interposable,
-}
-
-impl SymbolVisibility {
-    pub fn desc(&self) -> &str {
-        match *self {
-            SymbolVisibility::Hidden => "hidden",
-            SymbolVisibility::Protected => "protected",
-            SymbolVisibility::Interposable => "interposable",
-        }
-    }
-}
-
-impl FromStr for SymbolVisibility {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<SymbolVisibility, Self::Err> {
-        match s {
-            "hidden" => Ok(SymbolVisibility::Hidden),
-            "protected" => Ok(SymbolVisibility::Protected),
-            "interposable" => Ok(SymbolVisibility::Interposable),
-            _ => Err(format!(
-                "'{}' is not a valid value for \
-                    symbol-visibility. Use 'hidden', 'protected, or 'interposable'.",
-                s
-            )),
-        }
-    }
-}
-
-crate::json::serde_deserialize_from_str!(SymbolVisibility);
-
-impl ToJson for SymbolVisibility {
-    fn to_json(&self) -> Json {
-        match *self {
-            SymbolVisibility::Hidden => "hidden".to_json(),
-            SymbolVisibility::Protected => "protected".to_json(),
-            SymbolVisibility::Interposable => "interposable".to_json(),
-        }
-    }
-}
-
-impl FromStr for RelroLevel {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<RelroLevel, Self::Err> {
-        match s {
-            "full" => Ok(RelroLevel::Full),
-            "partial" => Ok(RelroLevel::Partial),
-            "off" => Ok(RelroLevel::Off),
-            "none" => Ok(RelroLevel::None),
-            _ => Err(format!(
-                "'{}' is not a valid value for \
-                        relro-level. Use 'full', 'partial, 'off', or 'none'.",
-                s
-            )),
-        }
-    }
-}
-
-crate::json::serde_deserialize_from_str!(RelroLevel);
-
-impl ToJson for RelroLevel {
-    fn to_json(&self) -> Json {
-        match *self {
-            RelroLevel::Full => "full".to_json(),
-            RelroLevel::Partial => "partial".to_json(),
-            RelroLevel::Off => "off".to_json(),
-            RelroLevel::None => "None".to_json(),
-        }
-    }
+    parse_error_type = "symbol visibility";
 }
 
 #[derive(Clone, Debug, PartialEq, Hash)]
@@ -1014,6 +916,18 @@ impl FromStr for SmallDataThresholdSupport {
 }
 
 crate::json::serde_deserialize_from_str!(SmallDataThresholdSupport);
+impl schemars::JsonSchema for SmallDataThresholdSupport {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SmallDataThresholdSupport".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema! ({
+            "type": "string",
+            "pattern": r#"^none|default-for-arch|llvm-module-flag=.+|llvm-arg=.+$"#,
+        })
+        .into()
+    }
+}
 
 impl ToJson for SmallDataThresholdSupport {
     fn to_json(&self) -> Value {
@@ -1026,76 +940,31 @@ impl ToJson for SmallDataThresholdSupport {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Hash)]
-pub enum MergeFunctions {
-    Disabled,
-    Trampolines,
-    Aliases,
-}
-
-impl MergeFunctions {
-    pub fn desc(&self) -> &str {
-        match *self {
-            MergeFunctions::Disabled => "disabled",
-            MergeFunctions::Trampolines => "trampolines",
-            MergeFunctions::Aliases => "aliases",
-        }
+crate::target_spec_enum! {
+    pub enum MergeFunctions {
+        Disabled = "disabled",
+        Trampolines = "trampolines",
+        Aliases = "aliases",
     }
+
+    parse_error_type = "value for merge-functions";
 }
 
-impl FromStr for MergeFunctions {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<MergeFunctions, Self::Err> {
-        match s {
-            "disabled" => Ok(MergeFunctions::Disabled),
-            "trampolines" => Ok(MergeFunctions::Trampolines),
-            "aliases" => Ok(MergeFunctions::Aliases),
-            _ => Err(format!(
-                "'{}' is not a valid value for \
-                    merge-functions. Use 'disabled', \
-                    'trampolines', or 'aliases'.",
-                s
-            )),
-        }
+crate::target_spec_enum! {
+    pub enum RelocModel {
+        Static = "static",
+        Pic = "pic",
+        Pie = "pie",
+        DynamicNoPic = "dynamic-no-pic",
+        Ropi = "ropi",
+        Rwpi = "rwpi",
+        RopiRwpi = "ropi-rwpi",
     }
-}
 
-crate::json::serde_deserialize_from_str!(MergeFunctions);
-
-impl ToJson for MergeFunctions {
-    fn to_json(&self) -> Json {
-        match *self {
-            MergeFunctions::Disabled => "disabled".to_json(),
-            MergeFunctions::Trampolines => "trampolines".to_json(),
-            MergeFunctions::Aliases => "aliases".to_json(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Hash, Debug)]
-pub enum RelocModel {
-    Static,
-    Pic,
-    Pie,
-    DynamicNoPic,
-    Ropi,
-    Rwpi,
-    RopiRwpi,
+    parse_error_type = "relocation model";
 }
 
 impl RelocModel {
-    pub fn desc(&self) -> &str {
-        match *self {
-            RelocModel::Static => "static",
-            RelocModel::Pic => "pic",
-            RelocModel::Pie => "pie",
-            RelocModel::DynamicNoPic => "dynamic-no-pic",
-            RelocModel::Ropi => "ropi",
-            RelocModel::Rwpi => "rwpi",
-            RelocModel::RopiRwpi => "ropi-rwpi",
-        }
-    }
     pub const fn desc_symbol(&self) -> Symbol {
         match *self {
             RelocModel::Static => kw::Static,
@@ -1107,250 +976,77 @@ impl RelocModel {
             RelocModel::RopiRwpi => sym::ropi_rwpi,
         }
     }
+}
 
-    pub const fn all() -> [Symbol; 7] {
-        [
-            RelocModel::Static.desc_symbol(),
-            RelocModel::Pic.desc_symbol(),
-            RelocModel::Pie.desc_symbol(),
-            RelocModel::DynamicNoPic.desc_symbol(),
-            RelocModel::Ropi.desc_symbol(),
-            RelocModel::Rwpi.desc_symbol(),
-            RelocModel::RopiRwpi.desc_symbol(),
-        ]
+crate::target_spec_enum! {
+    pub enum CodeModel {
+        Tiny = "tiny",
+        Small = "small",
+        Kernel = "kernel",
+        Medium = "medium",
+        Large = "large",
     }
+
+    parse_error_type = "code model";
 }
 
-impl FromStr for RelocModel {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<RelocModel, Self::Err> {
-        Ok(match s {
-            "static" => RelocModel::Static,
-            "pic" => RelocModel::Pic,
-            "pie" => RelocModel::Pie,
-            "dynamic-no-pic" => RelocModel::DynamicNoPic,
-            "ropi" => RelocModel::Ropi,
-            "rwpi" => RelocModel::Rwpi,
-            "ropi-rwpi" => RelocModel::RopiRwpi,
-            _ => {
-                return Err(format!(
-                    "invalid relocation model '{s}'.
-                        Run `rustc --print relocation-models` to \
-                        see the list of supported values.'"
-                ));
-            }
-        })
+crate::target_spec_enum! {
+    /// The float ABI setting to be configured in the LLVM target machine.
+    pub enum FloatAbi {
+        Soft = "soft",
+        Hard = "hard",
     }
+
+    parse_error_type = "float abi";
 }
 
-crate::json::serde_deserialize_from_str!(RelocModel);
-
-impl ToJson for RelocModel {
-    fn to_json(&self) -> Json {
-        self.desc().to_json()
+crate::target_spec_enum! {
+    /// The Rustc-specific variant of the ABI used for this target.
+    pub enum RustcAbi {
+        /// On x86-32 only: make use of SSE and SSE2 for ABI purposes.
+        X86Sse2 = "x86-sse2",
+        /// On x86-32/64 only: do not use any FPU or SIMD registers for the ABI.
+        X86Softfloat = "x86-softfloat",
     }
+
+    parse_error_type = "rustc abi";
 }
 
-#[derive(Clone, Copy, PartialEq, Hash, Debug)]
-pub enum CodeModel {
-    Tiny,
-    Small,
-    Kernel,
-    Medium,
-    Large,
-}
-
-impl FromStr for CodeModel {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<CodeModel, Self::Err> {
-        Ok(match s {
-            "tiny" => CodeModel::Tiny,
-            "small" => CodeModel::Small,
-            "kernel" => CodeModel::Kernel,
-            "medium" => CodeModel::Medium,
-            "large" => CodeModel::Large,
-            _ => {
-                return Err(format!(
-                    "'{s}' is not a valid code model. \
-                        Run `rustc --print code-models` to \
-                        see the list of supported values."
-                ));
-            }
-        })
+crate::target_spec_enum! {
+    pub enum TlsModel {
+        GeneralDynamic = "global-dynamic",
+        LocalDynamic = "local-dynamic",
+        InitialExec = "initial-exec",
+        LocalExec = "local-exec",
+        Emulated = "emulated",
     }
+
+    parse_error_type = "TLS model";
 }
 
-crate::json::serde_deserialize_from_str!(CodeModel);
-
-impl ToJson for CodeModel {
-    fn to_json(&self) -> Json {
-        match *self {
-            CodeModel::Tiny => "tiny",
-            CodeModel::Small => "small",
-            CodeModel::Kernel => "kernel",
-            CodeModel::Medium => "medium",
-            CodeModel::Large => "large",
-        }
-        .to_json()
+crate::target_spec_enum! {
+    /// Everything is flattened to a single enum to make the json encoding/decoding less annoying.
+    pub enum LinkOutputKind {
+        /// Dynamically linked non position-independent executable.
+        DynamicNoPicExe = "dynamic-nopic-exe",
+        /// Dynamically linked position-independent executable.
+        DynamicPicExe = "dynamic-pic-exe",
+        /// Statically linked non position-independent executable.
+        StaticNoPicExe = "static-nopic-exe",
+        /// Statically linked position-independent executable.
+        StaticPicExe = "static-pic-exe",
+        /// Regular dynamic library ("dynamically linked").
+        DynamicDylib = "dynamic-dylib",
+        /// Dynamic library with bundled libc ("statically linked").
+        StaticDylib = "static-dylib",
+        /// WASI module with a lifetime past the _initialize entry point
+        WasiReactorExe = "wasi-reactor-exe",
     }
-}
 
-/// The float ABI setting to be configured in the LLVM target machine.
-#[derive(Clone, Copy, PartialEq, Hash, Debug)]
-pub enum FloatAbi {
-    Soft,
-    Hard,
-}
-
-impl FromStr for FloatAbi {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<FloatAbi, Self::Err> {
-        Ok(match s {
-            "soft" => FloatAbi::Soft,
-            "hard" => FloatAbi::Hard,
-            _ => {
-                return Err(format!(
-                    "'{}' is not a valid value for \
-                        llvm-floatabi. Use 'soft' or 'hard'.",
-                    s
-                ));
-            }
-        })
-    }
-}
-
-crate::json::serde_deserialize_from_str!(FloatAbi);
-
-impl ToJson for FloatAbi {
-    fn to_json(&self) -> Json {
-        match *self {
-            FloatAbi::Soft => "soft",
-            FloatAbi::Hard => "hard",
-        }
-        .to_json()
-    }
-}
-
-/// The Rustc-specific variant of the ABI used for this target.
-#[derive(Clone, Copy, PartialEq, Hash, Debug)]
-pub enum RustcAbi {
-    /// On x86-32 only: make use of SSE and SSE2 for ABI purposes.
-    X86Sse2,
-    /// On x86-32/64 only: do not use any FPU or SIMD registers for the ABI.
-    X86Softfloat,
-}
-
-impl FromStr for RustcAbi {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<RustcAbi, Self::Err> {
-        Ok(match s {
-            "x86-sse2" => RustcAbi::X86Sse2,
-            "x86-softfloat" => RustcAbi::X86Softfloat,
-            _ => {
-                return Err(format!(
-                    "'{s}' is not a valid value for rustc-abi. \
-                        Use 'x86-softfloat' or leave the field unset."
-                ));
-            }
-        })
-    }
-}
-
-crate::json::serde_deserialize_from_str!(RustcAbi);
-
-impl ToJson for RustcAbi {
-    fn to_json(&self) -> Json {
-        match *self {
-            RustcAbi::X86Sse2 => "x86-sse2",
-            RustcAbi::X86Softfloat => "x86-softfloat",
-        }
-        .to_json()
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Hash, Debug)]
-pub enum TlsModel {
-    GeneralDynamic,
-    LocalDynamic,
-    InitialExec,
-    LocalExec,
-    Emulated,
-}
-
-impl FromStr for TlsModel {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<TlsModel, Self::Err> {
-        Ok(match s {
-            // Note the difference "general" vs "global" difference. The model name is "general",
-            // but the user-facing option name is "global" for consistency with other compilers.
-            "global-dynamic" => TlsModel::GeneralDynamic,
-            "local-dynamic" => TlsModel::LocalDynamic,
-            "initial-exec" => TlsModel::InitialExec,
-            "local-exec" => TlsModel::LocalExec,
-            "emulated" => TlsModel::Emulated,
-            _ => {
-                return Err(format!(
-                    "'{s}' is not a valid TLS model. \
-                        Run `rustc --print tls-models` to \
-                        see the list of supported values."
-                ));
-            }
-        })
-    }
-}
-
-crate::json::serde_deserialize_from_str!(TlsModel);
-
-impl ToJson for TlsModel {
-    fn to_json(&self) -> Json {
-        match *self {
-            TlsModel::GeneralDynamic => "global-dynamic",
-            TlsModel::LocalDynamic => "local-dynamic",
-            TlsModel::InitialExec => "initial-exec",
-            TlsModel::LocalExec => "local-exec",
-            TlsModel::Emulated => "emulated",
-        }
-        .to_json()
-    }
-}
-
-/// Everything is flattened to a single enum to make the json encoding/decoding less annoying.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub enum LinkOutputKind {
-    /// Dynamically linked non position-independent executable.
-    DynamicNoPicExe,
-    /// Dynamically linked position-independent executable.
-    DynamicPicExe,
-    /// Statically linked non position-independent executable.
-    StaticNoPicExe,
-    /// Statically linked position-independent executable.
-    StaticPicExe,
-    /// Regular dynamic library ("dynamically linked").
-    DynamicDylib,
-    /// Dynamic library with bundled libc ("statically linked").
-    StaticDylib,
-    /// WASI module with a lifetime past the _initialize entry point
-    WasiReactorExe,
+    parse_error_type = "CRT object kind";
 }
 
 impl LinkOutputKind {
-    fn as_str(&self) -> &'static str {
-        match self {
-            LinkOutputKind::DynamicNoPicExe => "dynamic-nopic-exe",
-            LinkOutputKind::DynamicPicExe => "dynamic-pic-exe",
-            LinkOutputKind::StaticNoPicExe => "static-nopic-exe",
-            LinkOutputKind::StaticPicExe => "static-pic-exe",
-            LinkOutputKind::DynamicDylib => "dynamic-dylib",
-            LinkOutputKind::StaticDylib => "static-dylib",
-            LinkOutputKind::WasiReactorExe => "wasi-reactor-exe",
-        }
-    }
-
     pub fn can_link_dylib(self) -> bool {
         match self {
             LinkOutputKind::StaticNoPicExe | LinkOutputKind::StaticPicExe => false,
@@ -1363,171 +1059,64 @@ impl LinkOutputKind {
     }
 }
 
-impl FromStr for LinkOutputKind {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<LinkOutputKind, Self::Err> {
-        Ok(match s {
-            "dynamic-nopic-exe" => LinkOutputKind::DynamicNoPicExe,
-            "dynamic-pic-exe" => LinkOutputKind::DynamicPicExe,
-            "static-nopic-exe" => LinkOutputKind::StaticNoPicExe,
-            "static-pic-exe" => LinkOutputKind::StaticPicExe,
-            "dynamic-dylib" => LinkOutputKind::DynamicDylib,
-            "static-dylib" => LinkOutputKind::StaticDylib,
-            "wasi-reactor-exe" => LinkOutputKind::WasiReactorExe,
-            _ => {
-                return Err(format!(
-                    "invalid value for CRT object kind. \
-                        Use '(dynamic,static)-(nopic,pic)-exe' or \
-                        '(dynamic,static)-dylib' or 'wasi-reactor-exe'"
-                ));
-            }
-        })
-    }
-}
-
-crate::json::serde_deserialize_from_str!(LinkOutputKind);
-
-impl fmt::Display for LinkOutputKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 pub type LinkArgs = BTreeMap<LinkerFlavor, Vec<StaticCow<str>>>;
 pub type LinkArgsCli = BTreeMap<LinkerFlavorCli, Vec<StaticCow<str>>>;
 
-/// Which kind of debuginfo does the target use?
-///
-/// Useful in determining whether a target supports Split DWARF (a target with
-/// `DebuginfoKind::Dwarf` and supporting `SplitDebuginfo::Unpacked` for example).
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub enum DebuginfoKind {
-    /// DWARF debuginfo (such as that used on `x86_64_unknown_linux_gnu`).
-    #[default]
-    Dwarf,
-    /// DWARF debuginfo in dSYM files (such as on Apple platforms).
-    DwarfDsym,
-    /// Program database files (such as on Windows).
-    Pdb,
-}
-
-impl DebuginfoKind {
-    fn as_str(&self) -> &'static str {
-        match self {
-            DebuginfoKind::Dwarf => "dwarf",
-            DebuginfoKind::DwarfDsym => "dwarf-dsym",
-            DebuginfoKind::Pdb => "pdb",
-        }
-    }
-}
-
-impl FromStr for DebuginfoKind {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "dwarf" => DebuginfoKind::Dwarf,
-            "dwarf-dsym" => DebuginfoKind::DwarfDsym,
-            "pdb" => DebuginfoKind::Pdb,
-            _ => {
-                return Err(format!(
-                    "'{s}' is not a valid value for debuginfo-kind. Use 'dwarf', \
-                        'dwarf-dsym' or 'pdb'."
-                ));
-            }
-        })
-    }
-}
-
-crate::json::serde_deserialize_from_str!(DebuginfoKind);
-
-impl ToJson for DebuginfoKind {
-    fn to_json(&self) -> Json {
-        self.as_str().to_json()
-    }
-}
-
-impl fmt::Display for DebuginfoKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub enum SplitDebuginfo {
-    /// Split debug-information is disabled, meaning that on supported platforms
-    /// you can find all debug information in the executable itself. This is
-    /// only supported for ELF effectively.
+crate::target_spec_enum! {
+    /// Which kind of debuginfo does the target use?
     ///
-    /// * Windows - not supported
-    /// * macOS - don't run `dsymutil`
-    /// * ELF - `.debug_*` sections
-    #[default]
-    Off,
+    /// Useful in determining whether a target supports Split DWARF (a target with
+    /// `DebuginfoKind::Dwarf` and supporting `SplitDebuginfo::Unpacked` for example).
+    #[derive(Default)]
+    pub enum DebuginfoKind {
+        /// DWARF debuginfo (such as that used on `x86_64_unknown_linux_gnu`).
+        #[default]
+        Dwarf = "dwarf",
+        /// DWARF debuginfo in dSYM files (such as on Apple platforms).
+        DwarfDsym = "dwarf-dsym",
+        /// Program database files (such as on Windows).
+        Pdb = "pdb",
+    }
 
-    /// Split debug-information can be found in a "packed" location separate
-    /// from the final artifact. This is supported on all platforms.
-    ///
-    /// * Windows - `*.pdb`
-    /// * macOS - `*.dSYM` (run `dsymutil`)
-    /// * ELF - `*.dwp` (run `thorin`)
-    Packed,
-
-    /// Split debug-information can be found in individual object files on the
-    /// filesystem. The main executable may point to the object files.
-    ///
-    /// * Windows - not supported
-    /// * macOS - supported, scattered object files
-    /// * ELF - supported, scattered `*.dwo` or `*.o` files (see `SplitDwarfKind`)
-    Unpacked,
+    parse_error_type = "debuginfo kind";
 }
 
-impl SplitDebuginfo {
-    fn as_str(&self) -> &'static str {
-        match self {
-            SplitDebuginfo::Off => "off",
-            SplitDebuginfo::Packed => "packed",
-            SplitDebuginfo::Unpacked => "unpacked",
-        }
+crate::target_spec_enum! {
+    #[derive(Default)]
+    pub enum SplitDebuginfo {
+        /// Split debug-information is disabled, meaning that on supported platforms
+        /// you can find all debug information in the executable itself. This is
+        /// only supported for ELF effectively.
+        ///
+        /// * Windows - not supported
+        /// * macOS - don't run `dsymutil`
+        /// * ELF - `.debug_*` sections
+        #[default]
+        Off = "off",
+
+        /// Split debug-information can be found in a "packed" location separate
+        /// from the final artifact. This is supported on all platforms.
+        ///
+        /// * Windows - `*.pdb`
+        /// * macOS - `*.dSYM` (run `dsymutil`)
+        /// * ELF - `*.dwp` (run `thorin`)
+        Packed = "packed",
+
+        /// Split debug-information can be found in individual object files on the
+        /// filesystem. The main executable may point to the object files.
+        ///
+        /// * Windows - not supported
+        /// * macOS - supported, scattered object files
+        /// * ELF - supported, scattered `*.dwo` or `*.o` files (see `SplitDwarfKind`)
+        Unpacked = "unpacked",
     }
-}
 
-impl FromStr for SplitDebuginfo {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "off" => SplitDebuginfo::Off,
-            "unpacked" => SplitDebuginfo::Unpacked,
-            "packed" => SplitDebuginfo::Packed,
-            _ => {
-                return Err(format!(
-                    "'{s}' is not a valid value for \
-                        split-debuginfo. Use 'off', 'unpacked', or 'packed'.",
-                ));
-            }
-        })
-    }
-}
-
-crate::json::serde_deserialize_from_str!(SplitDebuginfo);
-
-impl ToJson for SplitDebuginfo {
-    fn to_json(&self) -> Json {
-        self.as_str().to_json()
-    }
-}
-
-impl fmt::Display for SplitDebuginfo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
+    parse_error_type = "split debuginfo";
 }
 
 into_diag_arg_using_display!(SplitDebuginfo);
 
-#[derive(Clone, Debug, PartialEq, Eq, serde_derive::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde_derive::Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind")]
 #[serde(rename_all = "kebab-case")]
 pub enum StackProbeType {
@@ -1588,6 +1177,7 @@ bitflags::bitflags! {
         const KERNELADDRESS = 1 << 9;
         const SAFESTACK = 1 << 10;
         const DATAFLOW = 1 << 11;
+        const REALTIME = 1 << 12;
     }
 }
 rustc_data_structures::external_bitflags_debug! { SanitizerSet }
@@ -1638,6 +1228,7 @@ impl SanitizerSet {
             SanitizerSet::SHADOWCALLSTACK => "shadow-call-stack",
             SanitizerSet::THREAD => "thread",
             SanitizerSet::HWADDRESS => "hwaddress",
+            SanitizerSet::REALTIME => "realtime",
             _ => return None,
         })
     }
@@ -1682,12 +1273,26 @@ impl FromStr for SanitizerSet {
             "shadow-call-stack" => SanitizerSet::SHADOWCALLSTACK,
             "thread" => SanitizerSet::THREAD,
             "hwaddress" => SanitizerSet::HWADDRESS,
+            "realtime" => SanitizerSet::REALTIME,
             s => return Err(format!("unknown sanitizer {s}")),
         })
     }
 }
 
 crate::json::serde_deserialize_from_str!(SanitizerSet);
+impl schemars::JsonSchema for SanitizerSet {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SanitizerSet".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let all = Self::all().iter().map(|sanitizer| sanitizer.as_str()).collect::<Vec<_>>();
+        schemars::json_schema! ({
+            "type": "string",
+            "enum": all,
+        })
+        .into()
+    }
+}
 
 impl ToJson for SanitizerSet {
     fn to_json(&self) -> Json {
@@ -1699,17 +1304,20 @@ impl ToJson for SanitizerSet {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Hash, Debug)]
-pub enum FramePointer {
-    /// Forces the machine code generator to always preserve the frame pointers.
-    Always,
-    /// Forces the machine code generator to preserve the frame pointers except for the leaf
-    /// functions (i.e. those that don't call other functions).
-    NonLeaf,
-    /// Allows the machine code generator to omit the frame pointers.
-    ///
-    /// This option does not guarantee that the frame pointers will be omitted.
-    MayOmit,
+crate::target_spec_enum! {
+    pub enum FramePointer {
+        /// Forces the machine code generator to always preserve the frame pointers.
+        Always = "always",
+        /// Forces the machine code generator to preserve the frame pointers except for the leaf
+        /// functions (i.e. those that don't call other functions).
+        NonLeaf = "non-leaf",
+        /// Allows the machine code generator to omit the frame pointers.
+        ///
+        /// This option does not guarantee that the frame pointers will be omitted.
+        MayOmit = "may-omit",
+    }
+
+    parse_error_type = "frame pointer";
 }
 
 impl FramePointer {
@@ -1726,93 +1334,43 @@ impl FramePointer {
     }
 }
 
-impl FromStr for FramePointer {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "always" => Self::Always,
-            "non-leaf" => Self::NonLeaf,
-            "may-omit" => Self::MayOmit,
-            _ => return Err(format!("'{s}' is not a valid value for frame-pointer")),
-        })
+crate::target_spec_enum! {
+    /// Controls use of stack canaries.
+    pub enum StackProtector {
+        /// Disable stack canary generation.
+        None = "none",
+
+        /// On LLVM, mark all generated LLVM functions with the `ssp` attribute (see
+        /// llvm/docs/LangRef.rst). This triggers stack canary generation in
+        /// functions which contain an array of a byte-sized type with more than
+        /// eight elements.
+        Basic = "basic",
+
+        /// On LLVM, mark all generated LLVM functions with the `sspstrong`
+        /// attribute (see llvm/docs/LangRef.rst). This triggers stack canary
+        /// generation in functions which either contain an array, or which take
+        /// the address of a local variable.
+        Strong = "strong",
+
+        /// Generate stack canaries in all functions.
+        All = "all",
     }
-}
 
-crate::json::serde_deserialize_from_str!(FramePointer);
-
-impl ToJson for FramePointer {
-    fn to_json(&self) -> Json {
-        match *self {
-            Self::Always => "always",
-            Self::NonLeaf => "non-leaf",
-            Self::MayOmit => "may-omit",
-        }
-        .to_json()
-    }
-}
-
-/// Controls use of stack canaries.
-#[derive(Clone, Copy, Debug, PartialEq, Hash, Eq)]
-pub enum StackProtector {
-    /// Disable stack canary generation.
-    None,
-
-    /// On LLVM, mark all generated LLVM functions with the `ssp` attribute (see
-    /// llvm/docs/LangRef.rst). This triggers stack canary generation in
-    /// functions which contain an array of a byte-sized type with more than
-    /// eight elements.
-    Basic,
-
-    /// On LLVM, mark all generated LLVM functions with the `sspstrong`
-    /// attribute (see llvm/docs/LangRef.rst). This triggers stack canary
-    /// generation in functions which either contain an array, or which take
-    /// the address of a local variable.
-    Strong,
-
-    /// Generate stack canaries in all functions.
-    All,
-}
-
-impl StackProtector {
-    fn as_str(&self) -> &'static str {
-        match self {
-            StackProtector::None => "none",
-            StackProtector::Basic => "basic",
-            StackProtector::Strong => "strong",
-            StackProtector::All => "all",
-        }
-    }
-}
-
-impl FromStr for StackProtector {
-    type Err = ();
-
-    fn from_str(s: &str) -> Result<StackProtector, ()> {
-        Ok(match s {
-            "none" => StackProtector::None,
-            "basic" => StackProtector::Basic,
-            "strong" => StackProtector::Strong,
-            "all" => StackProtector::All,
-            _ => return Err(()),
-        })
-    }
-}
-
-impl fmt::Display for StackProtector {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
+    parse_error_type = "stack protector";
 }
 
 into_diag_arg_using_display!(StackProtector);
 
-#[derive(PartialEq, Clone, Debug)]
-pub enum BinaryFormat {
-    Coff,
-    Elf,
-    MachO,
-    Wasm,
-    Xcoff,
+crate::target_spec_enum! {
+    pub enum BinaryFormat {
+        Coff = "coff",
+        Elf = "elf",
+        MachO = "mach-o",
+        Wasm = "wasm",
+        Xcoff = "xcoff",
+    }
+
+    parse_error_type = "binary format";
 }
 
 impl BinaryFormat {
@@ -1825,38 +1383,6 @@ impl BinaryFormat {
             Self::Wasm => object::BinaryFormat::Wasm,
             Self::Xcoff => object::BinaryFormat::Xcoff,
         }
-    }
-}
-
-impl FromStr for BinaryFormat {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "coff" => Ok(Self::Coff),
-            "elf" => Ok(Self::Elf),
-            "mach-o" => Ok(Self::MachO),
-            "wasm" => Ok(Self::Wasm),
-            "xcoff" => Ok(Self::Xcoff),
-            _ => Err(format!(
-                "'{s}' is not a valid value for binary_format. \
-                    Use 'coff', 'elf', 'mach-o', 'wasm' or 'xcoff' "
-            )),
-        }
-    }
-}
-
-crate::json::serde_deserialize_from_str!(BinaryFormat);
-
-impl ToJson for BinaryFormat {
-    fn to_json(&self) -> Json {
-        match self {
-            Self::Coff => "coff",
-            Self::Elf => "elf",
-            Self::MachO => "mach-o",
-            Self::Wasm => "wasm",
-            Self::Xcoff => "xcoff",
-        }
-        .to_json()
     }
 }
 
@@ -1954,6 +1480,7 @@ supported_targets! {
     ("armv7-unknown-linux-musleabihf", armv7_unknown_linux_musleabihf),
     ("aarch64-unknown-linux-gnu", aarch64_unknown_linux_gnu),
     ("aarch64-unknown-linux-musl", aarch64_unknown_linux_musl),
+    ("aarch64_be-unknown-linux-musl", aarch64_be_unknown_linux_musl),
     ("x86_64-unknown-linux-musl", x86_64_unknown_linux_musl),
     ("i686-unknown-linux-musl", i686_unknown_linux_musl),
     ("i586-unknown-linux-musl", i586_unknown_linux_musl),
@@ -1963,6 +1490,7 @@ supported_targets! {
     ("mips64el-unknown-linux-muslabi64", mips64el_unknown_linux_muslabi64),
     ("hexagon-unknown-linux-musl", hexagon_unknown_linux_musl),
     ("hexagon-unknown-none-elf", hexagon_unknown_none_elf),
+    ("hexagon-unknown-qurt", hexagon_unknown_qurt),
 
     ("mips-unknown-linux-uclibc", mips_unknown_linux_uclibc),
     ("mipsel-unknown-linux-uclibc", mipsel_unknown_linux_uclibc),
@@ -2010,6 +1538,12 @@ supported_targets! {
     ("i686-unknown-haiku", i686_unknown_haiku),
     ("x86_64-unknown-haiku", x86_64_unknown_haiku),
 
+    ("aarch64-unknown-helenos", aarch64_unknown_helenos),
+    ("i686-unknown-helenos", i686_unknown_helenos),
+    ("powerpc-unknown-helenos", powerpc_unknown_helenos),
+    ("sparc64-unknown-helenos", sparc64_unknown_helenos),
+    ("x86_64-unknown-helenos", x86_64_unknown_helenos),
+
     ("i686-unknown-hurd-gnu", i686_unknown_hurd_gnu),
     ("x86_64-unknown-hurd-gnu", x86_64_unknown_hurd_gnu),
 
@@ -2029,7 +1563,12 @@ supported_targets! {
 
     ("aarch64-unknown-redox", aarch64_unknown_redox),
     ("i586-unknown-redox", i586_unknown_redox),
+    ("riscv64gc-unknown-redox", riscv64gc_unknown_redox),
     ("x86_64-unknown-redox", x86_64_unknown_redox),
+
+    ("x86_64-unknown-managarm-mlibc", x86_64_unknown_managarm_mlibc),
+    ("aarch64-unknown-managarm-mlibc", aarch64_unknown_managarm_mlibc),
+    ("riscv64gc-unknown-managarm-mlibc", riscv64gc_unknown_managarm_mlibc),
 
     ("i386-apple-ios", i386_apple_ios),
     ("x86_64-apple-ios", x86_64_apple_ios),
@@ -2096,6 +1635,7 @@ supported_targets! {
     ("wasm32v1-none", wasm32v1_none),
     ("wasm32-wasip1", wasm32_wasip1),
     ("wasm32-wasip2", wasm32_wasip2),
+    ("wasm32-wasip3", wasm32_wasip3),
     ("wasm32-wasip1-threads", wasm32_wasip1_threads),
     ("wasm32-wali-linux-musl", wasm32_wali_linux_musl),
     ("wasm64-unknown-unknown", wasm64_unknown_unknown),
@@ -2120,6 +1660,7 @@ supported_targets! {
     ("aarch64-unknown-hermit", aarch64_unknown_hermit),
     ("riscv64gc-unknown-hermit", riscv64gc_unknown_hermit),
     ("x86_64-unknown-hermit", x86_64_unknown_hermit),
+    ("x86_64-unknown-motor", x86_64_unknown_motor),
 
     ("x86_64-unikraft-linux-musl", x86_64_unikraft_linux_musl),
 
@@ -2145,10 +1686,12 @@ supported_targets! {
     ("riscv32imac-unknown-xous-elf", riscv32imac_unknown_xous_elf),
     ("riscv32gc-unknown-linux-gnu", riscv32gc_unknown_linux_gnu),
     ("riscv32gc-unknown-linux-musl", riscv32gc_unknown_linux_musl),
+    ("riscv64im-unknown-none-elf", riscv64im_unknown_none_elf),
     ("riscv64imac-unknown-none-elf", riscv64imac_unknown_none_elf),
     ("riscv64gc-unknown-none-elf", riscv64gc_unknown_none_elf),
     ("riscv64gc-unknown-linux-gnu", riscv64gc_unknown_linux_gnu),
     ("riscv64gc-unknown-linux-musl", riscv64gc_unknown_linux_musl),
+    ("riscv64a23-unknown-linux-gnu", riscv64a23_unknown_linux_gnu),
 
     ("sparc-unknown-none-elf", sparc_unknown_none_elf),
 
@@ -2309,6 +1852,223 @@ enum TargetKind {
     Builtin,
 }
 
+crate::target_spec_enum! {
+    pub enum Arch {
+        AArch64 = "aarch64",
+        AmdGpu = "amdgpu",
+        Arm = "arm",
+        Arm64EC = "arm64ec",
+        Avr = "avr",
+        Bpf = "bpf",
+        CSky = "csky",
+        Hexagon = "hexagon",
+        LoongArch32 = "loongarch32",
+        LoongArch64 = "loongarch64",
+        M68k = "m68k",
+        Mips = "mips",
+        Mips32r6 = "mips32r6",
+        Mips64 = "mips64",
+        Mips64r6 = "mips64r6",
+        Msp430 = "msp430",
+        Nvptx64 = "nvptx64",
+        PowerPC = "powerpc",
+        PowerPC64 = "powerpc64",
+        RiscV32 = "riscv32",
+        RiscV64 = "riscv64",
+        S390x = "s390x",
+        Sparc = "sparc",
+        Sparc64 = "sparc64",
+        SpirV = "spirv",
+        Wasm32 = "wasm32",
+        Wasm64 = "wasm64",
+        X86 = "x86",
+        X86_64 = "x86_64",
+        Xtensa = "xtensa",
+    }
+    other_variant = Other;
+}
+
+impl Arch {
+    pub fn desc_symbol(&self) -> Symbol {
+        match self {
+            Self::AArch64 => sym::aarch64,
+            Self::AmdGpu => sym::amdgpu,
+            Self::Arm => sym::arm,
+            Self::Arm64EC => sym::arm64ec,
+            Self::Avr => sym::avr,
+            Self::Bpf => sym::bpf,
+            Self::CSky => sym::csky,
+            Self::Hexagon => sym::hexagon,
+            Self::LoongArch32 => sym::loongarch32,
+            Self::LoongArch64 => sym::loongarch64,
+            Self::M68k => sym::m68k,
+            Self::Mips => sym::mips,
+            Self::Mips32r6 => sym::mips32r6,
+            Self::Mips64 => sym::mips64,
+            Self::Mips64r6 => sym::mips64r6,
+            Self::Msp430 => sym::msp430,
+            Self::Nvptx64 => sym::nvptx64,
+            Self::PowerPC => sym::powerpc,
+            Self::PowerPC64 => sym::powerpc64,
+            Self::RiscV32 => sym::riscv32,
+            Self::RiscV64 => sym::riscv64,
+            Self::S390x => sym::s390x,
+            Self::Sparc => sym::sparc,
+            Self::Sparc64 => sym::sparc64,
+            Self::SpirV => sym::spirv,
+            Self::Wasm32 => sym::wasm32,
+            Self::Wasm64 => sym::wasm64,
+            Self::X86 => sym::x86,
+            Self::X86_64 => sym::x86_64,
+            Self::Xtensa => sym::xtensa,
+            Self::Other(name) => rustc_span::Symbol::intern(name),
+        }
+    }
+
+    pub fn supports_c_variadic_definitions(&self) -> bool {
+        use Arch::*;
+
+        match self {
+            // These targets just do not support c-variadic definitions.
+            Bpf | SpirV => false,
+
+            // We don't know if the target supports c-variadic definitions, but we don't want
+            // to needlessly restrict custom target.json configurations.
+            Other(_) => true,
+
+            AArch64 | AmdGpu | Arm | Arm64EC | Avr | CSky | Hexagon | LoongArch32 | LoongArch64
+            | M68k | Mips | Mips32r6 | Mips64 | Mips64r6 | Msp430 | Nvptx64 | PowerPC
+            | PowerPC64 | RiscV32 | RiscV64 | S390x | Sparc | Sparc64 | Wasm32 | Wasm64 | X86
+            | X86_64 | Xtensa => true,
+        }
+    }
+}
+
+crate::target_spec_enum! {
+    pub enum Os {
+        Aix = "aix",
+        AmdHsa = "amdhsa",
+        Android = "android",
+        Cuda = "cuda",
+        Cygwin = "cygwin",
+        Dragonfly = "dragonfly",
+        Emscripten = "emscripten",
+        EspIdf = "espidf",
+        FreeBsd = "freebsd",
+        Fuchsia = "fuchsia",
+        Haiku = "haiku",
+        HelenOs = "helenos",
+        Hermit = "hermit",
+        Horizon = "horizon",
+        Hurd = "hurd",
+        Illumos = "illumos",
+        IOs = "ios",
+        L4Re = "l4re",
+        Linux = "linux",
+        LynxOs178 = "lynxos178",
+        MacOs = "macos",
+        Managarm = "managarm",
+        Motor = "motor",
+        NetBsd = "netbsd",
+        None = "none",
+        Nto = "nto",
+        NuttX = "nuttx",
+        OpenBsd = "openbsd",
+        Psp = "psp",
+        Psx = "psx",
+        Qurt = "qurt",
+        Redox = "redox",
+        Rtems = "rtems",
+        Solaris = "solaris",
+        SolidAsp3 = "solid_asp3",
+        TeeOs = "teeos",
+        Trusty = "trusty",
+        TvOs = "tvos",
+        Uefi = "uefi",
+        VexOs = "vexos",
+        VisionOs = "visionos",
+        Vita = "vita",
+        VxWorks = "vxworks",
+        Wasi = "wasi",
+        WatchOs = "watchos",
+        Windows = "windows",
+        Xous = "xous",
+        Zkvm = "zkvm",
+        Unknown = "unknown",
+    }
+    other_variant = Other;
+}
+
+impl Os {
+    pub fn desc_symbol(&self) -> Symbol {
+        Symbol::intern(self.desc())
+    }
+}
+
+crate::target_spec_enum! {
+    pub enum Env {
+        Gnu = "gnu",
+        MacAbi = "macabi",
+        Mlibc = "mlibc",
+        Msvc = "msvc",
+        Musl = "musl",
+        Newlib = "newlib",
+        Nto70 = "nto70",
+        Nto71 = "nto71",
+        Nto71IoSock = "nto71_iosock",
+        Nto80 = "nto80",
+        Ohos = "ohos",
+        Relibc = "relibc",
+        Sgx = "sgx",
+        Sim = "sim",
+        P1 = "p1",
+        P2 = "p2",
+        P3 = "p3",
+        Uclibc = "uclibc",
+        V5 = "v5",
+        Unspecified = "",
+    }
+    other_variant = Other;
+}
+
+impl Env {
+    pub fn desc_symbol(&self) -> Symbol {
+        Symbol::intern(self.desc())
+    }
+}
+
+crate::target_spec_enum! {
+    pub enum Abi {
+        Abi64 = "abi64",
+        AbiV2 = "abiv2",
+        AbiV2Hf = "abiv2hf",
+        Eabi = "eabi",
+        EabiHf = "eabihf",
+        ElfV1 = "elfv1",
+        ElfV2 = "elfv2",
+        Fortanix = "fortanix",
+        Ilp32 = "ilp32",
+        Ilp32e = "ilp32e",
+        Llvm = "llvm",
+        MacAbi = "macabi",
+        Sim = "sim",
+        SoftFloat = "softfloat",
+        Spe = "spe",
+        Uwp = "uwp",
+        VecDefault = "vec-default",
+        VecExtAbi = "vec-extabi",
+        X32 = "x32",
+        Unspecified = "",
+    }
+    other_variant = Other;
+}
+
+impl Abi {
+    pub fn desc_symbol(&self) -> Symbol {
+        Symbol::intern(self.desc())
+    }
+}
+
 /// Everything `rustc` knows about how to compile for a specific target.
 ///
 /// Every field here must be specified, and has no default value.
@@ -2325,10 +2085,10 @@ pub struct Target {
     /// Used for generating target documentation.
     pub metadata: TargetMetadata,
     /// Number of bits in a pointer. Influences the `target_pointer_width` `cfg` variable.
-    pub pointer_width: u32,
+    pub pointer_width: u16,
     /// Architecture to use for ABI considerations. Valid options include: "x86",
     /// "x86_64", "arm", "aarch64", "mips", "powerpc", "powerpc64", and others.
-    pub arch: StaticCow<str>,
+    pub arch: Arch,
     /// [Data layout](https://llvm.org/docs/LangRef.html#data-layout) to pass to LLVM.
     pub data_layout: StaticCow<str>,
     /// Optional settings with defaults.
@@ -2421,25 +2181,29 @@ type StaticCow<T> = Cow<'static, T>;
 /// construction, all its fields logically belong to `Target` and available from `Target`
 /// through `Deref` impls.
 #[derive(PartialEq, Clone, Debug)]
+#[rustc_lint_opt_ty]
 pub struct TargetOptions {
     /// Used as the `target_endian` `cfg` variable. Defaults to little endian.
     pub endian: Endian,
     /// Width of c_int type. Defaults to "32".
     pub c_int_width: u16,
-    /// OS name to use for conditional compilation (`target_os`). Defaults to "none".
-    /// "none" implies a bare metal target without `std` library.
-    /// A couple of targets having `std` also use "unknown" as an `os` value,
+    /// OS name to use for conditional compilation (`target_os`). Defaults to [`Os::None`].
+    /// [`Os::None`] implies a bare metal target without `std` library.
+    /// A couple of targets having `std` also use [`Os::Unknown`] as their `os` value,
     /// but they are exceptions.
-    pub os: StaticCow<str>,
-    /// Environment name to use for conditional compilation (`target_env`). Defaults to "".
-    pub env: StaticCow<str>,
+    pub os: Os,
+    /// Environment name to use for conditional compilation (`target_env`). Defaults to [`Env::Unspecified`].
+    pub env: Env,
     /// ABI name to distinguish multiple ABIs on the same OS and architecture. For instance, `"eabi"`
-    /// or `"eabihf"`. Defaults to "".
+    /// or `"eabihf"`. Defaults to [`Abi::Unspecified`].
     /// This field is *not* forwarded directly to LLVM; its primary purpose is `cfg(target_abi)`.
     /// However, parts of the backend do check this field for specific values to enable special behavior.
-    pub abi: StaticCow<str>,
+    pub abi: Abi,
     /// Vendor name to use for conditional compilation (`target_vendor`). Defaults to "unknown".
-    pub vendor: StaticCow<str>,
+    #[rustc_lint_opt_deny_field_access(
+        "use `Target::is_like_*` instead of this field; see https://github.com/rust-lang/rust/issues/100343 for rationale"
+    )]
+    vendor: StaticCow<str>,
 
     /// Linker to invoke
     pub linker: Option<StaticCow<str>>,
@@ -2499,10 +2263,10 @@ pub struct TargetOptions {
     /// Whether a cpu needs to be explicitly set.
     /// Set to true if there is no default cpu. Defaults to false.
     pub need_explicit_cpu: bool,
-    /// Default target features to pass to LLVM. These features overwrite
-    /// `-Ctarget-cpu` but can be overwritten with `-Ctarget-features`.
-    /// Corresponds to `llc -mattr=$features`.
-    /// Note that these are LLVM feature names, not Rust feature names!
+    /// Default (Rust) target features to enable for this target. These features
+    /// overwrite `-Ctarget-cpu` but can be overwritten with `-Ctarget-features`.
+    /// Corresponds to `llc -mattr=$llvm_features` where `$llvm_features` is the
+    /// result of mapping the Rust features in this field to LLVM features.
     ///
     /// Generally it is a bad idea to use negative target features because they often interact very
     /// poorly with how `-Ctarget-cpu` works. Instead, try to use a lower "base CPU" and enable the
@@ -2559,6 +2323,8 @@ pub struct TargetOptions {
     /// Also indicates whether to use Apple-specific ABI changes, such as extending function
     /// parameters to 32-bits.
     pub is_like_darwin: bool,
+    /// Whether the target is a GPU (e.g. NVIDIA, AMD, Intel).
+    pub is_like_gpu: bool,
     /// Whether the target toolchain is like Solaris's.
     /// Only useful for compiling against Illumos/Solaris,
     /// as they have a different set of linker flags. Defaults to false.
@@ -2626,6 +2392,9 @@ pub struct TargetOptions {
     pub archive_format: StaticCow<str>,
     /// Is asm!() allowed? Defaults to true.
     pub allow_asm: bool,
+    /// Static initializers must be acyclic.
+    /// Defaults to false
+    pub static_initializer_must_be_acyclic: bool,
     /// Whether the runtime startup code requires the `main` function be passed
     /// `argc` and `argv` values.
     pub main_needs_argc_argv: bool,
@@ -2789,6 +2558,13 @@ pub struct TargetOptions {
     /// distributed with the target, the sanitizer should still appear in this list for the target.
     pub supported_sanitizers: SanitizerSet,
 
+    /// The sanitizers that are enabled by default on this target.
+    ///
+    /// Note that the support here is at a codegen level. If the machine code with sanitizer
+    /// enabled can generated on this target, but the necessary supporting libraries are not
+    /// distributed with the target, the sanitizer should still appear in this list for the target.
+    pub default_sanitizers: SanitizerSet,
+
     /// Minimum number of bits in #[repr(C)] enum. Defaults to the size of c_int
     pub c_enum_min_bits: Option<u64>,
 
@@ -2859,6 +2635,10 @@ impl TargetOptions {
         // XCOFF and MachO don't support COMDAT.
         !self.is_like_aix && !self.is_like_darwin
     }
+
+    pub fn uses_pdb_debuginfo(&self) -> bool {
+        self.debuginfo_kind == DebuginfoKind::Pdb
+    }
 }
 
 impl TargetOptions {
@@ -2928,9 +2708,9 @@ impl Default for TargetOptions {
         TargetOptions {
             endian: Endian::Little,
             c_int_width: 32,
-            os: "none".into(),
-            env: "".into(),
-            abi: "".into(),
+            os: Os::None,
+            env: Env::Unspecified,
+            abi: Abi::Unspecified,
             vendor: "unknown".into(),
             linker: option_env!("CFG_DEFAULT_LINKER").map(|s| s.into()),
             linker_flavor: LinkerFlavor::Gnu(Cc::Yes, Lld::No),
@@ -2962,6 +2742,7 @@ impl Default for TargetOptions {
             abi_return_struct_as_int: false,
             is_like_aix: false,
             is_like_darwin: false,
+            is_like_gpu: false,
             is_like_solaris: false,
             is_like_windows: false,
             is_like_msvc: false,
@@ -2997,6 +2778,7 @@ impl Default for TargetOptions {
             archive_format: "gnu".into(),
             main_needs_argc_argv: true,
             allow_asm: true,
+            static_initializer_must_be_acyclic: false,
             has_thread_local: false,
             obj_is_bitcode: false,
             min_atomic_width: None,
@@ -3037,6 +2819,7 @@ impl Default for TargetOptions {
             // `Off` is supported by default, but targets can remove this manually, e.g. Windows.
             supported_split_debuginfo: Cow::Borrowed(&[SplitDebuginfo::Off]),
             supported_sanitizers: SanitizerSet::empty(),
+            default_sanitizers: SanitizerSet::empty(),
             c_enum_min_bits: None,
             generate_arange_section: true,
             supports_stack_protector: true,
@@ -3124,23 +2907,28 @@ impl Target {
         );
         check_eq!(
             self.is_like_solaris,
-            self.os == "solaris" || self.os == "illumos",
+            matches!(self.os, Os::Solaris | Os::Illumos),
             "`is_like_solaris` must be set if and only if `os` is `solaris` or `illumos`"
         );
         check_eq!(
+            self.is_like_gpu,
+            self.arch == Arch::Nvptx64 || self.arch == Arch::AmdGpu,
+            "`is_like_gpu` must be set if and only if `target` is `nvptx64` or `amdgcn`"
+        );
+        check_eq!(
             self.is_like_windows,
-            self.os == "windows" || self.os == "uefi" || self.os == "cygwin",
+            matches!(self.os, Os::Windows | Os::Uefi | Os::Cygwin),
             "`is_like_windows` must be set if and only if `os` is `windows`, `uefi` or `cygwin`"
         );
         check_eq!(
             self.is_like_wasm,
-            self.arch == "wasm32" || self.arch == "wasm64",
+            matches!(self.arch, Arch::Wasm32 | Arch::Wasm64),
             "`is_like_wasm` must be set if and only if `arch` is `wasm32` or `wasm64`"
         );
         if self.is_like_msvc {
             check!(self.is_like_windows, "if `is_like_msvc` is set, `is_like_windows` must be set");
         }
-        if self.os == "emscripten" {
+        if self.os == Os::Emscripten {
             check!(self.is_like_wasm, "the `emcscripten` os only makes sense on wasm-like targets");
         }
 
@@ -3156,24 +2944,19 @@ impl Target {
             "`linker_flavor` must be `msvc` if and only if `is_like_msvc` is set"
         );
         check_eq!(
-            self.is_like_wasm && self.os != "emscripten",
+            self.is_like_wasm && self.os != Os::Emscripten,
             matches!(self.linker_flavor, LinkerFlavor::WasmLld(..)),
             "`linker_flavor` must be `wasm-lld` if and only if `is_like_wasm` is set and the `os` is not `emscripten`",
         );
         check_eq!(
-            self.os == "emscripten",
+            self.os == Os::Emscripten,
             matches!(self.linker_flavor, LinkerFlavor::EmCc),
             "`linker_flavor` must be `em-cc` if and only if `os` is `emscripten`"
         );
         check_eq!(
-            self.arch == "bpf",
+            self.arch == Arch::Bpf,
             matches!(self.linker_flavor, LinkerFlavor::Bpf),
             "`linker_flavor` must be `bpf` if and only if `arch` is `bpf`"
-        );
-        check_eq!(
-            self.arch == "nvptx64",
-            matches!(self.linker_flavor, LinkerFlavor::Ptx),
-            "`linker_flavor` must be `ptc` if and only if `arch` is `nvptx64`"
         );
 
         for args in [
@@ -3185,7 +2968,7 @@ impl Target {
         ] {
             for (&flavor, flavor_args) in args {
                 check!(
-                    !flavor_args.is_empty() || self.arch == "avr",
+                    !flavor_args.is_empty() || self.arch == Arch::Avr,
                     "linker flavor args must not be empty"
                 );
                 // Check that flavors mentioned in link args are compatible with the default flavor.
@@ -3288,12 +3071,14 @@ impl Target {
         // except it and document the reasons.
         // Keep the default "unknown" vendor instead.
         check_ne!(self.vendor, "", "`vendor` cannot be empty");
-        check_ne!(self.os, "", "`os` cannot be empty");
+        if let Os::Other(s) = &self.os {
+            check!(!s.is_empty(), "`os` cannot be empty");
+        }
         if !self.can_use_os_unknown() {
             // Keep the default "none" for bare metal targets instead.
             check_ne!(
                 self.os,
-                "unknown",
+                Os::Unknown,
                 "`unknown` os can only be used on particular targets; use `none` for bare-metal targets"
             );
         }
@@ -3307,11 +3092,8 @@ impl Target {
             // BPF: when targeting user space vms (like rbpf), those can load dynamic libraries.
             // hexagon: when targeting QuRT, that OS can load dynamic libraries.
             // wasm{32,64}: dynamic linking is inherent in the definition of the VM.
-            if self.os == "none"
-                && (self.arch != "bpf"
-                    && self.arch != "hexagon"
-                    && self.arch != "wasm32"
-                    && self.arch != "wasm64")
+            if self.os == Os::None
+                && !matches!(self.arch, Arch::Bpf | Arch::Hexagon | Arch::Wasm32 | Arch::Wasm64)
             {
                 check!(
                     !self.dynamic_linking,
@@ -3343,7 +3125,7 @@ impl Target {
                 );
             }
             // The UEFI targets do not support dynamic linking but still require PIC (#101377).
-            if self.relocation_model == RelocModel::Pic && (self.os != "uefi") {
+            if self.relocation_model == RelocModel::Pic && self.os != Os::Uefi {
                 check!(
                     self.dynamic_linking || self.position_independent_executables,
                     "when the relocation model is `pic`, the target must support dynamic linking or use position-independent executables. \
@@ -3374,8 +3156,8 @@ impl Target {
 
         // Check that RISC-V targets always specify which ABI they use,
         // and that ARM targets specify their float ABI.
-        match &*self.arch {
-            "riscv32" => {
+        match self.arch {
+            Arch::RiscV32 => {
                 check_matches!(
                     &*self.llvm_abiname,
                     "ilp32" | "ilp32f" | "ilp32d" | "ilp32e",
@@ -3383,7 +3165,7 @@ impl Target {
                     self.llvm_abiname,
                 );
             }
-            "riscv64" => {
+            Arch::RiscV64 => {
                 // Note that the `lp64e` is still unstable as it's not (yet) part of the ELF psABI.
                 check_matches!(
                     &*self.llvm_abiname,
@@ -3392,7 +3174,7 @@ impl Target {
                     self.llvm_abiname,
                 );
             }
-            "arm" => {
+            Arch::Arm => {
                 check!(
                     self.llvm_floatabi.is_some(),
                     "ARM targets must set `llvm-floatabi` to `hard` or `soft`",
@@ -3405,13 +3187,13 @@ impl Target {
         if let Some(rust_abi) = self.rustc_abi {
             match rust_abi {
                 RustcAbi::X86Sse2 => check_matches!(
-                    &*self.arch,
-                    "x86",
+                    self.arch,
+                    Arch::X86,
                     "`x86-sse2` ABI is only valid for x86-32 targets"
                 ),
                 RustcAbi::X86Softfloat => check_matches!(
-                    &*self.arch,
-                    "x86" | "x86_64",
+                    self.arch,
+                    Arch::X86 | Arch::X86_64,
                     "`x86-softfloat` ABI is only valid for x86 targets"
                 ),
             }
@@ -3482,7 +3264,7 @@ impl Target {
     fn can_use_os_unknown(&self) -> bool {
         self.llvm_target == "wasm32-unknown-unknown"
             || self.llvm_target == "wasm64-unknown-unknown"
-            || (self.env == "sgx" && self.vendor == "fortanix")
+            || (self.env == Env::Sgx && self.vendor == "fortanix")
     }
 
     /// Load a built-in target
@@ -3514,10 +3296,19 @@ impl Target {
     pub fn search(
         target_tuple: &TargetTuple,
         sysroot: &Path,
+        unstable_options: bool,
     ) -> Result<(Target, TargetWarnings), String> {
         use std::{env, fs};
 
-        fn load_file(path: &Path) -> Result<(Target, TargetWarnings), String> {
+        fn load_file(
+            path: &Path,
+            unstable_options: bool,
+        ) -> Result<(Target, TargetWarnings), String> {
+            if !unstable_options {
+                return Err(
+                    "custom targets are unstable and require `-Zunstable-options`".to_string()
+                );
+            }
             let contents = fs::read_to_string(path).map_err(|e| e.to_string())?;
             Target::from_json(&contents)
         }
@@ -3541,7 +3332,7 @@ impl Target {
                 for dir in env::split_paths(&target_path) {
                     let p = dir.join(&path);
                     if p.is_file() {
-                        return load_file(&p);
+                        return load_file(&p, unstable_options);
                     }
                 }
 
@@ -3554,18 +3345,10 @@ impl Target {
                     Path::new("target.json"),
                 ]);
                 if p.is_file() {
-                    return load_file(&p);
+                    return load_file(&p, unstable_options);
                 }
 
-                // Leave in a specialized error message for the removed target.
-                // FIXME: If you see this and it's been a few months after this has been released,
-                // you can probably remove it.
-                if target_tuple == "i586-pc-windows-msvc" {
-                    Err("the `i586-pc-windows-msvc` target has been removed. Use the `i686-pc-windows-msvc` target instead.\n\
-                        Windows 10 (the minimum required OS version) requires a CPU baseline of at least i686 so you can safely switch".into())
-                } else {
-                    Err(format!("could not find specification for target {target_tuple:?}"))
-                }
+                Err(format!("could not find specification for target {target_tuple:?}"))
             }
             TargetTuple::TargetJson { ref contents, .. } => Target::from_json(contents),
         }
@@ -3578,15 +3361,15 @@ impl Target {
             // Avoid having to duplicate the small data support in every
             // target file by supporting a default value for each
             // architecture.
-            SmallDataThresholdSupport::DefaultForArch => match self.arch.as_ref() {
-                "mips" | "mips64" | "mips32r6" => {
+            SmallDataThresholdSupport::DefaultForArch => match self.arch {
+                Arch::Mips | Arch::Mips64 | Arch::Mips32r6 => {
                     SmallDataThresholdSupport::LlvmArg("mips-ssection-threshold".into())
                 }
-                "hexagon" => {
+                Arch::Hexagon => {
                     SmallDataThresholdSupport::LlvmArg("hexagon-small-data-threshold".into())
                 }
-                "m68k" => SmallDataThresholdSupport::LlvmArg("m68k-ssection-threshold".into()),
-                "riscv32" | "riscv64" => {
+                Arch::M68k => SmallDataThresholdSupport::LlvmArg("m68k-ssection-threshold".into()),
+                Arch::RiscV32 | Arch::RiscV64 => {
                     SmallDataThresholdSupport::LlvmModuleFlag("SmallDataLimit".into())
                 }
                 _ => SmallDataThresholdSupport::None,
@@ -3600,9 +3383,9 @@ impl Target {
         unstable_target_features: &FxIndexSet<Symbol>,
     ) -> Option<(object::Architecture, Option<object::SubArchitecture>)> {
         use object::Architecture;
-        Some(match self.arch.as_ref() {
-            "arm" => (Architecture::Arm, None),
-            "aarch64" => (
+        Some(match self.arch {
+            Arch::Arm => (Architecture::Arm, None),
+            Arch::AArch64 => (
                 if self.pointer_width == 32 {
                     Architecture::Aarch64_Ilp32
                 } else {
@@ -3610,11 +3393,11 @@ impl Target {
                 },
                 None,
             ),
-            "x86" => (Architecture::I386, None),
-            "s390x" => (Architecture::S390x, None),
-            "m68k" => (Architecture::M68k, None),
-            "mips" | "mips32r6" => (Architecture::Mips, None),
-            "mips64" | "mips64r6" => (
+            Arch::X86 => (Architecture::I386, None),
+            Arch::S390x => (Architecture::S390x, None),
+            Arch::M68k => (Architecture::M68k, None),
+            Arch::Mips | Arch::Mips32r6 => (Architecture::Mips, None),
+            Arch::Mips64 | Arch::Mips64r6 => (
                 // While there are currently no builtin targets
                 // using the N32 ABI, it is possible to specify
                 // it using a custom target specification. N32
@@ -3627,7 +3410,7 @@ impl Target {
                 },
                 None,
             ),
-            "x86_64" => (
+            Arch::X86_64 => (
                 if self.pointer_width == 32 {
                     Architecture::X86_64_X32
                 } else {
@@ -3635,11 +3418,11 @@ impl Target {
                 },
                 None,
             ),
-            "powerpc" => (Architecture::PowerPc, None),
-            "powerpc64" => (Architecture::PowerPc64, None),
-            "riscv32" => (Architecture::Riscv32, None),
-            "riscv64" => (Architecture::Riscv64, None),
-            "sparc" => {
+            Arch::PowerPC => (Architecture::PowerPc, None),
+            Arch::PowerPC64 => (Architecture::PowerPc64, None),
+            Arch::RiscV32 => (Architecture::Riscv32, None),
+            Arch::RiscV64 => (Architecture::Riscv64, None),
+            Arch::Sparc => {
                 if unstable_target_features.contains(&sym::v8plus) {
                     // Target uses V8+, aka EM_SPARC32PLUS, aka 64-bit V9 but in 32-bit mode
                     (Architecture::Sparc32Plus, None)
@@ -3648,17 +3431,22 @@ impl Target {
                     (Architecture::Sparc, None)
                 }
             }
-            "sparc64" => (Architecture::Sparc64, None),
-            "avr" => (Architecture::Avr, None),
-            "msp430" => (Architecture::Msp430, None),
-            "hexagon" => (Architecture::Hexagon, None),
-            "bpf" => (Architecture::Bpf, None),
-            "loongarch32" => (Architecture::LoongArch32, None),
-            "loongarch64" => (Architecture::LoongArch64, None),
-            "csky" => (Architecture::Csky, None),
-            "arm64ec" => (Architecture::Aarch64, Some(object::SubArchitecture::Arm64EC)),
-            // Unsupported architecture.
-            _ => return None,
+            Arch::Sparc64 => (Architecture::Sparc64, None),
+            Arch::Avr => (Architecture::Avr, None),
+            Arch::Msp430 => (Architecture::Msp430, None),
+            Arch::Hexagon => (Architecture::Hexagon, None),
+            Arch::Xtensa => (Architecture::Xtensa, None),
+            Arch::Bpf => (Architecture::Bpf, None),
+            Arch::LoongArch32 => (Architecture::LoongArch32, None),
+            Arch::LoongArch64 => (Architecture::LoongArch64, None),
+            Arch::CSky => (Architecture::Csky, None),
+            Arch::Arm64EC => (Architecture::Aarch64, Some(object::SubArchitecture::Arm64EC)),
+            Arch::AmdGpu
+            | Arch::Nvptx64
+            | Arch::SpirV
+            | Arch::Wasm32
+            | Arch::Wasm64
+            | Arch::Other(_) => return None,
         })
     }
 
@@ -3674,11 +3462,15 @@ impl Target {
         // FIXME(#112480) MSVC on x86-32 is unsound and fails to properly align many types with
         // more-than-4-byte-alignment on the stack. This makes alignments larger than 4 generally
         // unreliable on 32bit Windows.
-        if self.is_like_windows && self.arch == "x86" {
+        if self.is_like_windows && self.arch == Arch::X86 {
             Align::from_bytes(4).unwrap()
         } else {
             Align::MAX
         }
+    }
+
+    pub fn vendor_symbol(&self) -> Symbol {
+        Symbol::intern(&self.vendor)
     }
 }
 

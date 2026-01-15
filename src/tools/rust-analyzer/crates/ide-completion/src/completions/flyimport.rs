@@ -257,7 +257,7 @@ fn import_on_the_fly(
     };
     let user_input_lowercased = potential_import_name.to_lowercase();
 
-    let import_cfg = ctx.config.import_path_config(ctx.is_nightly);
+    let import_cfg = ctx.config.import_path_config();
 
     import_assets
         .search_for_imports(&ctx.sema, import_cfg, ctx.config.insert_use.prefix_kind)
@@ -266,7 +266,7 @@ fn import_on_the_fly(
             let original_item = &import.original_item;
             !ctx.is_item_hidden(&import.item_to_import)
                 && !ctx.is_item_hidden(original_item)
-                && ctx.check_stability(original_item.attrs(ctx.db).as_deref())
+                && ctx.check_stability(original_item.attrs(ctx.db).as_ref())
         })
         .filter(|import| filter_excluded_flyimport(ctx, import))
         .sorted_by(|a, b| {
@@ -304,7 +304,7 @@ fn import_on_the_fly_pat_(
         ItemInNs::Values(def) => matches!(def, hir::ModuleDef::Const(_)),
     };
     let user_input_lowercased = potential_import_name.to_lowercase();
-    let cfg = ctx.config.import_path_config(ctx.is_nightly);
+    let cfg = ctx.config.import_path_config();
 
     import_assets
         .search_for_imports(&ctx.sema, cfg, ctx.config.insert_use.prefix_kind)
@@ -313,7 +313,7 @@ fn import_on_the_fly_pat_(
             let original_item = &import.original_item;
             !ctx.is_item_hidden(&import.item_to_import)
                 && !ctx.is_item_hidden(original_item)
-                && ctx.check_stability(original_item.attrs(ctx.db).as_deref())
+                && ctx.check_stability(original_item.attrs(ctx.db).as_ref())
         })
         .sorted_by(|a, b| {
             let key = |import_path| {
@@ -346,7 +346,7 @@ fn import_on_the_fly_method(
 
     let user_input_lowercased = potential_import_name.to_lowercase();
 
-    let cfg = ctx.config.import_path_config(ctx.is_nightly);
+    let cfg = ctx.config.import_path_config();
 
     import_assets
         .search_for_imports(&ctx.sema, cfg, ctx.config.insert_use.prefix_kind)

@@ -94,7 +94,7 @@ fn discover_tests_in_module(
         if !f.is_test(db) {
             continue;
         }
-        let nav = f.try_to_nav(db).map(|r| r.call_site);
+        let nav = f.try_to_nav(&sema).map(|r| r.call_site);
         let fn_name = f.name(db).as_str().to_owned();
         r.push(TestItem {
             id: format!("{prefix_id}::{fn_name}"),
@@ -135,11 +135,11 @@ fn find_module_id_and_test_parents(
     module: Module,
 ) -> Option<(Vec<TestItem>, String)> {
     let Some(parent) = module.parent(sema.db) else {
-        let name = module.krate().display_name(sema.db)?.to_string();
+        let name = module.krate(sema.db).display_name(sema.db)?.to_string();
         return Some((
             vec![TestItem {
                 id: name.clone(),
-                kind: TestItemKind::Crate(module.krate().into()),
+                kind: TestItemKind::Crate(module.krate(sema.db).into()),
                 label: name.clone(),
                 parent: None,
                 file: None,
@@ -181,7 +181,7 @@ pub(crate) fn discover_tests_in_crate(
     let kind = TestItemKind::Crate(crate_id);
     let crate_test_id = crate_test_id.to_string();
     let crate_id: Crate = crate_id.into();
-    let module = crate_id.root_module();
+    let module = crate_id.root_module(db);
     let mut r = vec![TestItem {
         id: crate_test_id.clone(),
         kind,

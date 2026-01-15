@@ -1,6 +1,6 @@
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::mir;
-use rustc_middle::mir::interpret::{AllocInit, Allocation, InterpResult, Pointer};
+use rustc_middle::mir::interpret::{AllocInit, Allocation, GlobalAlloc, InterpResult, Pointer};
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{TyCtxt, TypeVisitable, TypeVisitableExt};
 use tracing::debug;
@@ -38,7 +38,14 @@ pub(crate) fn create_static_alloc<'tcx>(
     static_def_id: LocalDefId,
     layout: TyAndLayout<'tcx>,
 ) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
-    let alloc = Allocation::try_new(layout.size, layout.align.abi, AllocInit::Uninit, ())?;
+    // Inherit size and align from the `GlobalAlloc::Static` so we can avoid duplicating
+    // the alignment attribute logic.
+    let (size, align) =
+        GlobalAlloc::Static(static_def_id.into()).size_and_align(*ecx.tcx, ecx.typing_env);
+    assert_eq!(size, layout.size);
+    assert!(align >= layout.align.abi);
+
+    let alloc = Allocation::try_new(size, align, AllocInit::Uninit, ())?;
     let alloc_id = ecx.tcx.reserve_and_set_static_alloc(static_def_id.into());
     assert_eq!(ecx.machine.static_root_ids, None);
     ecx.machine.static_root_ids = Some((alloc_id, static_def_id));
@@ -67,7 +74,7 @@ impl EnteredTraceSpan for tracing::span::EnteredSpan {
     }
 }
 
-/// Shortand for calling [crate::interpret::Machine::enter_trace_span] on a [tracing::info_span!].
+/// Shorthand for calling [crate::interpret::Machine::enter_trace_span] on a [tracing::info_span!].
 /// This is supposed to be compiled out when [crate::interpret::Machine::enter_trace_span] has the
 /// default implementation (i.e. when it does not actually enter the span but instead returns `()`).
 /// This macro takes a type implementing the [crate::interpret::Machine] trait as its first argument
@@ -114,7 +121,7 @@ impl EnteredTraceSpan for tracing::span::EnteredSpan {
 /// ### `tracing_separate_thread` parameter
 ///
 /// This macro was introduced to obtain better traces of Miri without impacting release performance.
-/// Miri saves traces using the the `tracing_chrome` `tracing::Layer` so that they can be visualized
+/// Miri saves traces using the `tracing_chrome` `tracing::Layer` so that they can be visualized
 /// in <https://ui.perfetto.dev>. To instruct `tracing_chrome` to put some spans on a separate trace
 /// thread/line than other spans when viewed in <https://ui.perfetto.dev>, you can pass
 /// `tracing_separate_thread = tracing::field::Empty` to the tracing macros. This is useful to

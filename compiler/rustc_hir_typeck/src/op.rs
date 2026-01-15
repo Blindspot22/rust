@@ -20,7 +20,8 @@ use {rustc_ast as ast, rustc_hir as hir};
 
 use super::FnCtxt;
 use super::method::MethodCallee;
-use crate::Expectation;
+use crate::method::TreatNotYetDefinedOpaques;
+use crate::{Expectation, errors};
 
 impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// Checks a `a <op>= b`
@@ -307,23 +308,32 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 let mut path = None;
                 let lhs_ty_str = self.tcx.short_string(lhs_ty, &mut path);
                 let rhs_ty_str = self.tcx.short_string(rhs_ty, &mut path);
+
                 let (mut err, output_def_id) = match op {
+                    // Try and detect when `+=` was incorrectly
+                    // used instead of `==` in a let-chain
                     Op::AssignOp(assign_op) => {
-                        let s = assign_op.node.as_str();
-                        let mut err = struct_span_code_err!(
-                            self.dcx(),
-                            expr.span,
-                            E0368,
-                            "binary assignment operation `{}` cannot be applied to type `{}`",
-                            s,
-                            lhs_ty_str,
-                        );
-                        err.span_label(
-                            lhs_expr.span,
-                            format!("cannot use `{}` on type `{}`", s, lhs_ty_str),
-                        );
-                        self.note_unmet_impls_on_type(&mut err, &errors, false);
-                        (err, None)
+                        if let Err(e) =
+                            errors::maybe_emit_plus_equals_diagnostic(&self, assign_op, lhs_expr)
+                        {
+                            (e, None)
+                        } else {
+                            let s = assign_op.node.as_str();
+                            let mut err = struct_span_code_err!(
+                                self.dcx(),
+                                expr.span,
+                                E0368,
+                                "binary assignment operation `{}` cannot be applied to type `{}`",
+                                s,
+                                lhs_ty_str,
+                            );
+                            err.span_label(
+                                lhs_expr.span,
+                                format!("cannot use `{}` on type `{}`", s, lhs_ty_str),
+                            );
+                            self.note_unmet_impls_on_type(&mut err, &errors, false);
+                            (err, None)
+                        }
                     }
                     Op::BinOp(bin_op) => {
                         let message = match bin_op.node {
@@ -565,7 +575,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     rhs_ty,
                     lhs_expr,
                     lhs_ty,
-                    |lhs_ty, rhs_ty| is_compatible_after_call(lhs_ty, rhs_ty),
+                    is_compatible_after_call,
                 ) {
                     // Cool
                 }
@@ -962,18 +972,30 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let (opt_rhs_expr, opt_rhs_ty) = opt_rhs.unzip();
         let cause = self.cause(
             span,
-            ObligationCauseCode::BinOp {
-                lhs_hir_id: lhs_expr.hir_id,
-                rhs_hir_id: opt_rhs_expr.map(|expr| expr.hir_id),
-                rhs_span: opt_rhs_expr.map(|expr| expr.span),
-                rhs_is_lit: opt_rhs_expr
-                    .is_some_and(|expr| matches!(expr.kind, hir::ExprKind::Lit(_))),
-                output_ty: expected.only_has_type(self),
+            match opt_rhs_expr {
+                Some(rhs) => ObligationCauseCode::BinOp {
+                    lhs_hir_id: lhs_expr.hir_id,
+                    rhs_hir_id: rhs.hir_id,
+                    rhs_span: rhs.span,
+                    rhs_is_lit: matches!(rhs.kind, hir::ExprKind::Lit(_)),
+                    output_ty: expected.only_has_type(self),
+                },
+                None => ObligationCauseCode::UnOp { hir_id: lhs_expr.hir_id },
             },
         );
 
-        let method =
-            self.lookup_method_for_operator(cause.clone(), opname, trait_did, lhs_ty, opt_rhs_ty);
+        // We don't consider any other candidates if this lookup fails
+        // so we can freely treat opaque types as inference variables here
+        // to allow more code to compile.
+        let treat_opaques = TreatNotYetDefinedOpaques::AsInfer;
+        let method = self.lookup_method_for_operator(
+            cause.clone(),
+            opname,
+            trait_did,
+            lhs_ty,
+            opt_rhs_ty,
+            treat_opaques,
+        );
         match method {
             Some(ok) => {
                 let method = self.register_infer_ok_obligations(ok);
@@ -1017,7 +1039,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 );
                 let ocx = ObligationCtxt::new_with_diagnostics(&self.infcx);
                 ocx.register_obligation(obligation);
-                Err(ocx.select_all_or_error())
+                Err(ocx.evaluate_obligations_error_on_ambiguity())
             }
         }
     }
@@ -1068,6 +1090,17 @@ fn lang_item_for_unop(tcx: TyCtxt<'_>, op: hir::UnOp) -> (Symbol, Option<hir::de
         hir::UnOp::Not => (sym::not, lang.not_trait()),
         hir::UnOp::Neg => (sym::neg, lang.neg_trait()),
         hir::UnOp::Deref => bug!("Deref is not overloadable"),
+    }
+}
+
+/// Check if `expr` contains a `let` or `&&`, indicating presence of a let-chain
+pub(crate) fn contains_let_in_chain(expr: &hir::Expr<'_>) -> bool {
+    match &expr.kind {
+        hir::ExprKind::Let(..) => true,
+        hir::ExprKind::Binary(Spanned { node: hir::BinOpKind::And, .. }, left, right) => {
+            contains_let_in_chain(left) || contains_let_in_chain(right)
+        }
+        _ => false,
     }
 }
 
@@ -1157,8 +1190,8 @@ fn deref_ty_if_possible(ty: Ty<'_>) -> Ty<'_> {
     }
 }
 
-/// Returns `true` if this is a built-in arithmetic operation (e.g., u32
-/// + u32, i16x4 == i16x4) and false if these types would have to be
+/// Returns `true` if this is a built-in arithmetic operation (e.g.,
+/// u32 + u32, i16x4 == i16x4) and false if these types would have to be
 /// overloaded to be legal. There are two reasons that we distinguish
 /// builtin operations from overloaded ones (vs trying to drive
 /// everything uniformly through the trait system and intrinsics or
@@ -1178,7 +1211,7 @@ fn is_builtin_binop<'tcx>(lhs: Ty<'tcx>, rhs: Ty<'tcx>, category: BinOpCategory)
     // (See https://github.com/rust-lang/rust/issues/57447.)
     let (lhs, rhs) = (deref_ty_if_possible(lhs), deref_ty_if_possible(rhs));
 
-    match category.into() {
+    match category {
         BinOpCategory::Shortcircuit => true,
         BinOpCategory::Shift => {
             lhs.references_error()

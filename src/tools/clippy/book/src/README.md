@@ -1,15 +1,11 @@
 # Clippy
 
-[### IMPORTANT NOTE FOR CONTRIBUTORS ================](development/feature_freeze.md)
-
-----
-
 [![License: MIT OR Apache-2.0](https://img.shields.io/crates/l/clippy.svg)](https://github.com/rust-lang/rust-clippy#license)
 
 A collection of lints to catch common mistakes and improve your
 [Rust](https://github.com/rust-lang/rust) code.
 
-[There are over 750 lints included in this crate!](https://rust-lang.github.io/rust-clippy/master/index.html)
+[There are over 800 lints included in this crate!](https://rust-lang.github.io/rust-clippy/master/index.html)
 
 Lints are divided into categories, each with a default [lint
 level](https://doc.rust-lang.org/rustc/lints/levels.html). You can choose how

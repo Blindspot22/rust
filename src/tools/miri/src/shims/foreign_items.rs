@@ -2,9 +2,9 @@ use std::collections::hash_map::Entry;
 use std::io::Write;
 use std::path::Path;
 
-use rustc_abi::{Align, AlignFromBytesError, CanonAbi, Size};
-use rustc_apfloat::Float;
-use rustc_ast::expand::allocator::alloc_error_handler_name;
+use rustc_abi::{Align, CanonAbi, Size};
+use rustc_ast::expand::allocator::NO_ALLOC_SHIM_IS_UNSTABLE;
+use rustc_data_structures::either::Either;
 use rustc_hir::attrs::Linkage;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::CrateNum;
@@ -14,10 +14,12 @@ use rustc_middle::ty::{Instance, Ty};
 use rustc_middle::{mir, ty};
 use rustc_span::Symbol;
 use rustc_target::callconv::FnAbi;
+use rustc_target::spec::{Arch, Os};
 
-use self::helpers::{ToHost, ToSoft};
 use super::alloc::EvalContextExt as _;
 use super::backtrace::EvalContextExt as _;
+use crate::concurrency::GenmcEvalContextExt as _;
+use crate::helpers::EvalContextExt as _;
 use crate::*;
 
 /// Type of dynamic symbols (for `dlsym` et al)
@@ -50,24 +52,21 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     ) -> InterpResult<'tcx, Option<(&'tcx mir::Body<'tcx>, ty::Instance<'tcx>)>> {
         let this = self.eval_context_mut();
 
-        // Some shims forward to other MIR bodies.
-        match link_name.as_str() {
-            name if name == this.mangle_internal_symbol("__rust_alloc_error_handler") => {
-                // Forward to the right symbol that implements this function.
-                let Some(handler_kind) = this.tcx.alloc_error_handler_kind(()) else {
-                    // in real code, this symbol does not exist without an allocator
-                    throw_unsup_format!(
-                        "`__rust_alloc_error_handler` cannot be called when no alloc error handler is set"
-                    );
-                };
-                let name = Symbol::intern(
-                    this.mangle_internal_symbol(alloc_error_handler_name(handler_kind)),
-                );
-                let handler =
-                    this.lookup_exported_symbol(name)?.expect("missing alloc error handler symbol");
-                return interp_ok(Some(handler));
+        // Handle allocator shim.
+        if let Some(shim) = this.machine.allocator_shim_symbols.get(&link_name) {
+            match *shim {
+                Either::Left(other_fn) => {
+                    let handler = this
+                        .lookup_exported_symbol(other_fn)?
+                        .expect("missing alloc error handler symbol");
+                    return interp_ok(Some(handler));
+                }
+                Either::Right(special) => {
+                    this.rust_special_allocator_method(special, link_name, abi, args, dest)?;
+                    this.return_to_block(ret)?;
+                    return interp_ok(None);
+                }
             }
-            _ => {}
         }
 
         // FIXME: avoid allocating memory
@@ -101,10 +100,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
     fn is_dyn_sym(&self, name: &str) -> bool {
         let this = self.eval_context_ref();
-        match this.tcx.sess.target.os.as_ref() {
+        match &this.tcx.sess.target.os {
             os if this.target_os_is_unix() => shims::unix::foreign_items::is_dyn_sym(name, os),
-            "wasi" => shims::wasi::foreign_items::is_dyn_sym(name),
-            "windows" => shims::windows::foreign_items::is_dyn_sym(name),
+            Os::Windows => shims::windows::foreign_items::is_dyn_sym(name),
             _ => false,
         }
     }
@@ -247,33 +245,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
 impl<'tcx> EvalContextExtPriv<'tcx> for crate::MiriInterpCx<'tcx> {}
 trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
-    /// Check some basic requirements for this allocation request:
-    /// non-zero size, power-of-two alignment.
-    fn check_rustc_alloc_request(&self, size: u64, align: u64) -> InterpResult<'tcx> {
-        let this = self.eval_context_ref();
-        if size == 0 {
-            throw_ub_format!("creating allocation with size 0");
-        }
-        if size > this.max_size_of_val().bytes() {
-            throw_ub_format!("creating an allocation larger than half the address space");
-        }
-        if let Err(e) = Align::from_bytes(align) {
-            match e {
-                AlignFromBytesError::TooLarge(_) => {
-                    throw_unsup_format!(
-                        "creating allocation with alignment {align} exceeding rustc's maximum \
-                         supported value"
-                    );
-                }
-                AlignFromBytesError::NotPowerOfTwo(_) => {
-                    throw_ub_format!("creating allocation with non-power-of-two alignment {align}");
-                }
-            }
-        }
-
-        interp_ok(())
-    }
-
     fn emulate_foreign_item_inner(
         &mut self,
         link_name: Symbol,
@@ -333,7 +304,60 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // Here we dispatch all the shims for foreign functions. If you have a platform specific
         // shim, add it to the corresponding submodule.
         match link_name.as_str() {
+            // Magic function Rust emits (and not as part of the allocator shim).
+            name if name == this.mangle_internal_symbol(NO_ALLOC_SHIM_IS_UNSTABLE) => {
+                // This is a no-op shim that only exists to prevent making the allocator shims
+                // instantly stable.
+                let [] = this.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
+            }
+
             // Miri-specific extern functions
+            "miri_alloc" => {
+                let [size, align] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
+                let size = this.read_target_usize(size)?;
+                let align = this.read_target_usize(align)?;
+
+                this.check_rust_alloc_request(size, align)?;
+
+                let ptr = this.allocate_ptr(
+                    Size::from_bytes(size),
+                    Align::from_bytes(align).unwrap(),
+                    MiriMemoryKind::Miri.into(),
+                    AllocInit::Uninit,
+                )?;
+
+                this.write_pointer(ptr, dest)?;
+            }
+            "miri_dealloc" => {
+                let [ptr, old_size, align] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
+                let ptr = this.read_pointer(ptr)?;
+                let old_size = this.read_target_usize(old_size)?;
+                let align = this.read_target_usize(align)?;
+
+                // No need to check old_size/align; we anyway check that they match the allocation.
+                this.deallocate_ptr(
+                    ptr,
+                    Some((Size::from_bytes(old_size), Align::from_bytes(align).unwrap())),
+                    MiriMemoryKind::Miri.into(),
+                )?;
+            }
+            "miri_track_alloc" => {
+                let [ptr] = this.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
+                let ptr = this.read_pointer(ptr)?;
+                let (alloc_id, _, _) = this.ptr_get_alloc_id(ptr, 0).map_err_kind(|_e| {
+                    err_machine_stop!(TerminationInfo::Abort(format!(
+                        "pointer passed to `miri_get_alloc_id` must not be dangling, got {ptr:?}"
+                    )))
+                })?;
+                if this.machine.tracked_alloc_ids.insert(alloc_id) {
+                    let info = this.get_alloc_info(alloc_id);
+                    this.emit_diagnostic(NonHaltingDiagnostic::TrackingAlloc(
+                        alloc_id, info.size, info.align,
+                    ));
+                }
+            }
             "miri_start_unwind" => {
                 let [payload] =
                     this.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
@@ -411,6 +435,13 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 // Return value: 0 on success, otherwise the size it would have needed.
                 this.write_int(if success { 0 } else { needed_size }, dest)?;
             }
+            // Hint that a loop is spinning indefinitely.
+            "miri_spin_loop" => {
+                let [] = this.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
+
+                // Try to run another thread to maximize the chance of finding actual bugs.
+                this.yield_active_thread();
+            }
             // Obtains the size of a Miri backtrace. See the README for details.
             "miri_backtrace_size" => {
                 this.handle_miri_backtrace_size(abi, link_name, args, dest)?;
@@ -485,18 +516,37 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     }
                 }
             }
+            // GenMC mode: Assume statements block the current thread when their condition is false.
+            "miri_genmc_assume" => {
+                let [condition] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
+                if this.machine.data_race.as_genmc_ref().is_some() {
+                    this.handle_genmc_verifier_assume(condition)?;
+                } else {
+                    throw_unsup_format!("miri_genmc_assume is only supported in GenMC mode")
+                }
+            }
 
             // Aborting the process.
             "exit" => {
                 let [code] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let code = this.read_scalar(code)?.to_i32()?;
+                if let Some(genmc_ctx) = this.machine.data_race.as_genmc_ref() {
+                    // If there is no error, execution should continue (on a different thread).
+                    genmc_ctx.handle_exit(
+                        this.machine.threads.active_thread(),
+                        code,
+                        crate::concurrency::ExitType::ExitCalled,
+                    )?;
+                    return interp_ok(EmulateItemResult::AlreadyJumped);
+                }
                 throw_machine_stop!(TerminationInfo::Exit { code, leak_check: false });
             }
             "abort" => {
                 let [] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 throw_machine_stop!(TerminationInfo::Abort(
                     "the program aborted execution".to_owned()
-                ))
+                ));
             }
 
             // Standard C allocation
@@ -550,133 +600,6 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     }
                     this.write_null(dest)?;
                 }
-            }
-
-            // Rust allocation
-            name if name == this.mangle_internal_symbol("__rust_alloc") || name == "miri_alloc" => {
-                let default = |ecx: &mut MiriInterpCx<'tcx>| {
-                    // Only call `check_shim` when `#[global_allocator]` isn't used. When that
-                    // macro is used, we act like no shim exists, so that the exported function can run.
-                    let [size, align] =
-                        ecx.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
-                    let size = ecx.read_target_usize(size)?;
-                    let align = ecx.read_target_usize(align)?;
-
-                    ecx.check_rustc_alloc_request(size, align)?;
-
-                    let memory_kind = match link_name.as_str() {
-                        "miri_alloc" => MiriMemoryKind::Miri,
-                        _ => MiriMemoryKind::Rust,
-                    };
-
-                    let ptr = ecx.allocate_ptr(
-                        Size::from_bytes(size),
-                        Align::from_bytes(align).unwrap(),
-                        memory_kind.into(),
-                        AllocInit::Uninit,
-                    )?;
-
-                    ecx.write_pointer(ptr, dest)
-                };
-
-                match link_name.as_str() {
-                    "miri_alloc" => {
-                        default(this)?;
-                        return interp_ok(EmulateItemResult::NeedsReturn);
-                    }
-                    _ => return this.emulate_allocator(default),
-                }
-            }
-            name if name == this.mangle_internal_symbol("__rust_alloc_zeroed") => {
-                return this.emulate_allocator(|this| {
-                    // See the comment for `__rust_alloc` why `check_shim` is only called in the
-                    // default case.
-                    let [size, align] =
-                        this.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
-                    let size = this.read_target_usize(size)?;
-                    let align = this.read_target_usize(align)?;
-
-                    this.check_rustc_alloc_request(size, align)?;
-
-                    let ptr = this.allocate_ptr(
-                        Size::from_bytes(size),
-                        Align::from_bytes(align).unwrap(),
-                        MiriMemoryKind::Rust.into(),
-                        AllocInit::Zero,
-                    )?;
-                    this.write_pointer(ptr, dest)
-                });
-            }
-            name if name == this.mangle_internal_symbol("__rust_dealloc")
-                || name == "miri_dealloc" =>
-            {
-                let default = |ecx: &mut MiriInterpCx<'tcx>| {
-                    // See the comment for `__rust_alloc` why `check_shim` is only called in the
-                    // default case.
-                    let [ptr, old_size, align] =
-                        ecx.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
-                    let ptr = ecx.read_pointer(ptr)?;
-                    let old_size = ecx.read_target_usize(old_size)?;
-                    let align = ecx.read_target_usize(align)?;
-
-                    let memory_kind = match link_name.as_str() {
-                        "miri_dealloc" => MiriMemoryKind::Miri,
-                        _ => MiriMemoryKind::Rust,
-                    };
-
-                    // No need to check old_size/align; we anyway check that they match the allocation.
-                    ecx.deallocate_ptr(
-                        ptr,
-                        Some((Size::from_bytes(old_size), Align::from_bytes(align).unwrap())),
-                        memory_kind.into(),
-                    )
-                };
-
-                match link_name.as_str() {
-                    "miri_dealloc" => {
-                        default(this)?;
-                        return interp_ok(EmulateItemResult::NeedsReturn);
-                    }
-                    _ => return this.emulate_allocator(default),
-                }
-            }
-            name if name == this.mangle_internal_symbol("__rust_realloc") => {
-                return this.emulate_allocator(|this| {
-                    // See the comment for `__rust_alloc` why `check_shim` is only called in the
-                    // default case.
-                    let [ptr, old_size, align, new_size] =
-                        this.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
-                    let ptr = this.read_pointer(ptr)?;
-                    let old_size = this.read_target_usize(old_size)?;
-                    let align = this.read_target_usize(align)?;
-                    let new_size = this.read_target_usize(new_size)?;
-                    // No need to check old_size; we anyway check that they match the allocation.
-
-                    this.check_rustc_alloc_request(new_size, align)?;
-
-                    let align = Align::from_bytes(align).unwrap();
-                    let new_ptr = this.reallocate_ptr(
-                        ptr,
-                        Some((Size::from_bytes(old_size), align)),
-                        Size::from_bytes(new_size),
-                        align,
-                        MiriMemoryKind::Rust.into(),
-                        AllocInit::Uninit,
-                    )?;
-                    this.write_pointer(new_ptr, dest)
-                });
-            }
-            name if name == this.mangle_internal_symbol("__rust_no_alloc_shim_is_unstable_v2") => {
-                // This is a no-op shim that only exists to prevent making the allocator shims instantly stable.
-                let [] = this.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
-            }
-            name if name
-                == this.mangle_internal_symbol("__rust_alloc_error_handler_should_panic_v2") =>
-            {
-                // Gets the value of the `oom` option.
-                let [] = this.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
-                let val = this.tcx.sess.opts.unstable_opts.oom.should_panic();
-                this.write_int(val, dest)?;
             }
 
             // C memory handling functions
@@ -807,207 +730,22 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.mem_copy(ptr_src, ptr_dest, Size::from_bytes(n), true)?;
                 this.write_pointer(ptr_dest, dest)?;
             }
+            "memset" => {
+                let [ptr_dest, val, n] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                let ptr_dest = this.read_pointer(ptr_dest)?;
+                let val = this.read_scalar(val)?.to_i32()?;
+                let n = this.read_target_usize(n)?;
+                // The docs say val is "interpreted as unsigned char".
+                #[expect(clippy::as_conversions)]
+                let val = val as u8;
 
-            // math functions (note that there are also intrinsics for some other functions)
-            #[rustfmt::skip]
-            | "cbrtf"
-            | "coshf"
-            | "sinhf"
-            | "tanf"
-            | "tanhf"
-            | "acosf"
-            | "asinf"
-            | "atanf"
-            | "log1pf"
-            | "expm1f"
-            | "tgammaf"
-            | "erff"
-            | "erfcf"
-            => {
-                let [f] = this.check_shim_sig_lenient(abi, CanonAbi::C , link_name, args)?;
-                let f = this.read_scalar(f)?.to_f32()?;
-                // Using host floats (but it's fine, these operations do not have guaranteed precision).
-                let f_host = f.to_host();
-                let res = match link_name.as_str() {
-                    "cbrtf" => f_host.cbrt(),
-                    "coshf" => f_host.cosh(),
-                    "sinhf" => f_host.sinh(),
-                    "tanf" => f_host.tan(),
-                    "tanhf" => f_host.tanh(),
-                    "acosf" => f_host.acos(),
-                    "asinf" => f_host.asin(),
-                    "atanf" => f_host.atan(),
-                    "log1pf" => f_host.ln_1p(),
-                    "expm1f" => f_host.exp_m1(),
-                    "tgammaf" => f_host.gamma(),
-                    "erff" => f_host.erf(),
-                    "erfcf" => f_host.erfc(),
-                    _ => bug!(),
-                };
-                let res = res.to_soft();
-                // Apply a relative error of 16ULP to introduce some non-determinism
-                // simulating imprecise implementations and optimizations.
-                // FIXME: temporarily disabled as it breaks std tests.
-                // let res = math::apply_random_float_error_ulp(
-                //     this,
-                //     res,
-                //     4, // log2(16)
-                // );
-                let res = this.adjust_nan(res, &[f]);
-                this.write_scalar(res, dest)?;
-            }
-            #[rustfmt::skip]
-            | "_hypotf"
-            | "hypotf"
-            | "atan2f"
-            | "fdimf"
-            => {
-                let [f1, f2] = this.check_shim_sig_lenient(abi, CanonAbi::C , link_name, args)?;
-                let f1 = this.read_scalar(f1)?.to_f32()?;
-                let f2 = this.read_scalar(f2)?.to_f32()?;
-                // underscore case for windows, here and below
-                // (see https://docs.microsoft.com/en-us/cpp/c-runtime-library/reference/floating-point-primitives?view=vs-2019)
-                // Using host floats (but it's fine, these operations do not have guaranteed precision).
-                let res = match link_name.as_str() {
-                    "_hypotf" | "hypotf" => f1.to_host().hypot(f2.to_host()).to_soft(),
-                    "atan2f" => f1.to_host().atan2(f2.to_host()).to_soft(),
-                    #[allow(deprecated)]
-                    "fdimf" => f1.to_host().abs_sub(f2.to_host()).to_soft(),
-                    _ => bug!(),
-                };
-                // Apply a relative error of 16ULP to introduce some non-determinism
-                // simulating imprecise implementations and optimizations.
-                // FIXME: temporarily disabled as it breaks std tests.
-                // let res = math::apply_random_float_error_ulp(
-                //     this,
-                //     res,
-                //     4, // log2(16)
-                // );
-                let res = this.adjust_nan(res, &[f1, f2]);
-                this.write_scalar(res, dest)?;
-            }
-            #[rustfmt::skip]
-            | "cbrt"
-            | "cosh"
-            | "sinh"
-            | "tan"
-            | "tanh"
-            | "acos"
-            | "asin"
-            | "atan"
-            | "log1p"
-            | "expm1"
-            | "tgamma"
-            | "erf"
-            | "erfc"
-            => {
-                let [f] = this.check_shim_sig_lenient(abi, CanonAbi::C , link_name, args)?;
-                let f = this.read_scalar(f)?.to_f64()?;
-                // Using host floats (but it's fine, these operations do not have guaranteed precision).
-                let f_host = f.to_host();
-                let res = match link_name.as_str() {
-                    "cbrt" => f_host.cbrt(),
-                    "cosh" => f_host.cosh(),
-                    "sinh" => f_host.sinh(),
-                    "tan" => f_host.tan(),
-                    "tanh" => f_host.tanh(),
-                    "acos" => f_host.acos(),
-                    "asin" => f_host.asin(),
-                    "atan" => f_host.atan(),
-                    "log1p" => f_host.ln_1p(),
-                    "expm1" => f_host.exp_m1(),
-                    "tgamma" => f_host.gamma(),
-                    "erf" => f_host.erf(),
-                    "erfc" => f_host.erfc(),
-                    _ => bug!(),
-                };
-                let res = res.to_soft();
-                // Apply a relative error of 16ULP to introduce some non-determinism
-                // simulating imprecise implementations and optimizations.
-                // FIXME: temporarily disabled as it breaks std tests.
-                // let res = math::apply_random_float_error_ulp(
-                //     this,
-                //     res.to_soft(),
-                //     4, // log2(16)
-                // );
-                let res = this.adjust_nan(res, &[f]);
-                this.write_scalar(res, dest)?;
-            }
-            #[rustfmt::skip]
-            | "_hypot"
-            | "hypot"
-            | "atan2"
-            | "fdim"
-            => {
-                let [f1, f2] = this.check_shim_sig_lenient(abi, CanonAbi::C , link_name, args)?;
-                let f1 = this.read_scalar(f1)?.to_f64()?;
-                let f2 = this.read_scalar(f2)?.to_f64()?;
-                // underscore case for windows, here and below
-                // (see https://docs.microsoft.com/en-us/cpp/c-runtime-library/reference/floating-point-primitives?view=vs-2019)
-                // Using host floats (but it's fine, these operations do not have guaranteed precision).
-                let res = match link_name.as_str() {
-                    "_hypot" | "hypot" => f1.to_host().hypot(f2.to_host()).to_soft(),
-                    "atan2" => f1.to_host().atan2(f2.to_host()).to_soft(),
-                    #[allow(deprecated)]
-                    "fdim" => f1.to_host().abs_sub(f2.to_host()).to_soft(),
-                    _ => bug!(),
-                };
-                // Apply a relative error of 16ULP to introduce some non-determinism
-                // simulating imprecise implementations and optimizations.
-                // FIXME: temporarily disabled as it breaks std tests.
-                // let res = math::apply_random_float_error_ulp(
-                //     this,
-                //     res,
-                //     4, // log2(16)
-                // );
-                let res = this.adjust_nan(res, &[f1, f2]);
-                this.write_scalar(res, dest)?;
-            }
-            #[rustfmt::skip]
-            | "_ldexp"
-            | "ldexp"
-            | "scalbn"
-            => {
-                let [x, exp] = this.check_shim_sig_lenient(abi, CanonAbi::C , link_name, args)?;
-                // For radix-2 (binary) systems, `ldexp` and `scalbn` are the same.
-                let x = this.read_scalar(x)?.to_f64()?;
-                let exp = this.read_scalar(exp)?.to_i32()?;
+                // C requires that this must always be a valid pointer, even if `n` is zero, so we better check that.
+                this.ptr_get_alloc_id(ptr_dest, 0)?;
 
-                let res = x.scalbn(exp);
-                let res = this.adjust_nan(res, &[x]);
-                this.write_scalar(res, dest)?;
-            }
-            "lgammaf_r" => {
-                let [x, signp] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
-                let x = this.read_scalar(x)?.to_f32()?;
-                let signp = this.deref_pointer_as(signp, this.machine.layouts.i32)?;
-
-                // Using host floats (but it's fine, these operations do not have guaranteed precision).
-                let (res, sign) = x.to_host().ln_gamma();
-                this.write_int(sign, &signp)?;
-                let res = res.to_soft();
-                // Apply a relative error of 16ULP to introduce some non-determinism
-                // simulating imprecise implementations and optimizations.
-                // FIXME: temporarily disabled as it breaks std tests.
-                // let res = math::apply_random_float_error_ulp(this, res, 4 /* log2(16) */);
-                let res = this.adjust_nan(res, &[x]);
-                this.write_scalar(res, dest)?;
-            }
-            "lgamma_r" => {
-                let [x, signp] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
-                let x = this.read_scalar(x)?.to_f64()?;
-                let signp = this.deref_pointer_as(signp, this.machine.layouts.i32)?;
-
-                // Using host floats (but it's fine, these operations do not have guaranteed precision).
-                let (res, sign) = x.to_host().ln_gamma();
-                this.write_int(sign, &signp)?;
-                let res = res.to_soft();
-                // Apply a relative error of 16ULP to introduce some non-determinism
-                // simulating imprecise implementations and optimizations.
-                // FIXME: temporarily disabled as it breaks std tests.
-                // let res = math::apply_random_float_error_ulp(this, res, 4 /* log2(16) */);
-                let res = this.adjust_nan(res, &[x]);
-                this.write_scalar(res, dest)?;
+                let bytes = std::iter::repeat_n(val, n.try_into().unwrap());
+                this.write_bytes_ptr(ptr_dest, bytes)?;
+                this.write_pointer(ptr_dest, dest)?;
             }
 
             // LLVM intrinsics
@@ -1062,52 +800,44 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
             // Target-specific shims
             name if name.starts_with("llvm.x86.")
-                && (this.tcx.sess.target.arch == "x86"
-                    || this.tcx.sess.target.arch == "x86_64") =>
+                && matches!(this.tcx.sess.target.arch, Arch::X86 | Arch::X86_64) =>
             {
                 return shims::x86::EvalContextExt::emulate_x86_intrinsic(
                     this, link_name, abi, args, dest,
                 );
             }
-            name if name.starts_with("llvm.aarch64.") && this.tcx.sess.target.arch == "aarch64" => {
+            name if name.starts_with("llvm.aarch64.")
+                && this.tcx.sess.target.arch == Arch::AArch64 =>
+            {
                 return shims::aarch64::EvalContextExt::emulate_aarch64_intrinsic(
                     this, link_name, abi, args, dest,
                 );
             }
-            // FIXME: Move this to an `arm` submodule.
-            "llvm.arm.hint" if this.tcx.sess.target.arch == "arm" => {
-                let [arg] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
-                let arg = this.read_scalar(arg)?.to_i32()?;
-                // Note that different arguments might have different target feature requirements.
-                match arg {
-                    // YIELD
-                    1 => {
-                        this.expect_target_feature_for_intrinsic(link_name, "v6")?;
-                        this.yield_active_thread();
-                    }
-                    _ => {
-                        throw_unsup_format!("unsupported llvm.arm.hint argument {}", arg);
-                    }
-                }
-            }
 
-            // Platform-specific shims
-            _ =>
-                return match this.tcx.sess.target.os.as_ref() {
+            // Fallback to shims in submodules.
+            _ => {
+                // Math shims
+                #[expect(irrefutable_let_patterns)]
+                if let res = shims::math::EvalContextExt::emulate_foreign_item_inner(
+                    this, link_name, abi, args, dest,
+                )? && !matches!(res, EmulateItemResult::NotSupported)
+                {
+                    return interp_ok(res);
+                }
+
+                // Platform-specific shims
+                return match &this.tcx.sess.target.os {
                     _ if this.target_os_is_unix() =>
                         shims::unix::foreign_items::EvalContextExt::emulate_foreign_item_inner(
                             this, link_name, abi, args, dest,
                         ),
-                    "wasi" =>
-                        shims::wasi::foreign_items::EvalContextExt::emulate_foreign_item_inner(
-                            this, link_name, abi, args, dest,
-                        ),
-                    "windows" =>
+                    Os::Windows =>
                         shims::windows::foreign_items::EvalContextExt::emulate_foreign_item_inner(
                             this, link_name, abi, args, dest,
                         ),
                     _ => interp_ok(EmulateItemResult::NotSupported),
-                },
+                };
+            }
         };
         // We only fall through to here if we did *not* hit the `_` arm above,
         // i.e., if we actually emulated the function with one of the shims.

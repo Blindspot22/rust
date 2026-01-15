@@ -14,7 +14,6 @@ use std::io::{BufWriter, Write, stdout};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::def_id::{DefId, DefIdSet};
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
@@ -104,74 +103,6 @@ impl<'tcx> JsonRenderer<'tcx> {
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    fn serialize_and_write<T: Write>(
-        &self,
-        output_crate: types::Crate,
-        mut writer: BufWriter<T>,
-        path: &str,
-    ) -> Result<(), Error> {
-        self.sess().time("rustdoc_json_serialize_and_write", || {
-            try_err!(
-                serde_json::ser::to_writer(&mut writer, &output_crate).map_err(|e| e.to_string()),
-                path
-            );
-            try_err!(writer.flush(), path);
-            Ok(())
-        })
-    }
-}
-
-fn target(sess: &rustc_session::Session) -> types::Target {
-    // Build a set of which features are enabled on this target
-    let globally_enabled_features: FxHashSet<&str> =
-        sess.unstable_target_features.iter().map(|name| name.as_str()).collect();
-
-    // Build a map of target feature stability by feature name
-    use rustc_target::target_features::Stability;
-    let feature_stability: FxHashMap<&str, Stability> = sess
-        .target
-        .rust_target_features()
-        .iter()
-        .copied()
-        .map(|(name, stability, _)| (name, stability))
-        .collect();
-
-    types::Target {
-        triple: sess.opts.target_triple.tuple().into(),
-        target_features: sess
-            .target
-            .rust_target_features()
-            .iter()
-            .copied()
-            .filter(|(_, stability, _)| {
-                // Describe only target features which the user can toggle
-                stability.toggle_allowed().is_ok()
-            })
-            .map(|(name, stability, implied_features)| {
-                types::TargetFeature {
-                    name: name.into(),
-                    unstable_feature_gate: match stability {
-                        Stability::Unstable(feature_gate) => Some(feature_gate.as_str().into()),
-                        _ => None,
-                    },
-                    implies_features: implied_features
-                        .iter()
-                        .copied()
-                        .filter(|name| {
-                            // Imply only target features which the user can toggle
-                            feature_stability
-                                .get(name)
-                                .map(|stability| stability.toggle_allowed().is_ok())
-                                .unwrap_or(false)
-                        })
-                        .map(String::from)
-                        .collect(),
-                    globally_enabled: globally_enabled_features.contains(name),
-                }
-            })
-            .collect(),
     }
 }
 
@@ -305,26 +236,23 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
         unreachable!("RUN_ON_MODULE = false, should never call mod_item_in")
     }
 
-    fn after_krate(mut self) -> Result<(), Error> {
+    fn after_krate(self) -> Result<(), Error> {
         debug!("Done with crate");
 
         let e = ExternalCrate { crate_num: LOCAL_CRATE };
-
-        // We've finished using the index, and don't want to clone it, because it is big.
-        let index = std::mem::take(&mut self.index);
+        let sess = self.sess();
 
         // Note that tcx.rust_target_features is inappropriate here because rustdoc tries to run for
         // multiple targets: https://github.com/rust-lang/rust/pull/137632
         //
         // We want to describe a single target, so pass tcx.sess rather than tcx.
-        let target = target(self.tcx.sess);
+        let target = conversions::target(sess);
 
         debug!("Constructing Output");
         let output_crate = types::Crate {
             root: self.id_from_item_default(e.def_id().into()),
             crate_version: self.cache.crate_version.clone(),
             includes_private: self.cache.document_private,
-            index,
             paths: self
                 .cache
                 .paths
@@ -355,10 +283,19 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
                                 ExternalLocation::Remote(s) => Some(s.clone()),
                                 _ => None,
                             },
+                            path: self
+                                .tcx
+                                .used_crate_source(*crate_num)
+                                .paths()
+                                .next()
+                                .expect("crate should have at least 1 path")
+                                .clone(),
                         },
                     )
                 })
                 .collect(),
+            // Be careful to not clone the `index`, it is big.
+            index: self.index,
             target,
             format_version: types::FORMAT_VERSION,
         };
@@ -369,15 +306,32 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
             p.push(output_crate.index.get(&output_crate.root).unwrap().name.clone().unwrap());
             p.set_extension("json");
 
-            self.serialize_and_write(
+            serialize_and_write(
+                sess,
                 output_crate,
                 try_err!(File::create_buffered(&p), p),
                 &p.display().to_string(),
             )
         } else {
-            self.serialize_and_write(output_crate, BufWriter::new(stdout().lock()), "<stdout>")
+            serialize_and_write(sess, output_crate, BufWriter::new(stdout().lock()), "<stdout>")
         }
     }
+}
+
+fn serialize_and_write<T: Write>(
+    sess: &Session,
+    output_crate: types::Crate,
+    mut writer: BufWriter<T>,
+    path: &str,
+) -> Result<(), Error> {
+    sess.time("rustdoc_json_serialize_and_write", || {
+        try_err!(
+            serde_json::ser::to_writer(&mut writer, &output_crate).map_err(|e| e.to_string()),
+            path
+        );
+        try_err!(writer.flush(), path);
+        Ok(())
+    })
 }
 
 // Some nodes are used a lot. Make sure they don't unintentionally get bigger.
@@ -392,15 +346,12 @@ mod size_asserts {
     // tidy-alphabetical-start
     static_assert_size!(AssocItemConstraint, 112);
     static_assert_size!(Crate, 184);
-    static_assert_size!(ExternalCrate, 48);
     static_assert_size!(FunctionPointer, 168);
     static_assert_size!(GenericArg, 80);
     static_assert_size!(GenericArgs, 104);
     static_assert_size!(GenericBound, 72);
     static_assert_size!(GenericParamDef, 136);
     static_assert_size!(Impl, 304);
-    // `Item` contains a `PathBuf`, which is different sizes on different OSes.
-    static_assert_size!(Item, 528 + size_of::<std::path::PathBuf>());
     static_assert_size!(ItemSummary, 32);
     static_assert_size!(PolyTrait, 64);
     static_assert_size!(PreciseCapturingArg, 32);
@@ -408,4 +359,8 @@ mod size_asserts {
     static_assert_size!(Type, 80);
     static_assert_size!(WherePredicate, 160);
     // tidy-alphabetical-end
+
+    // These contains a `PathBuf`, which is different sizes on different OSes.
+    static_assert_size!(Item, 528 + size_of::<std::path::PathBuf>());
+    static_assert_size!(ExternalCrate, 48 + size_of::<std::path::PathBuf>());
 }

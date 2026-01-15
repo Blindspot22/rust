@@ -410,12 +410,33 @@ impl<'tcx> BorrowExplanation<'tcx> {
                 cx.add_sized_or_copy_bound_info(err, category, &path);
 
                 if let ConstraintCategory::Cast {
+                    is_raw_ptr_dyn_type_cast: _,
                     is_implicit_coercion: true,
                     unsize_to: Some(unsize_ty),
                 } = category
                 {
                     self.add_object_lifetime_default_note(tcx, err, unsize_ty);
                 }
+
+                let mut preds = path
+                    .iter()
+                    .filter_map(|constraint| match constraint.category {
+                        ConstraintCategory::Predicate(pred) if !pred.is_dummy() => Some(pred),
+                        _ => None,
+                    })
+                    .collect::<Vec<Span>>();
+                preds.sort();
+                preds.dedup();
+                if !preds.is_empty() {
+                    let s = if preds.len() == 1 { "" } else { "s" };
+                    err.span_note(
+                        preds,
+                        format!(
+                            "requirement{s} that the value outlives `{region_name}` introduced here"
+                        ),
+                    );
+                }
+
                 self.add_lifetime_bound_suggestion_to_diagnostic(err, &category, span, region_name);
             }
             _ => {}
@@ -438,7 +459,7 @@ impl<'tcx> BorrowExplanation<'tcx> {
 
             let elaborated_args =
                 std::iter::zip(*args, &generics.own_params).map(|(arg, param)| {
-                    if let Some(ty::Dynamic(obj, _, ty::Dyn)) = arg.as_type().map(Ty::kind) {
+                    if let Some(ty::Dynamic(obj, _)) = arg.as_type().map(Ty::kind) {
                         let default = tcx.object_lifetime_default(param.def_id);
 
                         let re_static = tcx.lifetimes.re_static;
@@ -464,7 +485,7 @@ impl<'tcx> BorrowExplanation<'tcx> {
 
                         has_dyn = true;
 
-                        Ty::new_dynamic(tcx, obj, implied_region, ty::Dyn).into()
+                        Ty::new_dynamic(tcx, obj, implied_region).into()
                     } else {
                         arg
                     }
@@ -565,7 +586,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
         let (blame_constraint, path) = self.regioncx.best_blame_constraint(
             borrow_region,
             NllRegionVariableOrigin::FreeRegion,
-            |r| self.regioncx.provides_universal_region(r, borrow_region, outlived_region),
+            outlived_region,
         );
         let BlameConstraint { category, from_closure, cause, .. } = blame_constraint;
 
@@ -667,7 +688,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
                 }
             }
 
-            Some(Cause::DropVar(local, location)) => {
+            Some(Cause::DropVar(local, location)) if !is_local_boring(local) => {
                 let mut should_note_order = false;
                 if self.local_name(local).is_some()
                     && let Some((WriteKind::StorageDeadOrDrop, place)) = kind_place
@@ -685,7 +706,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
                 }
             }
 
-            Some(Cause::LiveVar(..)) | None => {
+            Some(Cause::LiveVar(..) | Cause::DropVar(..)) | None => {
                 // Here, under NLL: no cause was found. Under polonius: no cause was found, or a
                 // boring local was found, which we ignore like NLLs do to match its diagnostics.
                 if let Some(region) = self.to_error_region_vid(borrow_region_vid) {
@@ -743,6 +764,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
                 {
                     // Just point to the function, to reduce the chance of overlapping spans.
                     let function_span = match func {
+                        Operand::RuntimeChecks(_) => span,
                         Operand::Constant(c) => c.span,
                         Operand::Copy(place) | Operand::Move(place) => {
                             if let Some(l) = place.as_local() {
@@ -788,6 +810,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
                     {
                         // Just point to the function, to reduce the chance of overlapping spans.
                         let function_span = match func {
+                            Operand::RuntimeChecks(_) => span,
                             Operand::Constant(c) => c.span,
                             Operand::Copy(place) | Operand::Move(place) => {
                                 if let Some(l) = place.as_local() {
@@ -829,16 +852,10 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
         // will only ever have one item at any given time, but by using a vector, we can pop from
         // it which simplifies the termination logic.
         let mut queue = vec![location];
-        let mut target =
-            if let Some(Statement { kind: StatementKind::Assign(box (place, _)), .. }) = stmt {
-                if let Some(local) = place.as_local() {
-                    local
-                } else {
-                    return false;
-                }
-            } else {
-                return false;
-            };
+        let Some(Statement { kind: StatementKind::Assign(box (place, _)), .. }) = stmt else {
+            return false;
+        };
+        let Some(mut target) = place.as_local() else { return false };
 
         debug!("was_captured_by_trait: target={:?} queue={:?}", target, queue);
         while let Some(current_location) = queue.pop() {

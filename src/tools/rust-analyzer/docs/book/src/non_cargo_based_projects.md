@@ -31,7 +31,7 @@ interface ProjectJson {
     /// It should point to the directory where std,
     /// core, and friends can be found:
     ///
-    /// https://github.com/rust-lang/rust/tree/master/library.
+    /// https://github.com/rust-lang/rust/tree/HEAD/library.
     ///
     /// If provided, rust-analyzer automatically adds
     /// dependencies on sysroot crates. Conversely,
@@ -144,6 +144,15 @@ interface Crate {
     /// Environment variables, used for
     /// the `env!` macro
     env: { [key: string]: string; };
+    /// Extra crate-level attributes applied to this crate.
+    ///
+    /// rust-analyzer will behave as if these attributes
+    /// were present before the first source line of the
+    /// crate root.
+    ///
+    /// Each string should contain the contents of a `#![...]`
+    /// crate-level attribute, without the surrounding `#![]`.
+    crate_attrs?: string[];
 
     /// Whether the crate is a proc-macro crate.
     is_proc_macro: boolean;

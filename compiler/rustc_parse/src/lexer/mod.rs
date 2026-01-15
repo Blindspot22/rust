@@ -6,7 +6,7 @@ use rustc_ast::util::unicode::{TEXT_FLOW_CONTROL_CHARS, contains_text_flow_contr
 use rustc_errors::codes::*;
 use rustc_errors::{Applicability, Diag, DiagCtxtHandle, StashKey};
 use rustc_lexer::{
-    Base, Cursor, DocStyle, FrontmatterAllowed, LiteralKind, RawStrError, is_whitespace,
+    Base, Cursor, DocStyle, FrontmatterAllowed, LiteralKind, RawStrError, is_horizontal_whitespace,
 };
 use rustc_literal_escaper::{EscapeError, Mode, check_for_errors};
 use rustc_session::lint::BuiltinLintDiag;
@@ -36,6 +36,10 @@ use unescape_error_reporting::{emit_unescape_error, escaped_char};
 #[cfg(target_pointer_width = "64")]
 rustc_data_structures::static_assert_size!(rustc_lexer::Token, 12);
 
+const INVISIBLE_CHARACTERS: [char; 8] = [
+    '\u{200b}', '\u{200c}', '\u{2060}', '\u{2061}', '\u{2062}', '\u{00ad}', '\u{034f}', '\u{061c}',
+];
+
 #[derive(Clone, Debug)]
 pub(crate) struct UnmatchedDelim {
     pub found_delim: Option<Delimiter>,
@@ -44,18 +48,43 @@ pub(crate) struct UnmatchedDelim {
     pub candidate_span: Option<Span>,
 }
 
+/// Which tokens should be stripped before lexing the tokens.
+pub enum StripTokens {
+    /// Strip both shebang and frontmatter.
+    ShebangAndFrontmatter,
+    /// Strip the shebang but not frontmatter.
+    ///
+    /// That means that char sequences looking like frontmatter are simply
+    /// interpreted as regular Rust lexemes.
+    Shebang,
+    /// Strip nothing.
+    ///
+    /// In other words, char sequences looking like a shebang or frontmatter
+    /// are simply interpreted as regular Rust lexemes.
+    Nothing,
+}
+
 pub(crate) fn lex_token_trees<'psess, 'src>(
     psess: &'psess ParseSess,
     mut src: &'src str,
     mut start_pos: BytePos,
     override_span: Option<Span>,
-    frontmatter_allowed: FrontmatterAllowed,
+    strip_tokens: StripTokens,
 ) -> Result<TokenStream, Vec<Diag<'psess>>> {
-    // Skip `#!`, if present.
-    if let Some(shebang_len) = rustc_lexer::strip_shebang(src) {
-        src = &src[shebang_len..];
-        start_pos = start_pos + BytePos::from_usize(shebang_len);
+    match strip_tokens {
+        StripTokens::Shebang | StripTokens::ShebangAndFrontmatter => {
+            if let Some(shebang_len) = rustc_lexer::strip_shebang(src) {
+                src = &src[shebang_len..];
+                start_pos = start_pos + BytePos::from_usize(shebang_len);
+            }
+        }
+        StripTokens::Nothing => {}
     }
+
+    let frontmatter_allowed = match strip_tokens {
+        StripTokens::ShebangAndFrontmatter => FrontmatterAllowed::Yes,
+        StripTokens::Shebang | StripTokens::Nothing => FrontmatterAllowed::No,
+    };
 
     let cursor = Cursor::new(src, frontmatter_allowed);
     let mut lexer = Lexer {
@@ -291,7 +320,7 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
                     // Include the leading `'` in the real identifier, for macro
                     // expansion purposes. See #12512 for the gory details of why
                     // this is necessary.
-                    let lifetime_name = self.str_from(start);
+                    let lifetime_name = nfc_normalize(self.str_from(start));
                     self.last_lifetime = Some(self.mk_sp(start, start + BytePos(1)));
                     if starts_with_number {
                         let span = self.mk_sp(start, self.pos);
@@ -300,8 +329,7 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
                             .with_span(span)
                             .stash(span, StashKey::LifetimeIsChar);
                     }
-                    let ident = Symbol::intern(lifetime_name);
-                    token::Lifetime(ident, IdentIsRaw::No)
+                    token::Lifetime(lifetime_name, IdentIsRaw::No)
                 }
                 rustc_lexer::TokenKind::RawLifetime => {
                     self.last_lifetime = Some(self.mk_sp(start, start + BytePos(1)));
@@ -348,7 +376,7 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
                             String::with_capacity(lifetime_name_without_tick.as_str().len() + 1);
                         lifetime_name.push('\'');
                         lifetime_name += lifetime_name_without_tick.as_str();
-                        let sym = Symbol::intern(&lifetime_name);
+                        let sym = nfc_normalize(&lifetime_name);
 
                         // Make sure we mark this as a raw identifier.
                         self.psess.raw_identifier_spans.push(span);
@@ -368,9 +396,8 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
                         self.pos = lt_start;
                         self.cursor = Cursor::new(&str_before[2 as usize..], FrontmatterAllowed::No);
 
-                        let lifetime_name = self.str_from(start);
-                        let ident = Symbol::intern(lifetime_name);
-                        token::Lifetime(ident, IdentIsRaw::No)
+                        let lifetime_name = nfc_normalize(self.str_from(start));
+                        token::Lifetime(lifetime_name, IdentIsRaw::No)
                     }
                 }
                 rustc_lexer::TokenKind::Semi => token::Semi,
@@ -433,6 +460,7 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
                         escaped: escaped_char(c),
                         sugg,
                         null: if c == '\x00' { Some(errors::UnknownTokenNull) } else { None },
+                        invisible: if INVISIBLE_CHARACTERS.contains(&c) { Some(errors::InvisibleCharacter) } else { None },
                         repeat: if repeats > 0 {
                             swallow_next_invalid = repeats;
                             Some(errors::UnknownTokenRepeat { repeats })
@@ -597,7 +625,7 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
 
         let last_line_start = within.rfind('\n').map_or(0, |i| i + 1);
         let last_line = &within[last_line_start..];
-        let last_line_trimmed = last_line.trim_start_matches(is_whitespace);
+        let last_line_trimmed = last_line.trim_start_matches(is_horizontal_whitespace);
         let last_line_start_pos = frontmatter_opening_end_pos + BytePos(last_line_start as u32);
 
         let frontmatter_span = self.mk_sp(frontmatter_opening_pos, self.pos);
@@ -640,7 +668,12 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
             });
         }
 
-        if !rest.trim_matches(is_whitespace).is_empty() {
+        // Only up to 255 `-`s are allowed in code fences
+        if u8::try_from(len_opening).is_err() {
+            self.dcx().emit_err(errors::FrontmatterTooManyDashes { len_opening });
+        }
+
+        if !rest.trim_matches(is_horizontal_whitespace).is_empty() {
             let span = self.mk_sp(last_line_start_pos, self.pos);
             self.dcx().emit_err(errors::FrontmatterExtraCharactersAfterClose { span });
         }

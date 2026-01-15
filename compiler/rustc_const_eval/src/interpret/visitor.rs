@@ -4,7 +4,6 @@
 use std::num::NonZero;
 
 use rustc_abi::{FieldIdx, FieldsShape, VariantIdx, Variants};
-use rustc_index::IndexVec;
 use rustc_middle::mir::interpret::InterpResult;
 use rustc_middle::ty::{self, Ty};
 use tracing::trace;
@@ -22,18 +21,6 @@ pub trait ValueVisitor<'tcx, M: Machine<'tcx>>: Sized {
     #[inline(always)]
     fn read_discriminant(&mut self, v: &Self::V) -> InterpResult<'tcx, VariantIdx> {
         self.ecx().read_discriminant(&v.to_op(self.ecx())?)
-    }
-
-    /// This function provides the chance to reorder the order in which fields are visited for
-    /// `FieldsShape::Aggregate`.
-    ///
-    /// The default means we iterate in source declaration order; alternatively this can do some
-    /// work with `memory_index` to iterate in memory order.
-    #[inline(always)]
-    fn aggregate_field_iter(
-        memory_index: &IndexVec<FieldIdx, u32>,
-    ) -> impl Iterator<Item = FieldIdx> + 'static {
-        memory_index.indices()
     }
 
     // Recursive actions, ready to be overloaded.
@@ -90,7 +77,7 @@ pub trait ValueVisitor<'tcx, M: Machine<'tcx>>: Sized {
         // Special treatment for special types, where the (static) layout is not sufficient.
         match *ty.kind() {
             // If it is a trait object, switch to the real type that was used to create it.
-            ty::Dynamic(data, _, ty::Dyn) => {
+            ty::Dynamic(data, _) => {
                 // Dyn types. This is unsized, and the actual dynamic type of the data is given by the
                 // vtable stored in the place metadata.
                 // unsized values are never immediate, so we can assert_mem_place
@@ -168,8 +155,8 @@ pub trait ValueVisitor<'tcx, M: Machine<'tcx>>: Sized {
             &FieldsShape::Union(fields) => {
                 self.visit_union(v, fields)?;
             }
-            FieldsShape::Arbitrary { memory_index, .. } => {
-                for idx in Self::aggregate_field_iter(memory_index) {
+            FieldsShape::Arbitrary { in_memory_order, .. } => {
+                for idx in in_memory_order.iter().copied() {
                     let field = self.ecx().project_field(v, idx)?;
                     self.visit_field(v, idx.as_usize(), &field)?;
                 }

@@ -36,15 +36,15 @@ use std::str::{self, CharIndices};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Weak};
 
-use pulldown_cmark::{
-    BrokenLink, CodeBlockKind, CowStr, Event, LinkType, Options, Parser, Tag, TagEnd, html,
-};
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
 use rustc_errors::{Diag, DiagMessage};
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::ty::TyCtxt;
 pub(crate) use rustc_resolve::rustdoc::main_body_opts;
 use rustc_resolve::rustdoc::may_be_doc_link;
+use rustc_resolve::rustdoc::pulldown_cmark::{
+    self, BrokenLink, CodeBlockKind, CowStr, Event, LinkType, Options, Parser, Tag, TagEnd, html,
+};
 use rustc_span::edition::Edition;
 use rustc_span::{Span, Symbol};
 use tracing::{debug, trace};
@@ -111,7 +111,11 @@ pub(crate) struct MarkdownWithToc<'a> {
 }
 /// A tuple struct like `Markdown` that renders the markdown escaping HTML tags
 /// and includes no paragraph tags.
-pub(crate) struct MarkdownItemInfo<'a>(pub(crate) &'a str, pub(crate) &'a mut IdMap);
+pub(crate) struct MarkdownItemInfo<'a> {
+    pub(crate) content: &'a str,
+    pub(crate) links: &'a [RenderedLink],
+    pub(crate) ids: &'a mut IdMap,
+}
 /// A tuple struct like `Markdown` that renders only the first paragraph.
 pub(crate) struct MarkdownSummaryLine<'a>(pub &'a str, pub &'a [RenderedLink]);
 
@@ -264,9 +268,7 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for CodeBlocks<'_, 'a, I> {
                                  </pre>\
                              </div>",
                                 added_classes = added_classes.join(" "),
-                                text = Escape(
-                                    original_text.strip_suffix('\n').unwrap_or(&original_text)
-                                ),
+                                text = Escape(original_text.trim_suffix('\n')),
                             )
                             .into(),
                         ));
@@ -321,31 +323,34 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for CodeBlocks<'_, 'a, I> {
             ))
         });
 
-        let tooltip = if ignore == Ignore::All {
-            highlight::Tooltip::IgnoreAll
-        } else if let Ignore::Some(platforms) = ignore {
-            highlight::Tooltip::IgnoreSome(platforms)
-        } else if compile_fail {
-            highlight::Tooltip::CompileFail
-        } else if should_panic {
-            highlight::Tooltip::ShouldPanic
-        } else if explicit_edition {
-            highlight::Tooltip::Edition(edition)
-        } else {
-            highlight::Tooltip::None
+        let tooltip = {
+            use highlight::Tooltip::*;
+
+            if ignore == Ignore::All {
+                Some(IgnoreAll)
+            } else if let Ignore::Some(platforms) = ignore {
+                Some(IgnoreSome(platforms))
+            } else if compile_fail {
+                Some(CompileFail)
+            } else if should_panic {
+                Some(ShouldPanic)
+            } else if explicit_edition {
+                Some(Edition(edition))
+            } else {
+                None
+            }
         };
 
         // insert newline to clearly separate it from the
         // previous block so we can shorten the html output
-        let mut s = String::new();
-        s.push('\n');
-
-        highlight::render_example_with_highlighting(
-            &text,
-            &mut s,
-            tooltip,
-            playground_button.as_deref(),
-            &added_classes,
+        let s = format!(
+            "\n{}",
+            highlight::render_example_with_highlighting(
+                &text,
+                tooltip.as_ref(),
+                playground_button.as_deref(),
+                &added_classes,
+            )
         );
         Some(Event::Html(s.into()))
     }
@@ -1458,15 +1463,28 @@ impl MarkdownWithToc<'_> {
     }
 }
 
-impl MarkdownItemInfo<'_> {
+impl<'a> MarkdownItemInfo<'a> {
+    pub(crate) fn new(content: &'a str, links: &'a [RenderedLink], ids: &'a mut IdMap) -> Self {
+        Self { content, links, ids }
+    }
+
     pub(crate) fn write_into(self, mut f: impl fmt::Write) -> fmt::Result {
-        let MarkdownItemInfo(md, ids) = self;
+        let MarkdownItemInfo { content: md, links, ids } = self;
 
         // This is actually common enough to special-case
         if md.is_empty() {
             return Ok(());
         }
-        let p = Parser::new_ext(md, main_body_opts()).into_offset_iter();
+
+        let replacer = move |broken_link: BrokenLink<'_>| {
+            links
+                .iter()
+                .find(|link| *link.original_text == *broken_link.reference)
+                .map(|link| (link.href.as_str().into(), link.tooltip.as_str().into()))
+        };
+
+        let p = Parser::new_with_broken_link_callback(md, main_body_opts(), Some(replacer));
+        let p = p.into_offset_iter();
 
         // Treat inline HTML as plain text.
         let p = p.map(|event| match event.0 {
@@ -1476,6 +1494,7 @@ impl MarkdownItemInfo<'_> {
 
         ids.handle_footnotes(|ids, existing_footnotes| {
             let p = HeadingLinks::new(p, None, ids, HeadingOffset::H1);
+            let p = SpannedLinkReplacer::new(p, links);
             let p = footnotes::Footnotes::new(p, existing_footnotes);
             let p = TableWrapper::new(p.map(|(ev, _)| ev));
             let p = p.filter(|event| {

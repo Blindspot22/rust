@@ -184,16 +184,6 @@ impl fmt::Debug for ty::BoundTy {
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for ty::Placeholder<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.universe == ty::UniverseIndex::ROOT {
-            write!(f, "!{:?}", self.bound)
-        } else {
-            write!(f, "!{}_{:?}", self.universe.index(), self.bound)
-        }
-    }
-}
-
 impl<'tcx> fmt::Debug for GenericArg<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind() {
@@ -253,7 +243,6 @@ TrivialTypeTraversalImpls! {
     crate::mir::FakeReadCause,
     crate::mir::Local,
     crate::mir::MirPhase,
-    crate::mir::NullOp<'tcx>,
     crate::mir::Promoted,
     crate::mir::RawPtrKind,
     crate::mir::RetagKind,
@@ -267,8 +256,8 @@ TrivialTypeTraversalImpls! {
     crate::ty::AssocItem,
     crate::ty::AssocKind,
     crate::ty::BoundRegion,
+    crate::ty::ScalarInt,
     crate::ty::UserTypeAnnotationIndex,
-    crate::ty::ValTree<'tcx>,
     crate::ty::abstract_const::NotConstEvaluatable,
     crate::ty::adjustment::AutoBorrowMutability,
     crate::ty::adjustment::PointerCoercion,
@@ -294,8 +283,9 @@ TrivialTypeTraversalImpls! {
 // interners).
 TrivialTypeTraversalAndLiftImpls! {
     // tidy-alphabetical-start
+    crate::mir::RuntimeChecks,
+    crate::ty::BoundTy,
     crate::ty::ParamTy,
-    crate::ty::PlaceholderType,
     crate::ty::instance::ReifyReason,
     rustc_hir::def_id::DefId,
     // tidy-alphabetical-end
@@ -390,11 +380,9 @@ impl<'tcx> TypeSuperFoldable<TyCtxt<'tcx>> for Ty<'tcx> {
             ty::Array(typ, sz) => ty::Array(typ.try_fold_with(folder)?, sz.try_fold_with(folder)?),
             ty::Slice(typ) => ty::Slice(typ.try_fold_with(folder)?),
             ty::Adt(tid, args) => ty::Adt(tid, args.try_fold_with(folder)?),
-            ty::Dynamic(trait_ty, region, representation) => ty::Dynamic(
-                trait_ty.try_fold_with(folder)?,
-                region.try_fold_with(folder)?,
-                representation,
-            ),
+            ty::Dynamic(trait_ty, region) => {
+                ty::Dynamic(trait_ty.try_fold_with(folder)?, region.try_fold_with(folder)?)
+            }
             ty::Tuple(ts) => ty::Tuple(ts.try_fold_with(folder)?),
             ty::FnDef(def_id, args) => ty::FnDef(def_id, args.try_fold_with(folder)?),
             ty::FnPtr(sig_tys, hdr) => ty::FnPtr(sig_tys.try_fold_with(folder)?, hdr),
@@ -437,8 +425,8 @@ impl<'tcx> TypeSuperFoldable<TyCtxt<'tcx>> for Ty<'tcx> {
             ty::Array(typ, sz) => ty::Array(typ.fold_with(folder), sz.fold_with(folder)),
             ty::Slice(typ) => ty::Slice(typ.fold_with(folder)),
             ty::Adt(tid, args) => ty::Adt(tid, args.fold_with(folder)),
-            ty::Dynamic(trait_ty, region, representation) => {
-                ty::Dynamic(trait_ty.fold_with(folder), region.fold_with(folder), representation)
+            ty::Dynamic(trait_ty, region) => {
+                ty::Dynamic(trait_ty.fold_with(folder), region.fold_with(folder))
             }
             ty::Tuple(ts) => ty::Tuple(ts.fold_with(folder)),
             ty::FnDef(def_id, args) => ty::FnDef(def_id, args.fold_with(folder)),
@@ -481,7 +469,7 @@ impl<'tcx> TypeSuperVisitable<TyCtxt<'tcx>> for Ty<'tcx> {
             }
             ty::Slice(typ) => typ.visit_with(visitor),
             ty::Adt(_, args) => args.visit_with(visitor),
-            ty::Dynamic(trait_ty, reg, _) => {
+            ty::Dynamic(trait_ty, reg) => {
                 try_visit!(trait_ty.visit_with(visitor));
                 reg.visit_with(visitor)
             }
@@ -598,11 +586,18 @@ impl<'tcx> TypeSuperFoldable<TyCtxt<'tcx>> for ty::Predicate<'tcx> {
         self,
         folder: &mut F,
     ) -> Result<Self, F::Error> {
+        // This method looks different to `Ty::try_super_fold_with` and `Const::super_fold_with`.
+        // Why is that? `PredicateKind` provides little scope for optimized folding, unlike
+        // `TyKind` and `ConstKind` (which have common variants that don't require recursive
+        // `fold_with` calls on their fields). So we just derive the `TypeFoldable` impl for
+        // `PredicateKind` and call it here because the derived code is as fast as hand-written
+        // code would be.
         let new = self.kind().try_fold_with(folder)?;
         Ok(folder.cx().reuse_or_mk_predicate(self, new))
     }
 
     fn super_fold_with<F: TypeFolder<TyCtxt<'tcx>>>(self, folder: &mut F) -> Self {
+        // See comment in `Predicate::try_super_fold_with`.
         let new = self.kind().fold_with(folder);
         folder.cx().reuse_or_mk_predicate(self, new)
     }
@@ -610,6 +605,7 @@ impl<'tcx> TypeSuperFoldable<TyCtxt<'tcx>> for ty::Predicate<'tcx> {
 
 impl<'tcx> TypeSuperVisitable<TyCtxt<'tcx>> for ty::Predicate<'tcx> {
     fn super_visit_with<V: TypeVisitor<TyCtxt<'tcx>>>(&self, visitor: &mut V) -> V::Result {
+        // See comment in `Predicate::try_super_fold_with`.
         self.kind().visit_with(visitor)
     }
 }
@@ -709,6 +705,37 @@ impl<'tcx> TypeSuperVisitable<TyCtxt<'tcx>> for ty::Const<'tcx> {
     }
 }
 
+impl<'tcx> TypeVisitable<TyCtxt<'tcx>> for ty::ValTree<'tcx> {
+    fn visit_with<V: TypeVisitor<TyCtxt<'tcx>>>(&self, visitor: &mut V) -> V::Result {
+        let inner: &ty::ValTreeKind<TyCtxt<'tcx>> = &*self;
+        inner.visit_with(visitor)
+    }
+}
+
+impl<'tcx> TypeFoldable<TyCtxt<'tcx>> for ty::ValTree<'tcx> {
+    fn try_fold_with<F: FallibleTypeFolder<TyCtxt<'tcx>>>(
+        self,
+        folder: &mut F,
+    ) -> Result<Self, F::Error> {
+        let inner: &ty::ValTreeKind<TyCtxt<'tcx>> = &*self;
+        let new_inner = inner.clone().try_fold_with(folder)?;
+
+        if inner == &new_inner {
+            Ok(self)
+        } else {
+            let valtree = folder.cx().intern_valtree(new_inner);
+            Ok(valtree)
+        }
+    }
+
+    fn fold_with<F: TypeFolder<TyCtxt<'tcx>>>(self, folder: &mut F) -> Self {
+        let inner: &ty::ValTreeKind<TyCtxt<'tcx>> = &*self;
+        let new_inner = inner.clone().fold_with(folder);
+
+        if inner == &new_inner { self } else { folder.cx().intern_valtree(new_inner) }
+    }
+}
+
 impl<'tcx> TypeVisitable<TyCtxt<'tcx>> for rustc_span::ErrorGuaranteed {
     fn visit_with<V: TypeVisitor<TyCtxt<'tcx>>>(&self, visitor: &mut V) -> V::Result {
         visitor.visit_error(*self)
@@ -798,6 +825,7 @@ macro_rules! list_fold {
 
 list_fold! {
     &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>> : mk_poly_existential_predicates,
+    &'tcx ty::List<(ty::OpaqueTypeKey<'tcx>, Ty<'tcx>)>: mk_predefined_opaques_in_body,
     &'tcx ty::List<PlaceElem<'tcx>> : mk_place_elems,
     &'tcx ty::List<ty::Pattern<'tcx>> : mk_patterns,
     &'tcx ty::List<ty::ArgOutlivesPredicate<'tcx>> : mk_outlives,

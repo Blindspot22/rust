@@ -13,7 +13,7 @@
 //! project is currently loading and we don't have a full project model, we
 //! still want to respond to various  requests.
 // FIXME: This is a mess that needs some untangling work
-use std::{iter, mem};
+use std::{iter, mem, sync::atomic::AtomicUsize};
 
 use hir::{ChangeWithProcMacros, ProcMacrosBuilder, db::DefDatabase};
 use ide_db::{
@@ -23,6 +23,7 @@ use ide_db::{
 use itertools::Itertools;
 use load_cargo::{ProjectFolders, load_proc_macro};
 use lsp_types::FileSystemWatcher;
+use paths::Utf8Path;
 use proc_macro_api::ProcMacroClient;
 use project_model::{ManifestPath, ProjectWorkspace, ProjectWorkspaceKind, WorkspaceBuildScripts};
 use stdx::{format_to, thread::ThreadIntent};
@@ -73,7 +74,7 @@ impl GlobalState {
             && !self.fetch_workspaces_queue.op_in_progress()
             && !self.fetch_build_data_queue.op_in_progress()
             && !self.fetch_proc_macros_queue.op_in_progress()
-            && !self.discover_workspace_queue.op_in_progress()
+            && self.discover_jobs_active == 0
             && self.vfs_progress_config_version >= self.vfs_config_version
     }
 
@@ -152,7 +153,9 @@ impl GlobalState {
         if self.fetch_build_data_error().is_err() {
             status.health |= lsp_ext::Health::Warning;
             message.push_str("Failed to run build scripts of some packages.\n\n");
-            message.push_str("Please refer to the logs for more details on the errors.");
+            message.push_str(
+                "Please refer to the language server logs for more details on the errors.",
+            );
         }
         if let Some(err) = &self.config_errors {
             status.health |= lsp_ext::Health::Warning;
@@ -215,6 +218,16 @@ impl GlobalState {
                     format_to!(
                         message,
                         "Workspace `{}` has sysroot errors: ",
+                        ws.manifest_or_root()
+                    );
+                    message.push_str(err);
+                    message.push_str("\n\n");
+                }
+                if let Some(err) = ws.sysroot.metadata_error() {
+                    status.health |= lsp_ext::Health::Warning;
+                    format_to!(
+                        message,
+                        "Failed to read Cargo metadata with dependencies for sysroot of `{}`: ",
                         ws.manifest_or_root()
                     );
                     message.push_str(err);
@@ -284,7 +297,7 @@ impl GlobalState {
                 .collect();
             let cargo_config = self.config.cargo(None);
             let discover_command = self.config.discover_workspace_config().cloned();
-            let is_quiescent = !(self.discover_workspace_queue.op_in_progress()
+            let is_quiescent = !(self.discover_jobs_active > 0
                 || self.vfs_progress_config_version < self.vfs_config_version
                 || !self.vfs_done);
 
@@ -316,7 +329,7 @@ impl GlobalState {
                     }
                 }
 
-                let mut workspaces = linked_projects
+                let mut workspaces: Vec<_> = linked_projects
                     .iter()
                     .map(|project| match project {
                         LinkedProject::ProjectManifest(manifest) => {
@@ -337,7 +350,7 @@ impl GlobalState {
                             Ok(workspace)
                         }
                     })
-                    .collect::<Vec<_>>();
+                    .collect();
 
                 let mut i = 0;
                 while i < workspaces.len() {
@@ -687,7 +700,7 @@ impl GlobalState {
                 };
                 info!("Using proc-macro server at {path}");
 
-                Some(ProcMacroClient::spawn(&path, &env).map_err(|err| {
+                Some(ProcMacroClient::spawn(&path, &env, ws.toolchain.as_ref()).map_err(|err| {
                     tracing::error!(
                         "Failed to run proc-macro server from path {path}, error: {err:?}",
                     );
@@ -739,13 +752,16 @@ impl GlobalState {
             })
             .collect();
 
+        self.incomplete_crate_graph = false;
         let (crate_graph, proc_macro_paths) = {
             // Create crate graph from all the workspaces
             let vfs = &self.vfs.read().0;
             let load = |path: &AbsPath| {
                 let vfs_path = vfs::VfsPath::from(path.to_path_buf());
                 self.crate_graph_file_dependencies.insert(vfs_path.clone());
-                vfs.file_id(&vfs_path).and_then(|(file_id, excluded)| {
+                let file_id = vfs.file_id(&vfs_path);
+                self.incomplete_crate_graph |= file_id.is_none();
+                file_id.and_then(|(file_id, excluded)| {
                     (excluded == vfs::FileExcluded::No).then_some(file_id)
                 })
             };
@@ -846,24 +862,22 @@ impl GlobalState {
     fn reload_flycheck(&mut self) {
         let _p = tracing::info_span!("GlobalState::reload_flycheck").entered();
         let config = self.config.flycheck(None);
-        let sender = self.flycheck_sender.clone();
-        let invocation_strategy = match config {
-            FlycheckConfig::CargoCommand { .. } => {
-                crate::flycheck::InvocationStrategy::PerWorkspace
-            }
-            FlycheckConfig::CustomCommand { ref invocation_strategy, .. } => {
-                invocation_strategy.clone()
-            }
-        };
+        let sender = &self.flycheck_sender;
+        let invocation_strategy = config.invocation_strategy();
+        let next_gen =
+            self.flycheck.iter().map(FlycheckHandle::generation).max().unwrap_or_default() + 1;
+        let generation = Arc::new(AtomicUsize::new(next_gen));
 
         self.flycheck = match invocation_strategy {
             crate::flycheck::InvocationStrategy::Once => {
                 vec![FlycheckHandle::spawn(
                     0,
-                    sender,
+                    generation.clone(),
+                    sender.clone(),
                     config,
                     None,
                     self.config.root_path().clone(),
+                    None,
                     None,
                 )]
             }
@@ -879,13 +893,17 @@ impl GlobalState {
                                 | ProjectWorkspaceKind::DetachedFile {
                                     cargo: Some((cargo, _, _)),
                                     ..
-                                } => (cargo.workspace_root(), Some(cargo.manifest_path())),
+                                } => (
+                                    cargo.workspace_root(),
+                                    Some(cargo.manifest_path()),
+                                    Some(cargo.target_directory()),
+                                ),
                                 ProjectWorkspaceKind::Json(project) => {
                                     // Enable flychecks for json projects if a custom flycheck command was supplied
                                     // in the workspace configuration.
                                     match config {
                                         FlycheckConfig::CustomCommand { .. } => {
-                                            (project.path(), None)
+                                            (project.path(), None, None)
                                         }
                                         _ => return None,
                                     }
@@ -895,14 +913,16 @@ impl GlobalState {
                             ws.sysroot.root().map(ToOwned::to_owned),
                         ))
                     })
-                    .map(|(id, (root, manifest_path), sysroot_root)| {
+                    .map(|(id, (root, manifest_path, target_dir), sysroot_root)| {
                         FlycheckHandle::spawn(
                             id,
+                            generation.clone(),
                             sender.clone(),
                             config.clone(),
                             sysroot_root,
                             root.to_path_buf(),
                             manifest_path.map(|it| it.to_path_buf()),
+                            target_dir.map(|it| AsRef::<Utf8Path>::as_ref(it).to_path_buf()),
                         )
                     })
                     .collect()

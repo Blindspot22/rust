@@ -1,13 +1,14 @@
-use clippy_utils::diagnostics::{span_lint, span_lint_and_sugg};
+use clippy_utils::diagnostics::{span_lint_and_help, span_lint_and_sugg};
 use clippy_utils::source::{reindent_multiline, snippet_indent, snippet_with_applicability, snippet_with_context};
 use clippy_utils::ty::is_copy;
 use clippy_utils::visitors::for_each_expr;
 use clippy_utils::{
-    SpanlessEq, can_move_expr_to_closure_no_visit, higher, is_expr_final_block_expr, is_expr_used_or_unified,
-    peel_hir_expr_while,
+    SpanlessEq, can_move_expr_to_closure_no_visit, desugar_await, higher, is_expr_final_block_expr,
+    is_expr_used_or_unified, paths, peel_hir_expr_while, span_contains_non_whitespace,
 };
 use core::fmt::{self, Write};
 use rustc_errors::Applicability;
+use rustc_hir::def_id::DefId;
 use rustc_hir::hir_id::HirIdSet;
 use rustc_hir::intravisit::{Visitor, walk_body, walk_expr};
 use rustc_hir::{Block, Expr, ExprKind, HirId, Pat, Stmt, StmtKind, UnOp};
@@ -166,7 +167,11 @@ impl<'tcx> LateLintPass<'tcx> for HashMapPass {
                     "if let {}::{entry_kind} = {map_str}.entry({key_str}) {body_str}",
                     map_ty.entry_path(),
                 ))
-            } else if let Some(insertion) = then_search.as_single_insertion() {
+            } else if let Some(insertion) = then_search.as_single_insertion()
+                && let span_in_between = then_expr.span.shrink_to_lo().between(insertion.call.span)
+                && let span_in_between = span_in_between.split_at(1).1
+                && !span_contains_non_whitespace(cx, span_in_between, true)
+            {
                 let value_str = snippet_with_context(cx, insertion.value.span, then_expr.span.ctxt(), "..", &mut app).0;
                 if contains_expr.negated {
                     if insertion.value.can_have_side_effects() {
@@ -194,7 +199,17 @@ impl<'tcx> LateLintPass<'tcx> for HashMapPass {
         if let Some(sugg) = sugg {
             span_lint_and_sugg(cx, MAP_ENTRY, expr.span, lint_msg, "try", sugg, app);
         } else {
-            span_lint(cx, MAP_ENTRY, expr.span, lint_msg);
+            span_lint_and_help(
+                cx,
+                MAP_ENTRY,
+                expr.span,
+                lint_msg,
+                None,
+                format!(
+                    "consider using the `Entry` API: https://doc.rust-lang.org/std/collections/struct.{}.html#entry-api",
+                    map_ty.name()
+                ),
+            );
         }
     }
 }
@@ -254,35 +269,28 @@ fn try_parse_contains<'tcx>(cx: &LateContext<'_>, expr: &'tcx Expr<'_>) -> Optio
         _ => None,
     });
 
-    match expr.kind {
-        ExprKind::MethodCall(
-            _,
+    if let ExprKind::MethodCall(_, map, [arg], _) = expr.kind
+        && let Expr {
+            kind: ExprKind::AddrOf(_, _, key),
+            span: key_span,
+            ..
+        } = arg
+        && key_span.eq_ctxt(expr.span)
+    {
+        let id = cx.typeck_results().type_dependent_def_id(expr.hir_id)?;
+        let expr = ContainsExpr {
+            negated,
             map,
-            [
-                Expr {
-                    kind: ExprKind::AddrOf(_, _, key),
-                    span: key_span,
-                    ..
-                },
-            ],
-            _,
-        ) if key_span.eq_ctxt(expr.span) => {
-            let id = cx.typeck_results().type_dependent_def_id(expr.hir_id)?;
-            let expr = ContainsExpr {
-                negated,
-                map,
-                key,
-                call_ctxt: expr.span.ctxt(),
-            };
-            if cx.tcx.is_diagnostic_item(sym::btreemap_contains_key, id) {
-                Some((MapType::BTree, expr))
-            } else if cx.tcx.is_diagnostic_item(sym::hashmap_contains_key, id) {
-                Some((MapType::Hash, expr))
-            } else {
-                None
-            }
-        },
-        _ => None,
+            key,
+            call_ctxt: expr.span.ctxt(),
+        };
+        match cx.tcx.get_diagnostic_name(id) {
+            Some(sym::btreemap_contains_key) => Some((MapType::BTree, expr)),
+            Some(sym::hashmap_contains_key) => Some((MapType::Hash, expr)),
+            _ => None,
+        }
+    } else {
+        None
     }
 }
 
@@ -311,7 +319,9 @@ struct InsertExpr<'tcx> {
 fn try_parse_insert<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) -> Option<InsertExpr<'tcx>> {
     if let ExprKind::MethodCall(_, map, [key, value], _) = expr.kind {
         let id = cx.typeck_results().type_dependent_def_id(expr.hir_id)?;
-        if cx.tcx.is_diagnostic_item(sym::btreemap_insert, id) || cx.tcx.is_diagnostic_item(sym::hashmap_insert, id) {
+        if let Some(insert) = cx.tcx.get_diagnostic_name(id)
+            && matches!(insert, sym::btreemap_insert | sym::hashmap_insert)
+        {
             Some(InsertExpr { map, key, value })
         } else {
             None
@@ -377,6 +387,8 @@ struct InsertSearcher<'cx, 'tcx> {
     loops: Vec<HirId>,
     /// Local variables created in the expression. These don't need to be captured.
     locals: HirIdSet,
+    /// Whether the map is a non-async-aware `MutexGuard`.
+    map_is_mutex_guard: bool,
 }
 impl<'tcx> InsertSearcher<'_, 'tcx> {
     /// Visit the expression as a branch in control flow. Multiple insert calls can be used, but
@@ -519,15 +531,22 @@ impl<'tcx> Visitor<'tcx> for InsertSearcher<'_, 'tcx> {
                 ExprKind::If(cond_expr, then_expr, Some(else_expr)) => {
                     self.is_single_insert = false;
                     self.visit_non_tail_expr(cond_expr);
-                    // Each branch may contain it's own insert expression.
+                    // Each branch may contain its own insert expression.
                     let mut is_map_used = self.visit_cond_arm(then_expr);
                     is_map_used |= self.visit_cond_arm(else_expr);
                     self.is_map_used = is_map_used;
                 },
                 ExprKind::Match(scrutinee_expr, arms, _) => {
+                    // If the map is a non-async-aware `MutexGuard` and
+                    // `.await` expression appears alongside map insertion in the same `then` or `else` block,
+                    // we cannot suggest using `entry()` because it would hold the lock across the await point,
+                    // triggering `await_holding_lock` and risking deadlock.
+                    if self.map_is_mutex_guard && desugar_await(expr).is_some() {
+                        self.can_use_entry = false;
+                    }
                     self.is_single_insert = false;
                     self.visit_non_tail_expr(scrutinee_expr);
-                    // Each branch may contain it's own insert expression.
+                    // Each branch may contain its own insert expression.
                     let mut is_map_used = self.is_map_used;
                     for arm in arms {
                         self.visit_pat(arm.pat);
@@ -720,16 +739,32 @@ fn find_insert_calls<'tcx>(
         edits: Vec::new(),
         loops: Vec::new(),
         locals: HirIdSet::default(),
+        map_is_mutex_guard: false,
     };
+    // Check if the map is a non-async-aware `MutexGuard`
+    if let rustc_middle::ty::Adt(adt, _) = cx.typeck_results().expr_ty(contains_expr.map).kind()
+        && is_mutex_guard(cx, adt.did())
+    {
+        s.map_is_mutex_guard = true;
+    }
+
     s.visit_expr(expr);
-    let allow_insert_closure = s.allow_insert_closure;
-    let is_single_insert = s.is_single_insert;
+    if !s.can_use_entry {
+        return None;
+    }
+
     let is_key_used_and_no_copy = s.is_key_used && !is_copy(cx, cx.typeck_results().expr_ty(contains_expr.key));
-    let edits = s.edits;
-    s.can_use_entry.then_some(InsertSearchResults {
-        edits,
-        allow_insert_closure,
-        is_single_insert,
+    Some(InsertSearchResults {
+        edits: s.edits,
+        allow_insert_closure: s.allow_insert_closure,
+        is_single_insert: s.is_single_insert,
         is_key_used_and_no_copy,
     })
+}
+
+fn is_mutex_guard(cx: &LateContext<'_>, def_id: DefId) -> bool {
+    match cx.tcx.get_diagnostic_name(def_id) {
+        Some(name) => matches!(name, sym::MutexGuard | sym::RwLockReadGuard | sym::RwLockWriteGuard),
+        None => paths::PARKING_LOT_GUARDS.iter().any(|guard| guard.matches(cx, def_id)),
+    }
 }

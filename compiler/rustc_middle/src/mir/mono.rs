@@ -48,6 +48,9 @@ pub enum InstantiationMode {
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug, Hash, HashStable, TyEncodable, TyDecodable)]
+pub struct NormalizationErrorInMono;
+
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Hash, HashStable, TyEncodable, TyDecodable)]
 pub enum MonoItem<'tcx> {
     Fn(Instance<'tcx>),
     Static(DefId),
@@ -149,7 +152,7 @@ impl<'tcx> MonoItem<'tcx> {
         // instantiation:
         // We emit an unused_attributes lint for this case, which should be kept in sync if possible.
         let codegen_fn_attrs = tcx.codegen_instance_attrs(instance.def);
-        if codegen_fn_attrs.contains_extern_indicator(tcx, instance.def.def_id())
+        if codegen_fn_attrs.contains_extern_indicator()
             || codegen_fn_attrs.flags.contains(CodegenFnAttrFlags::NAKED)
         {
             return InstantiationMode::GloballyShared { may_conflict: false };
@@ -371,7 +374,7 @@ pub struct MonoItemData {
 /// Visibility doesn't have any effect when linkage is internal.
 ///
 /// DSO means dynamic shared object, that is a dynamically linked executable or dylib.
-#[derive(Copy, Clone, PartialEq, Debug, HashStable)]
+#[derive(Copy, Clone, PartialEq, Debug, HashStable, TyEncodable, TyDecodable)]
 pub enum Visibility {
     /// Export the symbol from the DSO and apply overrides of the symbol by outside DSOs to within
     /// the DSO if the object file format supports this.

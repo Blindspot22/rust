@@ -21,6 +21,7 @@
                     "hello-world",
                 ),
             },
+            crate_attrs: [],
             is_proc_macro: false,
             proc_macro_cwd: AbsPathBuf(
                 "$ROOT$hello-world",
@@ -70,7 +71,7 @@
             },
         },
         ws_data: CrateWorkspaceData {
-            data_layout: Err(
+            target: Err(
                 "target_data_layout not loaded",
             ),
             toolchain: None,
@@ -106,6 +107,7 @@
                     "hello-world",
                 ),
             },
+            crate_attrs: [],
             is_proc_macro: false,
             proc_macro_cwd: AbsPathBuf(
                 "$ROOT$hello-world",
@@ -155,7 +157,7 @@
             },
         },
         ws_data: CrateWorkspaceData {
-            data_layout: Err(
+            target: Err(
                 "target_data_layout not loaded",
             ),
             toolchain: None,
@@ -191,6 +193,7 @@
                     "hello-world",
                 ),
             },
+            crate_attrs: [],
             is_proc_macro: false,
             proc_macro_cwd: AbsPathBuf(
                 "$ROOT$hello-world",
@@ -240,7 +243,7 @@
             },
         },
         ws_data: CrateWorkspaceData {
-            data_layout: Err(
+            target: Err(
                 "target_data_layout not loaded",
             ),
             toolchain: None,
@@ -276,6 +279,7 @@
                     "hello-world",
                 ),
             },
+            crate_attrs: [],
             is_proc_macro: false,
             proc_macro_cwd: AbsPathBuf(
                 "$ROOT$hello-world",
@@ -325,7 +329,7 @@
             },
         },
         ws_data: CrateWorkspaceData {
-            data_layout: Err(
+            target: Err(
                 "target_data_layout not loaded",
             ),
             toolchain: None,
@@ -344,6 +348,7 @@
                 ),
                 name: "libc",
             },
+            crate_attrs: [],
             is_proc_macro: false,
             proc_macro_cwd: AbsPathBuf(
                 "$ROOT$.cargo/registry/src/github.com-1ecc6299db9ec823/libc-0.2.98",
@@ -406,7 +411,7 @@
             },
         },
         ws_data: CrateWorkspaceData {
-            data_layout: Err(
+            target: Err(
                 "target_data_layout not loaded",
             ),
             toolchain: None,

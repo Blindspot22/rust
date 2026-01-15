@@ -1,14 +1,22 @@
 //! Implements calling functions from a native library.
 
+use std::cell::Cell;
+use std::marker::PhantomData;
 use std::ops::Deref;
+use std::os::raw::c_void;
+use std::ptr;
+use std::sync::atomic::AtomicBool;
 
-use libffi::high::call as ffi;
 use libffi::low::CodePtr;
-use rustc_abi::{BackendRepr, HasDataLayout, Size};
-use rustc_middle::mir::interpret::Pointer;
-use rustc_middle::ty::{self as ty, IntTy, UintTy};
+use libffi::middle::Type as FfiType;
+use rustc_abi::{HasDataLayout, Size};
+use rustc_data_structures::either;
+use rustc_middle::ty::layout::TyAndLayout;
+use rustc_middle::ty::{self, Ty};
 use rustc_span::Symbol;
 use serde::{Deserialize, Serialize};
+
+use crate::*;
 
 #[cfg_attr(
     not(all(
@@ -20,7 +28,21 @@ use serde::{Deserialize, Serialize};
 )]
 pub mod trace;
 
-use crate::*;
+/// An argument for an FFI call.
+#[derive(Debug, Clone)]
+pub struct OwnedArg {
+    /// The type descriptor for this argument.
+    ty: Option<FfiType>,
+    /// Corresponding bytes for the value.
+    bytes: Box<[u8]>,
+}
+
+impl OwnedArg {
+    /// Instantiates an argument from a type descriptor and bytes.
+    pub fn new(ty: FfiType, bytes: Box<[u8]>) -> Self {
+        Self { ty: Some(ty), bytes }
+    }
+}
 
 /// The final results of an FFI trace, containing every relevant event detected
 /// by the tracer.
@@ -69,90 +91,38 @@ impl AccessRange {
 
 impl<'tcx> EvalContextExtPriv<'tcx> for crate::MiriInterpCx<'tcx> {}
 trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
-    /// Call native host function and return the output as an immediate.
-    fn call_native_with_args<'a>(
+    /// Call native host function and return the output and the memory accesses
+    /// that occurred during the call.
+    fn call_native_raw(
         &mut self,
-        link_name: Symbol,
-        dest: &MPlaceTy<'tcx>,
-        ptr: CodePtr,
-        libffi_args: Vec<libffi::high::Arg<'a>>,
-    ) -> InterpResult<'tcx, (crate::ImmTy<'tcx>, Option<MemEvents>)> {
+        fun: CodePtr,
+        args: &mut [OwnedArg],
+        ret: (FfiType, Size),
+    ) -> InterpResult<'tcx, (Box<[u8]>, Option<MemEvents>)> {
         let this = self.eval_context_mut();
         #[cfg(target_os = "linux")]
-        let alloc = this.machine.allocator.as_ref().unwrap();
+        let alloc = this.machine.allocator.as_ref().unwrap().clone();
         #[cfg(not(target_os = "linux"))]
         // Placeholder value.
         let alloc = ();
 
-        trace::Supervisor::do_ffi(alloc, || {
-            // Call the function (`ptr`) with arguments `libffi_args`, and obtain the return value
-            // as the specified primitive integer type
-            let scalar = match dest.layout.ty.kind() {
-                // ints
-                ty::Int(IntTy::I8) => {
-                    // Unsafe because of the call to native code.
-                    // Because this is calling a C function it is not necessarily sound,
-                    // but there is no way around this and we've checked as much as we can.
-                    let x = unsafe { ffi::call::<i8>(ptr, libffi_args.as_slice()) };
-                    Scalar::from_i8(x)
-                }
-                ty::Int(IntTy::I16) => {
-                    let x = unsafe { ffi::call::<i16>(ptr, libffi_args.as_slice()) };
-                    Scalar::from_i16(x)
-                }
-                ty::Int(IntTy::I32) => {
-                    let x = unsafe { ffi::call::<i32>(ptr, libffi_args.as_slice()) };
-                    Scalar::from_i32(x)
-                }
-                ty::Int(IntTy::I64) => {
-                    let x = unsafe { ffi::call::<i64>(ptr, libffi_args.as_slice()) };
-                    Scalar::from_i64(x)
-                }
-                ty::Int(IntTy::Isize) => {
-                    let x = unsafe { ffi::call::<isize>(ptr, libffi_args.as_slice()) };
-                    Scalar::from_target_isize(x.try_into().unwrap(), this)
-                }
-                // uints
-                ty::Uint(UintTy::U8) => {
-                    let x = unsafe { ffi::call::<u8>(ptr, libffi_args.as_slice()) };
-                    Scalar::from_u8(x)
-                }
-                ty::Uint(UintTy::U16) => {
-                    let x = unsafe { ffi::call::<u16>(ptr, libffi_args.as_slice()) };
-                    Scalar::from_u16(x)
-                }
-                ty::Uint(UintTy::U32) => {
-                    let x = unsafe { ffi::call::<u32>(ptr, libffi_args.as_slice()) };
-                    Scalar::from_u32(x)
-                }
-                ty::Uint(UintTy::U64) => {
-                    let x = unsafe { ffi::call::<u64>(ptr, libffi_args.as_slice()) };
-                    Scalar::from_u64(x)
-                }
-                ty::Uint(UintTy::Usize) => {
-                    let x = unsafe { ffi::call::<usize>(ptr, libffi_args.as_slice()) };
-                    Scalar::from_target_usize(x.try_into().unwrap(), this)
-                }
-                // Functions with no declared return type (i.e., the default return)
-                // have the output_type `Tuple([])`.
-                ty::Tuple(t_list) if (*t_list).deref().is_empty() => {
-                    unsafe { ffi::call::<()>(ptr, libffi_args.as_slice()) };
-                    return interp_ok(ImmTy::uninit(dest.layout));
-                }
-                ty::RawPtr(..) => {
-                    let x = unsafe { ffi::call::<*const ()>(ptr, libffi_args.as_slice()) };
-                    let ptr = Pointer::new(Provenance::Wildcard, Size::from_bytes(x.addr()));
-                    Scalar::from_pointer(ptr, this)
-                }
-                _ =>
-                    return Err(err_unsup_format!(
-                        "unsupported return type for native call: {:?}",
-                        link_name
-                    ))
-                    .into(),
-            };
-            interp_ok(ImmTy::from_scalar(scalar, dest.layout))
-        })
+        // Expose InterpCx for use by closure callbacks.
+        this.machine.native_lib_ecx_interchange.set(ptr::from_mut(this).expose_provenance());
+
+        let res = trace::Supervisor::do_ffi(&alloc, || {
+            use libffi::middle::{Arg, Cif, Ret};
+
+            let cif = Cif::new(args.iter_mut().map(|arg| arg.ty.take().unwrap()), ret.0);
+            let arg_ptrs: Vec<_> = args.iter().map(|arg| Arg::new(&*arg.bytes)).collect();
+            let mut ret = vec![0u8; ret.1.bytes_usize()];
+
+            unsafe { cif.call_return_into(fun, &arg_ptrs, Ret::new::<[u8]>(&mut *ret)) };
+            ret.into()
+        });
+
+        this.machine.native_lib_ecx_interchange.set(0);
+
+        res
     }
 
     /// Get the pointer to the function of the specified name in the shared object file,
@@ -217,11 +187,9 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // so we cannot assume 1 access = 1 allocation. :(
             let mut rg = evt_rg.addr..evt_rg.end();
             while let Some(curr) = rg.next() {
-                let Some(alloc_id) = this.alloc_id_from_addr(
-                    curr.to_u64(),
-                    rg.len().try_into().unwrap(),
-                    /* only_exposed_allocations */ true,
-                ) else {
+                let Some(alloc_id) =
+                    this.alloc_id_from_addr(curr.to_u64(), rg.len().try_into().unwrap())
+                else {
                     throw_ub_format!("Foreign code did an out-of-bounds access!")
                 };
                 let alloc = this.get_alloc_raw(alloc_id)?;
@@ -243,7 +211,9 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 match evt {
                     AccessEvent::Read(_) => {
                         // If a provenance was read by the foreign code, expose it.
-                        for prov in alloc.provenance().get_range(this, overlap.into()) {
+                        for (_prov_range, prov) in
+                            alloc.provenance().get_range(overlap.into(), this)
+                        {
                             this.expose_provenance(prov)?;
                         }
                     }
@@ -267,6 +237,261 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         interp_ok(())
     }
+
+    /// Extract the value from the result of reading an operand from the machine
+    /// and convert it to a `OwnedArg`.
+    fn op_to_ffi_arg(&self, v: &OpTy<'tcx>, tracing: bool) -> InterpResult<'tcx, OwnedArg> {
+        let this = self.eval_context_ref();
+
+        // This should go first so that we emit unsupported before doing a bunch
+        // of extra work for types that aren't supported yet.
+        let ty = this.ty_to_ffitype(v.layout)?;
+
+        // Helper to print a warning when a pointer is shared with the native code.
+        let expose = |prov: Provenance| -> InterpResult<'tcx> {
+            static DEDUP: AtomicBool = AtomicBool::new(false);
+            if !DEDUP.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                // Newly set, so first time we get here.
+                this.emit_diagnostic(NonHaltingDiagnostic::NativeCallSharedMem { tracing });
+            }
+
+            this.expose_provenance(prov)?;
+            interp_ok(())
+        };
+
+        // Compute the byte-level representation of the argument. If there's a pointer in there, we
+        // expose it inside the AM. Later in `visit_reachable_allocs`, the "meta"-level provenance
+        // for accessing the pointee gets exposed; this is crucial to justify the C code effectively
+        // casting the integer in `byte` to a pointer and using that.
+        let bytes = match v.as_mplace_or_imm() {
+            either::Either::Left(mplace) => {
+                // Get the alloc id corresponding to this mplace, alongside
+                // a pointer that's offset to point to this particular
+                // mplace (not one at the base addr of the allocation).
+                let sz = mplace.layout.size.bytes_usize();
+                if sz == 0 {
+                    throw_unsup_format!("attempting to pass a ZST over FFI");
+                }
+                let (id, ofs, _) = this.ptr_get_alloc_id(mplace.ptr(), sz.try_into().unwrap())?;
+                let ofs = ofs.bytes_usize();
+                let range = ofs..ofs.strict_add(sz);
+                // Expose all provenances in the allocation within the byte range of the struct, if
+                // any. These pointers are being directly passed to native code by-value.
+                let alloc = this.get_alloc_raw(id)?;
+                for (_prov_range, prov) in alloc.provenance().get_range(range.clone().into(), this)
+                {
+                    expose(prov)?;
+                }
+                // Read the bytes that make up this argument. We cannot use the normal getter as
+                // those would fail if any part of the argument is uninitialized. Native code
+                // is kind of outside the interpreter, after all...
+                Box::from(alloc.inspect_with_uninit_and_ptr_outside_interpreter(range))
+            }
+            either::Either::Right(imm) => {
+                let mut bytes: Box<[u8]> = vec![0; imm.layout.size.bytes_usize()].into();
+
+                // A little helper to write scalars to our byte array.
+                let mut write_scalar = |this: &MiriInterpCx<'tcx>, sc: Scalar, pos: usize| {
+                    // If a scalar is a pointer, then expose its provenance.
+                    if let interpret::Scalar::Ptr(p, _) = sc {
+                        expose(p.provenance)?;
+                    }
+                    write_target_uint(
+                        this.data_layout().endian,
+                        &mut bytes[pos..][..sc.size().bytes_usize()],
+                        sc.to_scalar_int()?.to_bits_unchecked(),
+                    )
+                    .unwrap();
+                    interp_ok(())
+                };
+
+                // Write the scalar into the `bytes` buffer.
+                match *imm {
+                    Immediate::Scalar(sc) => write_scalar(this, sc, 0)?,
+                    Immediate::ScalarPair(sc_first, sc_second) => {
+                        // The first scalar has an offset of zero; compute the offset of the 2nd.
+                        let ofs_second = {
+                            let rustc_abi::BackendRepr::ScalarPair(a, b) = imm.layout.backend_repr
+                            else {
+                                span_bug!(
+                                    this.cur_span(),
+                                    "op_to_ffi_arg: invalid scalar pair layout: {:#?}",
+                                    imm.layout
+                                )
+                            };
+                            a.size(this).align_to(b.align(this).abi).bytes_usize()
+                        };
+
+                        write_scalar(this, sc_first, 0)?;
+                        write_scalar(this, sc_second, ofs_second)?;
+                    }
+                    Immediate::Uninit => {
+                        // Nothing to write.
+                    }
+                }
+
+                bytes
+            }
+        };
+        interp_ok(OwnedArg::new(ty, bytes))
+    }
+
+    fn ffi_ret_to_mem(&mut self, v: Box<[u8]>, dest: &MPlaceTy<'tcx>) -> InterpResult<'tcx> {
+        let this = self.eval_context_mut();
+        let len = v.len();
+        this.write_bytes_ptr(dest.ptr(), v)?;
+        if len == 0 {
+            return interp_ok(());
+        }
+        // We have no idea which provenance these bytes have, so we reset it to wildcard.
+        let tcx = this.tcx;
+        let (alloc_id, offset, _) = this.ptr_try_get_alloc_id(dest.ptr(), 0).unwrap();
+        let alloc = this.get_alloc_raw_mut(alloc_id)?.0;
+        alloc.process_native_write(&tcx, Some(alloc_range(offset, dest.layout.size)));
+        // Run the validation that would usually be part of `return`, also to reset
+        // any provenance and padding that would not survive the return.
+        if MiriMachine::enforce_validity(this, dest.layout) {
+            this.validate_operand(
+                &dest.clone().into(),
+                MiriMachine::enforce_validity_recursively(this, dest.layout),
+                /*reset_provenance_and_padding*/ true,
+            )?;
+        }
+        interp_ok(())
+    }
+
+    /// Parses an ADT to construct the matching libffi type.
+    fn adt_to_ffitype(
+        &self,
+        orig_ty: Ty<'_>,
+        adt_def: ty::AdtDef<'tcx>,
+        args: &'tcx ty::List<ty::GenericArg<'tcx>>,
+    ) -> InterpResult<'tcx, FfiType> {
+        let this = self.eval_context_ref();
+        // TODO: unions, etc.
+        if !adt_def.is_struct() {
+            throw_unsup_format!("passing an enum or union over FFI: {orig_ty}");
+        }
+        // TODO: Certain non-C reprs should be okay also.
+        if !adt_def.repr().c() {
+            throw_unsup_format!("passing a non-#[repr(C)] {} over FFI: {orig_ty}", adt_def.descr())
+        }
+
+        let mut fields = vec![];
+        for field in &adt_def.non_enum_variant().fields {
+            let layout = this.layout_of(field.ty(*this.tcx, args))?;
+            fields.push(this.ty_to_ffitype(layout)?);
+        }
+
+        interp_ok(FfiType::structure(fields))
+    }
+
+    /// Gets the matching libffi type for a given Ty.
+    fn ty_to_ffitype(&self, layout: TyAndLayout<'tcx>) -> InterpResult<'tcx, FfiType> {
+        use rustc_abi::{AddressSpace, BackendRepr, Float, Integer, Primitive};
+
+        // `BackendRepr::Scalar` is also a signal to pass this type as a scalar in the ABI. This
+        // matches what codegen does. This does mean that we support some types whose ABI is not
+        // stable, but that's fine -- we are anyway quite conservative in native-lib mode.
+        if let BackendRepr::Scalar(s) = layout.backend_repr {
+            // Simple sanity-check: this cannot be `repr(C)`.
+            assert!(!layout.ty.ty_adt_def().is_some_and(|adt| adt.repr().c()));
+            return interp_ok(match s.primitive() {
+                Primitive::Int(Integer::I8, /* signed */ true) => FfiType::i8(),
+                Primitive::Int(Integer::I16, /* signed */ true) => FfiType::i16(),
+                Primitive::Int(Integer::I32, /* signed */ true) => FfiType::i32(),
+                Primitive::Int(Integer::I64, /* signed */ true) => FfiType::i64(),
+                Primitive::Int(Integer::I8, /* signed */ false) => FfiType::u8(),
+                Primitive::Int(Integer::I16, /* signed */ false) => FfiType::u16(),
+                Primitive::Int(Integer::I32, /* signed */ false) => FfiType::u32(),
+                Primitive::Int(Integer::I64, /* signed */ false) => FfiType::u64(),
+                Primitive::Float(Float::F32) => FfiType::f32(),
+                Primitive::Float(Float::F64) => FfiType::f64(),
+                Primitive::Pointer(AddressSpace::ZERO) => FfiType::pointer(),
+                _ => throw_unsup_format!("unsupported scalar type for native call: {}", layout.ty),
+            });
+        }
+        interp_ok(match layout.ty.kind() {
+            // Scalar types have already been handled above.
+            ty::Adt(adt_def, args) => self.adt_to_ffitype(layout.ty, *adt_def, args)?,
+            // Rust uses `()` as return type for `void` function, which becomes `Tuple([])`.
+            ty::Tuple(t_list) if t_list.len() == 0 => FfiType::void(),
+            _ => {
+                throw_unsup_format!("unsupported type for native call: {}", layout.ty)
+            }
+        })
+    }
+}
+
+/// The data passed to the closure shim function used to intercept function pointer calls from
+/// native code.
+struct LibffiClosureData<'tcx> {
+    ecx_interchange: &'static Cell<usize>,
+    marker: PhantomData<MiriInterpCx<'tcx>>,
+}
+
+/// This function sets up a new libffi closure to intercept
+/// calls to rust code via function pointers passed to native code.
+///
+/// Calling this function leaks the data passed into the libffi closure as
+/// these need to be available until the execution terminates as the native
+/// code side could store a function pointer and only call it at a later point.
+pub fn build_libffi_closure<'tcx, 'this>(
+    this: &'this MiriInterpCx<'tcx>,
+    fn_sig: rustc_middle::ty::FnSig<'tcx>,
+) -> InterpResult<'tcx, unsafe extern "C" fn()> {
+    // Compute argument and return types in libffi representation.
+    let mut args = Vec::new();
+    for input in fn_sig.inputs().iter() {
+        let layout = this.layout_of(*input)?;
+        let ty = this.ty_to_ffitype(layout)?;
+        args.push(ty);
+    }
+    let res_type = fn_sig.output();
+    let res_type = {
+        let layout = this.layout_of(res_type)?;
+        this.ty_to_ffitype(layout)?
+    };
+
+    // Build the actual closure.
+    let closure_builder = libffi::middle::Builder::new().args(args).res(res_type);
+    let data = LibffiClosureData {
+        ecx_interchange: this.machine.native_lib_ecx_interchange,
+        marker: PhantomData,
+    };
+    let data = Box::leak(Box::new(data));
+    let closure = closure_builder.into_closure(libffi_closure_callback, data);
+    let closure = Box::leak(Box::new(closure));
+
+    // The actual argument/return type doesn't matter.
+    let fn_ptr = unsafe { closure.instantiate_code_ptr::<unsafe extern "C" fn()>() };
+    // Libffi returns a **reference** to a function ptr here.
+    // Therefore we need to dereference the reference to get the actual function pointer.
+    interp_ok(*fn_ptr)
+}
+
+/// A shim function to intercept calls back from native code into the interpreter
+/// via function pointers passed to the native code.
+///
+/// For now this shim only reports that such constructs are not supported by miri.
+/// As future improvement we might continue execution in the interpreter here.
+unsafe extern "C" fn libffi_closure_callback<'tcx>(
+    _cif: &libffi::low::ffi_cif,
+    _result: &mut c_void,
+    _args: *const *const c_void,
+    data: &LibffiClosureData<'tcx>,
+) {
+    let ecx = unsafe {
+        ptr::with_exposed_provenance_mut::<MiriInterpCx<'tcx>>(data.ecx_interchange.get())
+            .as_mut()
+            .expect("libffi closure called while no FFI call is active")
+    };
+    let err = err_unsup_format!("calling a function pointer through the FFI boundary");
+
+    crate::diagnostics::report_result(ecx, err.into());
+    // We abort the execution at this point as we cannot return the
+    // expected value here.
+    std::process::exit(1);
 }
 
 impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
@@ -276,6 +501,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     /// a native form (through `libffi` call).
     /// Then, convert the return value from the native form into something that
     /// can be stored in Miri's internal memory.
+    ///
+    /// Returns `true` if a call has been made, `false` if no functions of this name was found.
     fn call_native_fn(
         &mut self,
         link_name: Symbol,
@@ -284,47 +511,20 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     ) -> InterpResult<'tcx, bool> {
         let this = self.eval_context_mut();
         // Get the pointer to the function in the shared object file if it exists.
-        let code_ptr = match this.get_func_ptr_explicitly_from_lib(link_name) {
-            Some(ptr) => ptr,
-            None => {
-                // Shared object file does not export this function -- try the shims next.
-                return interp_ok(false);
-            }
+        let Some(code_ptr) = this.get_func_ptr_explicitly_from_lib(link_name) else {
+            // Shared object file does not export this function -- try the shims next.
+            return interp_ok(false);
         };
 
         // Do we have ptrace?
         let tracing = trace::Supervisor::is_enabled();
 
-        // Get the function arguments, and convert them to `libffi`-compatible form.
-        let mut libffi_args = Vec::<CArg>::with_capacity(args.len());
+        // Get the function arguments, copy them, and prepare the type descriptions.
+        let mut libffi_args = Vec::<OwnedArg>::with_capacity(args.len());
         for arg in args.iter() {
-            if !matches!(arg.layout.backend_repr, BackendRepr::Scalar(_)) {
-                throw_unsup_format!("only scalar argument types are supported for native calls")
-            }
-            let imm = this.read_immediate(arg)?;
-            libffi_args.push(imm_to_carg(&imm, this)?);
-            // If we are passing a pointer, expose its provenance. Below, all exposed memory
-            // (previously exposed and new exposed) will then be properly prepared.
-            if matches!(arg.layout.ty.kind(), ty::RawPtr(..)) {
-                let ptr = imm.to_scalar().to_pointer(this)?;
-                let Some(prov) = ptr.provenance else {
-                    // Pointer without provenance may not access any memory anyway, skip.
-                    continue;
-                };
-                // The first time this happens, print a warning.
-                if !this.machine.native_call_mem_warned.replace(true) {
-                    // Newly set, so first time we get here.
-                    this.emit_diagnostic(NonHaltingDiagnostic::NativeCallSharedMem { tracing });
-                }
-
-                this.expose_provenance(prov)?;
-            }
+            libffi_args.push(this.op_to_ffi_arg(arg, tracing)?);
         }
-        // Convert arguments to `libffi::high::Arg` type.
-        let libffi_args = libffi_args
-            .iter()
-            .map(|arg| arg.arg_downcast())
-            .collect::<Vec<libffi::high::Arg<'_>>>();
+        let ret_ty = this.ty_to_ffitype(dest.layout)?;
 
         // Prepare all exposed memory (both previously exposed, and just newly exposed since a
         // pointer was passed as argument). Uninitialised memory is left as-is, but any data
@@ -343,8 +543,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             std::hint::black_box(alloc.get_bytes_unchecked_raw().expose_provenance());
 
             if !tracing {
-                // Expose all provenances in this allocation, since the native code can do $whatever.
-                // Can be skipped when tracing; in that case we'll expose just the actually-read parts later.
+                // Expose all provenances in this allocation, since the native code can do
+                // $whatever. Can be skipped when tracing; in that case we'll expose just the
+                // actually-read parts later.
                 for prov in alloc.provenance().provenances() {
                     this.expose_provenance(prov)?;
                 }
@@ -354,7 +555,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             if info.mutbl.is_mut() {
                 let (alloc, cx) = this.get_alloc_raw_mut(alloc_id)?;
                 // These writes could initialize everything and wreck havoc with the pointers.
-                // We can skip that when tracing; in that case we'll later do that only for the memory that got actually written.
+                // We can skip that when tracing; in that case we'll later do that only for the
+                // memory that got actually written.
                 if !tracing {
                     alloc.process_native_write(&cx.tcx, None);
                 }
@@ -365,95 +567,13 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             interp_ok(())
         })?;
 
-        // Call the function and store output, depending on return type in the function signature.
+        // Call the function and store its output.
         let (ret, maybe_memevents) =
-            this.call_native_with_args(link_name, dest, code_ptr, libffi_args)?;
-
+            this.call_native_raw(code_ptr, &mut libffi_args, (ret_ty, dest.layout.size))?;
         if tracing {
             this.tracing_apply_accesses(maybe_memevents.unwrap())?;
         }
-
-        this.write_immediate(*ret, dest)?;
+        this.ffi_ret_to_mem(ret, dest)?;
         interp_ok(true)
     }
-}
-
-#[derive(Debug, Clone)]
-/// Enum of supported arguments to external C functions.
-// We introduce this enum instead of just calling `ffi::arg` and storing a list
-// of `libffi::high::Arg` directly, because the `libffi::high::Arg` just wraps a reference
-// to the value it represents: https://docs.rs/libffi/latest/libffi/high/call/struct.Arg.html
-// and we need to store a copy of the value, and pass a reference to this copy to C instead.
-enum CArg {
-    /// 8-bit signed integer.
-    Int8(i8),
-    /// 16-bit signed integer.
-    Int16(i16),
-    /// 32-bit signed integer.
-    Int32(i32),
-    /// 64-bit signed integer.
-    Int64(i64),
-    /// isize.
-    ISize(isize),
-    /// 8-bit unsigned integer.
-    UInt8(u8),
-    /// 16-bit unsigned integer.
-    UInt16(u16),
-    /// 32-bit unsigned integer.
-    UInt32(u32),
-    /// 64-bit unsigned integer.
-    UInt64(u64),
-    /// usize.
-    USize(usize),
-    /// Raw pointer, stored as C's `void*`.
-    RawPtr(*mut std::ffi::c_void),
-}
-
-impl<'a> CArg {
-    /// Convert a `CArg` to a `libffi` argument type.
-    fn arg_downcast(&'a self) -> libffi::high::Arg<'a> {
-        match self {
-            CArg::Int8(i) => ffi::arg(i),
-            CArg::Int16(i) => ffi::arg(i),
-            CArg::Int32(i) => ffi::arg(i),
-            CArg::Int64(i) => ffi::arg(i),
-            CArg::ISize(i) => ffi::arg(i),
-            CArg::UInt8(i) => ffi::arg(i),
-            CArg::UInt16(i) => ffi::arg(i),
-            CArg::UInt32(i) => ffi::arg(i),
-            CArg::UInt64(i) => ffi::arg(i),
-            CArg::USize(i) => ffi::arg(i),
-            CArg::RawPtr(i) => ffi::arg(i),
-        }
-    }
-}
-
-/// Extract the scalar value from the result of reading a scalar from the machine,
-/// and convert it to a `CArg`.
-fn imm_to_carg<'tcx>(v: &ImmTy<'tcx>, cx: &impl HasDataLayout) -> InterpResult<'tcx, CArg> {
-    interp_ok(match v.layout.ty.kind() {
-        // If the primitive provided can be converted to a type matching the type pattern
-        // then create a `CArg` of this primitive value with the corresponding `CArg` constructor.
-        // the ints
-        ty::Int(IntTy::I8) => CArg::Int8(v.to_scalar().to_i8()?),
-        ty::Int(IntTy::I16) => CArg::Int16(v.to_scalar().to_i16()?),
-        ty::Int(IntTy::I32) => CArg::Int32(v.to_scalar().to_i32()?),
-        ty::Int(IntTy::I64) => CArg::Int64(v.to_scalar().to_i64()?),
-        ty::Int(IntTy::Isize) =>
-            CArg::ISize(v.to_scalar().to_target_isize(cx)?.try_into().unwrap()),
-        // the uints
-        ty::Uint(UintTy::U8) => CArg::UInt8(v.to_scalar().to_u8()?),
-        ty::Uint(UintTy::U16) => CArg::UInt16(v.to_scalar().to_u16()?),
-        ty::Uint(UintTy::U32) => CArg::UInt32(v.to_scalar().to_u32()?),
-        ty::Uint(UintTy::U64) => CArg::UInt64(v.to_scalar().to_u64()?),
-        ty::Uint(UintTy::Usize) =>
-            CArg::USize(v.to_scalar().to_target_usize(cx)?.try_into().unwrap()),
-        ty::RawPtr(..) => {
-            let s = v.to_scalar().to_pointer(cx)?.addr();
-            // This relies on the `expose_provenance` in the `visit_reachable_allocs` callback
-            // above.
-            CArg::RawPtr(std::ptr::with_exposed_provenance_mut(s.bytes_usize()))
-        }
-        _ => throw_unsup_format!("unsupported argument type for native call: {}", v.layout.ty),
-    })
 }

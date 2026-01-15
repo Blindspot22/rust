@@ -683,6 +683,7 @@ function preLoadCss(cssUrl) {
                 break;
 
             case "+":
+            case "=":
                 ev.preventDefault();
                 expandAllDocs();
                 break;
@@ -790,6 +791,7 @@ function preLoadCss(cssUrl) {
             //block("associatedconstant", "associated-consts", "Associated Constants");
             block("foreigntype", "foreign-types", "Foreign Types");
             block("keyword", "keywords", "Keywords");
+            block("attribute", "attributes", "Attributes");
             block("attr", "attributes", "Attribute Macros");
             block("derive", "derives", "Derive Macros");
             block("traitalias", "trait-aliases", "Trait Aliases");
@@ -798,21 +800,34 @@ function preLoadCss(cssUrl) {
 
     // <https://github.com/search?q=repo%3Arust-lang%2Frust+[RUSTDOCIMPL]+trait.impl&type=code>
     window.register_implementors = imp => {
-        const implementors = document.getElementById("implementors-list");
-        const synthetic_implementors = document.getElementById("synthetic-implementors-list");
+        /** Takes an ID as input and returns a list of two elements. The first element is the DOM
+         * element with the given ID and the second is the "negative marker", meaning the location
+         * between the negative and non-negative impls.
+         *
+         * @param {string} id: ID of the DOM element.
+         *
+         * @return {[HTMLElement|null, HTMLElement|null]}
+         */
+        function implementorsElems(id) {
+            const elem = document.getElementById(id);
+            return [elem, elem ? elem.querySelector(".negative-marker") : null];
+        }
+        const implementors = implementorsElems("implementors-list");
+        const syntheticImplementors = implementorsElems("synthetic-implementors-list");
         const inlined_types = new Set();
 
         const TEXT_IDX = 0;
-        const SYNTHETIC_IDX = 1;
-        const TYPES_IDX = 2;
+        const IS_NEG_IDX = 1;
+        const SYNTHETIC_IDX = 2;
+        const TYPES_IDX = 3;
 
-        if (synthetic_implementors) {
+        if (syntheticImplementors[0]) {
             // This `inlined_types` variable is used to avoid having the same implementation
             // showing up twice. For example "String" in the "Sync" doc page.
             //
             // By the way, this is only used by and useful for traits implemented automatically
             // (like "Send" and "Sync").
-            onEachLazy(synthetic_implementors.getElementsByClassName("impl"), el => {
+            onEachLazy(syntheticImplementors[0].getElementsByClassName("impl"), el => {
                 const aliases = el.getAttribute("data-aliases");
                 if (!aliases) {
                     return;
@@ -825,7 +840,7 @@ function preLoadCss(cssUrl) {
         }
 
         // @ts-expect-error
-        let currentNbImpls = implementors.getElementsByClassName("impl").length;
+        let currentNbImpls = implementors[0].getElementsByClassName("impl").length;
         // @ts-expect-error
         const traitName = document.querySelector(".main-heading h1 > .trait").textContent;
         const baseIdName = "impl-" + traitName + "-";
@@ -847,7 +862,7 @@ function preLoadCss(cssUrl) {
 
             struct_loop:
             for (const struct of structs) {
-                const list = struct[SYNTHETIC_IDX] ? synthetic_implementors : implementors;
+                const list = struct[SYNTHETIC_IDX] ? syntheticImplementors : implementors;
 
                 // The types list is only used for synthetic impls.
                 // If this changes, `main.js` and `write_shared.rs` both need changed.
@@ -882,10 +897,24 @@ function preLoadCss(cssUrl) {
                 addClass(display, "impl");
                 display.appendChild(anchor);
                 display.appendChild(code);
-                // @ts-expect-error
-                list.appendChild(display);
+
+                // If this is a negative implementor, we put it into the right location (just
+                // before the negative impl marker).
+                if (struct[IS_NEG_IDX]) {
+                    // @ts-expect-error
+                    list[1].before(display);
+                } else {
+                    // @ts-expect-error
+                    list[0].appendChild(display);
+                }
                 currentNbImpls += 1;
             }
+        }
+        if (implementors[0]) {
+            implementors[0].classList.add("loaded");
+        }
+        if (syntheticImplementors[0]) {
+            syntheticImplementors[0].classList.add("loaded");
         }
     };
     if (window.pending_implementors) {
@@ -1619,7 +1648,7 @@ function preLoadCss(cssUrl) {
             ["↓", "Move down in search results"],
             ["← / →", "Switch result tab (when results focused)"],
             ["&#9166;", "Go to active search result"],
-            ["+", "Expand all sections"],
+            ["+ / =", "Expand all sections"],
             ["-", "Collapse all sections"],
             // for the sake of brevity, we don't say "inherit impl blocks",
             // although that would be more correct,
@@ -1640,7 +1669,7 @@ function preLoadCss(cssUrl) {
              restrict the search to a given item kind.",
             "Accepted kinds are: <code>fn</code>, <code>mod</code>, <code>struct</code>, \
              <code>enum</code>, <code>trait</code>, <code>type</code>, <code>macro</code>, \
-             and <code>const</code>.",
+             and <code>constant</code>.",
             "Search functions by type signature (e.g., <code>vec -&gt; usize</code> or \
              <code>-&gt; vec</code> or <code>String, enum:Cow -&gt; bool</code>)",
             "You can look for items with an exact name by putting double quotes around \
@@ -2134,7 +2163,15 @@ function preLoadCss(cssUrl) {
             // Should never happen, but the world is a dark and dangerous place.
             return;
         }
-        copyContentToClipboard(codeElem.textContent);
+        let content = "";
+        for (const node of codeElem.childNodes) {
+            // We exclude line numbers.
+            if (node instanceof HTMLElement && node.hasAttribute("data-nosnippet")) {
+                continue;
+            }
+            content += node.textContent;
+        }
+        copyContentToClipboard(content);
     }
 
     /**
@@ -2226,11 +2263,18 @@ function preLoadCss(cssUrl) {
     });
 }());
 
-// This section is a bugfix for firefox: when copying text with `user-select: none`, it adds
-// extra backline characters.
+
+// Workaround for browser-specific bugs when copying code snippets.
 //
-// Rustdoc issue: Workaround for https://github.com/rust-lang/rust/issues/141464
-// Firefox issue: https://bugzilla.mozilla.org/show_bug.cgi?id=1273836
+// * In Firefox, copying text that includes elements with `user-select: none`
+//   inserts extra blank lines.
+//   - Firefox issue: https://bugzilla.mozilla.org/show_bug.cgi?id=1273836
+//   - Rust issue: https://github.com/rust-lang/rust/issues/141464
+//
+// * In Chromium-based browsers, `document.getSelection()` includes elements
+//   with `user-select: none`, causing unwanted line numbers to be copied.
+//   - Chromium issue: https://issues.chromium.org/issues/446539520
+//   - Rust issue: https://github.com/rust-lang/rust/issues/146816
 (function() {
     document.body.addEventListener("copy", event => {
         let target = nonnull(event.target);
@@ -2247,9 +2291,13 @@ function preLoadCss(cssUrl) {
         if (!isInsideCode) {
             return;
         }
-        const selection = document.getSelection();
-         // @ts-expect-error
-        nonnull(event.clipboardData).setData("text/plain", selection.toString());
+        const selection = nonnull(document.getSelection());
+        const text = Array.from({ length: selection.rangeCount }, (_, i) => {
+            const fragment = selection.getRangeAt(i).cloneContents();
+            fragment.querySelectorAll("[data-nosnippet]").forEach(el => el.remove());
+            return fragment.textContent;
+        }).join("");
+        nonnull(event.clipboardData).setData("text/plain", text);
         event.preventDefault();
     });
 }());

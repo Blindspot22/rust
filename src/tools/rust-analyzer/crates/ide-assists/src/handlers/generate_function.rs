@@ -71,7 +71,7 @@ fn gen_fn(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
         fn_target_info(ctx, path, &call, fn_name)?;
 
     if let Some(m) = target_module
-        && !is_editable_crate(m.krate(), ctx.db())
+        && !is_editable_crate(m.krate(ctx.db()), ctx.db())
     {
         return None;
     }
@@ -143,7 +143,7 @@ fn gen_method(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     let adt = receiver_ty.as_adt()?;
 
     let target_module = adt.module(ctx.sema.db);
-    if !is_editable_crate(target_module.krate(), ctx.db()) {
+    if !is_editable_crate(target_module.krate(ctx.db()), ctx.db()) {
         return None;
     }
 
@@ -189,7 +189,7 @@ fn add_func_to_accumulator(
             )));
 
             // FIXME: adt may have generic params.
-            let impl_ = make::impl_(None, None, name, None, None).clone_for_update();
+            let impl_ = make::impl_(None, None, None, name, None, None).clone_for_update();
 
             func.indent(IndentLevel(1));
             impl_.get_or_create_assoc_item_list().add_item(func.into());
@@ -241,7 +241,7 @@ impl FunctionBuilder {
     ) -> Option<Self> {
         let target_module =
             target_module.or_else(|| ctx.sema.scope(target.syntax()).map(|it| it.module()))?;
-        let target_edition = target_module.krate().edition(ctx.db());
+        let target_edition = target_module.krate(ctx.db()).edition(ctx.db());
 
         let current_module = ctx.sema.scope(call.syntax())?.module();
         let visibility = calculate_necessary_visibility(current_module, target_module, ctx);
@@ -311,12 +311,12 @@ impl FunctionBuilder {
         target_module: Module,
         target: GeneratedFunctionTarget,
     ) -> Option<Self> {
-        let target_edition = target_module.krate().edition(ctx.db());
+        let target_edition = target_module.krate(ctx.db()).edition(ctx.db());
 
         let current_module = ctx.sema.scope(call.syntax())?.module();
         let visibility = calculate_necessary_visibility(current_module, target_module, ctx);
 
-        let fn_name = make::name(&name.text());
+        let fn_name = make::name(name.ident_token()?.text());
         let mut necessary_generic_params = FxHashSet::default();
         necessary_generic_params.extend(receiver_ty.generic_params(ctx.db()));
         let params = fn_args(
@@ -364,10 +364,13 @@ impl FunctionBuilder {
             Visibility::Crate => Some(make::visibility_pub_crate()),
             Visibility::Pub => Some(make::visibility_pub()),
         };
+        let type_params =
+            self.generic_param_list.filter(|list| list.generic_params().next().is_some());
         let fn_def = make::fn_(
+            None,
             visibility,
             self.fn_name,
-            self.generic_param_list,
+            type_params,
             self.where_clause,
             self.params,
             self.fn_body,
@@ -543,7 +546,7 @@ fn assoc_fn_target_info(
     let current_module = ctx.sema.scope(call.syntax())?.module();
     let module = adt.module(ctx.sema.db);
     let target_module = if current_module == module { None } else { Some(module) };
-    if current_module.krate() != module.krate() {
+    if current_module.krate(ctx.db()) != module.krate(ctx.db()) {
         return None;
     }
     let (impl_, file) = get_adt_source(ctx, &adt, fn_name)?;
@@ -1146,7 +1149,10 @@ fn fn_arg_type(
             convert_reference_type(ty.strip_references(), ctx.db(), famous_defs)
                 .map(|conversion| {
                     conversion
-                        .convert_type(ctx.db(), target_module.krate().to_display_target(ctx.db()))
+                        .convert_type(
+                            ctx.db(),
+                            target_module.krate(ctx.db()).to_display_target(ctx.db()),
+                        )
                         .to_string()
                 })
                 .or_else(|| ty.display_source_code(ctx.db(), target_module.into(), true).ok())
@@ -1232,7 +1238,7 @@ fn calculate_necessary_visibility(
     let current_module = current_module.nearest_non_block_module(db);
     let target_module = target_module.nearest_non_block_module(db);
 
-    if target_module.krate() != current_module.krate() {
+    if target_module.krate(ctx.db()) != current_module.krate(ctx.db()) {
         Visibility::Pub
     } else if current_module.path_to_root(db).contains(&target_module) {
         Visibility::None
@@ -2415,6 +2421,33 @@ impl Foo {
     }
 
     #[test]
+    fn create_method_with_unused_generics() {
+        check_assist(
+            generate_function,
+            r#"
+struct Foo<S>(S);
+impl<S> Foo<S> {
+    fn foo(&self) {
+        self.bar()$0;
+    }
+}
+"#,
+            r#"
+struct Foo<S>(S);
+impl<S> Foo<S> {
+    fn foo(&self) {
+        self.bar();
+    }
+
+    fn bar(&self) ${0:-> _} {
+        todo!()
+    }
+}
+"#,
+        )
+    }
+
+    #[test]
     fn create_function_with_async() {
         check_assist(
             generate_function,
@@ -3129,5 +3162,33 @@ fn main() {
 }
         "#,
         )
+    }
+
+    #[test]
+    fn no_generate_method_by_keyword() {
+        check_assist_not_applicable(
+            generate_function,
+            r#"
+fn main() {
+    s.super$0();
+}
+        "#,
+        );
+        check_assist_not_applicable(
+            generate_function,
+            r#"
+fn main() {
+    s.Self$0();
+}
+        "#,
+        );
+        check_assist_not_applicable(
+            generate_function,
+            r#"
+fn main() {
+    s.self$0();
+}
+        "#,
+        );
     }
 }

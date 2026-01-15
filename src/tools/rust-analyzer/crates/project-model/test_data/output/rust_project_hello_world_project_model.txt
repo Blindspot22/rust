@@ -12,6 +12,7 @@
                     "hello_world",
                 ),
             },
+            crate_attrs: [],
             is_proc_macro: false,
             proc_macro_cwd: AbsPathBuf(
                 "$ROOT$",
@@ -40,8 +41,8 @@
             entries: {},
         },
         ws_data: CrateWorkspaceData {
-            data_layout: Err(
-                "test has no data layout",
+            target: Err(
+                "test has no target data",
             ),
             toolchain: None,
         },

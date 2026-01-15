@@ -15,7 +15,7 @@
 
 use build_helper::exit;
 
-use super::compile::{run_cargo, rustc_cargo, std_cargo};
+use super::compile::{ArtifactKeepMode, run_cargo, rustc_cargo, std_cargo};
 use super::tool::{SourceType, prepare_tool_cargo};
 use crate::builder::{Builder, ShouldRun};
 use crate::core::build_steps::check::{CompilerForCheck, prepare_compiler_for_check};
@@ -170,10 +170,13 @@ impl Std {
 
 impl Step for Std {
     type Output = ();
-    const DEFAULT: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         run.crate_or_deps("sysroot").path("library")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        true
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -195,11 +198,7 @@ impl Step for Std {
             Kind::Clippy,
         );
 
-        std_cargo(builder, target, &mut cargo);
-
-        for krate in &*self.crates {
-            cargo.arg("-p").arg(krate);
-        }
+        std_cargo(builder, target, &mut cargo, &self.crates);
 
         let _guard = builder.msg(
             Kind::Clippy,
@@ -215,8 +214,7 @@ impl Step for Std {
             lint_args(builder, &self.config, IGNORED_RULES_FOR_STD_AND_RUSTC),
             &build_stamp::libstd_stamp(builder, build_compiler, target),
             vec![],
-            true,
-            false,
+            ArtifactKeepMode::OnlyRmeta,
         );
     }
 
@@ -257,10 +255,13 @@ impl Rustc {
 impl Step for Rustc {
     type Output = ();
     const IS_HOST: bool = true;
-    const DEFAULT: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         run.crate_or_deps("rustc-main").path("compiler")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        true
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -307,8 +308,7 @@ impl Step for Rustc {
             lint_args(builder, &self.config, IGNORED_RULES_FOR_STD_AND_RUSTC),
             &build_stamp::librustc_stamp(builder, build_compiler, target),
             vec![],
-            true,
-            false,
+            ArtifactKeepMode::OnlyRmeta,
         );
     }
 
@@ -366,21 +366,35 @@ impl Step for CodegenGcc {
         );
         self.build_compiler.configure_cargo(&mut cargo);
 
-        let _guard =
-            builder.msg(Kind::Clippy, "rustc_codegen_gcc", Mode::ToolRustc, build_compiler, target);
+        let _guard = builder.msg(
+            Kind::Clippy,
+            "rustc_codegen_gcc",
+            Mode::ToolRustcPrivate,
+            build_compiler,
+            target,
+        );
 
         let stamp = BuildStamp::new(&builder.cargo_out(build_compiler, Mode::Codegen, target))
             .with_prefix("rustc_codegen_gcc-check");
 
-        run_cargo(
+        let args = lint_args(builder, &self.config, &[]);
+        run_cargo(builder, cargo, args.clone(), &stamp, vec![], ArtifactKeepMode::OnlyRmeta);
+
+        // Same but we disable the features enabled by default.
+        let mut cargo = prepare_tool_cargo(
             builder,
-            cargo,
-            lint_args(builder, &self.config, &[]),
-            &stamp,
-            vec![],
-            true,
-            false,
+            build_compiler,
+            Mode::Codegen,
+            target,
+            Kind::Clippy,
+            "compiler/rustc_codegen_gcc",
+            SourceType::InTree,
+            &[],
         );
+        self.build_compiler.configure_cargo(&mut cargo);
+        println!("Now running clippy on `rustc_codegen_gcc` with `--no-default-features`");
+        cargo.arg("--no-default-features");
+        run_cargo(builder, cargo, args, &stamp, vec![], ArtifactKeepMode::OnlyRmeta);
     }
 
     fn metadata(&self) -> Option<StepMetadata> {
@@ -397,7 +411,7 @@ macro_rules! lint_any {
         $path:expr,
         $readable_name:expr,
         $mode:expr
-        $(,lint_by_default = $lint_by_default:expr)*
+        $(, lint_by_default = $lint_by_default:expr )?
         ;
     )+) => {
         $(
@@ -411,10 +425,13 @@ macro_rules! lint_any {
 
         impl Step for $name {
             type Output = ();
-            const DEFAULT: bool = if false $(|| $lint_by_default)* { true } else { false };
 
             fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
                 run.path($path)
+            }
+
+            fn is_default_step(_builder: &Builder<'_>) -> bool {
+                false $( || const { $lint_by_default } )?
             }
 
             fn make_run(run: RunConfig<'_>) {
@@ -459,8 +476,7 @@ macro_rules! lint_any {
                     lint_args(builder, &self.config, &[]),
                     &stamp,
                     vec![],
-                    true,
-                    false,
+                    ArtifactKeepMode::OnlyRmeta
                 );
             }
 
@@ -478,8 +494,8 @@ lint_any!(
     Bootstrap, "src/bootstrap", "bootstrap", Mode::ToolTarget;
     BuildHelper, "src/build_helper", "build_helper", Mode::ToolTarget;
     BuildManifest, "src/tools/build-manifest", "build-manifest", Mode::ToolTarget;
-    CargoMiri, "src/tools/miri/cargo-miri", "cargo-miri", Mode::ToolRustc;
-    Clippy, "src/tools/clippy", "clippy", Mode::ToolRustc;
+    CargoMiri, "src/tools/miri/cargo-miri", "cargo-miri", Mode::ToolRustcPrivate;
+    Clippy, "src/tools/clippy", "clippy", Mode::ToolRustcPrivate;
     CollectLicenseMetadata, "src/tools/collect-license-metadata", "collect-license-metadata", Mode::ToolTarget;
     Compiletest, "src/tools/compiletest", "compiletest", Mode::ToolTarget;
     CoverageDump, "src/tools/coverage-dump", "coverage-dump", Mode::ToolTarget;
@@ -487,14 +503,14 @@ lint_any!(
     Jsondoclint, "src/tools/jsondoclint", "jsondoclint", Mode::ToolTarget;
     LintDocs, "src/tools/lint-docs", "lint-docs", Mode::ToolTarget;
     LlvmBitcodeLinker, "src/tools/llvm-bitcode-linker", "llvm-bitcode-linker", Mode::ToolTarget;
-    Miri, "src/tools/miri", "miri", Mode::ToolRustc;
+    Miri, "src/tools/miri", "miri", Mode::ToolRustcPrivate;
     MiroptTestTools, "src/tools/miropt-test-tools", "miropt-test-tools", Mode::ToolTarget;
     OptDist, "src/tools/opt-dist", "opt-dist", Mode::ToolTarget;
     RemoteTestClient, "src/tools/remote-test-client", "remote-test-client", Mode::ToolTarget;
     RemoteTestServer, "src/tools/remote-test-server", "remote-test-server", Mode::ToolTarget;
-    RustAnalyzer, "src/tools/rust-analyzer", "rust-analyzer", Mode::ToolRustc;
-    Rustdoc, "src/librustdoc", "clippy", Mode::ToolRustc;
-    Rustfmt, "src/tools/rustfmt", "rustfmt", Mode::ToolRustc;
+    RustAnalyzer, "src/tools/rust-analyzer", "rust-analyzer", Mode::ToolRustcPrivate;
+    Rustdoc, "src/librustdoc", "clippy", Mode::ToolRustcPrivate;
+    Rustfmt, "src/tools/rustfmt", "rustfmt", Mode::ToolRustcPrivate;
     RustInstaller, "src/tools/rust-installer", "rust-installer", Mode::ToolTarget;
     Tidy, "src/tools/tidy", "tidy", Mode::ToolTarget;
     TestFloatParse, "src/tools/test-float-parse", "test-float-parse", Mode::ToolStd;
@@ -509,10 +525,13 @@ pub struct CI {
 
 impl Step for CI {
     type Output = ();
-    const DEFAULT: bool = false;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         run.alias("ci")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        false
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -559,6 +578,7 @@ impl Step for CI {
                 "clippy::same_item_push".into(),
                 "clippy::single_char_add_str".into(),
                 "clippy::to_string_in_format_args".into(),
+                "clippy::unconditional_recursion".into(),
             ],
             forbid: vec![],
         };
@@ -586,6 +606,7 @@ impl Step for CI {
                 "clippy::same_item_push".into(),
                 "clippy::single_char_add_str".into(),
                 "clippy::to_string_in_format_args".into(),
+                "clippy::unconditional_recursion".into(),
             ],
             forbid: vec![],
         };

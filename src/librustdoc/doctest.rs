@@ -9,31 +9,33 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use std::{fmt, panic, str};
+use std::{panic, str};
 
 pub(crate) use make::{BuildDocTestBuilder, DocTestBuilder};
 pub(crate) use markdown::test as test_markdown;
+use proc_macro2::{TokenStream, TokenTree};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxHasher, FxIndexMap, FxIndexSet};
 use rustc_errors::emitter::HumanReadableErrorType;
 use rustc_errors::{ColorConfig, DiagCtxtHandle};
-use rustc_hir as hir;
-use rustc_hir::CRATE_HIR_ID;
+use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def_id::LOCAL_CRATE;
+use rustc_hir::{Attribute, CRATE_HIR_ID};
 use rustc_interface::interface;
+use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{self, CrateType, ErrorOutputType, Input};
 use rustc_session::lint;
 use rustc_span::edition::Edition;
-use rustc_span::symbol::sym;
-use rustc_span::{FileName, Span};
+use rustc_span::{FileName, RemapPathScopeComponents, Span};
 use rustc_target::spec::{Target, TargetTuple};
 use tempfile::{Builder as TempFileBuilder, TempDir};
 use tracing::debug;
 
 use self::rust::HirCollector;
-use crate::config::{Options as RustdocOptions, OutputFormat};
+use crate::config::{MergeDoctests, Options as RustdocOptions, OutputFormat};
 use crate::html::markdown::{ErrorCodes, Ignore, LangString, MdRelLine};
 use crate::lint::init_lints;
 
@@ -60,24 +62,15 @@ impl MergedDoctestTimes {
         self.added_compilation_times += 1;
     }
 
-    fn display_times(&self) {
+    /// Returns `(total_time, compilation_time)`.
+    fn times_in_secs(&self) -> Option<(f64, f64)> {
         // If no merged doctest was compiled, then there is nothing to display since the numbers
         // displayed by `libtest` for standalone tests are already accurate (they include both
         // compilation and runtime).
-        if self.added_compilation_times > 0 {
-            println!("{self}");
+        if self.added_compilation_times == 0 {
+            return None;
         }
-    }
-}
-
-impl fmt::Display for MergedDoctestTimes {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "all doctests ran in {:.2}s; merged doctests compilation took {:.2}s",
-            self.total_time.elapsed().as_secs_f64(),
-            self.compilation_time.as_secs_f64(),
-        )
+        Some((self.total_time.elapsed().as_secs_f64(), self.compilation_time.as_secs_f64()))
     }
 }
 
@@ -132,8 +125,13 @@ pub(crate) fn generate_args_file(file_path: &Path, options: &RustdocOptions) -> 
     Ok(())
 }
 
-fn get_doctest_dir() -> io::Result<TempDir> {
-    TempFileBuilder::new().prefix("rustdoctest").tempdir()
+fn get_doctest_dir(opts: &RustdocOptions) -> io::Result<TempDir> {
+    let mut builder = TempFileBuilder::new();
+    builder.prefix("rustdoctest");
+    if opts.codegen_options.save_temps {
+        builder.disable_cleanup(true);
+    }
+    builder.tempdir()
 }
 
 pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions) {
@@ -173,6 +171,9 @@ pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions
         target_triple: options.target.clone(),
         crate_name: options.crate_name.clone(),
         remap_path_prefix: options.remap_path_prefix.clone(),
+        unstable_opts: options.unstable_opts.clone(),
+        error_format: options.error_format.clone(),
+        target_modifiers: options.target_modifiers.clone(),
         ..config::Options::default()
     };
 
@@ -198,13 +199,12 @@ pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions
         registry: rustc_driver::diagnostics_registry(),
         ice_file: None,
         using_internal_features: &rustc_driver::USING_INTERNAL_FEATURES,
-        expanded_args: options.expanded_args.clone(),
     };
 
     let externs = options.externs.clone();
     let json_unused_externs = options.json_unused_externs;
 
-    let temp_dir = match get_doctest_dir()
+    let temp_dir = match get_doctest_dir(&options)
         .map_err(|error| format!("failed to create temporary directory: {error:?}"))
     {
         Ok(temp_dir) => temp_dir,
@@ -214,13 +214,13 @@ pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions
     crate::wrap_return(dcx, generate_args_file(&args_path, &options));
 
     let extract_doctests = options.output_format == OutputFormat::Doctest;
+    let save_temps = options.codegen_options.save_temps;
     let result = interface::run_compiler(config, |compiler| {
         let krate = rustc_interface::passes::parse(&compiler.sess);
 
         let collector = rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
             let crate_name = tcx.crate_name(LOCAL_CRATE).to_string();
-            let crate_attrs = tcx.hir_attrs(CRATE_HIR_ID);
-            let opts = scrape_test_config(crate_name, crate_attrs, args_path);
+            let opts = scrape_test_config(tcx, crate_name, args_path);
 
             let hir_collector = HirCollector::new(
                 ErrorCodes::from(compiler.sess.opts.unstable_features.is_nightly_build()),
@@ -266,12 +266,15 @@ pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions
             eprintln!("{error}");
             // Since some files in the temporary folder are still owned and alive, we need
             // to manually remove the folder.
-            let _ = std::fs::remove_dir_all(temp_dir.path());
+            if !save_temps {
+                let _ = std::fs::remove_dir_all(temp_dir.path());
+            }
             std::process::exit(1);
         }
     };
 
     run_tests(
+        dcx,
         opts,
         &rustdoc_options,
         &unused_extern_reports,
@@ -323,6 +326,7 @@ pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions
 }
 
 pub(crate) fn run_tests(
+    dcx: DiagCtxtHandle<'_>,
     opts: GlobalTestOptions,
     rustdoc_options: &Arc<RustdocOptions>,
     unused_extern_reports: &Arc<Mutex<Vec<UnusedExterns>>>,
@@ -334,8 +338,8 @@ pub(crate) fn run_tests(
     let mut test_args = Vec::with_capacity(rustdoc_options.test_args.len() + 1);
     test_args.insert(0, "rustdoctest".to_string());
     test_args.extend_from_slice(&rustdoc_options.test_args);
-    if rustdoc_options.nocapture {
-        test_args.push("--nocapture".to_string());
+    if rustdoc_options.no_capture {
+        test_args.push("--no-capture".to_string());
     }
 
     let mut nb_errors = 0;
@@ -375,6 +379,13 @@ pub(crate) fn run_tests(
             }
             continue;
         }
+
+        if rustdoc_options.merge_doctests == MergeDoctests::Always {
+            let mut diag = dcx.struct_fatal("failed to merge doctests");
+            diag.note("requested explicitly on the command line with `--merge-doctests=yes`");
+            diag.emit();
+        }
+
         // We failed to compile all compatible tests as one so we push them into the
         // `standalone_tests` doctests.
         debug!("Failed to compile compatible doctests for edition {} all at once", edition);
@@ -400,23 +411,32 @@ pub(crate) fn run_tests(
     if ran_edition_tests == 0 || !standalone_tests.is_empty() {
         standalone_tests.sort_by(|a, b| a.desc.name.as_slice().cmp(b.desc.name.as_slice()));
         test::test_main_with_exit_callback(&test_args, standalone_tests, None, || {
+            let times = times.times_in_secs();
             // We ensure temp dir destructor is called.
             std::mem::drop(temp_dir.take());
-            times.display_times();
+            if let Some((total_time, compilation_time)) = times {
+                test::print_merged_doctests_times(&test_args, total_time, compilation_time);
+            }
         });
+    } else {
+        // If the first condition branch exited successfully, `test_main_with_exit_callback` will
+        // not exit the process. So to prevent displaying the times twice, we put it behind an
+        // `else` condition.
+        if let Some((total_time, compilation_time)) = times.times_in_secs() {
+            test::print_merged_doctests_times(&test_args, total_time, compilation_time);
+        }
     }
+    // We ensure temp dir destructor is called.
+    std::mem::drop(temp_dir);
     if nb_errors != 0 {
-        // We ensure temp dir destructor is called.
-        std::mem::drop(temp_dir);
-        times.display_times();
         std::process::exit(test::ERROR_EXIT_CODE);
     }
 }
 
 // Look for `#![doc(test(no_crate_inject))]`, used by crates in the std facade.
 fn scrape_test_config(
+    tcx: TyCtxt<'_>,
     crate_name: String,
-    attrs: &[hir::Attribute],
     args_file: PathBuf,
 ) -> GlobalTestOptions {
     let mut opts = GlobalTestOptions {
@@ -426,19 +446,26 @@ fn scrape_test_config(
         args_file,
     };
 
-    let test_attrs: Vec<_> = attrs
-        .iter()
-        .filter(|a| a.has_name(sym::doc))
-        .flat_map(|a| a.meta_item_list().unwrap_or_default())
-        .filter(|a| a.has_name(sym::test))
-        .collect();
-    let attrs = test_attrs.iter().flat_map(|a| a.meta_item_list().unwrap_or(&[]));
-
-    for attr in attrs {
-        if attr.has_name(sym::no_crate_inject) {
-            opts.no_crate_inject = true;
+    let source_map = tcx.sess.source_map();
+    'main: for attr in tcx.hir_attrs(CRATE_HIR_ID) {
+        let Attribute::Parsed(AttributeKind::Doc(d)) = attr else { continue };
+        for attr_span in &d.test_attrs {
+            // FIXME: This is ugly, remove when `test_attrs` has been ported to new attribute API.
+            if let Ok(snippet) = source_map.span_to_snippet(*attr_span)
+                && let Ok(stream) = TokenStream::from_str(&snippet)
+            {
+                // NOTE: `test(attr(..))` is handled when discovering the individual tests
+                if stream.into_iter().any(|token| {
+                    matches!(
+                        token,
+                        TokenTree::Ident(i) if i.to_string() == "no_crate_inject",
+                    )
+                }) {
+                    opts.no_crate_inject = true;
+                    break 'main;
+                }
+            }
         }
-        // NOTE: `test(attr(..))` is handled when discovering the individual tests
     }
 
     opts
@@ -598,7 +625,7 @@ fn run_test(
     ]);
     if let ErrorOutputType::HumanReadable { kind, color_config } = rustdoc_options.error_format {
         let short = kind.short();
-        let unicode = kind == HumanReadableErrorType::Unicode;
+        let unicode = kind == HumanReadableErrorType { unicode: true, short };
 
         if short {
             compiler_args.extend_from_slice(&["--error-format".to_owned(), "short".to_owned()]);
@@ -643,9 +670,9 @@ fn run_test(
             // tested as standalone tests.
             return (Duration::default(), Err(TestFailure::CompileError));
         }
-        if !rustdoc_options.nocapture {
-            // If `nocapture` is disabled, then we don't display rustc's output when compiling
-            // the merged doctests.
+        if !rustdoc_options.no_capture && rustdoc_options.merge_doctests == MergeDoctests::Auto {
+            // If `no_capture` is disabled, and we might fallback to standalone tests, then we don't
+            // display rustc's output when compiling the merged doctests.
             compiler.stderr(Stdio::null());
         }
         // bundled tests are an rlib, loaded by a separate runner executable
@@ -669,7 +696,13 @@ fn run_test(
 
     debug!("compiler invocation for doctest: {compiler:?}");
 
-    let mut child = compiler.spawn().expect("Failed to spawn rustc process");
+    let mut child = match compiler.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("Failed to spawn {:?}: {error:?}", compiler.get_program());
+            return (Duration::default(), Err(TestFailure::CompileError));
+        }
+    };
     let output = if let Some(merged_test_code) = &doctest.merged_test_code {
         // compile-fail tests never get merged, so this should always pass
         let status = child.wait().expect("Failed to wait");
@@ -720,10 +753,12 @@ fn run_test(
             // tested as standalone tests.
             return (instant.elapsed(), Err(TestFailure::CompileError));
         }
-        if !rustdoc_options.nocapture {
-            // If `nocapture` is disabled, then we don't display rustc's output when compiling
-            // the merged doctests.
+        if !rustdoc_options.no_capture && rustdoc_options.merge_doctests == MergeDoctests::Auto {
+            // If `no_capture` is disabled and we're autodetecting whether to merge,
+            // we don't display rustc's output when compiling the merged doctests.
             runner_compiler.stderr(Stdio::null());
+        } else {
+            runner_compiler.stderr(Stdio::inherit());
         }
         runner_compiler.arg("--error-format=short");
         debug!("compiler invocation for doctest runner: {runner_compiler:?}");
@@ -731,7 +766,13 @@ fn run_test(
         let status = if !status.success() {
             status
         } else {
-            let mut child_runner = runner_compiler.spawn().expect("Failed to spawn rustc process");
+            let mut child_runner = match runner_compiler.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    eprintln!("Failed to spawn {:?}: {error:?}", runner_compiler.get_program());
+                    return (Duration::default(), Err(TestFailure::CompileError));
+                }
+            };
             child_runner.wait().expect("Failed to wait")
         };
 
@@ -820,7 +861,7 @@ fn run_test(
         cmd.current_dir(run_directory);
     }
 
-    let result = if doctest.is_multiple_tests() || rustdoc_options.nocapture {
+    let result = if doctest.is_multiple_tests() || rustdoc_options.no_capture {
         cmd.status().map(|status| process::Output {
             status,
             stdout: Vec::new(),
@@ -874,7 +915,7 @@ impl IndividualTestOptions {
 
             DirState::Perm(path)
         } else {
-            DirState::Temp(get_doctest_dir().expect("rustdoc needs a tempdir"))
+            DirState::Temp(get_doctest_dir(options).expect("rustdoc needs a tempdir"))
         };
 
         Self { outdir, path: test_path }
@@ -930,14 +971,7 @@ impl ScrapedDocTest {
     }
     fn path(&self) -> PathBuf {
         match &self.filename {
-            FileName::Real(path) => {
-                if let Some(local_path) = path.local_path() {
-                    local_path.to_path_buf()
-                } else {
-                    // Somehow we got the filename from the metadata of another crate, should never happen
-                    unreachable!("doctest from a different crate");
-                }
-            }
+            FileName::Real(name) => name.path(RemapPathScopeComponents::DIAGNOSTICS).to_path_buf(),
             _ => PathBuf::from(r"doctest.rs"),
         }
     }
@@ -963,21 +997,20 @@ struct CreateRunnableDocTests {
     visited_tests: FxHashMap<(String, usize), usize>,
     unused_extern_reports: Arc<Mutex<Vec<UnusedExterns>>>,
     compiling_test_count: AtomicUsize,
-    can_merge_doctests: bool,
+    can_merge_doctests: MergeDoctests,
 }
 
 impl CreateRunnableDocTests {
     fn new(rustdoc_options: RustdocOptions, opts: GlobalTestOptions) -> CreateRunnableDocTests {
-        let can_merge_doctests = rustdoc_options.edition >= Edition::Edition2024;
         CreateRunnableDocTests {
             standalone_tests: Vec::new(),
             mergeable_tests: FxIndexMap::default(),
-            rustdoc_options: Arc::new(rustdoc_options),
             opts,
             visited_tests: FxHashMap::default(),
             unused_extern_reports: Default::default(),
             compiling_test_count: AtomicUsize::new(0),
-            can_merge_doctests,
+            can_merge_doctests: rustdoc_options.merge_doctests,
+            rustdoc_options: Arc::new(rustdoc_options),
         }
     }
 
@@ -985,7 +1018,7 @@ impl CreateRunnableDocTests {
         // For example `module/file.rs` would become `module_file_rs`
         let file = scraped_test
             .filename
-            .prefer_local()
+            .prefer_local_unconditionally()
             .to_string_lossy()
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -1015,10 +1048,7 @@ impl CreateRunnableDocTests {
             .span(scraped_test.span)
             .build(dcx);
         let is_standalone = !doctest.can_be_merged
-            || scraped_test.langstr.compile_fail
-            || scraped_test.langstr.test_harness
-            || scraped_test.langstr.standalone_crate
-            || self.rustdoc_options.nocapture
+            || self.rustdoc_options.no_capture
             || self.rustdoc_options.test_args.iter().any(|arg| arg == "--show-output");
         if is_standalone {
             let test_desc = self.generate_test_desc_and_fn(doctest, scraped_test);

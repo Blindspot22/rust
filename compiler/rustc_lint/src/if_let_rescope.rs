@@ -1,4 +1,4 @@
-use std::iter::repeat;
+use std::iter::repeat_n;
 use std::ops::ControlFlow;
 
 use hir::intravisit::{self, Visitor};
@@ -11,9 +11,8 @@ use rustc_middle::ty::significant_drop_order::{
     extract_component_with_significant_dtor, ty_dtor_span,
 };
 use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_session::lint::{FutureIncompatibilityReason, LintId};
+use rustc_session::lint::{LintId, fcw};
 use rustc_session::{declare_lint, impl_lint_pass};
-use rustc_span::edition::Edition;
 use rustc_span::{DUMMY_SP, Span};
 use smallvec::SmallVec;
 
@@ -86,8 +85,7 @@ declare_lint! {
     "`if let` assigns a shorter lifetime to temporary values being pattern-matched against in Edition 2024 and \
     rewriting in `match` is an option to preserve the semantics up to Edition 2021",
     @future_incompatible = FutureIncompatibleInfo {
-        reason: FutureIncompatibilityReason::EditionSemanticsChange(Edition::Edition2024),
-        reference: "<https://doc.rust-lang.org/edition-guide/rust-2024/temporary-if-let-scope.html>",
+        reason: fcw!(EditionSemanticsChange 2024 "temporary-if-let-scope"),
     };
 }
 
@@ -351,7 +349,7 @@ impl Subdiagnostic for IfLetRescopeRewrite {
                 .then_some(" _ => {}".chars())
                 .into_iter()
                 .flatten()
-                .chain(repeat('}').take(closing_brackets.count))
+                .chain(repeat_n('}', closing_brackets.count))
                 .collect(),
         ));
         let msg = diag.eagerly_translate(crate::fluent_generated::lint_suggestion);

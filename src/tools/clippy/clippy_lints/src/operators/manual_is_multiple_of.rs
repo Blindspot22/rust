@@ -13,14 +13,14 @@ use super::MANUAL_IS_MULTIPLE_OF;
 
 pub(super) fn check<'tcx>(
     cx: &LateContext<'tcx>,
-    expr: &Expr<'_>,
+    expr: &'tcx Expr<'tcx>,
     op: BinOpKind,
     lhs: &'tcx Expr<'tcx>,
     rhs: &'tcx Expr<'tcx>,
     msrv: Msrv,
 ) {
     if msrv.meets(cx, msrvs::UNSIGNED_IS_MULTIPLE_OF)
-        && let Some(operand) = uint_compare_to_zero(cx, op, lhs, rhs)
+        && let Some(operand) = uint_compare_to_zero(cx, expr, op, lhs, rhs)
         && let ExprKind::Binary(operand_op, operand_left, operand_right) = operand.kind
         && operand_op.node == BinOpKind::Rem
         && matches!(
@@ -35,7 +35,7 @@ pub(super) fn check<'tcx>(
     {
         let mut app = Applicability::MachineApplicable;
         let divisor = deref_sugg(
-            Sugg::hir_with_applicability(cx, operand_right, "_", &mut app),
+            Sugg::hir_with_context(cx, operand_right, expr.span.ctxt(), "_", &mut app),
             cx.typeck_results().expr_ty_adjusted(operand_right),
         );
         span_lint_and_sugg(
@@ -47,7 +47,7 @@ pub(super) fn check<'tcx>(
             format!(
                 "{}{}.is_multiple_of({divisor})",
                 if op == BinOpKind::Eq { "" } else { "!" },
-                Sugg::hir_with_applicability(cx, operand_left, "_", &mut app).maybe_paren()
+                Sugg::hir_with_context(cx, operand_left, expr.span.ctxt(), "_", &mut app).maybe_paren()
             ),
             app,
         );
@@ -57,18 +57,19 @@ pub(super) fn check<'tcx>(
 // If we have a `x == 0`, `x != 0` or `x > 0` (or the reverted ones), return the non-zero operand
 fn uint_compare_to_zero<'tcx>(
     cx: &LateContext<'tcx>,
+    e: &'tcx Expr<'tcx>,
     op: BinOpKind,
     lhs: &'tcx Expr<'tcx>,
     rhs: &'tcx Expr<'tcx>,
 ) -> Option<&'tcx Expr<'tcx>> {
     let operand = if matches!(lhs.kind, ExprKind::Binary(..))
         && matches!(op, BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Gt)
-        && is_zero_integer_const(cx, rhs)
+        && is_zero_integer_const(cx, rhs, e.span.ctxt())
     {
         lhs
     } else if matches!(rhs.kind, ExprKind::Binary(..))
         && matches!(op, BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt)
-        && is_zero_integer_const(cx, lhs)
+        && is_zero_integer_const(cx, lhs, e.span.ctxt())
     {
         rhs
     } else {

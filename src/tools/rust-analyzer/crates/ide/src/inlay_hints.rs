@@ -5,12 +5,15 @@ use std::{
 
 use either::Either;
 use hir::{
-    ClosureStyle, DisplayTarget, EditionedFileId, HasVisibility, HirDisplay, HirDisplayError,
-    HirWrite, InRealFile, ModuleDef, ModuleDefId, Semantics, sym,
+    ClosureStyle, DisplayTarget, EditionedFileId, GenericParam, GenericParamId, HasVisibility,
+    HirDisplay, HirDisplayError, HirWrite, InRealFile, ModuleDef, ModuleDefId, Semantics, sym,
 };
-use ide_db::{FileRange, RootDatabase, famous_defs::FamousDefs, text_edit::TextEditBuilder};
+use ide_db::{
+    FileRange, MiniCore, RootDatabase, famous_defs::FamousDefs, text_edit::TextEditBuilder,
+};
 use ide_db::{FxHashSet, text_edit::TextEdit};
 use itertools::Itertools;
+use macros::UpmapFromRaFixture;
 use smallvec::{SmallVec, smallvec};
 use stdx::never;
 use syntax::{
@@ -37,6 +40,8 @@ mod implicit_static;
 mod implied_dyn_trait;
 mod lifetime;
 mod param_name;
+mod placeholders;
+mod ra_fixture;
 mod range_exclusive;
 
 // Feature: Inlay Hints
@@ -80,13 +85,11 @@ pub(crate) fn inlay_hints(
     db: &RootDatabase,
     file_id: FileId,
     range_limit: Option<TextRange>,
-    config: &InlayHintsConfig,
+    config: &InlayHintsConfig<'_>,
 ) -> Vec<InlayHint> {
     let _p = tracing::info_span!("inlay_hints").entered();
     let sema = Semantics::new(db);
-    let file_id = sema
-        .attach_first_edition(file_id)
-        .unwrap_or_else(|| EditionedFileId::current_edition(db, file_id));
+    let file_id = sema.attach_first_edition(file_id);
     let file = sema.parse(file_id);
     let file = file.syntax();
 
@@ -130,14 +133,12 @@ pub(crate) fn inlay_hints_resolve(
     file_id: FileId,
     resolve_range: TextRange,
     hash: u64,
-    config: &InlayHintsConfig,
+    config: &InlayHintsConfig<'_>,
     hasher: impl Fn(&InlayHint) -> u64,
 ) -> Option<InlayHint> {
     let _p = tracing::info_span!("inlay_hints_resolve").entered();
     let sema = Semantics::new(db);
-    let file_id = sema
-        .attach_first_edition(file_id)
-        .unwrap_or_else(|| EditionedFileId::current_edition(db, file_id));
+    let file_id = sema.attach_first_edition(file_id);
     let file = sema.parse(file_id);
     let file = file.syntax();
 
@@ -206,7 +207,7 @@ fn hints(
     hints: &mut Vec<InlayHint>,
     ctx: &mut InlayHintCtx,
     famous_defs @ FamousDefs(sema, _krate): &FamousDefs<'_, '_>,
-    config: &InlayHintsConfig,
+    config: &InlayHintsConfig<'_>,
     file_id: EditionedFileId,
     display_target: DisplayTarget,
     node: SyntaxNode,
@@ -228,15 +229,16 @@ fn hints(
                 chaining::hints(hints, famous_defs, config, display_target, &expr);
                 adjustment::hints(hints, famous_defs, config, display_target, &expr);
                 match expr {
-                    ast::Expr::CallExpr(it) => param_name::hints(hints, famous_defs, config, ast::Expr::from(it)),
+                    ast::Expr::CallExpr(it) => param_name::hints(hints, famous_defs, config, file_id, ast::Expr::from(it)),
                     ast::Expr::MethodCallExpr(it) => {
-                        param_name::hints(hints, famous_defs, config, ast::Expr::from(it))
+                        param_name::hints(hints, famous_defs, config, file_id, ast::Expr::from(it))
                     }
                     ast::Expr::ClosureExpr(it) => {
                         closure_captures::hints(hints, famous_defs, config, it.clone());
                         closure_ret::hints(hints, famous_defs, config, display_target, it)
                     },
                     ast::Expr::RangeExpr(it) => range_exclusive::hints(hints, famous_defs, config, it),
+                    ast::Expr::Literal(it) => ra_fixture::hints(hints, famous_defs.0, file_id, config, it),
                     _ => Some(()),
                 }
             },
@@ -284,6 +286,10 @@ fn hints(
                     implied_dyn_trait::hints(hints, famous_defs, config, Either::Right(dyn_));
                     Some(())
                 },
+                ast::Type::InferType(placeholder) => {
+                    placeholders::type_hints(hints, famous_defs, config, display_target, placeholder);
+                    Some(())
+                },
                 _ => Some(()),
             },
             ast::GenericParamList(it) => bounds::hints(hints, famous_defs, config,  it),
@@ -292,24 +298,28 @@ fn hints(
     };
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InlayHintsConfig {
+#[derive(Clone, Debug)]
+pub struct InlayHintsConfig<'a> {
     pub render_colons: bool,
     pub type_hints: bool,
     pub sized_bound: bool,
     pub discriminant_hints: DiscriminantHints,
     pub parameter_hints: bool,
+    pub parameter_hints_for_missing_arguments: bool,
     pub generic_parameter_hints: GenericParameterHints,
     pub chaining_hints: bool,
     pub adjustment_hints: AdjustmentHints,
+    pub adjustment_hints_disable_reborrows: bool,
     pub adjustment_hints_mode: AdjustmentHintsMode,
     pub adjustment_hints_hide_outside_unsafe: bool,
     pub closure_return_type_hints: ClosureReturnTypeHints,
     pub closure_capture_hints: bool,
     pub binding_mode_hints: bool,
     pub implicit_drop_hints: bool,
+    pub implied_dyn_trait_hints: bool,
     pub lifetime_elision_hints: LifetimeElisionHints,
     pub param_names_for_lifetime_elision_hints: bool,
+    pub hide_inferred_type_hints: bool,
     pub hide_named_constructor_hints: bool,
     pub hide_closure_initialization_hints: bool,
     pub hide_closure_parameter_hints: bool,
@@ -318,9 +328,10 @@ pub struct InlayHintsConfig {
     pub max_length: Option<usize>,
     pub closing_brace_hints_min_lines: Option<usize>,
     pub fields_to_resolve: InlayFieldsToResolve,
+    pub minicore: MiniCore<'a>,
 }
 
-impl InlayHintsConfig {
+impl InlayHintsConfig<'_> {
     fn lazy_text_edit(&self, finish: impl FnOnce() -> TextEdit) -> LazyProperty<TextEdit> {
         if self.fields_to_resolve.resolve_text_edits {
             LazyProperty::Lazy
@@ -426,7 +437,7 @@ pub enum LifetimeElisionHints {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AdjustmentHints {
     Always,
-    ReborrowOnly,
+    BorrowsOnly,
     Never,
 }
 
@@ -463,7 +474,7 @@ pub enum InlayHintPosition {
     After,
 }
 
-#[derive(Debug)]
+#[derive(Debug, UpmapFromRaFixture)]
 pub struct InlayHint {
     /// The text range this inlay hint applies to.
     pub range: TextRange,
@@ -482,9 +493,10 @@ pub struct InlayHint {
 }
 
 /// A type signaling that a value is either computed, or is available for computation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, UpmapFromRaFixture)]
 pub enum LazyProperty<T> {
     Computed(T),
+    #[default]
     Lazy,
 }
 
@@ -534,7 +546,7 @@ pub enum InlayTooltip {
     Markdown(String),
 }
 
-#[derive(Default, Hash)]
+#[derive(Default, Hash, UpmapFromRaFixture)]
 pub struct InlayHintLabel {
     pub parts: SmallVec<[InlayHintLabelPart; 1]>,
 }
@@ -620,6 +632,7 @@ impl fmt::Debug for InlayHintLabel {
     }
 }
 
+#[derive(UpmapFromRaFixture)]
 pub struct InlayHintLabelPart {
     pub text: String,
     /// Source location represented by this label part. The client will use this to fetch the part's
@@ -667,7 +680,7 @@ impl fmt::Debug for InlayHintLabelPart {
 
 #[derive(Debug)]
 struct InlayHintLabelBuilder<'a> {
-    db: &'a RootDatabase,
+    sema: &'a Semantics<'a, RootDatabase>,
     result: InlayHintLabel,
     last_part: String,
     resolve: bool,
@@ -689,7 +702,22 @@ impl HirWrite for InlayHintLabelBuilder<'_> {
             LazyProperty::Lazy
         } else {
             LazyProperty::Computed({
-                let Some(location) = ModuleDef::from(def).try_to_nav(self.db) else { return };
+                let Some(location) = ModuleDef::from(def).try_to_nav(self.sema) else { return };
+                let location = location.call_site();
+                FileRange { file_id: location.file_id, range: location.focus_or_full_range() }
+            })
+        });
+    }
+
+    fn start_location_link_generic(&mut self, def: GenericParamId) {
+        never!(self.location.is_some(), "location link is already started");
+        self.make_new_part();
+
+        self.location = Some(if self.resolve {
+            LazyProperty::Lazy
+        } else {
+            LazyProperty::Computed({
+                let Some(location) = GenericParam::from(def).try_to_nav(self.sema) else { return };
                 let location = location.call_site();
                 FileRange { file_id: location.file_id, range: location.focus_or_full_range() }
             })
@@ -721,7 +749,7 @@ impl InlayHintLabelBuilder<'_> {
 
 fn label_of_ty(
     famous_defs @ FamousDefs(sema, _): &FamousDefs<'_, '_>,
-    config: &InlayHintsConfig,
+    config: &InlayHintsConfig<'_>,
     ty: &hir::Type<'_>,
     display_target: DisplayTarget,
 ) -> Option<InlayHintLabel> {
@@ -731,7 +759,7 @@ fn label_of_ty(
         mut max_length: Option<usize>,
         ty: &hir::Type<'_>,
         label_builder: &mut InlayHintLabelBuilder<'_>,
-        config: &InlayHintsConfig,
+        config: &InlayHintsConfig<'_>,
         display_target: DisplayTarget,
     ) -> Result<(), HirDisplayError> {
         let iter_item_type = hint_iterator(sema, famous_defs, ty);
@@ -754,14 +782,30 @@ fn label_of_ty(
                     )
                 });
 
+                let module_def_location = |label_builder: &mut InlayHintLabelBuilder<'_>,
+                                           def: ModuleDef,
+                                           name| {
+                    let def = def.try_into();
+                    if let Ok(def) = def {
+                        label_builder.start_location_link(def);
+                    }
+                    #[expect(
+                        clippy::question_mark,
+                        reason = "false positive; replacing with `?` leads to 'type annotations needed' error"
+                    )]
+                    if let Err(err) = label_builder.write_str(name) {
+                        return Err(err);
+                    }
+                    if def.is_ok() {
+                        label_builder.end_location_link();
+                    }
+                    Ok(())
+                };
+
                 label_builder.write_str(LABEL_START)?;
-                label_builder.start_location_link(ModuleDef::from(iter_trait).into());
-                label_builder.write_str(LABEL_ITERATOR)?;
-                label_builder.end_location_link();
+                module_def_location(label_builder, ModuleDef::from(iter_trait), LABEL_ITERATOR)?;
                 label_builder.write_str(LABEL_MIDDLE)?;
-                label_builder.start_location_link(ModuleDef::from(item).into());
-                label_builder.write_str(LABEL_ITEM)?;
-                label_builder.end_location_link();
+                module_def_location(label_builder, ModuleDef::from(item), LABEL_ITEM)?;
                 label_builder.write_str(LABEL_MIDDLE2)?;
                 rec(sema, famous_defs, max_length, &ty, label_builder, config, display_target)?;
                 label_builder.write_str(LABEL_END)?;
@@ -775,7 +819,7 @@ fn label_of_ty(
     }
 
     let mut label_builder = InlayHintLabelBuilder {
-        db: sema.db,
+        sema,
         last_part: String::new(),
         location: None,
         result: InlayHintLabel::default(),
@@ -795,7 +839,7 @@ fn hint_iterator<'db>(
 ) -> Option<(hir::Trait, hir::TypeAlias, hir::Type<'db>)> {
     let db = sema.db;
     let strukt = ty.strip_references().as_adt()?;
-    let krate = strukt.module(db).krate();
+    let krate = strukt.module(db).krate(db);
     if krate != famous_defs.core()? {
         return None;
     }
@@ -824,7 +868,7 @@ fn hint_iterator<'db>(
 
 fn ty_to_text_edit(
     sema: &Semantics<'_, RootDatabase>,
-    config: &InlayHintsConfig,
+    config: &InlayHintsConfig<'_>,
     node_for_hint: &SyntaxNode,
     ty: &hir::Type<'_>,
     offset_to_insert_ty: TextSize,
@@ -855,6 +899,7 @@ mod tests {
 
     use expect_test::Expect;
     use hir::ClosureStyle;
+    use ide_db::MiniCore;
     use itertools::Itertools;
     use test_utils::extract_annotations;
 
@@ -864,11 +909,12 @@ mod tests {
 
     use super::{ClosureReturnTypeHints, GenericParameterHints, InlayFieldsToResolve};
 
-    pub(super) const DISABLED_CONFIG: InlayHintsConfig = InlayHintsConfig {
+    pub(super) const DISABLED_CONFIG: InlayHintsConfig<'_> = InlayHintsConfig {
         discriminant_hints: DiscriminantHints::Never,
         render_colons: false,
         type_hints: false,
         parameter_hints: false,
+        parameter_hints_for_missing_arguments: false,
         sized_bound: false,
         generic_parameter_hints: GenericParameterHints {
             type_hints: false,
@@ -880,9 +926,11 @@ mod tests {
         closure_return_type_hints: ClosureReturnTypeHints::Never,
         closure_capture_hints: false,
         adjustment_hints: AdjustmentHints::Never,
+        adjustment_hints_disable_reborrows: false,
         adjustment_hints_mode: AdjustmentHintsMode::Prefix,
         adjustment_hints_hide_outside_unsafe: false,
         binding_mode_hints: false,
+        hide_inferred_type_hints: false,
         hide_named_constructor_hints: false,
         hide_closure_initialization_hints: false,
         hide_closure_parameter_hints: false,
@@ -892,9 +940,11 @@ mod tests {
         closing_brace_hints_min_lines: None,
         fields_to_resolve: InlayFieldsToResolve::empty(),
         implicit_drop_hints: false,
+        implied_dyn_trait_hints: false,
         range_exclusive_hints: false,
+        minicore: MiniCore::default(),
     };
-    pub(super) const TEST_CONFIG: InlayHintsConfig = InlayHintsConfig {
+    pub(super) const TEST_CONFIG: InlayHintsConfig<'_> = InlayHintsConfig {
         type_hints: true,
         parameter_hints: true,
         chaining_hints: true,
@@ -911,7 +961,7 @@ mod tests {
 
     #[track_caller]
     pub(super) fn check_with_config(
-        config: InlayHintsConfig,
+        config: InlayHintsConfig<'_>,
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
     ) {
         let (analysis, file_id) = fixture::file(ra_fixture);
@@ -930,7 +980,7 @@ mod tests {
 
     #[track_caller]
     pub(super) fn check_expect(
-        config: InlayHintsConfig,
+        config: InlayHintsConfig<'_>,
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
         expect: Expect,
     ) {
@@ -945,7 +995,7 @@ mod tests {
     /// expect test.
     #[track_caller]
     pub(super) fn check_edit(
-        config: InlayHintsConfig,
+        config: InlayHintsConfig<'_>,
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
         expect: Expect,
     ) {
@@ -968,7 +1018,7 @@ mod tests {
 
     #[track_caller]
     pub(super) fn check_no_edit(
-        config: InlayHintsConfig,
+        config: InlayHintsConfig<'_>,
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
     ) {
         let (analysis, file_id) = fixture::file(ra_fixture);

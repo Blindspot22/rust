@@ -84,11 +84,11 @@ Note that when building `rustc`,
 `profiler_builtins` is only included when `build.profiler = true` is set in `bootstrap.toml`.
 
 When compiling with `-C instrument-coverage`,
-[`CrateLoader::postprocess()`][crate-loader-postprocess] dynamically loads
+[`CStore::postprocess()`][crate-loader-postprocess] dynamically loads
 `profiler_builtins` by calling `inject_profiler_runtime()`.
 
 [compiler-rt-profile]: https://github.com/llvm/llvm-project/tree/main/compiler-rt/lib/profile
-[crate-loader-postprocess]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_metadata/creader/struct.CrateLoader.html#method.postprocess
+[crate-loader-postprocess]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_metadata/creader/struct.CStore.html#method.postprocess
 
 ## Testing coverage instrumentation
 
@@ -130,8 +130,8 @@ and `mir-opt` tests can be refreshed by running:
 ./x test tests/mir-opt --bless
 ```
 
-[`tests/mir-opt/coverage/instrument_coverage.rs`]: https://github.com/rust-lang/rust/blob/master/tests/mir-opt/coverage/instrument_coverage.rs
-[`tests/coverage`]: https://github.com/rust-lang/rust/tree/master/tests/coverage
-[`src/tools/coverage-dump`]: https://github.com/rust-lang/rust/tree/master/src/tools/coverage-dump
-[`tests/coverage-run-rustdoc`]: https://github.com/rust-lang/rust/tree/master/tests/coverage-run-rustdoc
-[`tests/codegen-llvm/instrument-coverage/testprog.rs`]: https://github.com/rust-lang/rust/blob/master/tests/mir-opt/coverage/instrument_coverage.rs
+[`tests/mir-opt/coverage/instrument_coverage.rs`]: https://github.com/rust-lang/rust/blob/HEAD/tests/mir-opt/coverage/instrument_coverage.rs
+[`tests/coverage`]: https://github.com/rust-lang/rust/tree/HEAD/tests/coverage
+[`src/tools/coverage-dump`]: https://github.com/rust-lang/rust/tree/HEAD/src/tools/coverage-dump
+[`tests/coverage-run-rustdoc`]: https://github.com/rust-lang/rust/tree/HEAD/tests/coverage-run-rustdoc
+[`tests/codegen-llvm/instrument-coverage/testprog.rs`]: https://github.com/rust-lang/rust/blob/HEAD/tests/mir-opt/coverage/instrument_coverage.rs

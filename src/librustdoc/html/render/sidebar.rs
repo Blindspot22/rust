@@ -13,6 +13,7 @@ use super::{Context, ItemSection, item_ty_to_section};
 use crate::clean;
 use crate::formats::Impl;
 use crate::formats::item_type::ItemType;
+use crate::html::format::{print_path, print_type};
 use crate::html::markdown::{IdMap, MarkdownWithToc};
 use crate::html::render::print_item::compare_names;
 
@@ -127,10 +128,12 @@ pub(crate) mod filters {
     use askama::filters::Safe;
 
     use crate::html::escape::EscapeBodyTextWithWbr;
-    pub(crate) fn wrapped<T, V: askama::Values>(v: T, _: V) -> askama::Result<Safe<impl Display>>
-    where
-        T: Display,
-    {
+
+    #[askama::filter_fn]
+    pub(crate) fn wrapped(
+        v: impl Display,
+        _: &dyn askama::Values,
+    ) -> askama::Result<Safe<impl Display>> {
         let string = v.to_string();
         Ok(Safe(fmt::from_fn(move |f| EscapeBodyTextWithWbr(&string).fmt(f))))
     }
@@ -558,8 +561,8 @@ fn sidebar_deref_methods<'a>(
                 };
                 let title = format!(
                     "Methods from {:#}<Target={:#}>",
-                    impl_.inner_impl().trait_.as_ref().unwrap().print(cx),
-                    real_target.print(cx),
+                    print_path(impl_.inner_impl().trait_.as_ref().unwrap(), cx),
+                    print_type(real_target, cx),
                 );
                 // We want links' order to be reproducible so we don't use unstable sort.
                 ret.sort();
@@ -690,7 +693,7 @@ fn sidebar_render_assoc_items(
                     ty::ImplPolarity::Positive | ty::ImplPolarity::Reservation => "",
                     ty::ImplPolarity::Negative => "!",
                 };
-                let generated = Link::new(encoded, format!("{prefix}{:#}", trait_.print(cx)));
+                let generated = Link::new(encoded, format!("{prefix}{:#}", print_path(trait_, cx)));
                 if links.insert(generated.clone()) { Some(generated) } else { None }
             })
             .collect::<Vec<Link<'static>>>();

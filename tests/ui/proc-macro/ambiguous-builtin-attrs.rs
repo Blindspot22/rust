@@ -1,5 +1,6 @@
 //@ edition:2018
 //@ proc-macro: builtin-attrs.rs
+//@ ignore-backends: gcc
 #![feature(decl_macro)] //~ ERROR `feature` is ambiguous
 
 extern crate builtin_attrs;
@@ -8,7 +9,7 @@ use builtin_attrs::{bench, test};
 
 #[repr(C)] //~ ERROR `repr` is ambiguous
 struct S;
-#[cfg_attr(all(), repr(C))] //~ ERROR `repr` is ambiguous
+#[cfg_attr(true, repr(C))] //~ ERROR `repr` is ambiguous
 struct SCond;
 
 #[test] // OK, shadowed

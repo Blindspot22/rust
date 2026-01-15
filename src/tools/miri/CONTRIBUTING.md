@@ -255,6 +255,12 @@ when installing the Miri toolchain. Alternatively, set the `RUSTUP_TOOLCHAIN` en
 
 [`etc/rust_analyzer_helix.toml`]: https://github.com/rust-lang/miri/blob/master/etc/rust_analyzer_helix.toml
 
+### Zed
+
+Copy [`etc/rust_analyzer_zed.json`] to `.zed/settings.json` in the project root directory.
+
+[`etc/rust_analyzer_zed.json`]: https://github.com/rust-lang/miri/blob/master/etc/rust_analyzer_zed.json
+
 ### Advanced configuration
 
 If you are building Miri with a locally built rustc, set
@@ -345,7 +351,7 @@ you need to pull rustc changes into Miri first, and then re-do the rustc push.
 If this fails due to authentication problems, it can help to make josh push via ssh instead of
 https. Add the following to your `.gitconfig`:
 
-```toml
+```text
 [url "git@github.com:"]
     pushInsteadOf = https://github.com/
 ```

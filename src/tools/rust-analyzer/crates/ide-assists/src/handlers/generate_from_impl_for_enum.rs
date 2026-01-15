@@ -1,7 +1,11 @@
+use hir::next_solver::{DbInterner, TypingMode};
 use ide_db::{RootDatabase, famous_defs::FamousDefs};
 use syntax::ast::{self, AstNode, HasName};
 
-use crate::{AssistContext, AssistId, Assists, utils::generate_trait_impl_text_intransitive};
+use crate::{
+    AssistContext, AssistId, Assists,
+    utils::{generate_trait_impl_text_intransitive, is_selected},
+};
 
 // Assist: generate_from_impl_for_enum
 //
@@ -25,8 +29,68 @@ pub(crate) fn generate_from_impl_for_enum(
     ctx: &AssistContext<'_>,
 ) -> Option<()> {
     let variant = ctx.find_node_at_offset::<ast::Variant>()?;
-    let variant_name = variant.name()?;
-    let enum_ = ast::Adt::Enum(variant.parent_enum());
+    let adt = ast::Adt::Enum(variant.parent_enum());
+    let variants = selected_variants(ctx, &variant)?;
+
+    let target = variant.syntax().text_range();
+    acc.add(
+        AssistId::generate("generate_from_impl_for_enum"),
+        "Generate `From` impl for this enum variant(s)",
+        target,
+        |edit| {
+            let start_offset = variant.parent_enum().syntax().text_range().end();
+            let from_impl = variants
+                .into_iter()
+                .map(|variant_info| {
+                    let from_trait = format!("From<{}>", variant_info.ty);
+                    let impl_code = generate_impl_code(variant_info);
+                    generate_trait_impl_text_intransitive(&adt, &from_trait, &impl_code)
+                })
+                .collect::<String>();
+            edit.insert(start_offset, from_impl);
+        },
+    )
+}
+
+fn generate_impl_code(VariantInfo { name, field_name, ty }: VariantInfo) -> String {
+    if let Some(field) = field_name {
+        format!(
+            r#"    fn from({field}: {ty}) -> Self {{
+        Self::{name} {{ {field} }}
+    }}"#
+        )
+    } else {
+        format!(
+            r#"    fn from(v: {ty}) -> Self {{
+        Self::{name}(v)
+    }}"#
+        )
+    }
+}
+
+struct VariantInfo {
+    name: ast::Name,
+    field_name: Option<ast::Name>,
+    ty: ast::Type,
+}
+
+fn selected_variants(ctx: &AssistContext<'_>, variant: &ast::Variant) -> Option<Vec<VariantInfo>> {
+    variant
+        .parent_enum()
+        .variant_list()?
+        .variants()
+        .filter(|it| is_selected(it, ctx.selection_trimmed(), true))
+        .map(|variant| {
+            let (name, ty) = extract_variant_info(&ctx.sema, &variant)?;
+            Some(VariantInfo { name: variant.name()?, field_name: name, ty })
+        })
+        .collect()
+}
+
+fn extract_variant_info(
+    sema: &'_ hir::Semantics<'_, RootDatabase>,
+    variant: &ast::Variant,
+) -> Option<(Option<ast::Name>, ast::Type)> {
     let (field_name, field_type) = match variant.kind() {
         ast::StructKind::Tuple(field_list) => {
             if field_list.fields().count() != 1 {
@@ -44,53 +108,31 @@ pub(crate) fn generate_from_impl_for_enum(
         ast::StructKind::Unit => return None,
     };
 
-    if existing_from_impl(&ctx.sema, &variant).is_some() {
+    if existing_from_impl(sema, variant).is_some() {
         cov_mark::hit!(test_add_from_impl_already_exists);
         return None;
     }
-
-    let target = variant.syntax().text_range();
-    acc.add(
-        AssistId::generate("generate_from_impl_for_enum"),
-        "Generate `From` impl for this enum variant",
-        target,
-        |edit| {
-            let start_offset = variant.parent_enum().syntax().text_range().end();
-            let from_trait = format!("From<{field_type}>");
-            let impl_code = if let Some(name) = field_name {
-                format!(
-                    r#"    fn from({name}: {field_type}) -> Self {{
-        Self::{variant_name} {{ {name} }}
-    }}"#
-                )
-            } else {
-                format!(
-                    r#"    fn from(v: {field_type}) -> Self {{
-        Self::{variant_name}(v)
-    }}"#
-                )
-            };
-            let from_impl = generate_trait_impl_text_intransitive(&enum_, &from_trait, &impl_code);
-            edit.insert(start_offset, from_impl);
-        },
-    )
+    Some((field_name, field_type))
 }
 
 fn existing_from_impl(
     sema: &'_ hir::Semantics<'_, RootDatabase>,
     variant: &ast::Variant,
 ) -> Option<()> {
+    let db = sema.db;
     let variant = sema.to_def(variant)?;
-    let enum_ = variant.parent_enum(sema.db);
-    let krate = enum_.module(sema.db).krate();
-
+    let krate = variant.module(db).krate(db);
     let from_trait = FamousDefs(sema, krate).core_convert_From()?;
+    let interner = DbInterner::new_with(db, krate.base());
+    use hir::next_solver::infer::DbInternerInferExt;
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
 
-    let enum_type = enum_.ty(sema.db);
-
-    let wrapped_type = variant.fields(sema.db).first()?.ty(sema.db);
-
-    if enum_type.impls_trait(sema.db, from_trait, &[wrapped_type]) { Some(()) } else { None }
+    let variant = variant.instantiate_infer(&infcx);
+    let enum_ = variant.parent_enum(sema.db);
+    let field_ty = variant.fields(sema.db).first()?.ty(sema.db);
+    let enum_ty = enum_.ty(sema.db);
+    tracing::debug!(?enum_, ?field_ty, ?enum_ty);
+    enum_ty.impls_trait(infcx, from_trait, &[field_ty]).then_some(())
 }
 
 #[cfg(test)]
@@ -120,14 +162,44 @@ impl From<u32> for A {
     }
 
     #[test]
+    fn test_generate_from_impl_for_multiple_enum_variants() {
+        check_assist(
+            generate_from_impl_for_enum,
+            r#"
+//- minicore: from
+enum A { $0Foo(u32), Bar$0(i32) }
+"#,
+            r#"
+enum A { Foo(u32), Bar(i32) }
+
+impl From<u32> for A {
+    fn from(v: u32) -> Self {
+        Self::Foo(v)
+    }
+}
+
+impl From<i32> for A {
+    fn from(v: i32) -> Self {
+        Self::Bar(v)
+    }
+}
+"#,
+        );
+    }
+
+    // FIXME(next-solver): it would be nice to not be *required* to resolve the
+    // path in order to properly generate assists
+    #[test]
     fn test_generate_from_impl_for_enum_complicated_path() {
         check_assist(
             generate_from_impl_for_enum,
             r#"
 //- minicore: from
+mod foo { pub mod bar { pub mod baz { pub struct Boo; } } }
 enum A { $0One(foo::bar::baz::Boo) }
 "#,
             r#"
+mod foo { pub mod bar { pub mod baz { pub struct Boo; } } }
 enum A { One(foo::bar::baz::Boo) }
 
 impl From<foo::bar::baz::Boo> for A {

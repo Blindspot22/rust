@@ -16,11 +16,11 @@ use syntax::ast::HasName;
 use triomphe::Arc;
 
 use crate::{
-    AdtId, AstIdLoc, ConstId, ConstParamId, CrateRootModuleId, DefWithBodyId, EnumId,
-    EnumVariantId, ExternBlockId, ExternCrateId, FunctionId, FxIndexMap, GenericDefId,
-    GenericParamId, HasModule, ImplId, ItemContainerId, LifetimeParamId, LocalModuleId, Lookup,
-    Macro2Id, MacroId, MacroRulesId, ModuleDefId, ModuleId, ProcMacroId, StaticId, StructId,
-    TraitAliasId, TraitId, TypeAliasId, TypeOrConstParamId, TypeParamId, UseId, VariantId,
+    AdtId, AstIdLoc, ConstId, ConstParamId, DefWithBodyId, EnumId, EnumVariantId, ExternBlockId,
+    ExternCrateId, FunctionId, FxIndexMap, GenericDefId, GenericParamId, HasModule, ImplId,
+    ItemContainerId, LifetimeParamId, Lookup, Macro2Id, MacroId, MacroRulesId, ModuleDefId,
+    ModuleId, ProcMacroId, StaticId, StructId, TraitId, TypeAliasId, TypeOrConstParamId,
+    TypeParamId, UseId, VariantId,
     builtin_type::BuiltinType,
     db::DefDatabase,
     expr_store::{
@@ -55,7 +55,7 @@ pub struct Resolver<'db> {
 struct ModuleItemMap<'db> {
     def_map: &'db DefMap,
     local_def_map: &'db LocalDefMap,
-    module_id: LocalModuleId,
+    module_id: ModuleId,
 }
 
 impl fmt::Debug for ModuleItemMap<'_> {
@@ -105,7 +105,6 @@ pub enum TypeNs {
     TypeAliasId(TypeAliasId),
     BuiltinType(BuiltinType),
     TraitId(TraitId),
-    TraitAliasId(TraitAliasId),
 
     ModuleId(ModuleId),
 }
@@ -187,15 +186,15 @@ impl<'db> Resolver<'db> {
             Path::Normal(it) => &it.mod_path,
             Path::LangItem(l, seg) => {
                 let type_ns = match *l {
-                    LangItemTarget::Union(it) => TypeNs::AdtId(it.into()),
-                    LangItemTarget::TypeAlias(it) => TypeNs::TypeAliasId(it),
-                    LangItemTarget::Struct(it) => TypeNs::AdtId(it.into()),
-                    LangItemTarget::EnumVariant(it) => TypeNs::EnumVariantId(it),
+                    LangItemTarget::UnionId(it) => TypeNs::AdtId(it.into()),
+                    LangItemTarget::TypeAliasId(it) => TypeNs::TypeAliasId(it),
+                    LangItemTarget::StructId(it) => TypeNs::AdtId(it.into()),
+                    LangItemTarget::EnumVariantId(it) => TypeNs::EnumVariantId(it),
                     LangItemTarget::EnumId(it) => TypeNs::AdtId(it.into()),
-                    LangItemTarget::Trait(it) => TypeNs::TraitId(it),
-                    LangItemTarget::Function(_)
-                    | LangItemTarget::ImplDef(_)
-                    | LangItemTarget::Static(_) => return None,
+                    LangItemTarget::TraitId(it) => TypeNs::TraitId(it),
+                    LangItemTarget::FunctionId(_)
+                    | LangItemTarget::ImplId(_)
+                    | LangItemTarget::StaticId(_) => return None,
                 };
                 return Some((
                     type_ns,
@@ -335,14 +334,14 @@ impl<'db> Resolver<'db> {
                 return Some((
                     ResolveValueResult::ValueNs(
                         match *l {
-                            LangItemTarget::Function(it) => ValueNs::FunctionId(it),
-                            LangItemTarget::Static(it) => ValueNs::StaticId(it),
-                            LangItemTarget::Struct(it) => ValueNs::StructId(it),
-                            LangItemTarget::EnumVariant(it) => ValueNs::EnumVariantId(it),
-                            LangItemTarget::Union(_)
-                            | LangItemTarget::ImplDef(_)
-                            | LangItemTarget::TypeAlias(_)
-                            | LangItemTarget::Trait(_)
+                            LangItemTarget::FunctionId(it) => ValueNs::FunctionId(it),
+                            LangItemTarget::StaticId(it) => ValueNs::StaticId(it),
+                            LangItemTarget::StructId(it) => ValueNs::StructId(it),
+                            LangItemTarget::EnumVariantId(it) => ValueNs::EnumVariantId(it),
+                            LangItemTarget::UnionId(_)
+                            | LangItemTarget::ImplId(_)
+                            | LangItemTarget::TypeAliasId(_)
+                            | LangItemTarget::TraitId(_)
                             | LangItemTarget::EnumId(_) => return None,
                         },
                         None,
@@ -352,15 +351,15 @@ impl<'db> Resolver<'db> {
             }
             Path::LangItem(l, Some(_)) => {
                 let type_ns = match *l {
-                    LangItemTarget::Union(it) => TypeNs::AdtId(it.into()),
-                    LangItemTarget::TypeAlias(it) => TypeNs::TypeAliasId(it),
-                    LangItemTarget::Struct(it) => TypeNs::AdtId(it.into()),
-                    LangItemTarget::EnumVariant(it) => TypeNs::EnumVariantId(it),
+                    LangItemTarget::UnionId(it) => TypeNs::AdtId(it.into()),
+                    LangItemTarget::TypeAliasId(it) => TypeNs::TypeAliasId(it),
+                    LangItemTarget::StructId(it) => TypeNs::AdtId(it.into()),
+                    LangItemTarget::EnumVariantId(it) => TypeNs::EnumVariantId(it),
                     LangItemTarget::EnumId(it) => TypeNs::AdtId(it.into()),
-                    LangItemTarget::Trait(it) => TypeNs::TraitId(it),
-                    LangItemTarget::Function(_)
-                    | LangItemTarget::ImplDef(_)
-                    | LangItemTarget::Static(_) => return None,
+                    LangItemTarget::TraitId(it) => TypeNs::TraitId(it),
+                    LangItemTarget::FunctionId(_)
+                    | LangItemTarget::ImplId(_)
+                    | LangItemTarget::StaticId(_) => return None,
                 };
                 // Remaining segments start from 0 because lang paths have no segments other than the remaining.
                 return Some((
@@ -609,14 +608,14 @@ impl<'db> Resolver<'db> {
             },
         );
         local_def_map.extern_prelude().for_each(|(name, (def, _extern_crate))| {
-            res.add(name, ScopeDef::ModuleDef(ModuleDefId::ModuleId(def.into())));
+            res.add(name, ScopeDef::ModuleDef(ModuleDefId::ModuleId(def)));
         });
         BUILTIN_SCOPE.iter().for_each(|(name, &def)| {
             res.add_per_ns(name, def);
         });
         if let Some((prelude, _use)) = def_map.prelude() {
             let prelude_def_map = prelude.def_map(db);
-            for (name, def) in prelude_def_map[prelude.local_id].scope.entries() {
+            for (name, def) in prelude_def_map[prelude].scope.entries() {
                 res.add_per_ns(name, def)
             }
         }
@@ -648,7 +647,7 @@ impl<'db> Resolver<'db> {
         self.module_scope
             .local_def_map
             .extern_prelude()
-            .map(|(name, module_id)| (name.clone(), module_id.0.into()))
+            .map(|(name, module_id)| (name.clone(), module_id.0))
     }
 
     pub fn traits_in_scope(&self, db: &dyn DefDatabase) -> FxHashSet<TraitId> {
@@ -675,7 +674,7 @@ impl<'db> Resolver<'db> {
         // Fill in the prelude traits
         if let Some((prelude, _use)) = self.module_scope.def_map.prelude() {
             let prelude_def_map = prelude.def_map(db);
-            traits.extend(prelude_def_map[prelude.local_id].scope.traits());
+            traits.extend(prelude_def_map[prelude].scope.traits());
         }
         // Fill in module visible traits
         traits.extend(self.module_scope.def_map[self.module_scope.module_id].scope.traits());
@@ -692,8 +691,7 @@ impl<'db> Resolver<'db> {
     }
 
     pub fn module(&self) -> ModuleId {
-        let (def_map, _, local_id) = self.item_scope_();
-        def_map.module_id(local_id)
+        self.item_scope_().2
     }
 
     pub fn item_scope(&self) -> &ItemScope {
@@ -707,6 +705,20 @@ impl<'db> Resolver<'db> {
 
     pub fn def_map(&self) -> &DefMap {
         self.item_scope_().0
+    }
+
+    #[inline]
+    pub fn top_level_def_map(&self) -> &'db DefMap {
+        self.module_scope.def_map
+    }
+
+    #[inline]
+    pub fn is_visible(&self, db: &dyn DefDatabase, visibility: Visibility) -> bool {
+        visibility.is_visible_from_def_map(
+            db,
+            self.module_scope.def_map,
+            self.module_scope.module_id,
+        )
     }
 
     pub fn generic_def(&self) -> Option<GenericDefId> {
@@ -873,7 +885,7 @@ impl<'db> Resolver<'db> {
                 resolver.scopes.push(Scope::BlockScope(ModuleItemMap {
                     def_map,
                     local_def_map,
-                    module_id: DefMap::ROOT,
+                    module_id: def_map.root,
                 }));
                 // FIXME: This adds as many module scopes as there are blocks, but resolving in each
                 // already traverses all parents, so this is O(n²). I think we could only store the
@@ -924,7 +936,7 @@ fn handle_macro_def_scope(
         // A macro is allowed to refer to variables from before its declaration.
         // Therefore, if we got to the rib of its declaration, give up its hygiene
         // and use its parent expansion.
-        *hygiene_id = HygieneId::new(parent_ctx.opaque_and_semitransparent(db));
+        *hygiene_id = HygieneId::new(parent_ctx.opaque_and_semiopaque(db));
         *hygiene_info = parent_ctx.outer_expn(db).map(|expansion| {
             let expansion = db.lookup_intern_macro_call(expansion.into());
             (parent_ctx.parent(db), expansion.def)
@@ -938,7 +950,7 @@ fn hygiene_info(
     hygiene_id: HygieneId,
 ) -> Option<(SyntaxContext, MacroDefId)> {
     if !hygiene_id.is_root() {
-        let ctx = hygiene_id.lookup();
+        let ctx = hygiene_id.syntax_context();
         ctx.outer_expn(db).map(|expansion| {
             let expansion = db.lookup_intern_macro_call(expansion.into());
             (ctx.parent(db), expansion.def)
@@ -972,7 +984,7 @@ impl<'db> Resolver<'db> {
     }
 
     /// The innermost block scope that contains items or the module scope that contains this resolver.
-    fn item_scope_(&self) -> (&DefMap, &LocalDefMap, LocalModuleId) {
+    fn item_scope_(&self) -> (&DefMap, &LocalDefMap, ModuleId) {
         self.scopes()
             .find_map(|scope| match scope {
                 Scope::BlockScope(m) => Some((m.def_map, m.local_def_map, m.module_id)),
@@ -1076,7 +1088,9 @@ fn resolver_for_scope_<'db>(
         if let Some(block) = scopes.block(scope) {
             let def_map = block_def_map(db, block);
             let local_def_map = block.lookup(db).module.only_local_def_map(db);
-            r = r.push_block_scope(def_map, local_def_map);
+            // Using `DefMap::ROOT` is okay here since inside modules other than the root,
+            // there can't directly be expressions.
+            r = r.push_block_scope(def_map, local_def_map, def_map.root);
             // FIXME: This adds as many module scopes as there are blocks, but resolving in each
             // already traverses all parents, so this is O(n²). I think we could only store the
             // innermost module scope instead?
@@ -1109,12 +1123,9 @@ impl<'db> Resolver<'db> {
         self,
         def_map: &'db DefMap,
         local_def_map: &'db LocalDefMap,
+        module_id: ModuleId,
     ) -> Resolver<'db> {
-        self.push_scope(Scope::BlockScope(ModuleItemMap {
-            def_map,
-            local_def_map,
-            module_id: DefMap::ROOT,
-        }))
+        self.push_scope(Scope::BlockScope(ModuleItemMap { def_map, local_def_map, module_id }))
     }
 
     fn push_expr_scope(
@@ -1150,7 +1161,6 @@ impl<'db> ModuleItemMap<'db> {
                 let ty = match def.def {
                     ModuleDefId::AdtId(it) => TypeNs::AdtId(it),
                     ModuleDefId::TraitId(it) => TypeNs::TraitId(it),
-                    ModuleDefId::TraitAliasId(it) => TypeNs::TraitAliasId(it),
                     ModuleDefId::TypeAliasId(it) => TypeNs::TypeAliasId(it),
                     ModuleDefId::BuiltinType(it) => TypeNs::BuiltinType(it),
 
@@ -1195,7 +1205,6 @@ fn to_value_ns(per_ns: PerNs) -> Option<(ValueNs, Option<ImportOrGlob>)> {
 
         ModuleDefId::AdtId(AdtId::EnumId(_) | AdtId::UnionId(_))
         | ModuleDefId::TraitId(_)
-        | ModuleDefId::TraitAliasId(_)
         | ModuleDefId::TypeAliasId(_)
         | ModuleDefId::BuiltinType(_)
         | ModuleDefId::MacroId(_)
@@ -1214,7 +1223,6 @@ fn to_type_ns(per_ns: PerNs) -> Option<(TypeNs, Option<ImportOrExternCrate>)> {
         ModuleDefId::BuiltinType(it) => TypeNs::BuiltinType(it),
 
         ModuleDefId::TraitId(it) => TypeNs::TraitId(it),
-        ModuleDefId::TraitAliasId(it) => TypeNs::TraitAliasId(it),
 
         ModuleDefId::ModuleId(it) => TypeNs::ModuleId(it),
 
@@ -1275,9 +1283,9 @@ pub trait HasResolver: Copy {
 impl HasResolver for ModuleId {
     fn resolver(self, db: &dyn DefDatabase) -> Resolver<'_> {
         let (mut def_map, local_def_map) = self.local_def_map(db);
-        let mut module_id = self.local_id;
+        let mut module_id = self;
 
-        if !self.is_block_module() {
+        if self.block(db).is_none() {
             return Resolver {
                 scopes: vec![],
                 module_scope: ModuleItemMap { def_map, local_def_map, module_id },
@@ -1287,9 +1295,9 @@ impl HasResolver for ModuleId {
         let mut modules: SmallVec<[_; 1]> = smallvec![];
         while let Some(parent) = def_map.parent() {
             let block_def_map = mem::replace(&mut def_map, parent.def_map(db));
-            modules.push(block_def_map);
-            if !parent.is_block_module() {
-                module_id = parent.local_id;
+            let block_module_id = mem::replace(&mut module_id, parent);
+            modules.push((block_def_map, block_module_id));
+            if parent.block(db).is_none() {
                 break;
             }
         }
@@ -1297,30 +1305,14 @@ impl HasResolver for ModuleId {
             scopes: Vec::with_capacity(modules.len()),
             module_scope: ModuleItemMap { def_map, local_def_map, module_id },
         };
-        for def_map in modules.into_iter().rev() {
-            resolver = resolver.push_block_scope(def_map, local_def_map);
+        for (def_map, module_id) in modules.into_iter().rev() {
+            resolver = resolver.push_block_scope(def_map, local_def_map, module_id);
         }
         resolver
     }
 }
 
-impl HasResolver for CrateRootModuleId {
-    fn resolver(self, db: &dyn DefDatabase) -> Resolver<'_> {
-        let (def_map, local_def_map) = self.local_def_map(db);
-        Resolver {
-            scopes: vec![],
-            module_scope: ModuleItemMap { def_map, local_def_map, module_id: DefMap::ROOT },
-        }
-    }
-}
-
 impl HasResolver for TraitId {
-    fn resolver(self, db: &dyn DefDatabase) -> Resolver<'_> {
-        lookup_resolver(db, self).push_generic_params_scope(db, self.into())
-    }
-}
-
-impl HasResolver for TraitAliasId {
     fn resolver(self, db: &dyn DefDatabase) -> Resolver<'_> {
         lookup_resolver(db, self).push_generic_params_scope(db, self.into())
     }
@@ -1410,7 +1402,6 @@ impl HasResolver for GenericDefId {
             GenericDefId::FunctionId(inner) => inner.resolver(db),
             GenericDefId::AdtId(adt) => adt.resolver(db),
             GenericDefId::TraitId(inner) => inner.resolver(db),
-            GenericDefId::TraitAliasId(inner) => inner.resolver(db),
             GenericDefId::TypeAliasId(inner) => inner.resolver(db),
             GenericDefId::ImplId(inner) => inner.resolver(db),
             GenericDefId::ConstId(inner) => inner.resolver(db),

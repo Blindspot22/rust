@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::ops::{ControlFlow, Range};
 
 use hir::def::{CtorKind, DefKind};
-use rustc_abi::{FIRST_VARIANT, FieldIdx, VariantIdx};
+use rustc_abi::{FIRST_VARIANT, FieldIdx, ScalableElt, VariantIdx};
 use rustc_errors::{ErrorGuaranteed, MultiSpan};
 use rustc_hir as hir;
 use rustc_hir::LangItem;
@@ -17,12 +17,13 @@ use rustc_span::{DUMMY_SP, Span, Symbol, sym};
 use rustc_type_ir::TyKind::*;
 use rustc_type_ir::solve::SizedTraitKind;
 use rustc_type_ir::walk::TypeWalker;
-use rustc_type_ir::{self as ir, BoundVar, CollectAndApply, DynKind, TypeVisitableExt, elaborate};
+use rustc_type_ir::{self as ir, BoundVar, CollectAndApply, TypeVisitableExt, elaborate};
 use tracing::instrument;
 use ty::util::IntTypeExt;
 
 use super::GenericParamDefKind;
 use crate::infer::canonical::Canonical;
+use crate::traits::ObligationCause;
 use crate::ty::InferTy::*;
 use crate::ty::{
     self, AdtDef, BoundRegionKind, Discr, GenericArg, GenericArgs, GenericArgsRef, List, ParamEnv,
@@ -38,6 +39,7 @@ pub type FnSig<'tcx> = ir::FnSig<TyCtxt<'tcx>>;
 pub type Binder<'tcx, T> = ir::Binder<TyCtxt<'tcx>, T>;
 pub type EarlyBinder<'tcx, T> = ir::EarlyBinder<TyCtxt<'tcx>, T>;
 pub type TypingMode<'tcx> = ir::TypingMode<TyCtxt<'tcx>>;
+pub type Placeholder<'tcx, T> = ir::Placeholder<TyCtxt<'tcx>, T>;
 
 pub trait Article {
     fn article(&self) -> &'static str;
@@ -486,12 +488,28 @@ impl<'tcx> Ty<'tcx> {
         {
             ty
         } else {
-            Ty::new(tcx, Bound(index, bound_ty))
+            Ty::new(tcx, Bound(ty::BoundVarIndexKind::Bound(index), bound_ty))
         }
     }
 
     #[inline]
-    pub fn new_placeholder(tcx: TyCtxt<'tcx>, placeholder: ty::PlaceholderType) -> Ty<'tcx> {
+    pub fn new_canonical_bound(tcx: TyCtxt<'tcx>, var: BoundVar) -> Ty<'tcx> {
+        // Use a pre-interned one when possible.
+        if let Some(ty) = tcx.types.anon_canonical_bound_tys.get(var.as_usize()).copied() {
+            ty
+        } else {
+            Ty::new(
+                tcx,
+                Bound(
+                    ty::BoundVarIndexKind::Canonical,
+                    ty::BoundTy { var, kind: ty::BoundTyKind::Anon },
+                ),
+            )
+        }
+    }
+
+    #[inline]
+    pub fn new_placeholder(tcx: TyCtxt<'tcx>, placeholder: ty::PlaceholderType<'tcx>) -> Ty<'tcx> {
         Ty::new(tcx, Placeholder(placeholder))
     }
 
@@ -734,7 +752,6 @@ impl<'tcx> Ty<'tcx> {
         tcx: TyCtxt<'tcx>,
         obj: &'tcx List<ty::PolyExistentialPredicate<'tcx>>,
         reg: ty::Region<'tcx>,
-        repr: DynKind,
     ) -> Ty<'tcx> {
         if cfg!(debug_assertions) {
             let projection_count = obj
@@ -767,7 +784,7 @@ impl<'tcx> Ty<'tcx> {
                 but it has {projection_count}"
             );
         }
-        Ty::new(tcx, Dynamic(obj, reg, repr))
+        Ty::new(tcx, Dynamic(obj, reg))
     }
 
     #[inline]
@@ -862,11 +879,6 @@ impl<'tcx> Ty<'tcx> {
         Ty::new_imm_ref(tcx, tcx.lifetimes.re_static, tcx.types.str_)
     }
 
-    #[inline]
-    pub fn new_diverging_default(tcx: TyCtxt<'tcx>) -> Ty<'tcx> {
-        if tcx.features().never_type_fallback() { tcx.types.never } else { tcx.types.unit }
-    }
-
     // lang and diagnostic tys
 
     fn new_generic_adt(tcx: TyCtxt<'tcx>, wrapper_def_id: DefId, ty_param: Ty<'tcx>) -> Ty<'tcx> {
@@ -900,6 +912,12 @@ impl<'tcx> Ty<'tcx> {
     #[inline]
     pub fn new_box(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Ty<'tcx> {
         let def_id = tcx.require_lang_item(LangItem::OwnedBox, DUMMY_SP);
+        Ty::new_generic_adt(tcx, def_id, ty)
+    }
+
+    #[inline]
+    pub fn new_option(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Ty<'tcx> {
+        let def_id = tcx.require_lang_item(LangItem::Option, DUMMY_SP);
         Ty::new_generic_adt(tcx, def_id, ty)
     }
 
@@ -940,7 +958,7 @@ impl<'tcx> rustc_type_ir::inherent::Ty<TyCtxt<'tcx>> for Ty<'tcx> {
         Ty::new_param(tcx, param.index, param.name)
     }
 
-    fn new_placeholder(tcx: TyCtxt<'tcx>, placeholder: ty::PlaceholderType) -> Self {
+    fn new_placeholder(tcx: TyCtxt<'tcx>, placeholder: ty::PlaceholderType<'tcx>) -> Self {
         Ty::new_placeholder(tcx, placeholder)
     }
 
@@ -950,6 +968,10 @@ impl<'tcx> rustc_type_ir::inherent::Ty<TyCtxt<'tcx>> for Ty<'tcx> {
 
     fn new_anon_bound(tcx: TyCtxt<'tcx>, debruijn: ty::DebruijnIndex, var: ty::BoundVar) -> Self {
         Ty::new_bound(tcx, debruijn, ty::BoundTy { var, kind: ty::BoundTyKind::Anon })
+    }
+
+    fn new_canonical_bound(tcx: TyCtxt<'tcx>, var: ty::BoundVar) -> Self {
+        Ty::new_canonical_bound(tcx, var)
     }
 
     fn new_alias(
@@ -980,9 +1002,8 @@ impl<'tcx> rustc_type_ir::inherent::Ty<TyCtxt<'tcx>> for Ty<'tcx> {
         interner: TyCtxt<'tcx>,
         preds: &'tcx List<ty::PolyExistentialPredicate<'tcx>>,
         region: ty::Region<'tcx>,
-        kind: ty::DynKind,
     ) -> Self {
-        Ty::new_dynamic(interner, preds, region, kind)
+        Ty::new_dynamic(interner, preds, region)
     }
 
     fn new_coroutine(
@@ -1197,6 +1218,12 @@ impl<'tcx> Ty<'tcx> {
         *self.kind() == Str
     }
 
+    /// Returns true if this type is `&str`. The reference's lifetime is ignored.
+    #[inline]
+    pub fn is_imm_ref_str(self) -> bool {
+        matches!(self.kind(), ty::Ref(_, inner, hir::Mutability::Not) if inner.is_str())
+    }
+
     #[inline]
     pub fn is_param(self, index: u32) -> bool {
         match self.kind() {
@@ -1232,12 +1259,33 @@ impl<'tcx> Ty<'tcx> {
         }
     }
 
+    #[inline]
+    pub fn is_scalable_vector(self) -> bool {
+        match self.kind() {
+            Adt(def, _) => def.repr().scalable(),
+            _ => false,
+        }
+    }
+
     pub fn sequence_element_type(self, tcx: TyCtxt<'tcx>) -> Ty<'tcx> {
         match self.kind() {
             Array(ty, _) | Slice(ty) => *ty,
             Str => tcx.types.u8,
             _ => bug!("`sequence_element_type` called on non-sequence value: {}", self),
         }
+    }
+
+    pub fn scalable_vector_element_count_and_type(self, tcx: TyCtxt<'tcx>) -> (u16, Ty<'tcx>) {
+        let Adt(def, args) = self.kind() else {
+            bug!("`scalable_vector_size_and_type` called on invalid type")
+        };
+        let Some(ScalableElt::ElementCount(element_count)) = def.repr().scalable else {
+            bug!("`scalable_vector_size_and_type` called on non-scalable vector type");
+        };
+        let variant = def.non_enum_variant();
+        assert_eq!(variant.fields.len(), 1);
+        let field_ty = variant.fields[FieldIdx::ZERO].ty(tcx, args);
+        (element_count, field_ty)
     }
 
     pub fn simd_size_and_type(self, tcx: TyCtxt<'tcx>) -> (u64, Ty<'tcx>) {
@@ -1324,6 +1372,36 @@ impl<'tcx> Ty<'tcx> {
         }
     }
 
+    pub fn pinned_ty(self) -> Option<Ty<'tcx>> {
+        match self.kind() {
+            Adt(def, args) if def.is_pin() => Some(args.type_at(0)),
+            _ => None,
+        }
+    }
+
+    pub fn pinned_ref(self) -> Option<(Ty<'tcx>, ty::Mutability)> {
+        if let Adt(def, args) = self.kind()
+            && def.is_pin()
+            && let &ty::Ref(_, ty, mutbl) = args.type_at(0).kind()
+        {
+            return Some((ty, mutbl));
+        }
+        None
+    }
+
+    pub fn maybe_pinned_ref(self) -> Option<(Ty<'tcx>, ty::Pinnedness, ty::Mutability)> {
+        match *self.kind() {
+            Adt(def, args)
+                if def.is_pin()
+                    && let ty::Ref(_, ty, mutbl) = *args.type_at(0).kind() =>
+            {
+                Some((ty, ty::Pinnedness::Pinned, mutbl))
+            }
+            ty::Ref(_, ty, mutbl) => Some((ty, ty::Pinnedness::Not, mutbl)),
+            _ => None,
+        }
+    }
+
     /// Panics if called on any type other than `Box<T>`.
     pub fn expect_boxed_ty(self) -> Ty<'tcx> {
         self.boxed_ty()
@@ -1356,7 +1434,7 @@ impl<'tcx> Ty<'tcx> {
 
     #[inline]
     pub fn is_trait(self) -> bool {
-        matches!(self.kind(), Dynamic(_, _, ty::Dyn))
+        matches!(self.kind(), Dynamic(_, _))
     }
 
     #[inline]
@@ -1477,18 +1555,13 @@ impl<'tcx> Ty<'tcx> {
         let mut cor_ty = self;
         let mut ty = cor_ty;
         loop {
-            if let ty::Coroutine(def_id, args) = ty.kind() {
-                cor_ty = ty;
-                f(ty);
-                if tcx.is_async_drop_in_place_coroutine(*def_id) {
-                    ty = args.first().unwrap().expect_ty();
-                    continue;
-                } else {
-                    return cor_ty;
-                }
-            } else {
+            let ty::Coroutine(def_id, args) = ty.kind() else { return cor_ty };
+            cor_ty = ty;
+            f(ty);
+            if !tcx.is_async_drop_in_place_coroutine(*def_id) {
                 return cor_ty;
             }
+            ty = args.first().unwrap().expect_ty();
         }
     }
 
@@ -1640,7 +1713,7 @@ impl<'tcx> Ty<'tcx> {
         tcx: TyCtxt<'tcx>,
         normalize: impl FnMut(Ty<'tcx>) -> Ty<'tcx>,
     ) -> Result<Ty<'tcx>, Ty<'tcx>> {
-        let tail = tcx.struct_tail_raw(self, normalize, || {});
+        let tail = tcx.struct_tail_raw(self, &ObligationCause::dummy(), normalize, || {});
         match tail.kind() {
             // Sized types
             ty::Infer(ty::IntVar(_) | ty::FloatVar(_))
@@ -1671,7 +1744,7 @@ impl<'tcx> Ty<'tcx> {
 
             ty::Str | ty::Slice(_) => Ok(tcx.types.usize),
 
-            ty::Dynamic(_, _, ty::Dyn) => {
+            ty::Dynamic(_, _) => {
                 let dyn_metadata = tcx.require_lang_item(LangItem::DynMetadata, DUMMY_SP);
                 Ok(tcx.type_of(dyn_metadata).instantiate(tcx, &[tail.into()]))
             }
@@ -1853,7 +1926,7 @@ impl<'tcx> Ty<'tcx> {
             | ty::Never
             | ty::Error(_) => true,
 
-            ty::Str | ty::Slice(_) | ty::Dynamic(_, _, ty::Dyn) => match sizedness {
+            ty::Str | ty::Slice(_) | ty::Dynamic(_, _) => match sizedness {
                 SizedTraitKind::Sized => false,
                 SizedTraitKind::MetaSized => true,
             },

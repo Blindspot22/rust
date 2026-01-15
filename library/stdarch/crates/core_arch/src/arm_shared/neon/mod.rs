@@ -104,7 +104,8 @@ types! {
 }
 
 types! {
-    #![unstable(feature = "stdarch_neon_f16", issue = "136306")]
+    #![cfg_attr(not(target_arch = "arm"), stable(feature = "stdarch_neon_fp16", since = "CURRENT_RUSTC_VERSION"))]
+    #![cfg_attr(target_arch = "arm", unstable(feature = "stdarch_arm_neon_intrinsics", issue = "111800"))]
 
     /// Arm-specific 64-bit wide vector of four packed `f16`.
     pub struct float16x4_t(4 x pub(crate) f16);
@@ -747,19 +748,40 @@ pub struct uint32x4x4_t(
 /// Arm-specific type containing two `float16x4_t` vectors.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-#[unstable(feature = "stdarch_neon_f16", issue = "136306")]
+#[cfg_attr(
+    not(target_arch = "arm"),
+    stable(feature = "stdarch_neon_fp16", since = "CURRENT_RUSTC_VERSION")
+)]
+#[cfg_attr(
+    target_arch = "arm",
+    unstable(feature = "stdarch_arm_neon_intrinsics", issue = "111800")
+)]
 pub struct float16x4x2_t(pub float16x4_t, pub float16x4_t);
 
 /// Arm-specific type containing three `float16x4_t` vectors.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-#[unstable(feature = "stdarch_neon_f16", issue = "136306")]
+#[cfg_attr(
+    not(target_arch = "arm"),
+    stable(feature = "stdarch_neon_fp16", since = "CURRENT_RUSTC_VERSION")
+)]
+#[cfg_attr(
+    target_arch = "arm",
+    unstable(feature = "stdarch_arm_neon_intrinsics", issue = "111800")
+)]
 pub struct float16x4x3_t(pub float16x4_t, pub float16x4_t, pub float16x4_t);
 
 /// Arm-specific type containing four `float16x4_t` vectors.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-#[unstable(feature = "stdarch_neon_f16", issue = "136306")]
+#[cfg_attr(
+    not(target_arch = "arm"),
+    stable(feature = "stdarch_neon_fp16", since = "CURRENT_RUSTC_VERSION")
+)]
+#[cfg_attr(
+    target_arch = "arm",
+    unstable(feature = "stdarch_arm_neon_intrinsics", issue = "111800")
+)]
 pub struct float16x4x4_t(
     pub float16x4_t,
     pub float16x4_t,
@@ -770,19 +792,40 @@ pub struct float16x4x4_t(
 /// Arm-specific type containing two `float16x8_t` vectors.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-#[unstable(feature = "stdarch_neon_f16", issue = "136306")]
+#[cfg_attr(
+    not(target_arch = "arm"),
+    stable(feature = "stdarch_neon_fp16", since = "CURRENT_RUSTC_VERSION")
+)]
+#[cfg_attr(
+    target_arch = "arm",
+    unstable(feature = "stdarch_arm_neon_intrinsics", issue = "111800")
+)]
 pub struct float16x8x2_t(pub float16x8_t, pub float16x8_t);
 
 /// Arm-specific type containing three `float16x8_t` vectors.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-#[unstable(feature = "stdarch_neon_f16", issue = "136306")]
+#[cfg_attr(
+    not(target_arch = "arm"),
+    stable(feature = "stdarch_neon_fp16", since = "CURRENT_RUSTC_VERSION")
+)]
+#[cfg_attr(
+    target_arch = "arm",
+    unstable(feature = "stdarch_arm_neon_intrinsics", issue = "111800")
+)]
 pub struct float16x8x3_t(pub float16x8_t, pub float16x8_t, pub float16x8_t);
 
 /// Arm-specific type containing four `float16x8_t` vectors.
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-#[unstable(feature = "stdarch_neon_f16", issue = "136306")]
+#[cfg_attr(
+    not(target_arch = "arm"),
+    stable(feature = "stdarch_neon_fp16", since = "CURRENT_RUSTC_VERSION")
+)]
+#[cfg_attr(
+    target_arch = "arm",
+    unstable(feature = "stdarch_arm_neon_intrinsics", issue = "111800")
+)]
 pub struct float16x8x4_t(
     pub float16x8_t,
     pub float16x8_t,
@@ -5503,8 +5546,12 @@ mod tests {
     test_vcombine!(test_vcombine_s16 => vcombine_s16([3_i16, -4, 5, -6], [13_i16, -14, 15, -16]));
     test_vcombine!(test_vcombine_u16 => vcombine_u16([3_u16, 4, 5, 6], [13_u16, 14, 15, 16]));
     test_vcombine!(test_vcombine_p16 => vcombine_p16([3_u16, 4, 5, 6], [13_u16, 14, 15, 16]));
-    test_vcombine!(test_vcombine_f16 => vcombine_f16([3_f16, 4., 5., 6.],
-    [13_f16, 14., 15., 16.]));
+    #[cfg(not(target_arch = "arm64ec"))]
+    mod fp16 {
+        use super::*;
+        test_vcombine!(test_vcombine_f16 => vcombine_f16([3_f16, 4., 5., 6.],
+        [13_f16, 14., 15., 16.]));
+    }
 
     test_vcombine!(test_vcombine_s32 => vcombine_s32([3_i32, -4], [13_i32, -14]));
     test_vcombine!(test_vcombine_u32 => vcombine_u32([3_u32, 4], [13_u32, 14]));

@@ -4,17 +4,18 @@
 
 use rustc_abi::ExternAbi;
 use rustc_ast::ast;
+use rustc_data_structures::fx::FxHashSet;
+use rustc_data_structures::thin_vec::ThinVec;
 use rustc_hir as hir;
-use rustc_hir::attrs::{self, DeprecatedSince};
+use rustc_hir::attrs::{self, DeprecatedSince, DocAttribute, DocInline, HideOrShow};
 use rustc_hir::def::CtorKind;
 use rustc_hir::def_id::DefId;
 use rustc_hir::{HeaderSafety, Safety};
 use rustc_metadata::rendered_const;
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::{bug, ty};
-use rustc_span::{Pos, kw, sym};
+use rustc_span::{Pos, Symbol, kw, sym};
 use rustdoc_json_types::*;
-use thin_vec::ThinVec;
 
 use crate::clean::{self, ItemId};
 use crate::formats::item_type::ItemType;
@@ -45,14 +46,14 @@ impl JsonRenderer<'_> {
             .attrs
             .other_attrs
             .iter()
-            .filter_map(|a| maybe_from_hir_attr(a, item.item_id, self.tcx))
+            .flat_map(|a| maybe_from_hir_attr(a, item.item_id, self.tcx))
             .collect();
         let span = item.span(self.tcx);
         let visibility = item.visibility(self.tcx);
         let clean::ItemInner { name, item_id, .. } = *item.inner;
         let id = self.id_from_item(item);
         let inner = match item.kind {
-            clean::KeywordItem => return None,
+            clean::KeywordItem | clean::AttributeItem => return None,
             clean::StrippedItem(ref inner) => {
                 match &**inner {
                     // We document stripped modules as with `Module::is_stripped` set to
@@ -85,7 +86,7 @@ impl JsonRenderer<'_> {
     fn ids(&self, items: &[clean::Item]) -> Vec<Id> {
         items
             .iter()
-            .filter(|i| !i.is_stripped() && !i.is_keyword())
+            .filter(|i| !i.is_stripped() && !i.is_keyword() && !i.is_attribute())
             .map(|i| self.id_from_item(i))
             .collect()
     }
@@ -93,7 +94,10 @@ impl JsonRenderer<'_> {
     fn ids_keeping_stripped(&self, items: &[clean::Item]) -> Vec<Option<Id>> {
         items
             .iter()
-            .map(|i| (!i.is_stripped() && !i.is_keyword()).then(|| self.id_from_item(i)))
+            .map(|i| {
+                (!i.is_stripped() && !i.is_keyword() && !i.is_attribute())
+                    .then(|| self.id_from_item(i))
+            })
             .collect()
     }
 }
@@ -332,8 +336,8 @@ fn from_clean_item(item: &clean::Item, renderer: &JsonRenderer<'_>) -> ItemEnum 
             bounds: b.into_json(renderer),
             type_: Some(t.item_type.as_ref().unwrap_or(&t.type_).into_json(renderer)),
         },
-        // `convert_item` early returns `None` for stripped items and keywords.
-        KeywordItem => unreachable!(),
+        // `convert_item` early returns `None` for stripped items, keywords and attributes.
+        KeywordItem | AttributeItem => unreachable!(),
         StrippedItem(inner) => {
             match inner.as_ref() {
                 ModuleItem(m) => ItemEnum::Module(Module {
@@ -463,7 +467,7 @@ impl FromClean<clean::GenericParamDefKind> for GenericParamDefKind {
                 default: default.into_json(renderer),
                 is_synthetic: *synthetic,
             },
-            Const { ty, default, synthetic: _ } => GenericParamDefKind::Const {
+            Const { ty, default } => GenericParamDefKind::Const {
                 type_: ty.into_json(renderer),
                 default: default.as_ref().map(|x| x.as_ref().clone()),
             },
@@ -887,6 +891,7 @@ impl FromClean<ItemType> for ItemKind {
             AssocType => ItemKind::AssocType,
             ForeignType => ItemKind::ExternType,
             Keyword => ItemKind::Keyword,
+            Attribute => ItemKind::Attribute,
             TraitAlias => ItemKind::TraitAlias,
             ProcAttribute => ItemKind::ProcAttribute,
             ProcDerive => ItemKind::ProcDerive,
@@ -897,30 +902,23 @@ impl FromClean<ItemType> for ItemKind {
 /// Maybe convert a attribute from hir to json.
 ///
 /// Returns `None` if the attribute shouldn't be in the output.
-fn maybe_from_hir_attr(
-    attr: &hir::Attribute,
-    item_id: ItemId,
-    tcx: TyCtxt<'_>,
-) -> Option<Attribute> {
+fn maybe_from_hir_attr(attr: &hir::Attribute, item_id: ItemId, tcx: TyCtxt<'_>) -> Vec<Attribute> {
     use attrs::AttributeKind as AK;
 
     let kind = match attr {
         hir::Attribute::Parsed(kind) => kind,
 
         hir::Attribute::Unparsed(_) => {
-            return Some(if attr.has_name(sym::macro_export) {
-                Attribute::MacroExport
-                // FIXME: We should handle `#[doc(hidden)]`.
-            } else {
-                other_attr(tcx, attr)
-            });
+            // FIXME: We should handle `#[doc(hidden)]`.
+            return vec![other_attr(tcx, attr)];
         }
     };
 
-    Some(match kind {
-        AK::Deprecation { .. } => return None, // Handled separately into Item::deprecation.
+    vec![match kind {
+        AK::Deprecation { .. } => return Vec::new(), // Handled separately into Item::deprecation.
         AK::DocComment { .. } => unreachable!("doc comments stripped out earlier"),
 
+        AK::MacroExport { .. } => Attribute::MacroExport,
         AK::MustUse { reason, span: _ } => {
             Attribute::MustUse { reason: reason.map(|s| s.to_string()) }
         }
@@ -937,9 +935,118 @@ fn maybe_from_hir_attr(
         AK::NoMangle(_) => Attribute::NoMangle,
         AK::NonExhaustive(_) => Attribute::NonExhaustive,
         AK::AutomaticallyDerived(_) => Attribute::AutomaticallyDerived,
+        AK::Doc(d) => {
+            fn toggle_attr(ret: &mut Vec<Attribute>, name: &str, v: &Option<rustc_span::Span>) {
+                if v.is_some() {
+                    ret.push(Attribute::Other(format!("#[doc({name})]")));
+                }
+            }
+
+            fn name_value_attr(
+                ret: &mut Vec<Attribute>,
+                name: &str,
+                v: &Option<(Symbol, rustc_span::Span)>,
+            ) {
+                if let Some((v, _)) = v {
+                    // We use `as_str` and debug display to have characters escaped and `"`
+                    // characters surrounding the string.
+                    ret.push(Attribute::Other(format!("#[doc({name} = {:?})]", v.as_str())));
+                }
+            }
+
+            let DocAttribute {
+                aliases,
+                hidden,
+                inline,
+                cfg,
+                auto_cfg,
+                auto_cfg_change,
+                fake_variadic,
+                keyword,
+                attribute,
+                masked,
+                notable_trait,
+                search_unbox,
+                html_favicon_url,
+                html_logo_url,
+                html_playground_url,
+                html_root_url,
+                html_no_source,
+                issue_tracker_base_url,
+                rust_logo,
+                test_attrs,
+                no_crate_inject,
+            } = &**d;
+
+            let mut ret = Vec::new();
+
+            for (alias, _) in aliases {
+                // We use `as_str` and debug display to have characters escaped and `"` characters
+                // surrounding the string.
+                ret.push(Attribute::Other(format!("#[doc(alias = {:?})]", alias.as_str())));
+            }
+            toggle_attr(&mut ret, "hidden", hidden);
+            if let Some(inline) = inline.first() {
+                ret.push(Attribute::Other(format!(
+                    "#[doc({})]",
+                    match inline.0 {
+                        DocInline::Inline => "inline",
+                        DocInline::NoInline => "no_inline",
+                    }
+                )));
+            }
+            for sub_cfg in cfg {
+                ret.push(Attribute::Other(format!("#[doc(cfg({sub_cfg}))]")));
+            }
+            for (auto_cfg, _) in auto_cfg {
+                let kind = match auto_cfg.kind {
+                    HideOrShow::Hide => "hide",
+                    HideOrShow::Show => "show",
+                };
+                let mut out = format!("#[doc(auto_cfg({kind}(");
+                for (pos, value) in auto_cfg.values.iter().enumerate() {
+                    if pos > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(value.name.as_str());
+                    if let Some((value, _)) = value.value {
+                        // We use `as_str` and debug display to have characters escaped and `"`
+                        // characters surrounding the string.
+                        out.push_str(&format!(" = {:?}", value.as_str()));
+                    }
+                }
+                out.push_str(")))]");
+                ret.push(Attribute::Other(out));
+            }
+            for (change, _) in auto_cfg_change {
+                ret.push(Attribute::Other(format!("#[doc(auto_cfg = {change})]")));
+            }
+            toggle_attr(&mut ret, "fake_variadic", fake_variadic);
+            name_value_attr(&mut ret, "keyword", keyword);
+            name_value_attr(&mut ret, "attribute", attribute);
+            toggle_attr(&mut ret, "masked", masked);
+            toggle_attr(&mut ret, "notable_trait", notable_trait);
+            toggle_attr(&mut ret, "search_unbox", search_unbox);
+            name_value_attr(&mut ret, "html_favicon_url", html_favicon_url);
+            name_value_attr(&mut ret, "html_logo_url", html_logo_url);
+            name_value_attr(&mut ret, "html_playground_url", html_playground_url);
+            name_value_attr(&mut ret, "html_root_url", html_root_url);
+            toggle_attr(&mut ret, "html_no_source", html_no_source);
+            name_value_attr(&mut ret, "issue_tracker_base_url", issue_tracker_base_url);
+            toggle_attr(&mut ret, "rust_logo", rust_logo);
+            let source_map = tcx.sess.source_map();
+            for attr_span in test_attrs {
+                // FIXME: This is ugly, remove when `test_attrs` has been ported to new attribute API.
+                if let Ok(snippet) = source_map.span_to_snippet(*attr_span) {
+                    ret.push(Attribute::Other(format!("#[doc(test(attr({snippet})))")));
+                }
+            }
+            toggle_attr(&mut ret, "no_crate_inject", no_crate_inject);
+            return ret;
+        }
 
         _ => other_attr(tcx, attr),
-    })
+    }]
 }
 
 fn other_attr(tcx: TyCtxt<'_>, attr: &hir::Attribute) -> Attribute {
@@ -986,4 +1093,56 @@ fn format_integer_type(it: rustc_abi::IntegerType) -> String {
         Fixed(I128, false) => "u128",
     }
     .to_owned()
+}
+
+pub(super) fn target(sess: &rustc_session::Session) -> Target {
+    // Build a set of which features are enabled on this target
+    let globally_enabled_features: FxHashSet<&str> =
+        sess.unstable_target_features.iter().map(|name| name.as_str()).collect();
+
+    // Build a map of target feature stability by feature name
+    use rustc_target::target_features::Stability;
+    let feature_stability: FxHashMap<&str, Stability> = sess
+        .target
+        .rust_target_features()
+        .iter()
+        .copied()
+        .map(|(name, stability, _)| (name, stability))
+        .collect();
+
+    Target {
+        triple: sess.opts.target_triple.tuple().into(),
+        target_features: sess
+            .target
+            .rust_target_features()
+            .iter()
+            .copied()
+            .filter(|(_, stability, _)| {
+                // Describe only target features which the user can toggle
+                stability.toggle_allowed().is_ok()
+            })
+            .map(|(name, stability, implied_features)| {
+                TargetFeature {
+                    name: name.into(),
+                    unstable_feature_gate: match stability {
+                        Stability::Unstable(feature_gate) => Some(feature_gate.as_str().into()),
+                        _ => None,
+                    },
+                    implies_features: implied_features
+                        .iter()
+                        .copied()
+                        .filter(|name| {
+                            // Imply only target features which the user can toggle
+                            feature_stability
+                                .get(name)
+                                .map(|stability| stability.toggle_allowed().is_ok())
+                                .unwrap_or(false)
+                        })
+                        .map(String::from)
+                        .collect(),
+                    globally_enabled: globally_enabled_features.contains(name),
+                }
+            })
+            .collect(),
+    }
 }

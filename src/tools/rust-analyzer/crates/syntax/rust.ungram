@@ -154,7 +154,6 @@ Item =
 | Static
 | Struct
 | Trait
-| TraitAlias
 | TypeAlias
 | Union
 | Use
@@ -306,11 +305,8 @@ Trait =
   Attr* Visibility?
   'unsafe'? 'auto'?
   'trait' Name GenericParamList?
-  (':' TypeBoundList?)? WhereClause? AssocItemList
-
-TraitAlias =
-  Attr* Visibility?
-  'trait' Name GenericParamList? '=' TypeBoundList? WhereClause? ';'
+  (((':' TypeBoundList?)? WhereClause? AssocItemList) |
+  ('=' TypeBoundList? WhereClause? ';'))
 
 AssocItemList =
   '{' Attr* AssocItem* '}'
@@ -442,7 +438,10 @@ FormatArgsExpr =
   ')'
 
 FormatArgsArg =
-  (Name '=')? Expr
+  arg_name:FormatArgsArgName? Expr
+
+FormatArgsArgName =
+  '=' // This also has a name, but it's any token and we can't put it here
 
 MacroExpr =
   MacroCall

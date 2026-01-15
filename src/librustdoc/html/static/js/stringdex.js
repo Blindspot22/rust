@@ -1,3 +1,4 @@
+// ignore-tidy-filelength
 /**
  * @import * as stringdex from "./stringdex.d.ts"
  */
@@ -50,6 +51,52 @@ class RoaringBitmap {
                 container.array[(cardinalityOld * 2) + 1] = (value >> 8) & 0xFF;
                 container.cardinality = cardinalityOld + 1;
                 pspecial += 2;
+            }
+            this.consumed_len_bytes = pspecial - i;
+            return this;
+        } else if (u8array[i] > 0xe0) {
+            // Special representation of tiny sets that are runs
+            const lspecial = u8array[i] & 0x0f;
+            this.keysAndCardinalities = new Uint8Array(lspecial * 4);
+            i += 1;
+            const key = u8array[i + 2] | (u8array[i + 3] << 8);
+            const value = u8array[i] | (u8array[i + 1] << 8);
+            const container = new RoaringBitmapRun(1, new Uint8Array(4));
+            container.array[0] = value & 0xFF;
+            container.array[1] = (value >> 8) & 0xFF;
+            container.array[2] = lspecial - 1;
+            this.containers.push(container);
+            this.keysAndCardinalities[0] = key & 0xFF;
+            this.keysAndCardinalities[1] = (key >> 8) & 0xFF;
+            this.keysAndCardinalities[2] = lspecial - 1;
+            this.consumed_len_bytes = 5;
+            return this;
+        } else if (u8array[i] > 0xd0) {
+            // Special representation of tiny sets that are close together
+            const lspecial = u8array[i] & 0x0f;
+            this.keysAndCardinalities = new Uint8Array(lspecial * 4);
+            let pspecial = i + 1;
+            let key = u8array[pspecial + 2] | (u8array[pspecial + 3] << 8);
+            let value = u8array[pspecial] | (u8array[pspecial + 1] << 8);
+            let entry = (key << 16) | value;
+            let container;
+            container = new RoaringBitmapArray(1, new Uint8Array(4));
+            container.array[0] = value & 0xFF;
+            container.array[1] = (value >> 8) & 0xFF;
+            this.containers.push(container);
+            this.keysAndCardinalities[0] = key;
+            this.keysAndCardinalities[1] = key >> 8;
+            pspecial += 4;
+            for (let ispecial = 1; ispecial < lspecial; ispecial += 1) {
+                entry += u8array[pspecial];
+                value = entry & 0xffff;
+                key = entry >> 16;
+                container = this.addToArrayAt(key);
+                const cardinalityOld = container.cardinality;
+                container.array[cardinalityOld * 2] = value & 0xFF;
+                container.array[(cardinalityOld * 2) + 1] = (value >> 8) & 0xFF;
+                container.cardinality = cardinalityOld + 1;
+                pspecial += 1;
             }
             this.consumed_len_bytes = pspecial - i;
             return this;
@@ -486,6 +533,63 @@ class RoaringBitmap {
         return mid === -1 ? false : this.containers[mid].contains(value);
     }
     /**
+     * @param {number} keyvalue
+     * @returns {RoaringBitmap}
+     */
+    remove(keyvalue) {
+        const key = keyvalue >> 16;
+        const value = keyvalue & 0xFFFF;
+        const mid = this.getContainerId(key);
+        if (mid === -1) {
+            return this;
+        }
+        const container = this.containers[mid];
+        if (!container.contains(value)) {
+            return this;
+        }
+        const newCardinality = (this.keysAndCardinalities[(mid * 4) + 2] |
+            (this.keysAndCardinalities[(mid * 4) + 3] << 8));
+        const l = this.containers.length;
+        const m = l - (newCardinality === 0 ? 1 : 0);
+        const result = new RoaringBitmap(null, 0);
+        result.keysAndCardinalities = new Uint8Array(m * 4);
+        let j = 0;
+        for (let i = 0; i < l; i += 1) {
+            if (i === mid) {
+                if (newCardinality !== 0) {
+                    result.keysAndCardinalities[(j * 4) + 0] = key;
+                    result.keysAndCardinalities[(j * 4) + 1] = key >> 8;
+                    const card = newCardinality - 1;
+                    result.keysAndCardinalities[(j * 4) + 2] = card;
+                    result.keysAndCardinalities[(j * 4) + 3] = card >> 8;
+                    const newContainer = new RoaringBitmapArray(
+                        newCardinality,
+                        new Uint8Array(newCardinality * 2),
+                    );
+                    let newContainerSlot = 0;
+                    for (const containerValue of container.values()) {
+                        if (containerValue !== value) {
+                            newContainer.array[newContainerSlot] = value & 0xFF;
+                            newContainerSlot += 1;
+                            newContainer.array[newContainerSlot] = value >> 8;
+                            newContainerSlot += 1;
+                        }
+                    }
+                    result.containers.push(newContainer);
+                    j += 1;
+                }
+            } else {
+                result.keysAndCardinalities[(j * 4) + 0] = this.keysAndCardinalities[(i * 4) + 0];
+                result.keysAndCardinalities[(j * 4) + 1] = this.keysAndCardinalities[(i * 4) + 1];
+                result.keysAndCardinalities[(j * 4) + 2] = this.keysAndCardinalities[(i * 4) + 2];
+                result.keysAndCardinalities[(j * 4) + 3] = this.keysAndCardinalities[(i * 4) + 3];
+                result.containers.push(this.containers[i]);
+                j += 1;
+            }
+        }
+        return result;
+    }
+    /**
      * @param {number} key
      * @returns {number}
      */
@@ -878,6 +982,46 @@ function bitCount(n) {
 /*eslint-enable */
 
 /**
+ * https://en.wikipedia.org/wiki/Boyer%E2%80%93Moore%E2%80%93Horspool_algorithm
+ */
+class Uint8ArraySearchPattern {
+    /** @param {Uint8Array} needle */
+    constructor(needle) {
+        this.needle = needle;
+        this.skipTable = [];
+        const m = needle.length;
+        for (let i = 0; i < 256; i += 1) {
+            this.skipTable.push(m);
+        }
+        for (let i = 0; i < m - 1; i += 1) {
+            this.skipTable[needle[i]] = m - 1 - i;
+        }
+    }
+    /**
+     * @param {Uint8Array} haystack
+     * @returns {boolean}
+     */
+    matches(haystack) {
+        const needle = this.needle;
+        const skipTable = this.skipTable;
+        const m = needle.length;
+        const n = haystack.length;
+
+        let skip = 0;
+        search: while (n - skip >= m) {
+            for (let i = m - 1; i >= 0; i -= 1) {
+                if (haystack[skip + i] !== needle[i]) {
+                    skip += skipTable[haystack[skip + m  - 1]];
+                    continue search;
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+}
+
+/**
  * @param {stringdex.Hooks} hooks
  * @returns {Promise<stringdex.Database>}
  */
@@ -887,12 +1031,6 @@ function loadDatabase(hooks) {
         rr_: function(data) {
             const dataObj = JSON.parse(data);
             for (const colName of Object.keys(dataObj)) {
-                if (Object.hasOwn(dataObj[colName], "I")) {
-                    registry.searchTreeRoots.set(
-                        colName,
-                        makeSearchTreeFromBase64(dataObj[colName].I)[1],
-                    );
-                }
                 if (Object.hasOwn(dataObj[colName], "N")) {
                     const counts = [];
                     const countsstring = dataObj[colName]["N"];
@@ -915,6 +1053,9 @@ function loadDatabase(hooks) {
                         makeUint8ArrayFromBase64(dataObj[colName]["H"]),
                         new RoaringBitmap(makeUint8ArrayFromBase64(dataObj[colName]["E"]), 0),
                         colName,
+                        Object.hasOwn(dataObj[colName], "I") ?
+                            makeSearchTreeFromBase64(dataObj[colName].I)[1] :
+                            null,
                     ));
                 }
             }
@@ -978,7 +1119,7 @@ function loadDatabase(hooks) {
      *      searchTreePromises: HashTable<Promise<SearchTree>>;
      *      dataColumnLoadPromiseCallbacks: HashTable<function(any, Uint8Array[]?): any>;
      *      dataColumns: Map<string, DataColumn>;
-     *      dataColumnsBuckets: Map<string, HashTable<Promise<Uint8Array[]>>>;
+     *      dataColumnsBuckets: HashTable<Promise<Uint8Array[]>>;
      *      searchTreeLoadByNodeID: function(Uint8Array): Promise<SearchTree>;
      *      searchTreeRootCallback?: function(any, Database?): any;
      *      dataLoadByNameAndHash: function(string, Uint8Array): Promise<Uint8Array[]>;
@@ -990,7 +1131,7 @@ function loadDatabase(hooks) {
         searchTreePromises: new HashTable(),
         dataColumnLoadPromiseCallbacks: new HashTable(),
         dataColumns: new Map(),
-        dataColumnsBuckets: new Map(),
+        dataColumnsBuckets: new HashTable(),
         searchTreeLoadByNodeID: function(nodeid) {
             const existingPromise = registry.searchTreePromises.get(nodeid);
             if (existingPromise) {
@@ -1013,22 +1154,39 @@ function loadDatabase(hooks) {
                     const id2 = id1 + ((nodeid[4] << 8) | nodeid[5]);
                     leaves = RoaringBitmap.makeSingleton(id1)
                         .union(RoaringBitmap.makeSingleton(id2));
+                } else if (!isWhole && (nodeid[0] & 0xf0) === 0x80) {
+                    const id1 = ((nodeid[0] & 0x0f) << 16) | (nodeid[1] << 8) | nodeid[2];
+                    const id2 = id1 + ((nodeid[3] << 4) | ((nodeid[4] >> 4) & 0x0f));
+                    const id3 = id2 + (((nodeid[4] & 0x0f) << 8) | nodeid[5]);
+                    leaves = RoaringBitmap.makeSingleton(id1)
+                        .union(RoaringBitmap.makeSingleton(id2))
+                        .union(RoaringBitmap.makeSingleton(id3));
                 } else {
                     leaves = RoaringBitmap.makeSingleton(
                         (nodeid[2] << 24) | (nodeid[3] << 16) |
                         (nodeid[4] << 8) | nodeid[5],
                     );
                 }
-                const data = (nodeid[0] & 0x20) !== 0 ?
-                    Uint8Array.of(((nodeid[0] & 0x0f) << 4) | (nodeid[1] >> 4)) :
-                    EMPTY_UINT8;
-                newPromise = Promise.resolve(new SearchTree(
-                    EMPTY_SEARCH_TREE_BRANCHES,
-                    EMPTY_SEARCH_TREE_BRANCHES,
-                    data,
-                    isWhole ? leaves : EMPTY_BITMAP,
-                    isWhole ? EMPTY_BITMAP : leaves,
-                ));
+                if (isWhole) {
+                    const data = (nodeid[0] & 0x20) !== 0 ?
+                        Uint8Array.of(((nodeid[0] & 0x0f) << 4) | (nodeid[1] >> 4)) :
+                        EMPTY_UINT8;
+                    newPromise = Promise.resolve(new PrefixSearchTree(
+                        EMPTY_SEARCH_TREE_BRANCHES,
+                        EMPTY_SEARCH_TREE_BRANCHES,
+                        data,
+                        leaves,
+                        EMPTY_BITMAP,
+                    ));
+                } else {
+                    const data = (nodeid[0] & 0xf0) === 0x80 ? 0 : (
+                        ((nodeid[0] & 0x0f) << 4) | (nodeid[1] >> 4));
+                    newPromise = Promise.resolve(new SuffixSearchTree(
+                        EMPTY_SEARCH_TREE_BRANCHES,
+                        data,
+                        leaves,
+                    ));
+                }
             } else {
                 const hashHex = makeHexFromUint8Array(nodeid);
                 newPromise = new Promise((resolve, reject) => {
@@ -1058,12 +1216,7 @@ function loadDatabase(hooks) {
             return newPromise;
         },
         dataLoadByNameAndHash: function(name, hash) {
-            let dataColumnBuckets = registry.dataColumnsBuckets.get(name);
-            if (dataColumnBuckets === undefined) {
-                dataColumnBuckets = new HashTable();
-                registry.dataColumnsBuckets.set(name, dataColumnBuckets);
-            }
-            const existingBucket = dataColumnBuckets.get(hash);
+            const existingBucket = registry.dataColumnsBuckets.get(hash);
             if (existingBucket) {
                 return existingBucket;
             }
@@ -1091,16 +1244,17 @@ function loadDatabase(hooks) {
                     hooks.loadDataByNameAndHash(name, hashHex);
                 }
             });
-            dataColumnBuckets.set(hash, newBucket);
+            registry.dataColumnsBuckets.set(hash, newBucket);
             return newBucket;
         },
     };
 
     /**
      * The set of child subtrees.
+     * @template ST
      * @type {{
      *    nodeids: Uint8Array,
-     *    subtrees: Array<Promise<SearchTree>|null>,
+     *    subtrees: Array<Promise<ST>|null>,
      * }}
      */
     class SearchTreeBranches {
@@ -1128,7 +1282,7 @@ function loadDatabase(hooks) {
             );
         }
         // https://github.com/microsoft/TypeScript/issues/17227
-        /** @returns {Generator<[number, Promise<SearchTree>|null]>} */
+        /** @returns {Generator<[number, Promise<ST>|null]>} */
         entries() {
             throw new Error();
         }
@@ -1157,10 +1311,12 @@ function loadDatabase(hooks) {
     /**
      * A sorted array of search tree branches.
      *
+     * @template ST
+     * @extends SearchTreeBranches<ST>
      * @type {{
      *    keys: Uint8Array,
      *    nodeids: Uint8Array,
-     *    subtrees: Array<Promise<SearchTree>|null>,
+     *    subtrees: Array<Promise<ST>|null>,
      * }}
      */
     class SearchTreeBranchesArray extends SearchTreeBranches {
@@ -1179,7 +1335,7 @@ function loadDatabase(hooks) {
                 i += 1;
             }
         }
-        /** @returns {Generator<[number, Promise<SearchTree>|null]>} */
+        /** @returns {Generator<[number, Promise<ST>|null]>} */
         * entries() {
             let i = 0;
             const l = this.keys.length;
@@ -1246,12 +1402,16 @@ function loadDatabase(hooks) {
     }
 
     /**
+     * @template ST
      * @param {number[]} alphabitmap_chars
      * @param {number} width
-     * @return {(typeof SearchTreeBranches)&{"ALPHABITMAP_CHARS": number[], "width": number}}
+     * @return {(typeof SearchTreeBranches<ST>)&{"ALPHABITMAP_CHARS": number[], "width": number}}
      */
     function makeSearchTreeBranchesAlphaBitmapClass(alphabitmap_chars, width) {
         const bitwidth = width * 8;
+        /**
+         * @extends SearchTreeBranches<ST>
+         */
         const cls = class SearchTreeBranchesAlphaBitmap extends SearchTreeBranches {
             /**
              * @param {number} bitmap
@@ -1265,7 +1425,7 @@ function loadDatabase(hooks) {
                 this.bitmap = bitmap;
                 this.nodeids = nodeids;
             }
-            /** @returns {Generator<[number, Promise<SearchTree>|null]>} */
+            /** @returns {Generator<[number, Promise<ST>|null]>} */
             * entries() {
                 let i = 0;
                 let j = 0;
@@ -1295,15 +1455,7 @@ function loadDatabase(hooks) {
              * @returns {number}
              */
             getKey(branch_index) {
-                //return this.getKeys()[branch_index];
-                let alpha_index = 0;
-                while (branch_index >= 0) {
-                    if (this.bitmap & (1 << alpha_index)) {
-                        branch_index -= 1;
-                    }
-                    alpha_index += 1;
-                }
-                return alphabitmap_chars[alpha_index];
+                return this.getKeys()[branch_index];
             }
             /**
              * @returns {Uint8Array}
@@ -1326,20 +1478,35 @@ function loadDatabase(hooks) {
         return cls;
     }
 
+    /**
+     * @template ST
+     * @type {(typeof SearchTreeBranches<any>)&{"ALPHABITMAP_CHARS": number[], "width": number}}
+     */
     const SearchTreeBranchesShortAlphaBitmap =
         makeSearchTreeBranchesAlphaBitmapClass(SHORT_ALPHABITMAP_CHARS, 3);
 
+    /**
+     * @template ST
+     * @type {(typeof SearchTreeBranches<any>)&{"ALPHABITMAP_CHARS": number[], "width": number}}
+     */
     const SearchTreeBranchesLongAlphaBitmap =
         makeSearchTreeBranchesAlphaBitmapClass(LONG_ALPHABITMAP_CHARS, 4);
 
     /**
-     * A [suffix tree], used for name-based search.
+     * @typedef {PrefixSearchTree|SuffixSearchTree|InlineNeighborsTree} SearchTree
+     * @typedef {PrefixTrie|SuffixTrie} Trie
+     */
+
+    /**
+     * An interleaved [prefix] and [suffix tree],
+     * used for name-based search.
      *
-     * This data structure is used to drive substring matches,
+     * This data structure is used to drive prefix matches,
      * such as matching the query "link" to `LinkedList`,
      * and Lev-distance matches, such as matching the
      * query "hahsmap" to `HashMap`.
      *
+     * [prefix tree]: https://en.wikipedia.org/wiki/Prefix_tree
      * [suffix tree]: https://en.wikipedia.org/wiki/Suffix_tree
      *
      * branches
@@ -1358,17 +1525,17 @@ function loadDatabase(hooks) {
      *   will include these.
      *
      * @type {{
-     *     might_have_prefix_branches: SearchTreeBranches,
-     *     branches: SearchTreeBranches,
+     *     might_have_prefix_branches: SearchTreeBranches<SearchTree>,
+     *     branches: SearchTreeBranches<SearchTree>,
      *     data: Uint8Array,
      *     leaves_suffix: RoaringBitmap,
      *     leaves_whole: RoaringBitmap,
      * }}
      */
-    class SearchTree {
+    class PrefixSearchTree {
         /**
-         * @param {SearchTreeBranches} branches
-         * @param {SearchTreeBranches} might_have_prefix_branches
+         * @param {SearchTreeBranches<SearchTree>} branches
+         * @param {SearchTreeBranches<SearchTree>} might_have_prefix_branches
          * @param {Uint8Array} data
          * @param {RoaringBitmap} leaves_whole
          * @param {RoaringBitmap} leaves_suffix
@@ -1392,25 +1559,31 @@ function loadDatabase(hooks) {
          * A Trie pointer refers to a single node in a logical decompressed search tree
          * (the real search tree is compressed).
          *
-         * @return {Trie}
+         * @param {DataColumn} dataColumn
+         * @param {Uint8ArraySearchPattern} searchPattern
+         * @return {PrefixTrie}
          */
-        trie() {
-            return new Trie(this, 0);
+        trie(dataColumn, searchPattern) {
+            return new PrefixTrie(this, 0, dataColumn, searchPattern);
         }
 
         /**
          * Return the trie representing `name`
          * @param {Uint8Array|string} name
+         * @param {DataColumn} dataColumn
          * @returns {Promise<Trie?>}
          */
-        async search(name) {
+        async search(name, dataColumn) {
             if (typeof name === "string") {
                 const utf8encoder = new TextEncoder();
                 name = utf8encoder.encode(name);
             }
-            let trie = this.trie();
+            const searchPattern = new Uint8ArraySearchPattern(name);
+            /** @type {Trie} */
+            let trie = this.trie(dataColumn, searchPattern);
             for (const datum of name) {
                 // code point definitely exists
+                /** @type {Promise<Trie>?} */
                 const newTrie = trie.child(datum);
                 if (newTrie) {
                     trie = await newTrie;
@@ -1423,26 +1596,28 @@ function loadDatabase(hooks) {
 
         /**
          * @param {Uint8Array|string} name
+         * @param {DataColumn} dataColumn
          * @returns {AsyncGenerator<Trie>}
          */
-        async* searchLev(name) {
+        async* searchLev(name, dataColumn) {
             if (typeof name === "string") {
                 const utf8encoder = new TextEncoder();
                 name = utf8encoder.encode(name);
             }
             const w = name.length;
             if (w < 3) {
-                const trie = await this.search(name);
+                const trie = await this.search(name, dataColumn);
                 if (trie !== null) {
                     yield trie;
                 }
                 return;
             }
+            const searchPattern = new Uint8ArraySearchPattern(name);
             const levParams = w >= 6 ?
                 new Lev2TParametricDescription(w) :
                 new Lev1TParametricDescription(w);
             /** @type {Array<[Promise<Trie>, number]>} */
-            const stack = [[Promise.resolve(this.trie()), 0]];
+            const stack = [[Promise.resolve(this.trie(dataColumn, searchPattern)), 0]];
             const n = levParams.n;
             while (stack.length !== 0) {
                 // It's not empty
@@ -1475,20 +1650,29 @@ function loadDatabase(hooks) {
                 }
             }
         }
+
+        /** @returns {RoaringBitmap} */
+        getCurrentLeaves() {
+            return this.leaves_whole.union(this.leaves_suffix);
+        }
     }
 
     /**
      * A representation of a set of strings in the search index,
      * as a subset of the entire tree.
      */
-    class Trie {
+    class PrefixTrie {
         /**
-         * @param {SearchTree} tree
+         * @param {PrefixSearchTree} tree
          * @param {number} offset
+         * @param {DataColumn} dataColumn
+         * @param {Uint8ArraySearchPattern} searchPattern
          */
-        constructor(tree, offset) {
+        constructor(tree, offset, dataColumn, searchPattern) {
             this.tree = tree;
             this.offset = offset;
+            this.dataColumn = dataColumn;
+            this.searchPattern = searchPattern;
         }
 
         /**
@@ -1514,11 +1698,35 @@ function loadDatabase(hooks) {
                 const current_layer = layer;
                 layer = [];
                 for await (const tree of current_layer) {
-                    yield tree.leaves_whole.union(tree.leaves_suffix);
+                    /** @type {number[]?} */
+                    let rejected = null;
+                    let leaves = tree.getCurrentLeaves();
+                    for (const leaf of leaves.entries()) {
+                        const haystack = await this.dataColumn.at(leaf);
+                        if (haystack === undefined || !this.searchPattern.matches(haystack)) {
+                            if (!rejected) {
+                                rejected = [];
+                            }
+                            rejected.push(leaf);
+                        }
+                    }
+                    if (rejected) {
+                        if (leaves.cardinality() !== rejected.length) {
+                            for (const rej of rejected) {
+                                leaves = leaves.remove(rej);
+                            }
+                            yield leaves;
+                        }
+                    } else {
+                        yield leaves;
+                    }
                 }
-                /** @type {HashTable<[number, SearchTree][]>} */
+                /** @type {HashTable<[number, PrefixSearchTree|SuffixSearchTree][]>} */
                 const subnodes = new HashTable();
-                for await (const node of current_layer) {
+                for await (const nodeEncoded of current_layer) {
+                    const node = nodeEncoded instanceof InlineNeighborsTree ?
+                        nodeEncoded.decode() :
+                        nodeEncoded;
                     const branches = node.branches;
                     const l = branches.subtrees.length;
                     for (let i = 0; i < l; ++i) {
@@ -1548,12 +1756,14 @@ function loadDatabase(hooks) {
                     const res = registry.searchTreeLoadByNodeID(newnode);
                     for (const [byte, node] of subnode_list) {
                         const branches = node.branches;
-                        const might_have_prefix_branches = node.might_have_prefix_branches;
                         const i = branches.getIndex(byte);
                         branches.subtrees[i] = res;
-                        const mhpI = might_have_prefix_branches.getIndex(byte);
-                        if (mhpI !== -1) {
-                            might_have_prefix_branches.subtrees[mhpI] = res;
+                        if (node instanceof PrefixSearchTree) {
+                            const might_have_prefix_branches = node.might_have_prefix_branches;
+                            const mhpI = might_have_prefix_branches.getIndex(byte);
+                            if (mhpI !== -1) {
+                                might_have_prefix_branches.subtrees[mhpI] = res;
+                            }
                         }
                     }
                     layer.push(res);
@@ -1580,7 +1790,13 @@ function loadDatabase(hooks) {
                 // we then yield the smallest ones (can't yield bigger ones
                 // if we want to do them in order)
                 for (const {node, len} of current_layer) {
-                    const tree = await node;
+                    const treeEncoded = await node;
+                    const tree = treeEncoded instanceof InlineNeighborsTree ?
+                        treeEncoded.decode() :
+                        treeEncoded;
+                    if (!(tree instanceof PrefixSearchTree)) {
+                        continue;
+                    }
                     const length = len + tree.data.length;
                     if (minLength === null || length < minLength) {
                         minLength = length;
@@ -1637,10 +1853,16 @@ function loadDatabase(hooks) {
                     }
                 }
                 // if we still have more subtrees to walk, then keep going
-                /** @type {HashTable<{byte: number, tree: SearchTree, len: number}[]>} */
+                /** @type {HashTable<{byte: number, tree: PrefixSearchTree, len: number}[]>} */
                 const subnodes = new HashTable();
                 for await (const {node, len} of current_layer) {
-                    const tree = await node;
+                    const treeEncoded = await node;
+                    const tree = treeEncoded instanceof InlineNeighborsTree ?
+                        treeEncoded.decode() :
+                        treeEncoded;
+                    if (!(tree instanceof PrefixSearchTree)) {
+                        continue;
+                    }
                     const length = len + tree.data.length;
                     const mhp_branches = tree.might_have_prefix_branches;
                     const l = mhp_branches.subtrees.length;
@@ -1663,8 +1885,6 @@ function loadDatabase(hooks) {
                                     subnode_list.push({byte, tree, len});
                                 }
                             }
-                        } else {
-                            throw new Error(`malformed tree; index ${i} does not exist`);
                         }
                     }
                 }
@@ -1728,14 +1948,21 @@ function loadDatabase(hooks) {
                             this.tree.might_have_prefix_branches.subtrees[mhpI] = node;
                         }
                     }
-                    nodes.push([k, node.then(node => node.trie())]);
+                    nodes.push([k, node.then(node => {
+                        return node.trie(this.dataColumn, this.searchPattern);
+                    })]);
                     i += 1;
                 }
                 return nodes;
             } else {
                 /** @type {number} */
                 const codePoint = data[this.offset];
-                const trie = new Trie(this.tree, this.offset + 1);
+                const trie = new PrefixTrie(
+                    this.tree,
+                    this.offset + 1,
+                    this.dataColumn,
+                    this.searchPattern,
+                );
                 return [[codePoint, Promise.resolve(trie)]];
             }
         }
@@ -1777,14 +2004,21 @@ function loadDatabase(hooks) {
                         this.tree.might_have_prefix_branches.subtrees[i] = node;
                         this.tree.branches.subtrees[this.tree.branches.getIndex(k)] = node;
                     }
-                    nodes.push([k, node.then(node => node.trie())]);
+                    nodes.push([k, node.then(node => {
+                        return node.trie(this.dataColumn, this.searchPattern);
+                    })]);
                     i += 1;
                 }
                 return nodes;
             } else {
                 /** @type {number} */
                 const codePoint = data[this.offset];
-                const trie = new Trie(this.tree, this.offset + 1);
+                const trie = new PrefixTrie(
+                    this.tree,
+                    this.offset + 1,
+                    this.dataColumn,
+                    this.searchPattern,
+                );
                 return [[codePoint, Promise.resolve(trie)]];
             }
         }
@@ -1811,12 +2045,483 @@ function loadDatabase(hooks) {
                             this.tree.might_have_prefix_branches.subtrees[mhpI] = branch;
                         }
                     }
-                    return branch.then(branch => branch.trie());
+                    return branch.then(branch => branch.trie(this.dataColumn, this.searchPattern));
                 }
             } else if (this.tree.data[this.offset] === byte) {
-                return Promise.resolve(new Trie(this.tree, this.offset + 1));
+                return Promise.resolve(new PrefixTrie(
+                    this.tree,
+                    this.offset + 1,
+                    this.dataColumn,
+                    this.searchPattern,
+                ));
             }
             return null;
+        }
+    }
+    /**
+     * A [suffix tree], used for name-based search.
+     *
+     * This data structure is used to drive substring matches,
+     * such as matching the query "inked" to `LinkedList`.
+     *
+     * [suffix tree]: https://en.wikipedia.org/wiki/Suffix_tree
+     *
+     * Suffix trees do not actually carry the intermediate data
+     * between branches, so, in order to validate the results,
+     * they must go through a filtering step at the end.
+     * Suffix trees also cannot match lev and exact matches,
+     * so those just return empty sets.
+     *
+     * branches
+     * : A sorted-array map of subtrees.
+     *
+     * dataLen
+     * : The length of the substring used by this node.
+     *
+     * leaves_suffix
+     * : The IDs of every entry that matches. Levenshtein matches
+     *   won't include these.
+     *
+     * @type {{
+     *     branches: SearchTreeBranches<SearchTree>,
+     *     dataLen: number,
+     *     leaves_suffix: RoaringBitmap,
+     * }}
+     */
+    class SuffixSearchTree {
+        /**
+         * @param {SearchTreeBranches<SearchTree>} branches
+         * @param {number} dataLen
+         * @param {RoaringBitmap} leaves_suffix
+         */
+        constructor(
+            branches,
+            dataLen,
+            leaves_suffix,
+        ) {
+            this.branches = branches;
+            this.dataLen = dataLen;
+            this.leaves_suffix = leaves_suffix;
+        }
+        /**
+         * Returns the Trie for the root node.
+         *
+         * A Trie pointer refers to a single node in a logical decompressed search tree
+         * (the real search tree is compressed).
+         *
+         * @param {DataColumn} dataColumn
+         * @param {Uint8ArraySearchPattern} searchPattern
+         * @return {Trie}
+         */
+        trie(dataColumn, searchPattern) {
+            return new SuffixTrie(this, 0, dataColumn, searchPattern);
+        }
+
+        /**
+         * Return the trie representing `name`
+         * @param {Uint8Array|string} name
+         * @param {DataColumn} dataColumn
+         * @returns {Promise<Trie?>}
+         */
+        async search(name, dataColumn) {
+            if (typeof name === "string") {
+                const utf8encoder = new TextEncoder();
+                name = utf8encoder.encode(name);
+            }
+            const searchPattern = new Uint8ArraySearchPattern(name);
+            let trie = this.trie(dataColumn, searchPattern);
+            for (const datum of name) {
+                // code point definitely exists
+                const newTrie = trie.child(datum);
+                if (newTrie) {
+                    trie = await newTrie;
+                } else {
+                    return null;
+                }
+            }
+            return trie;
+        }
+
+        /**
+         * @param {Uint8Array|string} _name
+         * @param {DataColumn} _dataColumn
+         * @returns {AsyncGenerator<Trie>}
+         */
+        async* searchLev(_name, _dataColumn) {
+            // this function only returns whole-string matches,
+            // which pure-suffix nodes don't have, so is
+            // intentionally blank
+        }
+
+        /** @returns {RoaringBitmap} */
+        getCurrentLeaves() {
+            return this.leaves_suffix;
+        }
+    }
+
+    /**
+     * A representation of a set of strings in the search index,
+     * as a subset of the entire tree (suffix-only).
+     */
+    class SuffixTrie {
+        /**
+         * @param {SuffixSearchTree} tree
+         * @param {number} offset
+         * @param {DataColumn} dataColumn
+         * @param {Uint8ArraySearchPattern} searchPattern
+         */
+        constructor(tree, offset, dataColumn, searchPattern) {
+            this.tree = tree;
+            this.offset = offset;
+            this.dataColumn = dataColumn;
+            this.searchPattern = searchPattern;
+        }
+
+        /**
+         * All exact matches for the string represented by this node.
+         * Since pure-suffix nodes have no exactly-matching children,
+         * this function returns the empty bitmap.
+         * @returns {RoaringBitmap}
+         */
+        matches() {
+            return EMPTY_BITMAP;
+        }
+
+        /**
+         * All matches for strings that contain the string represented by this node.
+         * @returns {AsyncGenerator<RoaringBitmap>}
+         */
+        async* substringMatches() {
+            /** @type {Promise<SearchTree>[]} */
+            let layer = [Promise.resolve(this.tree)];
+            while (layer.length) {
+                const current_layer = layer;
+                layer = [];
+                for await (const tree of current_layer) {
+                    /** @type {number[]?} */
+                    let rejected = null;
+                    let leaves = tree.getCurrentLeaves();
+                    for (const leaf of leaves.entries()) {
+                        const haystack = await this.dataColumn.at(leaf);
+                        if (haystack === undefined || !this.searchPattern.matches(haystack)) {
+                            if (!rejected) {
+                                rejected = [];
+                            }
+                            rejected.push(leaf);
+                        }
+                    }
+                    if (rejected) {
+                        if (leaves.cardinality() !== rejected.length) {
+                            for (const rej of rejected) {
+                                leaves = leaves.remove(rej);
+                            }
+                            yield leaves;
+                        }
+                    } else {
+                        yield leaves;
+                    }
+                }
+                /** @type {HashTable<[number, PrefixSearchTree|SuffixSearchTree][]>} */
+                const subnodes = new HashTable();
+                for await (const nodeEncoded of current_layer) {
+                    const node = nodeEncoded instanceof InlineNeighborsTree ?
+                        nodeEncoded.decode() :
+                        nodeEncoded;
+                    const branches = node.branches;
+                    const l = branches.subtrees.length;
+                    for (let i = 0; i < l; ++i) {
+                        const subtree = branches.subtrees[i];
+                        if (subtree) {
+                            layer.push(subtree);
+                        } else if (subtree === null) {
+                            const newnode = branches.getNodeID(i);
+                            if (!newnode) {
+                                throw new Error(`malformed tree; no node for index ${i}`);
+                            } else {
+                                let subnode_list = subnodes.get(newnode);
+                                if (!subnode_list) {
+                                    subnode_list = [[i, node]];
+                                    subnodes.set(newnode, subnode_list);
+                                } else {
+                                    subnode_list.push([i, node]);
+                                }
+                            }
+                        } else {
+                            throw new Error(`malformed tree; index ${i} does not exist`);
+                        }
+                    }
+                }
+                for (const [newnode, subnode_list] of subnodes.entries()) {
+                    const res = registry.searchTreeLoadByNodeID(newnode);
+                    for (const [i, node] of subnode_list) {
+                        const branches = node.branches;
+                        branches.subtrees[i] = res;
+                    }
+                    layer.push(res);
+                }
+            }
+        }
+
+        /**
+         * All matches for strings that start with the string represented by this node.
+         * Since this is a pure-suffix node, there aren't any.
+         * @returns {AsyncGenerator<RoaringBitmap>}
+         */
+        async* prefixMatches() {
+            // this function only returns prefix matches,
+            // which pure-suffix nodes don't have, so is
+            // intentionally blank
+        }
+
+        /**
+         * Returns all keys that are children of this node.
+         * @returns {Uint8Array}
+         */
+        keysExcludeSuffixOnly() {
+            return EMPTY_UINT8;
+        }
+
+        /**
+         * Returns all nodes that are direct children of this node.
+         * @returns {[number, Promise<Trie>][]}
+         */
+        childrenExcludeSuffixOnly() {
+            return [];
+        }
+
+        /**
+         * Returns a single node that is a direct child of this node.
+         * @param {number} byte
+         * @returns {Promise<Trie>?}
+         */
+        child(byte) {
+            if (this.offset === this.tree.dataLen) {
+                const i = this.tree.branches.getIndex(byte);
+                if (i !== -1) {
+                    /** @type {Promise<SearchTree>?} */
+                    let branch = this.tree.branches.subtrees[i];
+                    if (branch === null) {
+                        const newnode = this.tree.branches.getNodeID(i);
+                        if (!newnode) {
+                            throw new Error(`malformed tree; no node for key ${byte}`);
+                        }
+                        branch = registry.searchTreeLoadByNodeID(newnode);
+                        this.tree.branches.subtrees[i] = branch;
+                    }
+                    return branch.then(branch => branch.trie(this.dataColumn, this.searchPattern));
+                }
+            } else {
+                return Promise.resolve(new SuffixTrie(
+                    this.tree,
+                    this.offset + 1,
+                    this.dataColumn,
+                    this.searchPattern,
+                ));
+            }
+            return null;
+        }
+    }
+
+    /**
+     * Represents a subtree where all transitive leaves
+     * have a shared 16bit prefix and there are no sub-branches.
+     */
+    class InlineNeighborsTree {
+        /**
+         * @param {Uint8Array} encoded
+         * @param {number} start
+         */
+        constructor(
+            encoded,
+            start,
+        ) {
+            this.encoded = encoded;
+            this.start = start;
+        }
+        /**
+         * @return {PrefixSearchTree|SuffixSearchTree}
+         */
+        decode() {
+            let i = this.start;
+            const encoded = this.encoded;
+            const has_branches = (encoded[i] & 0x04) !== 0;
+            /** @type {boolean} */
+            const is_suffixes_only = (encoded[i] & 0x01) !== 0;
+            let leaves_count = ((encoded[i] >> 4) & 0x07) + 1;
+            let leaves_is_run = (encoded[i] >> 7) !== 0;
+            i += 1;
+            let branch_count = 0;
+            if (has_branches) {
+                branch_count = encoded[i] + 1;
+                i += 1;
+            }
+            const dlen = encoded[i] & 0x3f;
+            if ((encoded[i] & 0x80) !== 0) {
+                leaves_count = 0;
+                leaves_is_run = false;
+            }
+            i += 1;
+            /** @type {Uint8Array} */
+            let data = EMPTY_UINT8;
+            if (!is_suffixes_only && dlen !== 0) {
+                data = encoded.subarray(i, i + dlen);
+                i += dlen;
+            }
+            const leaf_value_upper = encoded[i] | (encoded[i + 1] << 8);
+            i += 2;
+            /** @type {Promise<SearchTree>[]} */
+            const branch_nodes = [];
+            for (let j = 0; j < branch_count; j += 1) {
+                const branch_dlen = encoded[i] & 0x0f;
+                const branch_leaves_count = ((encoded[i] >> 4) & 0x07) + 1;
+                const branch_leaves_is_run = (encoded[i] >> 7) !== 0;
+                i += 1;
+                /** @type {Uint8Array} */
+                let branch_data = EMPTY_UINT8;
+                if (!is_suffixes_only && branch_dlen !== 0) {
+                    branch_data = encoded.subarray(i, i + branch_dlen);
+                    i += branch_dlen;
+                }
+                const branch_leaves = new RoaringBitmap(null);
+                branch_leaves.keysAndCardinalities = Uint8Array.of(
+                    leaf_value_upper & 0xff,
+                    (leaf_value_upper >> 8) & 0xff,
+                    (branch_leaves_count - 1) & 0xff,
+                    ((branch_leaves_count - 1) >> 8) & 0xff,
+                );
+                if (branch_leaves_is_run) {
+                    branch_leaves.containers = [
+                        new RoaringBitmapRun(
+                            1,
+                            Uint8Array.of(
+                                encoded[i],
+                                encoded[i + 1],
+                                branch_leaves_count - 1,
+                                0,
+                            ),
+                        ),
+                    ];
+                    i += 2;
+                } else {
+                    branch_leaves.containers = [
+                        new RoaringBitmapArray(
+                            branch_leaves_count,
+                            encoded.subarray(i, i + (branch_leaves_count * 2)),
+                        ),
+                    ];
+                    i += branch_leaves_count * 2;
+                }
+                branch_nodes.push(Promise.resolve(
+                    is_suffixes_only ?
+                        new SuffixSearchTree(
+                            EMPTY_SEARCH_TREE_BRANCHES,
+                            branch_dlen,
+                            branch_leaves,
+                        ) :
+                        new PrefixSearchTree(
+                            EMPTY_SEARCH_TREE_BRANCHES,
+                            EMPTY_SEARCH_TREE_BRANCHES,
+                            branch_data,
+                            branch_leaves,
+                            EMPTY_BITMAP,
+                        ),
+                ));
+            }
+            /** @type {SearchTreeBranchesArray<SearchTree>} */
+            const branches = branch_count === 0 ?
+                EMPTY_SEARCH_TREE_BRANCHES :
+                new SearchTreeBranchesArray(
+                    encoded.subarray(i, i + branch_count),
+                    EMPTY_UINT8,
+                );
+            i += branch_count;
+            branches.subtrees = branch_nodes;
+            let leaves = EMPTY_BITMAP;
+            if (leaves_count !== 0) {
+                leaves = new RoaringBitmap(null);
+                leaves.keysAndCardinalities = Uint8Array.of(
+                    leaf_value_upper & 0xff,
+                    (leaf_value_upper >> 8) & 0xff,
+                    (leaves_count - 1) & 0xff,
+                    ((leaves_count - 1) >> 8) & 0xff,
+                );
+                if (leaves_is_run) {
+                    leaves.containers = [
+                        new RoaringBitmapRun(
+                            1,
+                            Uint8Array.of(
+                                encoded[i],
+                                encoded[i + 1],
+                                leaves_count - 1,
+                                0,
+                            ),
+                        ),
+                    ];
+                    i += 2;
+                } else {
+                    leaves.containers = [
+                        new RoaringBitmapArray(
+                            leaves_count,
+                            encoded.subarray(i, i + (leaves_count * 2)),
+                        ),
+                    ];
+                    i += leaves_count * 2;
+                }
+            }
+            return is_suffixes_only ?
+                new SuffixSearchTree(
+                    branches,
+                    dlen,
+                    leaves,
+                ) :
+                new PrefixSearchTree(
+                    branches,
+                    branches,
+                    data,
+                    leaves,
+                    EMPTY_BITMAP,
+                );
+        }
+
+        /**
+         * Returns the Trie for the root node.
+         *
+         * A Trie pointer refers to a single node in a logical decompressed search tree
+         * (the real search tree is compressed).
+         *
+         * @param {DataColumn} dataColumn
+         * @param {Uint8ArraySearchPattern} searchPattern
+         * @return {Trie}
+         */
+        trie(dataColumn, searchPattern) {
+            const tree = this.decode();
+            return tree instanceof SuffixSearchTree ?
+                new SuffixTrie(tree, 0, dataColumn, searchPattern) :
+                new PrefixTrie(tree, 0, dataColumn, searchPattern);
+        }
+
+        /**
+         * Return the trie representing `name`
+         * @param {Uint8Array|string} name
+         * @param {DataColumn} dataColumn
+         * @returns {Promise<Trie?>}
+         */
+        search(name, dataColumn) {
+            return this.decode().search(name, dataColumn);
+        }
+
+        /**
+         * @param {Uint8Array|string} name
+         * @param {DataColumn} dataColumn
+         * @returns {AsyncGenerator<Trie>}
+         */
+        searchLev(name, dataColumn) {
+            return this.decode().searchLev(name, dataColumn);
+        }
+
+        /** @returns {RoaringBitmap} */
+        getCurrentLeaves() {
+            return this.decode().getCurrentLeaves();
         }
     }
 
@@ -1827,12 +2532,14 @@ function loadDatabase(hooks) {
          * @param {Uint8Array} hashes
          * @param {RoaringBitmap} emptyset
          * @param {string} name
+         * @param {SearchTree?} searchTree
          */
-        constructor(counts, hashes, emptyset, name) {
+        constructor(counts, hashes, emptyset, name, searchTree) {
+            this.searchTree = searchTree;
             this.hashes = hashes;
             this.emptyset = emptyset;
             this.name = name;
-            /** @type {{"hash": Uint8Array, "data": Promise<Uint8Array[]>?, "end": number}[]} */
+            /** @type {{"hash": Uint8Array, "data": Uint8Array[]?, "end": number}[]} */
             this.buckets = [];
             this.bucket_keys = [];
             const l = counts.length;
@@ -1866,62 +2573,92 @@ function loadDatabase(hooks) {
         /**
          * Look up a cell by row ID.
          * @param {number} id
-         * @returns {Promise<Uint8Array|undefined>}
+         * @returns {Promise<Uint8Array>|Uint8Array|undefined}
          */
-        async at(id) {
+        at(id) {
             if (this.emptyset.contains(id)) {
-                return Promise.resolve(EMPTY_UINT8);
+                return EMPTY_UINT8;
             } else {
                 let idx = -1;
                 while (this.bucket_keys[idx + 1] <= id) {
                     idx += 1;
                 }
                 if (idx === -1 || idx >= this.bucket_keys.length) {
-                    return Promise.resolve(undefined);
+                    return undefined;
                 } else {
                     const start = this.bucket_keys[idx];
-                    const {hash, end} = this.buckets[idx];
-                    let data = this.buckets[idx].data;
+                    const bucket = this.buckets[idx];
+                    const data = this.buckets[idx].data;
                     if (data === null) {
-                        const dataSansEmptyset = await registry.dataLoadByNameAndHash(
-                            this.name,
-                            hash,
-                        );
-                        // After the `await` resolves, another task might fill
-                        // in the data. If so, we should use that.
-                        data = this.buckets[idx].data;
-                        if (data !== null) {
-                            return (await data)[id - start];
-                        }
-                        /** @type {(Uint8Array[])|null} */
-                        let dataWithEmptyset = null;
-                        let pos = start;
-                        let insertCount = 0;
-                        while (pos < end) {
-                            if (this.emptyset.contains(pos)) {
-                                if (dataWithEmptyset === null) {
-                                    dataWithEmptyset = dataSansEmptyset.splice(0, insertCount);
-                                } else if (insertCount !== 0) {
-                                    dataWithEmptyset.push(
-                                        ...dataSansEmptyset.splice(0, insertCount),
-                                    );
-                                }
-                                insertCount = 0;
-                                dataWithEmptyset.push(EMPTY_UINT8);
-                            } else {
-                                insertCount += 1;
-                            }
-                            pos += 1;
-                        }
-                        data = Promise.resolve(
-                            dataWithEmptyset === null ?
-                                dataSansEmptyset :
-                                dataWithEmptyset.concat(dataSansEmptyset),
-                        );
-                        this.buckets[idx].data = data;
+                        return this.atAsyncFetch(id, start, bucket);
+                    } else {
+                        return data[id - start];
                     }
-                    return (await data)[id - start];
                 }
+            }
+        }
+        /**
+         * Look up a cell by row ID.
+         * @param {number} id
+         * @param {number} start
+         * @param {{hash: Uint8Array, data: Uint8Array[] | null, end: number}} bucket
+         * @returns {Promise<Uint8Array>}
+         */
+        async atAsyncFetch(id, start, bucket) {
+            const {hash, end} = bucket;
+            const dataSansEmptysetOrig = await registry.dataLoadByNameAndHash(
+                this.name,
+                hash,
+            );
+            // After the `await` resolves, another task might fill
+            // in the data. If so, we should use that.
+            let data = bucket.data;
+            if (data !== null) {
+                return data[id - start];
+            }
+            const dataSansEmptyset = [...dataSansEmptysetOrig];
+            /** @type {(Uint8Array[])|null} */
+            let dataWithEmptyset = null;
+            let pos = start;
+            let insertCount = 0;
+            while (pos < end) {
+                if (this.emptyset.contains(pos)) {
+                    if (dataWithEmptyset === null) {
+                        dataWithEmptyset = dataSansEmptyset.splice(0, insertCount);
+                    } else if (insertCount !== 0) {
+                        dataWithEmptyset.push(
+                            ...dataSansEmptyset.splice(0, insertCount),
+                        );
+                    }
+                    insertCount = 0;
+                    dataWithEmptyset.push(EMPTY_UINT8);
+                } else {
+                    insertCount += 1;
+                }
+                pos += 1;
+            }
+            data = dataWithEmptyset === null ?
+                dataSansEmptyset :
+                dataWithEmptyset.concat(dataSansEmptyset);
+            bucket.data = data;
+            return data[id - start];
+        }
+        /**
+         * Search by exact substring
+         * @param {Uint8Array|string} name
+         * @returns {Promise<Trie?>}
+         */
+        async search(name) {
+            return await (this.searchTree ? this.searchTree.search(name, this) : null);
+        }
+        /**
+         * Search by whole, inexact match
+         * @param {Uint8Array|string} name
+         * @returns {AsyncGenerator<Trie>}
+         */
+        async *searchLev(name) {
+            if (this.searchTree) {
+                yield* this.searchTree.searchLev(name, this);
             }
         }
     }
@@ -2015,7 +2752,7 @@ function loadDatabase(hooks) {
         const data_history = [];
         let canonical = EMPTY_UINT8;
         /** @type {SearchTree} */
-        let tree = new SearchTree(
+        let tree = new PrefixSearchTree(
             EMPTY_SEARCH_TREE_BRANCHES,
             EMPTY_SEARCH_TREE_BRANCHES,
             EMPTY_UINT8,
@@ -2029,8 +2766,8 @@ function loadDatabase(hooks) {
          * @returns {{
          *     "cpbranches": Uint8Array,
          *     "csbranches": Uint8Array,
-         *     "might_have_prefix_branches": SearchTreeBranches,
-         *     "branches": SearchTreeBranches,
+         *     "might_have_prefix_branches": SearchTreeBranches<SearchTree>,
+         *     "branches": SearchTreeBranches<SearchTree>,
          *     "cpnodes": Uint8Array,
          *     "csnodes": Uint8Array,
          *     "consumed_len_bytes": number,
@@ -2051,6 +2788,12 @@ function loadDatabase(hooks) {
             const start_point = i;
             let cplen;
             let cslen;
+            /**
+             * @type {(
+             *   typeof SearchTreeBranches<SearchTree> &
+             *   {"ALPHABITMAP_CHARS": number[], "width": number}
+             * )?}
+             */
             let alphabitmap = null;
             if (is_pure_suffixes_only_node) {
                 cplen = 0;
@@ -2283,20 +3026,117 @@ function loadDatabase(hooks) {
             // because that's the canonical, hashed version of the data
             let compression_tag = input[i];
             const is_pure_suffixes_only_node = (compression_tag & 0x01) !== 0;
-            if (compression_tag > 1) {
-                // compressed node
-                const is_long_compressed = (compression_tag & 0x04) !== 0;
-                const is_data_compressed = (compression_tag & 0x08) !== 0;
+            const is_long_compressed = (compression_tag & 0x04) !== 0;
+            const is_data_compressed = (compression_tag & 0x08) !== 0;
+            i += 1;
+            if (is_long_compressed) {
+                compression_tag |= input[i] << 8;
                 i += 1;
-                if (is_long_compressed) {
-                    compression_tag |= input[i] << 8;
-                    i += 1;
-                    compression_tag |= input[i] << 16;
-                    i += 1;
-                }
-                let dlen = input[i];
+            }
+            /** @type {number} */
+            let dlen;
+            /** @type {number} */
+            let no_leaves_flag;
+            /** @type {number} */
+            let inline_neighbors_flag;
+            if (is_data_compressed && is_pure_suffixes_only_node) {
+                dlen = 0;
+                no_leaves_flag = 0x80;
+                inline_neighbors_flag = 0;
+            } else {
+                dlen = input[i] & 0x3F;
+                no_leaves_flag = input[i] & 0x80;
+                inline_neighbors_flag = input[i] & 0x40;
                 i += 1;
+            }
+            if (inline_neighbors_flag !== 0) {
+                // node with packed leaves and common 16bit prefix
+                const leaves_count = no_leaves_flag !== 0 ?
+                    0 :
+                    ((compression_tag >> 4) & 0x07) + 1;
+                const leaves_is_run = no_leaves_flag === 0 &&
+                    ((compression_tag >> 4) & 0x08) !== 0;
+                const branch_count = is_long_compressed ?
+                    ((compression_tag >> 8) & 0xff) + 1 :
+                    0;
                 if (is_data_compressed) {
+                    data = data_history[data_history.length - dlen - 1];
+                    dlen = data.length;
+                } else if (is_pure_suffixes_only_node) {
+                    data = EMPTY_UINT8;
+                } else {
+                    data = dlen === 0 ?
+                        EMPTY_UINT8 :
+                        new Uint8Array(input.buffer, i + input.byteOffset, dlen);
+                    i += dlen;
+                }
+                const branches_start = i;
+                // leaf_value_upper
+                i += 2;
+                // branch_nodes
+                for (let j = 0; j < branch_count; j += 1) {
+                    const branch_dlen = input[i] & 0x0f;
+                    const branch_leaves_count = ((input[i] >> 4) & 0x0f) + 1;
+                    const branch_leaves_is_run = (input[i] >> 7) !== 0;
+                    i += 1;
+                    if (!is_pure_suffixes_only_node) {
+                        i += branch_dlen;
+                    }
+                    if (branch_leaves_is_run) {
+                        i += 2;
+                    } else {
+                        i += branch_leaves_count * 2;
+                    }
+                }
+                // branch keys
+                i += branch_count;
+                // leaves
+                if (leaves_is_run) {
+                    i += 2;
+                } else {
+                    i += leaves_count * 2;
+                }
+                if (is_data_compressed) {
+                    const clen = (
+                        1 + // first compression header byte
+                        (is_long_compressed ? 1 : 0) + // branch count
+                        1 + // data length and other flags
+                        dlen + // data
+                        (i - branches_start) // branches and leaves
+                    );
+                    const canonical = new Uint8Array(clen);
+                    let ci = 0;
+                    canonical[ci] = input[start] ^ 0x08;
+                    ci += 1;
+                    if (is_long_compressed) {
+                        canonical[ci] = input[start + ci];
+                        ci += 1;
+                    }
+                    canonical[ci] = dlen | no_leaves_flag | 0x40;
+                    ci += 1;
+                    for (let j = 0; j < dlen; j += 1) {
+                        canonical[ci] = data[j];
+                        ci += 1;
+                    }
+                    for (let j = branches_start; j < i; j += 1) {
+                        canonical[ci] = input[j];
+                        ci += 1;
+                    }
+                    tree = new InlineNeighborsTree(canonical, 0);
+                    siphashOfBytes(canonical, 0, 0, 0, 0, hash);
+                } else {
+                    tree = new InlineNeighborsTree(input, start);
+                    siphashOfBytes(new Uint8Array(
+                        input.buffer,
+                        start + input.byteOffset,
+                        i - start,
+                    ), 0, 0, 0, 0, hash);
+                }
+            } else if (compression_tag > 1) {
+                // compressed node
+                if (is_pure_suffixes_only_node) {
+                    data = EMPTY_UINT8;
+                } else if (is_data_compressed) {
                     data = data_history[data_history.length - dlen - 1];
                     dlen = data.length;
                 } else {
@@ -2319,80 +3159,118 @@ function loadDatabase(hooks) {
                 let whole;
                 let suffix;
                 if (is_pure_suffixes_only_node) {
-                    whole = EMPTY_BITMAP;
-                    suffix = input[i] === 0 ?
-                        EMPTY_BITMAP1 :
-                        new RoaringBitmap(input, i);
-                    i += suffix.consumed_len_bytes;
-                } else if (input[i] === 0xff) {
-                    whole = EMPTY_BITMAP;
-                    suffix = EMPTY_BITMAP1;
-                    i += 1;
-                } else {
-                    whole = input[i] === 0 ?
-                        EMPTY_BITMAP1 :
-                        new RoaringBitmap(input, i);
-                    i += whole.consumed_len_bytes;
-                    suffix = input[i] === 0 ?
-                        EMPTY_BITMAP1 :
-                        new RoaringBitmap(input, i);
-                    i += suffix.consumed_len_bytes;
-                }
-                tree = new SearchTree(
-                    branches,
-                    might_have_prefix_branches,
-                    data,
-                    whole,
-                    suffix,
-                );
-                const clen = (
-                    (is_pure_suffixes_only_node ? 3 : 4) + // lengths of children and data
-                    dlen +
-                    cpnodes.length + csnodes.length +
-                    cpbranches.length + csbranches.length +
-                    whole.consumed_len_bytes +
-                    suffix.consumed_len_bytes
-                );
-                if (canonical.length < clen) {
-                    canonical = new Uint8Array(clen);
-                }
-                let ci = 0;
-                canonical[ci] = is_pure_suffixes_only_node ? 1 : 0;
-                ci += 1;
-                canonical[ci] = dlen;
-                ci += 1;
-                canonical.set(data, ci);
-                ci += dlen;
-                canonical[ci] = input[coffset];
-                ci += 1;
-                if (!is_pure_suffixes_only_node) {
-                    canonical[ci] = input[coffset + 1];
+                    if (no_leaves_flag) {
+                        whole = EMPTY_BITMAP;
+                        suffix = EMPTY_BITMAP;
+                    } else {
+                        suffix = input[i] === 0 ?
+                            EMPTY_BITMAP1 :
+                            new RoaringBitmap(input, i);
+                        i += suffix.consumed_len_bytes;
+                    }
+                    tree = new SuffixSearchTree(
+                        branches,
+                        dlen,
+                        suffix,
+                    );
+                    const clen = (
+                        // lengths of children and data
+                        (is_data_compressed ? 2 : 3) +
+                        // branches
+                        csnodes.length +
+                        csbranches.length +
+                        // leaves
+                        suffix.consumed_len_bytes
+                    );
+                    if (canonical.length < clen) {
+                        canonical = new Uint8Array(clen);
+                    }
+                    let ci = 0;
+                    if (is_data_compressed) {
+                        canonical[ci] = 0x09;
+                        ci += 1;
+                    } else {
+                        canonical[ci] = 1;
+                        ci += 1;
+                        canonical[ci] = dlen | no_leaves_flag;
+                        ci += 1;
+                    }
+                    canonical[ci] = input[coffset]; // suffix child count
                     ci += 1;
+                    canonical.set(csnodes, ci);
+                    ci += csnodes.length;
+                    canonical.set(csbranches, ci);
+                    ci += csbranches.length;
+                    const leavesOffset = i - suffix.consumed_len_bytes;
+                    for (let j = leavesOffset; j < i; j += 1) {
+                        canonical[ci + j - leavesOffset] = input[j];
+                    }
+                    siphashOfBytes(canonical.subarray(0, clen), 0, 0, 0, 0, hash);
+                } else {
+                    if (no_leaves_flag) {
+                        whole = EMPTY_BITMAP;
+                        suffix = EMPTY_BITMAP;
+                    } else {
+                        whole = input[i] === 0 ?
+                            EMPTY_BITMAP1 :
+                            new RoaringBitmap(input, i);
+                        i += whole.consumed_len_bytes;
+                        suffix = input[i] === 0 ?
+                            EMPTY_BITMAP1 :
+                            new RoaringBitmap(input, i);
+                        i += suffix.consumed_len_bytes;
+                    }
+                    tree = new PrefixSearchTree(
+                        branches,
+                        might_have_prefix_branches,
+                        data,
+                        whole,
+                        suffix,
+                    );
+                    const clen = (
+                        4 + // lengths of children and data
+                        dlen +
+                        cpnodes.length + csnodes.length +
+                        cpbranches.length + csbranches.length +
+                        whole.consumed_len_bytes +
+                        suffix.consumed_len_bytes
+                    );
+                    if (canonical.length < clen) {
+                        canonical = new Uint8Array(clen);
+                    }
+                    let ci = 0;
+                    canonical[ci] = 0;
+                    ci += 1;
+                    canonical[ci] = dlen | no_leaves_flag;
+                    ci += 1;
+                    canonical.set(data, ci);
+                    ci += data.length;
+                    canonical[ci] = input[coffset]; // prefix child count
+                    ci += 1;
+                    canonical[ci] = input[coffset + 1]; // suffix child count
+                    ci += 1;
+                    canonical.set(cpnodes, ci);
+                    ci += cpnodes.length;
+                    canonical.set(csnodes, ci);
+                    ci += csnodes.length;
+                    canonical.set(cpbranches, ci);
+                    ci += cpbranches.length;
+                    canonical.set(csbranches, ci);
+                    ci += csbranches.length;
+                    const leavesOffset = i - whole.consumed_len_bytes - suffix.consumed_len_bytes;
+                    for (let j = leavesOffset; j < i; j += 1) {
+                        canonical[ci + j - leavesOffset] = input[j];
+                    }
+                    siphashOfBytes(canonical.subarray(0, clen), 0, 0, 0, 0, hash);
                 }
-                canonical.set(cpnodes, ci);
-                ci += cpnodes.length;
-                canonical.set(csnodes, ci);
-                ci += csnodes.length;
-                canonical.set(cpbranches, ci);
-                ci += cpbranches.length;
-                canonical.set(csbranches, ci);
-                ci += csbranches.length;
-                const leavesOffset = i - whole.consumed_len_bytes - suffix.consumed_len_bytes;
-                for (let j = leavesOffset; j < i; j += 1) {
-                    canonical[ci + j - leavesOffset] = input[j];
-                }
-                siphashOfBytes(canonical.subarray(0, clen), 0, 0, 0, 0, hash);
-                hash[2] &= 0x7f;
             } else {
                 // uncompressed node
-                const dlen = input [i + 1];
-                i += 2;
-                if (dlen === 0) {
+                if (dlen === 0 || is_pure_suffixes_only_node) {
                     data = EMPTY_UINT8;
                 } else {
                     data = new Uint8Array(input.buffer, i + input.byteOffset, dlen);
+                    i += dlen;
                 }
-                i += dlen;
                 const {
                     consumed_len_bytes: branches_consumed_len_bytes,
                     branches,
@@ -2401,16 +3279,15 @@ function loadDatabase(hooks) {
                 i += branches_consumed_len_bytes;
                 let whole;
                 let suffix;
-                if (is_pure_suffixes_only_node) {
+                if (no_leaves_flag) {
+                    whole = EMPTY_BITMAP;
+                    suffix = EMPTY_BITMAP;
+                } else if (is_pure_suffixes_only_node) {
                     whole = EMPTY_BITMAP;
                     suffix = input[i] === 0 ?
                         EMPTY_BITMAP1 :
                         new RoaringBitmap(input, i);
                     i += suffix.consumed_len_bytes;
-                } else if (input[i] === 0xff) {
-                    whole = EMPTY_BITMAP;
-                    suffix = EMPTY_BITMAP;
-                    i += 1;
                 } else {
                     whole = input[i] === 0 ?
                         EMPTY_BITMAP1 :
@@ -2426,48 +3303,58 @@ function loadDatabase(hooks) {
                     start + input.byteOffset,
                     i - start,
                 ), 0, 0, 0, 0, hash);
-                hash[2] &= 0x7f;
-                tree = new SearchTree(
-                    branches,
-                    might_have_prefix_branches,
-                    data,
-                    whole,
-                    suffix,
-                );
+                tree = is_pure_suffixes_only_node ?
+                    new SuffixSearchTree(
+                        branches,
+                        dlen,
+                        suffix,
+                    ) :
+                    new PrefixSearchTree(
+                        branches,
+                        might_have_prefix_branches,
+                        data,
+                        whole,
+                        suffix,
+                    );
             }
+            hash[2] &= 0x7f;
             hash_history.push({hash: truncatedHash.slice(), used: false});
             if (data.length !== 0) {
                 data_history.push(data);
             }
-            const tree_branch_nodeids = tree.branches.nodeids;
-            const tree_branch_subtrees = tree.branches.subtrees;
-            let j = 0;
-            let lb = tree.branches.subtrees.length;
-            while (j < lb) {
-                // node id with a 1 in its most significant bit is inlined, and, so
-                // it won't be in the stash
-                if ((tree_branch_nodeids[j * 6] & 0x80) === 0) {
-                    const subtree = stash.getWithOffsetKey(tree_branch_nodeids, j * 6);
-                    if (subtree !== undefined) {
-                        tree_branch_subtrees[j] = Promise.resolve(subtree);
+            if (!(tree instanceof InlineNeighborsTree)) {
+                const tree_branch_nodeids = tree.branches.nodeids;
+                const tree_branch_subtrees = tree.branches.subtrees;
+                let j = 0;
+                const lb = tree.branches.subtrees.length;
+                while (j < lb) {
+                    // node id with a 1 in its most significant bit is inlined, and, so
+                    // it won't be in the stash
+                    if ((tree_branch_nodeids[j * 6] & 0x80) === 0) {
+                        const subtree = stash.getWithOffsetKey(tree_branch_nodeids, j * 6);
+                        if (subtree !== undefined) {
+                            tree_branch_subtrees[j] = Promise.resolve(subtree);
+                        }
                     }
+                    j += 1;
                 }
-                j += 1;
             }
-            const tree_mhp_branch_nodeids = tree.might_have_prefix_branches.nodeids;
-            const tree_mhp_branch_subtrees = tree.might_have_prefix_branches.subtrees;
-            j = 0;
-            lb = tree.might_have_prefix_branches.subtrees.length;
-            while (j < lb) {
-                // node id with a 1 in its most significant bit is inlined, and, so
-                // it won't be in the stash
-                if ((tree_mhp_branch_nodeids[j * 6] & 0x80) === 0) {
-                    const subtree = stash.getWithOffsetKey(tree_mhp_branch_nodeids, j * 6);
-                    if (subtree !== undefined) {
-                        tree_mhp_branch_subtrees[j] = Promise.resolve(subtree);
+            if (tree instanceof PrefixSearchTree) {
+                const tree_mhp_branch_nodeids = tree.might_have_prefix_branches.nodeids;
+                const tree_mhp_branch_subtrees = tree.might_have_prefix_branches.subtrees;
+                let j = 0;
+                const lb = tree.might_have_prefix_branches.subtrees.length;
+                while (j < lb) {
+                    // node id with a 1 in its most significant bit is inlined, and, so
+                    // it won't be in the stash
+                    if ((tree_mhp_branch_nodeids[j * 6] & 0x80) === 0) {
+                        const subtree = stash.getWithOffsetKey(tree_mhp_branch_nodeids, j * 6);
+                        if (subtree !== undefined) {
+                            tree_mhp_branch_subtrees[j] = Promise.resolve(subtree);
+                        }
                     }
+                    j += 1;
                 }
-                j += 1;
             }
             if (i !== l) {
                 stash.set(truncatedHash, tree);

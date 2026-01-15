@@ -1,212 +1,166 @@
-//! Trait solving using Chalk.
+//! Trait solving using next trait solver.
 
-use core::fmt;
-use std::env::var;
-
-use chalk_ir::{DebruijnIndex, GoalData, fold::TypeFoldable};
-use chalk_recursive::Cache;
-use chalk_solve::{Solver, logging_db::LoggingRustIrDatabase, rust_ir};
+use std::hash::Hash;
 
 use base_db::Crate;
-use hir_def::{BlockId, TraitId, lang_item::LangItem};
+use hir_def::{
+    AdtId, AssocItemId, HasModule, ImplId, Lookup, TraitId,
+    lang_item::LangItems,
+    nameres::DefMap,
+    signatures::{ConstFlags, EnumFlags, FnFlags, StructFlags, TraitFlags, TypeAliasFlags},
+};
 use hir_expand::name::Name;
 use intern::sym;
-use span::Edition;
-use stdx::{never, panic_context};
-use triomphe::Arc;
-
-use crate::{
-    AliasEq, AliasTy, Canonical, DomainGoal, Goal, Guidance, InEnvironment, Interner, ProjectionTy,
-    ProjectionTyExt, Solution, TraitRefExt, Ty, TyKind, TypeFlags, WhereClause, db::HirDatabase,
-    infer::unify::InferenceTable, utils::UnevaluatedConstEvaluatorFolder,
+use rustc_next_trait_solver::solve::{HasChanged, SolverDelegateEvalExt};
+use rustc_type_ir::{
+    TypingMode,
+    inherent::{AdtDef, BoundExistentialPredicates, IntoKind, Span as _},
+    solve::Certainty,
 };
 
-/// This controls how much 'time' we give the Chalk solver before giving up.
-const CHALK_SOLVER_FUEL: i32 = 1000;
+use crate::{
+    db::HirDatabase,
+    next_solver::{
+        Canonical, DbInterner, GenericArgs, Goal, ParamEnv, Predicate, SolverContext, Span,
+        StoredClauses, Ty, TyKind,
+        infer::{
+            DbInternerInferExt, InferCtxt,
+            traits::{Obligation, ObligationCause},
+        },
+        obligation_ctxt::ObligationCtxt,
+    },
+};
 
-#[derive(Debug, Copy, Clone)]
-pub(crate) struct ChalkContext<'a> {
-    pub(crate) db: &'a dyn HirDatabase,
-    pub(crate) krate: Crate,
-    pub(crate) block: Option<BlockId>,
-}
-
-fn create_chalk_solver() -> chalk_recursive::RecursiveSolver<Interner> {
-    let overflow_depth =
-        var("CHALK_OVERFLOW_DEPTH").ok().and_then(|s| s.parse().ok()).unwrap_or(500);
-    let max_size = var("CHALK_SOLVER_MAX_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(150);
-    chalk_recursive::RecursiveSolver::new(overflow_depth, max_size, Some(Cache::new()))
-}
-
-/// A set of clauses that we assume to be true. E.g. if we are inside this function:
-/// ```rust
-/// fn foo<T: Default>(t: T) {}
-/// ```
-/// we assume that `T: Default`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TraitEnvironment {
+/// Type for `hir`, because commonly we want both param env and a crate in an exported API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ParamEnvAndCrate<'db> {
+    pub param_env: ParamEnv<'db>,
     pub krate: Crate,
-    pub block: Option<BlockId>,
-    // FIXME make this a BTreeMap
-    traits_from_clauses: Box<[(Ty, TraitId)]>,
-    pub env: chalk_ir::Environment<Interner>,
 }
 
-impl TraitEnvironment {
-    pub fn empty(krate: Crate) -> Arc<Self> {
-        Arc::new(TraitEnvironment {
-            krate,
-            block: None,
-            traits_from_clauses: Box::default(),
-            env: chalk_ir::Environment::new(Interner),
-        })
-    }
-
-    pub fn new(
-        krate: Crate,
-        block: Option<BlockId>,
-        traits_from_clauses: Box<[(Ty, TraitId)]>,
-        env: chalk_ir::Environment<Interner>,
-    ) -> Arc<Self> {
-        Arc::new(TraitEnvironment { krate, block, traits_from_clauses, env })
-    }
-
-    // pub fn with_block(self: &mut Arc<Self>, block: BlockId) {
-    pub fn with_block(this: &mut Arc<Self>, block: BlockId) {
-        Arc::make_mut(this).block = Some(block);
-    }
-
-    pub fn traits_in_scope_from_clauses(&self, ty: Ty) -> impl Iterator<Item = TraitId> + '_ {
-        self.traits_from_clauses
-            .iter()
-            .filter_map(move |(self_ty, trait_id)| (*self_ty == ty).then_some(*trait_id))
+impl<'db> ParamEnvAndCrate<'db> {
+    #[inline]
+    pub fn store(self) -> StoredParamEnvAndCrate {
+        StoredParamEnvAndCrate { param_env: self.param_env.clauses.store(), krate: self.krate }
     }
 }
 
-pub(crate) fn normalize_projection_query(
-    db: &dyn HirDatabase,
-    projection: ProjectionTy,
-    env: Arc<TraitEnvironment>,
-) -> Ty {
-    if projection.substitution.iter(Interner).any(|arg| {
-        arg.ty(Interner)
-            .is_some_and(|ty| ty.data(Interner).flags.intersects(TypeFlags::HAS_TY_INFER))
-    }) {
-        never!(
-            "Invoking `normalize_projection_query` with a projection type containing inference var"
-        );
-        return TyKind::Error.intern(Interner);
-    }
-
-    let mut table = InferenceTable::new(db, env);
-    let ty = table.normalize_projection_ty(projection);
-    table.resolve_completely(ty)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StoredParamEnvAndCrate {
+    param_env: StoredClauses,
+    pub krate: Crate,
 }
 
-/// Solve a trait goal using Chalk.
-pub(crate) fn trait_solve_query(
-    db: &dyn HirDatabase,
-    krate: Crate,
-    block: Option<BlockId>,
-    goal: Canonical<InEnvironment<Goal>>,
-) -> Option<Solution> {
-    let _p = tracing::info_span!("trait_solve_query", detail = ?match &goal.value.goal.data(Interner) {
-        GoalData::DomainGoal(DomainGoal::Holds(WhereClause::Implemented(it))) => db
-            .trait_signature(it.hir_trait_id())
-            .name
-            .display(db, Edition::LATEST)
-            .to_string(),
-        GoalData::DomainGoal(DomainGoal::Holds(WhereClause::AliasEq(_))) => "alias_eq".to_owned(),
-        _ => "??".to_owned(),
-    })
-    .entered();
-
-    if let GoalData::DomainGoal(DomainGoal::Holds(WhereClause::AliasEq(AliasEq {
-        alias: AliasTy::Projection(projection_ty),
-        ..
-    }))) = &goal.value.goal.data(Interner)
-        && let TyKind::BoundVar(_) = projection_ty.self_type_parameter(db).kind(Interner)
-    {
-        // Hack: don't ask Chalk to normalize with an unknown self type, it'll say that's impossible
-        return Some(Solution::Ambig(Guidance::Unknown));
+impl StoredParamEnvAndCrate {
+    #[inline]
+    pub fn param_env(&self) -> ParamEnv<'_> {
+        ParamEnv { clauses: self.param_env.as_ref() }
     }
 
-    // Chalk see `UnevaluatedConst` as a unique concrete value, but we see it as an alias for another const. So
-    // we should get rid of it when talking to chalk.
-    let goal = goal
-        .try_fold_with(&mut UnevaluatedConstEvaluatorFolder { db }, DebruijnIndex::INNERMOST)
-        .unwrap();
-
-    // We currently don't deal with universes (I think / hope they're not yet
-    // relevant for our use cases?)
-    let u_canonical = chalk_ir::UCanonical { canonical: goal, universes: 1 };
-    solve(db, krate, block, &u_canonical)
+    #[inline]
+    pub fn as_ref(&self) -> ParamEnvAndCrate<'_> {
+        ParamEnvAndCrate { param_env: self.param_env(), krate: self.krate }
+    }
 }
 
-fn solve(
-    db: &dyn HirDatabase,
-    krate: Crate,
-    block: Option<BlockId>,
-    goal: &chalk_ir::UCanonical<chalk_ir::InEnvironment<chalk_ir::Goal<Interner>>>,
-) -> Option<chalk_solve::Solution<Interner>> {
-    let _p = tracing::info_span!("solve", ?krate, ?block).entered();
-    let context = ChalkContext { db, krate, block };
-    tracing::debug!("solve goal: {:?}", goal);
-    let mut solver = create_chalk_solver();
+/// This should be used in `hir` only.
+pub fn structurally_normalize_ty<'db>(
+    infcx: &InferCtxt<'db>,
+    ty: Ty<'db>,
+    env: ParamEnv<'db>,
+) -> Ty<'db> {
+    let TyKind::Alias(..) = ty.kind() else { return ty };
+    let mut ocx = ObligationCtxt::new(infcx);
+    let ty = ocx.structurally_normalize_ty(&ObligationCause::dummy(), env, ty).unwrap_or(ty);
+    ty.replace_infer_with_error(infcx.interner)
+}
 
-    let fuel = std::cell::Cell::new(CHALK_SOLVER_FUEL);
+#[derive(Clone, Debug, PartialEq)]
+pub enum NextTraitSolveResult {
+    Certain,
+    Uncertain,
+    NoSolution,
+}
 
-    let should_continue = || {
-        db.unwind_if_revision_cancelled();
-        let remaining = fuel.get();
-        fuel.set(remaining - 1);
-        if remaining == 0 {
-            tracing::debug!("fuel exhausted");
+impl NextTraitSolveResult {
+    pub fn no_solution(&self) -> bool {
+        matches!(self, NextTraitSolveResult::NoSolution)
+    }
+
+    pub fn certain(&self) -> bool {
+        matches!(self, NextTraitSolveResult::Certain)
+    }
+
+    pub fn uncertain(&self) -> bool {
+        matches!(self, NextTraitSolveResult::Uncertain)
+    }
+}
+
+pub fn next_trait_solve_canonical_in_ctxt<'db>(
+    infer_ctxt: &InferCtxt<'db>,
+    goal: Canonical<'db, Goal<'db, Predicate<'db>>>,
+) -> NextTraitSolveResult {
+    infer_ctxt.probe(|_| {
+        let context = <&SolverContext<'db>>::from(infer_ctxt);
+
+        tracing::info!(?goal);
+
+        let (goal, var_values) = context.instantiate_canonical(&goal);
+        tracing::info!(?var_values);
+
+        let res = context.evaluate_root_goal(goal, Span::dummy(), None);
+
+        let obligation = Obligation {
+            cause: ObligationCause::dummy(),
+            param_env: goal.param_env,
+            recursion_depth: 0,
+            predicate: goal.predicate,
+        };
+        infer_ctxt.inspect_evaluated_obligation(&obligation, &res, || {
+            Some(context.evaluate_root_goal_for_proof_tree(goal, Span::dummy()).1)
+        });
+
+        let res = res.map(|r| (r.has_changed, r.certainty));
+
+        tracing::debug!("solve_nextsolver({:?}) => {:?}", goal, res);
+
+        match res {
+            Err(_) => NextTraitSolveResult::NoSolution,
+            Ok((_, Certainty::Yes)) => NextTraitSolveResult::Certain,
+            Ok((_, Certainty::Maybe { .. })) => NextTraitSolveResult::Uncertain,
         }
-        remaining > 0
+    })
+}
+
+/// Solve a trait goal using next trait solver.
+pub fn next_trait_solve_in_ctxt<'db, 'a>(
+    infer_ctxt: &'a InferCtxt<'db>,
+    goal: Goal<'db, Predicate<'db>>,
+) -> Result<(HasChanged, Certainty), rustc_type_ir::solve::NoSolution> {
+    tracing::info!(?goal);
+
+    let context = <&SolverContext<'db>>::from(infer_ctxt);
+
+    let res = context.evaluate_root_goal(goal, Span::dummy(), None);
+
+    let obligation = Obligation {
+        cause: ObligationCause::dummy(),
+        param_env: goal.param_env,
+        recursion_depth: 0,
+        predicate: goal.predicate,
     };
+    infer_ctxt.inspect_evaluated_obligation(&obligation, &res, || {
+        Some(context.evaluate_root_goal_for_proof_tree(goal, Span::dummy()).1)
+    });
 
-    let mut solve = || {
-        let _ctx = if is_chalk_debug() || is_chalk_print() {
-            Some(panic_context::enter(format!("solving {goal:?}")))
-        } else {
-            None
-        };
-        let solution = if is_chalk_print() {
-            let logging_db =
-                LoggingRustIrDatabaseLoggingOnDrop(LoggingRustIrDatabase::new(context));
-            solver.solve_limited(&logging_db.0, goal, &should_continue)
-        } else {
-            solver.solve_limited(&context, goal, &should_continue)
-        };
+    let res = res.map(|r| (r.has_changed, r.certainty));
 
-        tracing::debug!("solve({:?}) => {:?}", goal, solution);
+    tracing::debug!("solve_nextsolver({:?}) => {:?}", goal, res);
 
-        solution
-    };
-
-    // don't set the TLS for Chalk unless Chalk debugging is active, to make
-    // extra sure we only use it for debugging
-    if is_chalk_debug() { crate::tls::set_current_program(db, solve) } else { solve() }
+    res
 }
 
-struct LoggingRustIrDatabaseLoggingOnDrop<'a>(LoggingRustIrDatabase<Interner, ChalkContext<'a>>);
-
-impl Drop for LoggingRustIrDatabaseLoggingOnDrop<'_> {
-    fn drop(&mut self) {
-        tracing::info!("chalk program:\n{}", self.0);
-    }
-}
-
-fn is_chalk_debug() -> bool {
-    std::env::var("CHALK_DEBUG").is_ok()
-}
-
-fn is_chalk_print() -> bool {
-    std::env::var("CHALK_PRINT").is_ok()
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, salsa::Update)]
 pub enum FnTrait {
     // Warning: Order is important. If something implements `x` it should also implement
     // `y` if `y <= x`.
@@ -219,63 +173,7 @@ pub enum FnTrait {
     AsyncFn,
 }
 
-impl fmt::Display for FnTrait {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            FnTrait::FnOnce => write!(f, "FnOnce"),
-            FnTrait::FnMut => write!(f, "FnMut"),
-            FnTrait::Fn => write!(f, "Fn"),
-            FnTrait::AsyncFnOnce => write!(f, "AsyncFnOnce"),
-            FnTrait::AsyncFnMut => write!(f, "AsyncFnMut"),
-            FnTrait::AsyncFn => write!(f, "AsyncFn"),
-        }
-    }
-}
-
 impl FnTrait {
-    pub const fn function_name(&self) -> &'static str {
-        match self {
-            FnTrait::FnOnce => "call_once",
-            FnTrait::FnMut => "call_mut",
-            FnTrait::Fn => "call",
-            FnTrait::AsyncFnOnce => "async_call_once",
-            FnTrait::AsyncFnMut => "async_call_mut",
-            FnTrait::AsyncFn => "async_call",
-        }
-    }
-
-    const fn lang_item(self) -> LangItem {
-        match self {
-            FnTrait::FnOnce => LangItem::FnOnce,
-            FnTrait::FnMut => LangItem::FnMut,
-            FnTrait::Fn => LangItem::Fn,
-            FnTrait::AsyncFnOnce => LangItem::AsyncFnOnce,
-            FnTrait::AsyncFnMut => LangItem::AsyncFnMut,
-            FnTrait::AsyncFn => LangItem::AsyncFn,
-        }
-    }
-
-    pub const fn from_lang_item(lang_item: LangItem) -> Option<Self> {
-        match lang_item {
-            LangItem::FnOnce => Some(FnTrait::FnOnce),
-            LangItem::FnMut => Some(FnTrait::FnMut),
-            LangItem::Fn => Some(FnTrait::Fn),
-            LangItem::AsyncFnOnce => Some(FnTrait::AsyncFnOnce),
-            LangItem::AsyncFnMut => Some(FnTrait::AsyncFnMut),
-            LangItem::AsyncFn => Some(FnTrait::AsyncFn),
-            _ => None,
-        }
-    }
-
-    pub const fn to_chalk_ir(self) -> rust_ir::ClosureKind {
-        // Chalk doesn't support async fn traits.
-        match self {
-            FnTrait::AsyncFnOnce | FnTrait::FnOnce => rust_ir::ClosureKind::FnOnce,
-            FnTrait::AsyncFnMut | FnTrait::FnMut => rust_ir::ClosureKind::FnMut,
-            FnTrait::AsyncFn | FnTrait::Fn => rust_ir::ClosureKind::Fn,
-        }
-    }
-
     pub fn method_name(self) -> Name {
         match self {
             FnTrait::FnOnce => Name::new_symbol_root(sym::call_once),
@@ -287,12 +185,198 @@ impl FnTrait {
         }
     }
 
-    pub fn get_id(self, db: &dyn HirDatabase, krate: Crate) -> Option<TraitId> {
-        self.lang_item().resolve_trait(db, krate)
+    pub fn get_id(self, lang_items: &LangItems) -> Option<TraitId> {
+        match self {
+            FnTrait::FnOnce => lang_items.FnOnce,
+            FnTrait::FnMut => lang_items.FnMut,
+            FnTrait::Fn => lang_items.Fn,
+            FnTrait::AsyncFnOnce => lang_items.AsyncFnOnce,
+            FnTrait::AsyncFnMut => lang_items.AsyncFnMut,
+            FnTrait::AsyncFn => lang_items.AsyncFn,
+        }
+    }
+}
+
+/// This should not be used in `hir-ty`, only in `hir`.
+pub fn implements_trait_unique<'db>(
+    ty: Ty<'db>,
+    db: &'db dyn HirDatabase,
+    env: ParamEnvAndCrate<'db>,
+    trait_: TraitId,
+) -> bool {
+    implements_trait_unique_impl(db, env, trait_, &mut |infcx| {
+        infcx.fill_rest_fresh_args(trait_.into(), [ty.into()])
+    })
+}
+
+/// This should not be used in `hir-ty`, only in `hir`.
+pub fn implements_trait_unique_with_args<'db>(
+    db: &'db dyn HirDatabase,
+    env: ParamEnvAndCrate<'db>,
+    trait_: TraitId,
+    args: GenericArgs<'db>,
+) -> bool {
+    implements_trait_unique_impl(db, env, trait_, &mut |_| args)
+}
+
+fn implements_trait_unique_impl<'db>(
+    db: &'db dyn HirDatabase,
+    env: ParamEnvAndCrate<'db>,
+    trait_: TraitId,
+    create_args: &mut dyn FnMut(&InferCtxt<'db>) -> GenericArgs<'db>,
+) -> bool {
+    let interner = DbInterner::new_with(db, env.krate);
+    // FIXME(next-solver): I believe this should be `PostAnalysis`.
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+
+    let args = create_args(&infcx);
+    let trait_ref = rustc_type_ir::TraitRef::new_from_args(interner, trait_.into(), args);
+    let goal = Goal::new(interner, env.param_env, trait_ref);
+
+    let result = crate::traits::next_trait_solve_in_ctxt(&infcx, goal);
+    matches!(result, Ok((_, Certainty::Yes)))
+}
+
+pub fn is_inherent_impl_coherent(db: &dyn HirDatabase, def_map: &DefMap, impl_id: ImplId) -> bool {
+    let self_ty = db.impl_self_ty(impl_id).instantiate_identity();
+    let self_ty = self_ty.kind();
+    let impl_allowed = match self_ty {
+        TyKind::Tuple(_)
+        | TyKind::FnDef(_, _)
+        | TyKind::Array(_, _)
+        | TyKind::Never
+        | TyKind::RawPtr(_, _)
+        | TyKind::Ref(_, _, _)
+        | TyKind::Slice(_)
+        | TyKind::Str
+        | TyKind::Bool
+        | TyKind::Char
+        | TyKind::Int(_)
+        | TyKind::Uint(_)
+        | TyKind::Float(_) => def_map.is_rustc_coherence_is_core(),
+
+        TyKind::Adt(adt_def, _) => adt_def.def_id().0.module(db).krate(db) == def_map.krate(),
+        TyKind::Dynamic(it, _) => it
+            .principal_def_id()
+            .is_some_and(|trait_id| trait_id.0.module(db).krate(db) == def_map.krate()),
+
+        _ => true,
+    };
+    impl_allowed || {
+        let rustc_has_incoherent_inherent_impls = match self_ty {
+            TyKind::Tuple(_)
+            | TyKind::FnDef(_, _)
+            | TyKind::Array(_, _)
+            | TyKind::Never
+            | TyKind::RawPtr(_, _)
+            | TyKind::Ref(_, _, _)
+            | TyKind::Slice(_)
+            | TyKind::Str
+            | TyKind::Bool
+            | TyKind::Char
+            | TyKind::Int(_)
+            | TyKind::Uint(_)
+            | TyKind::Float(_) => true,
+
+            TyKind::Adt(adt_def, _) => match adt_def.def_id().0 {
+                hir_def::AdtId::StructId(id) => db
+                    .struct_signature(id)
+                    .flags
+                    .contains(StructFlags::RUSTC_HAS_INCOHERENT_INHERENT_IMPLS),
+                hir_def::AdtId::UnionId(id) => db
+                    .union_signature(id)
+                    .flags
+                    .contains(StructFlags::RUSTC_HAS_INCOHERENT_INHERENT_IMPLS),
+                hir_def::AdtId::EnumId(it) => db
+                    .enum_signature(it)
+                    .flags
+                    .contains(EnumFlags::RUSTC_HAS_INCOHERENT_INHERENT_IMPLS),
+            },
+            TyKind::Dynamic(it, _) => it.principal_def_id().is_some_and(|trait_id| {
+                db.trait_signature(trait_id.0)
+                    .flags
+                    .contains(TraitFlags::RUSTC_HAS_INCOHERENT_INHERENT_IMPLS)
+            }),
+
+            _ => false,
+        };
+        let items = impl_id.impl_items(db);
+        rustc_has_incoherent_inherent_impls
+            && !items.items.is_empty()
+            && items.items.iter().all(|&(_, assoc)| match assoc {
+                AssocItemId::FunctionId(it) => {
+                    db.function_signature(it).flags.contains(FnFlags::RUSTC_ALLOW_INCOHERENT_IMPL)
+                }
+                AssocItemId::ConstId(it) => {
+                    db.const_signature(it).flags.contains(ConstFlags::RUSTC_ALLOW_INCOHERENT_IMPL)
+                }
+                AssocItemId::TypeAliasId(it) => db
+                    .type_alias_signature(it)
+                    .flags
+                    .contains(TypeAliasFlags::RUSTC_ALLOW_INCOHERENT_IMPL),
+            })
+    }
+}
+
+/// Checks whether the impl satisfies the orphan rules.
+///
+/// Given `impl<P1..=Pn> Trait<T1..=Tn> for T0`, an `impl`` is valid only if at least one of the following is true:
+/// - Trait is a local trait
+/// - All of
+///   - At least one of the types `T0..=Tn`` must be a local type. Let `Ti`` be the first such type.
+///   - No uncovered type parameters `P1..=Pn` may appear in `T0..Ti`` (excluding `Ti`)
+pub fn check_orphan_rules<'db>(db: &'db dyn HirDatabase, impl_: ImplId) -> bool {
+    let Some(impl_trait) = db.impl_trait(impl_) else {
+        // not a trait impl
+        return true;
+    };
+
+    let local_crate = impl_.lookup(db).container.krate(db);
+    let is_local = |tgt_crate| tgt_crate == local_crate;
+
+    let trait_ref = impl_trait.instantiate_identity();
+    let trait_id = trait_ref.def_id.0;
+    if is_local(trait_id.module(db).krate(db)) {
+        // trait to be implemented is local
+        return true;
     }
 
-    #[inline]
-    pub(crate) fn is_async(self) -> bool {
-        matches!(self, FnTrait::AsyncFn | FnTrait::AsyncFnMut | FnTrait::AsyncFnOnce)
-    }
+    let unwrap_fundamental = |mut ty: Ty<'db>| {
+        // Unwrap all layers of fundamental types with a loop.
+        loop {
+            match ty.kind() {
+                TyKind::Ref(_, referenced, _) => ty = referenced,
+                TyKind::Adt(adt_def, subs) => {
+                    let AdtId::StructId(s) = adt_def.def_id().0 else {
+                        break ty;
+                    };
+                    let struct_signature = db.struct_signature(s);
+                    if struct_signature.flags.contains(StructFlags::FUNDAMENTAL) {
+                        let next = subs.types().next();
+                        match next {
+                            Some(it) => ty = it,
+                            None => break ty,
+                        }
+                    } else {
+                        break ty;
+                    }
+                }
+                _ => break ty,
+            }
+        }
+    };
+    //   - At least one of the types `T0..=Tn`` must be a local type. Let `Ti`` be the first such type.
+
+    // FIXME: param coverage
+    //   - No uncovered type parameters `P1..=Pn` may appear in `T0..Ti`` (excluding `Ti`)
+    let is_not_orphan = trait_ref.args.types().any(|ty| match unwrap_fundamental(ty).kind() {
+        TyKind::Adt(adt_def, _) => is_local(adt_def.def_id().0.module(db).krate(db)),
+        TyKind::Error(_) => true,
+        TyKind::Dynamic(it, _) => {
+            it.principal_def_id().is_some_and(|trait_id| is_local(trait_id.0.module(db).krate(db)))
+        }
+        _ => false,
+    });
+    #[allow(clippy::let_and_return)]
+    is_not_orphan
 }

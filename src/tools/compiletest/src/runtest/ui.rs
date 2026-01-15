@@ -115,10 +115,14 @@ impl TestCx<'_> {
         }
 
         if errors > 0 {
-            println!("To update references, rerun the tests and pass the `--bless` flag");
+            writeln!(
+                self.stdout,
+                "To update references, rerun the tests and pass the `--bless` flag"
+            );
             let relative_path_to_file =
                 self.testpaths.relative_dir.join(self.testpaths.file.file_name().unwrap());
-            println!(
+            writeln!(
+                self.stdout,
                 "To only update this specific test, also pass `--test-args {}`",
                 relative_path_to_file,
             );
@@ -203,8 +207,12 @@ impl TestCx<'_> {
 
         debug!(
             "run_ui_test: explicit={:?} config.compare_mode={:?} \
-               proc_res.status={:?} props.error_patterns={:?}",
-            explicit, self.config.compare_mode, proc_res.status, self.props.error_patterns
+               proc_res.status={:?} props.error_patterns={:?} output_to_check={:?}",
+            explicit,
+            self.config.compare_mode,
+            proc_res.status,
+            self.props.error_patterns,
+            output_to_check,
         );
 
         // Compiler diagnostics (expected errors) are always tied to the compile-time ProcRes.
@@ -245,7 +253,7 @@ impl TestCx<'_> {
                 rustc.arg(crate_name);
             }
 
-            let res = self.compose_and_run_compiler(rustc, None, self.testpaths);
+            let res = self.compose_and_run_compiler(rustc, None);
             if !res.status.success() {
                 self.fatal_proc_rec("failed to compile fixed code", &res);
             }

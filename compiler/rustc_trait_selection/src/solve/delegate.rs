@@ -126,13 +126,12 @@ impl<'tcx> rustc_next_trait_solver::delegate::SolverDelegate for SolverDelegate<
             }
             ty::PredicateKind::Subtype(ty::SubtypePredicate { a, b, .. })
             | ty::PredicateKind::Coerce(ty::CoercePredicate { a, b }) => {
-                if self.shallow_resolve(a).is_ty_var() && self.shallow_resolve(b).is_ty_var() {
-                    // FIXME: We also need to register a subtype relation between these vars
-                    // when those are added, and if they aren't in the same sub root then
-                    // we should mark this goal as `has_changed`.
-                    Some(Certainty::AMBIGUOUS)
-                } else {
-                    None
+                match (self.shallow_resolve(a).kind(), self.shallow_resolve(b).kind()) {
+                    (&ty::Infer(ty::TyVar(a_vid)), &ty::Infer(ty::TyVar(b_vid))) => {
+                        self.sub_unify_ty_vids_raw(a_vid, b_vid);
+                        Some(Certainty::AMBIGUOUS)
+                    }
+                    _ => None,
                 }
             }
             ty::PredicateKind::Clause(ty::ClauseKind::ConstArgHasType(ct, _)) => {
@@ -238,13 +237,14 @@ impl<'tcx> rustc_next_trait_solver::delegate::SolverDelegate for SolverDelegate<
         canonical.instantiate(self.tcx, &values)
     }
 
-    fn instantiate_canonical_var_with_infer(
+    fn instantiate_canonical_var(
         &self,
         kind: CanonicalVarKind<'tcx>,
         span: Span,
+        var_values: &[ty::GenericArg<'tcx>],
         universe_map: impl Fn(ty::UniverseIndex) -> ty::UniverseIndex,
     ) -> ty::GenericArg<'tcx> {
-        self.0.instantiate_canonical_var(span, kind, universe_map)
+        self.0.instantiate_canonical_var(span, kind, var_values, universe_map)
     }
 
     fn add_item_bounds_for_hidden_type(
@@ -294,22 +294,20 @@ impl<'tcx> rustc_next_trait_solver::delegate::SolverDelegate for SolverDelegate<
     // register candidates. We probably need to register >1 since we may have an OR of ANDs.
     fn is_transmutable(
         &self,
-        dst: Ty<'tcx>,
         src: Ty<'tcx>,
+        dst: Ty<'tcx>,
         assume: ty::Const<'tcx>,
     ) -> Result<Certainty, NoSolution> {
         // Erase regions because we compute layouts in `rustc_transmute`,
         // which will ICE for region vars.
-        let (dst, src) = self.tcx.erase_regions((dst, src));
+        let (dst, src) = self.tcx.erase_and_anonymize_regions((dst, src));
 
         let Some(assume) = rustc_transmute::Assume::from_const(self.tcx, assume) else {
             return Err(NoSolution);
         };
 
         // FIXME(transmutability): This really should be returning nested goals for `Answer::If*`
-        match rustc_transmute::TransmuteTypeEnv::new(self.0.tcx)
-            .is_transmutable(rustc_transmute::Types { src, dst }, assume)
-        {
+        match rustc_transmute::TransmuteTypeEnv::new(self.0.tcx).is_transmutable(src, dst, assume) {
             rustc_transmute::Answer::Yes => Ok(Certainty::Yes),
             rustc_transmute::Answer::No(_) | rustc_transmute::Answer::If(_) => Err(NoSolution),
         }

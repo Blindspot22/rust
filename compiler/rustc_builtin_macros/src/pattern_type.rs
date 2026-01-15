@@ -1,5 +1,5 @@
 use rustc_ast::tokenstream::TokenStream;
-use rustc_ast::{AnonConst, DUMMY_NODE_ID, Ty, TyPat, TyPatKind, ast, token};
+use rustc_ast::{AnonConst, DUMMY_NODE_ID, MgcaDisambiguation, Ty, TyPat, TyPatKind, ast, token};
 use rustc_errors::PResult;
 use rustc_expand::base::{self, DummyResult, ExpandResult, ExtCtxt, MacroExpanderResult};
 use rustc_parse::exp;
@@ -30,36 +30,54 @@ fn parse_pat_ty<'a>(
     let ty = parser.parse_ty()?;
     parser.expect_keyword(exp!(Is))?;
 
-    let pat = pat_to_ty_pat(
-        cx,
-        *parser.parse_pat_no_top_guard(
-            None,
-            RecoverComma::No,
-            RecoverColon::No,
-            CommaRecoveryMode::EitherTupleOrPipe,
-        )?,
-    );
+    let start = parser.token.span;
+    let pat = if parser.eat(exp!(Bang)) {
+        parser.expect_keyword(exp!(Null))?;
+        ty_pat(TyPatKind::NotNull, start.to(parser.token.span))
+    } else {
+        pat_to_ty_pat(
+            cx,
+            parser.parse_pat_no_top_guard(
+                None,
+                RecoverComma::No,
+                RecoverColon::No,
+                CommaRecoveryMode::EitherTupleOrPipe,
+            )?,
+        )
+    };
 
     if parser.token != token::Eof {
         parser.unexpected()?;
     }
 
-    Ok((ty, pat))
+    Ok((ty, Box::new(pat)))
 }
 
-fn ty_pat(kind: TyPatKind, span: Span) -> Box<TyPat> {
-    Box::new(TyPat { id: DUMMY_NODE_ID, kind, span, tokens: None })
+fn ty_pat(kind: TyPatKind, span: Span) -> TyPat {
+    TyPat { id: DUMMY_NODE_ID, kind, span, tokens: None }
 }
 
-fn pat_to_ty_pat(cx: &mut ExtCtxt<'_>, pat: ast::Pat) -> Box<TyPat> {
+fn pat_to_ty_pat(cx: &mut ExtCtxt<'_>, pat: ast::Pat) -> TyPat {
     let kind = match pat.kind {
         ast::PatKind::Range(start, end, include_end) => TyPatKind::Range(
-            start.map(|value| Box::new(AnonConst { id: DUMMY_NODE_ID, value })),
-            end.map(|value| Box::new(AnonConst { id: DUMMY_NODE_ID, value })),
+            start.map(|value| {
+                Box::new(AnonConst {
+                    id: DUMMY_NODE_ID,
+                    value,
+                    mgca_disambiguation: MgcaDisambiguation::Direct,
+                })
+            }),
+            end.map(|value| {
+                Box::new(AnonConst {
+                    id: DUMMY_NODE_ID,
+                    value,
+                    mgca_disambiguation: MgcaDisambiguation::Direct,
+                })
+            }),
             include_end,
         ),
         ast::PatKind::Or(variants) => {
-            TyPatKind::Or(variants.into_iter().map(|pat| pat_to_ty_pat(cx, *pat)).collect())
+            TyPatKind::Or(variants.into_iter().map(|pat| pat_to_ty_pat(cx, pat)).collect())
         }
         ast::PatKind::Err(guar) => TyPatKind::Err(guar),
         _ => TyPatKind::Err(cx.dcx().span_err(pat.span, "pattern not supported in pattern types")),

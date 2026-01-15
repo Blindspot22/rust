@@ -10,7 +10,7 @@ use std::hash::Hash;
 use std::intrinsics;
 use std::marker::{DiscriminantKind, PointeeSized};
 
-use rustc_abi::{FieldIdx, VariantIdx};
+use rustc_abi::FieldIdx;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::LocalDefId;
 use rustc_serialize::{Decodable, Encodable};
@@ -216,10 +216,7 @@ impl<'tcx, E: TyEncoder<'tcx>> Encodable<E> for ty::ParamEnv<'tcx> {
 #[inline]
 fn decode_arena_allocable<'tcx, D: TyDecoder<'tcx>, T: ArenaAllocatable<'tcx> + Decodable<D>>(
     decoder: &mut D,
-) -> &'tcx T
-where
-    D: TyDecoder<'tcx>,
-{
+) -> &'tcx T {
     decoder.interner().arena.alloc(Decodable::decode(decoder))
 }
 
@@ -230,10 +227,7 @@ fn decode_arena_allocable_slice<
     T: ArenaAllocatable<'tcx> + Decodable<D>,
 >(
     decoder: &mut D,
-) -> &'tcx [T]
-where
-    D: TyDecoder<'tcx>,
-{
+) -> &'tcx [T] {
     decoder.interner().arena.alloc_from_iter(<Vec<T> as Decodable<D>>::decode(decoder))
 }
 
@@ -495,15 +489,6 @@ impl<'tcx, D: TyDecoder<'tcx>> Decodable<D> for &'tcx ty::List<LocalDefId> {
     }
 }
 
-impl<'tcx, D: TyDecoder<'tcx>> RefDecodable<'tcx, D> for ty::List<(VariantIdx, FieldIdx)> {
-    fn decode(decoder: &mut D) -> &'tcx Self {
-        let len = decoder.read_usize();
-        decoder.interner().mk_offset_of_from_iter(
-            (0..len).map::<(VariantIdx, FieldIdx), _>(|_| Decodable::decode(decoder)),
-        )
-    }
-}
-
 impl_decodable_via_ref! {
     &'tcx ty::TypeckResults<'tcx>,
     &'tcx ty::List<Ty<'tcx>>,
@@ -583,7 +568,7 @@ impl_arena_copy_decoder! {<'tcx>
     rustc_span::def_id::DefId,
     rustc_span::def_id::LocalDefId,
     (rustc_middle::middle::exported_symbols::ExportedSymbol<'tcx>, rustc_middle::middle::exported_symbols::SymbolExportInfo),
-    ty::DeducedParamAttrs,
+    rustc_middle::middle::deduced_param_attrs::DeducedParamAttrs,
 }
 
 #[macro_export]

@@ -616,8 +616,15 @@ fn test_replace_range() {
 }
 
 #[test]
-#[should_panic]
-fn test_replace_range_char_boundary() {
+#[should_panic = "start of range should be a character boundary"]
+fn test_replace_range_start_char_boundary() {
+    let mut s = "Hello, 世界!".to_owned();
+    s.replace_range(8.., "");
+}
+
+#[test]
+#[should_panic = "end of range should be a character boundary"]
+fn test_replace_range_end_char_boundary() {
     let mut s = "Hello, 世界!".to_owned();
     s.replace_range(..8, "");
 }
@@ -632,28 +639,32 @@ fn test_replace_range_inclusive_range() {
 }
 
 #[test]
-#[should_panic]
+#[should_panic = "range end index 6 out of range for slice of length 5"]
 fn test_replace_range_out_of_bounds() {
     let mut s = String::from("12345");
     s.replace_range(5..6, "789");
 }
 
 #[test]
-#[should_panic]
+#[should_panic = "range end index 5 out of range for slice of length 5"]
 fn test_replace_range_inclusive_out_of_bounds() {
     let mut s = String::from("12345");
     s.replace_range(5..=5, "789");
 }
 
+// The overflowed index value is target-dependent,
+// so we don't check for its exact value in the panic message
 #[test]
-#[should_panic]
+#[should_panic = "out of range for slice of length 3"]
 fn test_replace_range_start_overflow() {
     let mut s = String::from("123");
     s.replace_range((Excluded(usize::MAX), Included(0)), "");
 }
 
+// The overflowed index value is target-dependent,
+// so we don't check for its exact value in the panic message
 #[test]
-#[should_panic]
+#[should_panic = "out of range for slice of length 3"]
 fn test_replace_range_end_overflow() {
     let mut s = String::from("456");
     s.replace_range((Included(0), Included(usize::MAX)), "");
@@ -717,6 +728,40 @@ fn test_replace_range_evil_end_bound() {
     let mut s = String::from("🦀");
     s.replace_range(EvilRange(Cell::new(false)), "");
     assert_eq!(Ok(""), str::from_utf8(s.as_bytes()));
+}
+
+#[test]
+fn test_replace_first() {
+    let mut s = String::from("~ First ❌ Middle ❌ Last ❌ ~");
+    s.replace_first("❌", "✅✅");
+    assert_eq!(s, "~ First ✅✅ Middle ❌ Last ❌ ~");
+    s.replace_first("🦀", "😳");
+    assert_eq!(s, "~ First ✅✅ Middle ❌ Last ❌ ~");
+
+    let mut s = String::from("❌");
+    s.replace_first('❌', "✅✅");
+    assert_eq!(s, "✅✅");
+
+    let mut s = String::from("");
+    s.replace_first('🌌', "❌");
+    assert_eq!(s, "");
+}
+
+#[test]
+fn test_replace_last() {
+    let mut s = String::from("~ First ❌ Middle ❌ Last ❌ ~");
+    s.replace_last("❌", "✅✅");
+    assert_eq!(s, "~ First ❌ Middle ❌ Last ✅✅ ~");
+    s.replace_last("🦀", "😳");
+    assert_eq!(s, "~ First ❌ Middle ❌ Last ✅✅ ~");
+
+    let mut s = String::from("❌");
+    s.replace_last::<char>('❌', "✅✅");
+    assert_eq!(s, "✅✅");
+
+    let mut s = String::from("");
+    s.replace_last::<char>('🌌', "❌");
+    assert_eq!(s, "");
 }
 
 #[test]

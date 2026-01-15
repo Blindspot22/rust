@@ -9,8 +9,8 @@ use rustc_data_structures::fx::FxIndexMap;
 use rustc_errors::DiagCtxtHandle;
 use rustc_session::config::{
     self, CodegenOptions, CrateType, ErrorOutputType, Externs, Input, JsonUnusedExterns,
-    OptionsTargetModifiers, Sysroot, UnstableOptions, get_cmd_lint_options, nightly_options,
-    parse_crate_types_from_list, parse_externs, parse_target_triple,
+    OptionsTargetModifiers, OutFileName, Sysroot, UnstableOptions, get_cmd_lint_options,
+    nightly_options, parse_crate_types_from_list, parse_externs, parse_target_triple,
 };
 use rustc_session::lint::Level;
 use rustc_session::search_paths::SearchPath;
@@ -61,6 +61,15 @@ pub(crate) enum InputMode {
     NoInputMergeFinalize,
     /// A crate or markdown file.
     HasFile(Input),
+}
+
+/// Whether to run multiple doctests in the same binary.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum MergeDoctests {
+    #[default]
+    Never,
+    Always,
+    Auto,
 }
 
 /// Configuration options for rustdoc.
@@ -121,6 +130,8 @@ pub(crate) struct Options {
     /// Optional path to persist the doctest executables to, defaults to a
     /// temporary directory if not set.
     pub(crate) persist_doctests: Option<PathBuf>,
+    /// Whether to merge
+    pub(crate) merge_doctests: MergeDoctests,
     /// Runtool to run doctests with
     pub(crate) test_runtool: Option<String>,
     /// Arguments to pass to the runtool
@@ -155,7 +166,7 @@ pub(crate) struct Options {
     /// Whether doctests should emit unused externs
     pub(crate) json_unused_externs: JsonUnusedExterns,
     /// Whether to skip capturing stdout and stderr of tests.
-    pub(crate) nocapture: bool,
+    pub(crate) no_capture: bool,
 
     /// Configuration for scraping examples from the current crate. If this option is Some(..) then
     /// the compiler will scrape examples and not generate documentation.
@@ -164,12 +175,6 @@ pub(crate) struct Options {
     /// Note: this field is duplicated in `RenderOptions` because it's useful
     /// to have it in both places.
     pub(crate) unstable_features: rustc_feature::UnstableFeatures,
-
-    /// All commandline args used to invoke the compiler, with @file args fully expanded.
-    /// This will only be used within debug info, e.g. in the pdb file on windows
-    /// This is mainly useful for other tools that reads that debuginfo to figure out
-    /// how to call the compiler with the same arguments.
-    pub(crate) expanded_args: Vec<String>,
 
     /// Arguments to be used when compiling doctests.
     pub(crate) doctest_build_args: Vec<String>,
@@ -217,7 +222,7 @@ impl fmt::Debug for Options {
             .field("no_run", &self.no_run)
             .field("test_builder_wrappers", &self.test_builder_wrappers)
             .field("remap-file-prefix", &self.remap_path_prefix)
-            .field("nocapture", &self.nocapture)
+            .field("no_capture", &self.no_capture)
             .field("scrape_examples_options", &self.scrape_examples_options)
             .field("unstable_features", &self.unstable_features)
             .finish()
@@ -317,10 +322,9 @@ pub(crate) enum ModuleSorting {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum EmitType {
-    Unversioned,
     Toolchain,
     InvocationSpecific,
-    DepInfo(Option<PathBuf>),
+    DepInfo(Option<OutFileName>),
 }
 
 impl FromStr for EmitType {
@@ -328,17 +332,14 @@ impl FromStr for EmitType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "unversioned-shared-resources" => Ok(Self::Unversioned),
             "toolchain-shared-resources" => Ok(Self::Toolchain),
             "invocation-specific" => Ok(Self::InvocationSpecific),
             "dep-info" => Ok(Self::DepInfo(None)),
-            option => {
-                if let Some(file) = option.strip_prefix("dep-info=") {
-                    Ok(Self::DepInfo(Some(Path::new(file).into())))
-                } else {
-                    Err(())
-                }
-            }
+            option => match option.strip_prefix("dep-info=") {
+                Some("-") => Ok(Self::DepInfo(Some(OutFileName::Stdout))),
+                Some(f) => Ok(Self::DepInfo(Some(OutFileName::Real(f.into())))),
+                None => Err(()),
+            },
         }
     }
 }
@@ -348,10 +349,10 @@ impl RenderOptions {
         self.emit.is_empty() || self.emit.contains(&EmitType::InvocationSpecific)
     }
 
-    pub(crate) fn dep_info(&self) -> Option<Option<&Path>> {
+    pub(crate) fn dep_info(&self) -> Option<Option<&OutFileName>> {
         for emit in &self.emit {
             if let EmitType::DepInfo(file) = emit {
-                return Some(file.as_deref());
+                return Some(file.as_ref());
             }
         }
         None
@@ -399,6 +400,9 @@ impl Options {
         }
 
         let color = config::parse_color(early_dcx, matches);
+        let crate_name = matches.opt_str("crate-name");
+        let unstable_features =
+            rustc_feature::UnstableFeatures::from_environment(crate_name.as_deref());
         let config::JsonConfig { json_rendered, json_unused_externs, json_color, .. } =
             config::parse_json(early_dcx, matches);
         let error_format =
@@ -454,15 +458,22 @@ impl Options {
             return None;
         }
 
-        let mut emit = Vec::new();
+        let mut emit = FxIndexMap::<_, EmitType>::default();
         for list in matches.opt_strs("emit") {
             for kind in list.split(',') {
                 match kind.parse() {
-                    Ok(kind) => emit.push(kind),
+                    Ok(kind) => {
+                        // De-duplicate emit types and the last wins.
+                        // Only one instance for each type is allowed
+                        // regardless the actual data it carries.
+                        // This matches rustc's `--emit` behavior.
+                        emit.insert(std::mem::discriminant(&kind), kind);
+                    }
                     Err(()) => dcx.fatal(format!("unrecognized emission type: {kind}")),
                 }
             }
         }
+        let emit = emit.into_values().collect::<Vec<_>>();
 
         let show_coverage = matches.opt_present("show-coverage");
         let output_format_s = matches.opt_str("output-format");
@@ -756,7 +767,6 @@ impl Options {
             }
         };
 
-        let crate_name = matches.opt_str("crate-name");
         let bin_crate = crate_types.contains(&CrateType::Executable);
         let proc_macro_crate = crate_types.contains(&CrateType::ProcMacro);
         let playground_url = matches.opt_str("playground-url");
@@ -786,7 +796,7 @@ impl Options {
         let run_check = matches.opt_present("check");
         let generate_redirect_map = matches.opt_present("generate-redirect-map");
         let show_type_layout = matches.opt_present("show-type-layout");
-        let nocapture = matches.opt_present("nocapture");
+        let no_capture = matches.opt_present("no-capture");
         let generate_link_to_definition = matches.opt_present("generate-link-to-definition");
         let generate_macro_expansion = matches.opt_present("generate-macro-expansion");
         let extern_html_root_takes_precedence =
@@ -796,6 +806,8 @@ impl Options {
             Ok(result) => result,
             Err(e) => dcx.fatal(format!("--merge option error: {e}")),
         };
+        let merge_doctests = parse_merge_doctests(matches, edition, dcx);
+        tracing::debug!("merge_doctests: {merge_doctests:?}");
 
         if generate_link_to_definition && (show_coverage || output_format != OutputFormat::Html) {
             dcx.struct_warn(
@@ -814,11 +826,9 @@ impl Options {
 
         let scrape_examples_options = ScrapeExamplesOptions::new(matches, dcx);
         let with_examples = matches.opt_strs("with-examples");
-        let call_locations = crate::scrape_examples::load_call_locations(with_examples, dcx);
+        let call_locations =
+            crate::scrape_examples::load_call_locations(with_examples, dcx, &mut loaded_paths);
         let doctest_build_args = matches.opt_strs("doctest-build-arg");
-
-        let unstable_features =
-            rustc_feature::UnstableFeatures::from_environment(crate_name.as_deref());
 
         let disable_minification = matches.opt_present("disable-minification");
 
@@ -849,6 +859,7 @@ impl Options {
             crate_version,
             test_run_directory,
             persist_doctests,
+            merge_doctests,
             test_runtool,
             test_runtool_args,
             test_builder,
@@ -856,13 +867,12 @@ impl Options {
             no_run,
             test_builder_wrappers,
             remap_path_prefix,
-            nocapture,
+            no_capture,
             crate_name,
             output_format,
             json_unused_externs,
             scrape_examples_options,
             unstable_features,
-            expanded_args: args,
             doctest_build_args,
             target_modifiers,
         };
@@ -976,15 +986,16 @@ fn parse_extern_html_roots(
     Ok(externs)
 }
 
-/// Path directly to crate-info file.
+/// Path directly to crate-info directory.
 ///
-/// For example, `/home/user/project/target/doc.parts/<crate>/crate-info`.
+/// For example, `/home/user/project/target/doc.parts`.
+/// Each crate has its info stored in a file called `CRATENAME.json`.
 #[derive(Clone, Debug)]
 pub(crate) struct PathToParts(pub(crate) PathBuf);
 
 impl PathToParts {
     fn from_flag(path: String) -> Result<PathToParts, String> {
-        let mut path = PathBuf::from(path);
+        let path = PathBuf::from(path);
         // check here is for diagnostics
         if path.exists() && !path.is_dir() {
             Err(format!(
@@ -993,20 +1004,22 @@ impl PathToParts {
             ))
         } else {
             // if it doesn't exist, we'll create it. worry about that in write_shared
-            path.push("crate-info");
             Ok(PathToParts(path))
         }
     }
 }
 
-/// Reports error if --include-parts-dir / crate-info is not a file
+/// Reports error if --include-parts-dir is not a directory
 fn parse_include_parts_dir(m: &getopts::Matches) -> Result<Vec<PathToParts>, String> {
     let mut ret = Vec::new();
     for p in m.opt_strs("include-parts-dir") {
         let p = PathToParts::from_flag(p)?;
         // this is just for diagnostic
-        if !p.0.is_file() {
-            return Err(format!("--include-parts-dir expected {} to be a file", p.0.display()));
+        if !p.0.is_dir() {
+            return Err(format!(
+                "--include-parts-dir expected {} to be a directory",
+                p.0.display()
+            ));
         }
         ret.push(p);
     }
@@ -1041,5 +1054,22 @@ fn parse_merge(m: &getopts::Matches) -> Result<ShouldMerge, &'static str> {
         }
         Some("finalize") => Ok(ShouldMerge { read_rendered_cci: false, write_rendered_cci: true }),
         Some(_) => Err("argument to --merge must be `none`, `shared`, or `finalize`"),
+    }
+}
+
+fn parse_merge_doctests(
+    m: &getopts::Matches,
+    edition: Edition,
+    dcx: DiagCtxtHandle<'_>,
+) -> MergeDoctests {
+    match m.opt_str("merge-doctests").as_deref() {
+        Some("y") | Some("yes") | Some("on") | Some("true") => MergeDoctests::Always,
+        Some("n") | Some("no") | Some("off") | Some("false") => MergeDoctests::Never,
+        Some("auto") => MergeDoctests::Auto,
+        None if edition < Edition::Edition2024 => MergeDoctests::Never,
+        None => MergeDoctests::Auto,
+        Some(_) => {
+            dcx.fatal("argument to --merge-doctests must be a boolean (true/false) or 'auto'")
+        }
     }
 }

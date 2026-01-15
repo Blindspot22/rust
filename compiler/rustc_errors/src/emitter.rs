@@ -16,6 +16,8 @@ use std::iter;
 use std::path::Path;
 use std::sync::Arc;
 
+use anstream::{AutoStream, ColorChoice};
+use anstyle::{AnsiColor, Effects};
 use derive_setters::Setters;
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_data_structures::sync::{DynSend, IntoDynSyncSend};
@@ -25,7 +27,6 @@ use rustc_lint_defs::pluralize;
 use rustc_span::hygiene::{ExpnKind, MacroKind};
 use rustc_span::source_map::SourceMap;
 use rustc_span::{FileLines, FileName, SourceFile, Span, char_width, str_width};
-use termcolor::{Buffer, BufferWriter, Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tracing::{debug, instrument, trace, warn};
 
 use crate::registry::Registry;
@@ -45,16 +46,14 @@ const DEFAULT_COLUMN_WIDTH: usize = 140;
 
 /// Describes the way the content of the `rendered` field of the json output is generated
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HumanReadableErrorType {
-    Default,
-    Unicode,
-    AnnotateSnippet,
-    Short,
+pub struct HumanReadableErrorType {
+    pub short: bool,
+    pub unicode: bool,
 }
 
 impl HumanReadableErrorType {
     pub fn short(&self) -> bool {
-        *self == HumanReadableErrorType::Short
+        self.short
     }
 }
 
@@ -472,9 +471,12 @@ pub trait Emitter {
             .chain(span.span_labels().iter().map(|sp_label| sp_label.span))
             .filter_map(|sp| {
                 if !sp.is_dummy() && source_map.is_imported(sp) {
-                    let maybe_callsite = sp.source_callsite();
-                    if sp != maybe_callsite {
-                        return Some((sp, maybe_callsite));
+                    let mut span = sp;
+                    while let Some(callsite) = span.parent_callsite() {
+                        span = callsite;
+                        if !source_map.is_imported(span) {
+                            return Some((sp, span));
+                        }
                     }
                 }
                 None
@@ -525,39 +527,29 @@ impl Emitter for HumanEmitter {
         !self.short_message
     }
 
-    fn supports_color(&self) -> bool {
-        self.dst.supports_color()
-    }
-
     fn translator(&self) -> &Translator {
         &self.translator
     }
 }
 
-/// An emitter that does nothing when emitting a non-fatal diagnostic.
-/// Fatal diagnostics are forwarded to `fatal_emitter` to avoid silent
-/// failures of rustc, as witnessed e.g. in issue #89358.
-pub struct FatalOnlyEmitter {
-    pub fatal_emitter: Box<dyn Emitter + DynSend>,
-    pub fatal_note: Option<String>,
+/// An emitter that adds a note to each diagnostic.
+pub struct EmitterWithNote {
+    pub emitter: Box<dyn Emitter + DynSend>,
+    pub note: String,
 }
 
-impl Emitter for FatalOnlyEmitter {
+impl Emitter for EmitterWithNote {
     fn source_map(&self) -> Option<&SourceMap> {
         None
     }
 
     fn emit_diagnostic(&mut self, mut diag: DiagInner, registry: &Registry) {
-        if diag.level == Level::Fatal {
-            if let Some(fatal_note) = &self.fatal_note {
-                diag.sub(Level::Note, fatal_note.clone(), MultiSpan::new());
-            }
-            self.fatal_emitter.emit_diagnostic(diag, registry);
-        }
+        diag.sub(Level::Note, self.note.clone(), MultiSpan::new());
+        self.emitter.emit_diagnostic(diag, registry);
     }
 
     fn translator(&self) -> &Translator {
-        self.fatal_emitter.translator()
+        self.emitter.translator()
     }
 }
 
@@ -612,7 +604,7 @@ pub enum OutputTheme {
     Unicode,
 }
 
-/// Handles the writing of `HumanReadableErrorType::Default` and `HumanReadableErrorType::Short`
+/// Handles the writing of `HumanReadableErrorType`
 #[derive(Setters)]
 pub struct HumanEmitter {
     #[setters(skip)]
@@ -1462,7 +1454,7 @@ impl HumanEmitter {
         max_line_num_len: usize,
         is_secondary: bool,
         is_cont: bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<CodeWindowStatus> {
         let mut buffer = StyledBuffer::new();
 
         if !msp.has_primary_spans() && !msp.has_span_labels() && is_secondary && !self.short_message
@@ -1526,16 +1518,17 @@ impl HumanEmitter {
                 label_width += 2;
             }
             let mut line = 0;
+            let mut pad = false;
             for (text, style) in msgs.iter() {
                 let text =
                     self.translator.translate_message(text, args).map_err(Report::new).unwrap();
                 // Account for newlines to align output to its label.
-                for text in normalize_whitespace(&text).lines() {
+                for text in normalize_whitespace(&text).split('\n') {
                     buffer.append(
                         line,
                         &format!(
                             "{}{}",
-                            if line == 0 { String::new() } else { " ".repeat(label_width) },
+                            if pad { " ".repeat(label_width) } else { String::new() },
                             text
                         ),
                         match style {
@@ -1544,7 +1537,9 @@ impl HumanEmitter {
                         },
                     );
                     line += 1;
+                    pad = true;
                 }
+                pad = false;
                 // We add lines above, but if the last line has no explicit newline (which would
                 // yield an empty line), then we revert one line up to continue with the next
                 // styled text chunk on the same line as the last one from the prior one. Otherwise
@@ -1575,12 +1570,14 @@ impl HumanEmitter {
         }
         let mut annotated_files = FileWithAnnotatedLines::collect_annotations(self, args, msp);
         trace!("{annotated_files:#?}");
+        let mut code_window_status = CodeWindowStatus::Open;
 
         // Make sure our primary file comes first
         let primary_span = msp.primary_span().unwrap_or_default();
         let (Some(sm), false) = (self.sm.as_ref(), primary_span.is_dummy()) else {
             // If we don't have span information, emit and exit
-            return emit_to_destination(&buffer.render(), level, &mut self.dst, self.short_message);
+            return emit_to_destination(&buffer.render(), level, &mut self.dst, self.short_message)
+                .map(|_| code_window_status);
         };
         let primary_lo = sm.lookup_char_pos(primary_span.lo());
         if let Ok(pos) =
@@ -1589,6 +1586,9 @@ impl HumanEmitter {
             annotated_files.swap(0, pos);
         }
 
+        // An end column separator should be emitted when a file with with a
+        // source, is followed by one without a source
+        let mut col_sep_before_no_show_source = false;
         let annotated_files_len = annotated_files.len();
         // Print out the annotate source lines that correspond with the error
         for (file_idx, annotated_file) in annotated_files.into_iter().enumerate() {
@@ -1599,6 +1599,26 @@ impl HumanEmitter {
                 &annotated_file.file,
             ) {
                 if !self.short_message {
+                    // Add an end column separator when a file without a source
+                    // comes after one with a source
+                    //    ╭▸ $DIR/deriving-meta-unknown-trait.rs:1:10
+                    //    │
+                    // LL │ #[derive(Eqr)]
+                    //    │          ━━━
+                    //    ╰╴ (<- It prints *this* line)
+                    //    ╭▸ $SRC_DIR/core/src/cmp.rs:356:0
+                    //    │
+                    //    ╰╴note: similarly named derive macro `Eq` defined here
+                    if col_sep_before_no_show_source {
+                        let buffer_msg_line_offset = buffer.num_lines();
+                        self.draw_col_separator_end(
+                            &mut buffer,
+                            buffer_msg_line_offset,
+                            max_line_num_len + 1,
+                        );
+                    }
+                    col_sep_before_no_show_source = false;
+
                     // We'll just print an unannotated message.
                     for (annotation_id, line) in annotated_file.lines.iter().enumerate() {
                         let mut annotations = line.annotations.clone();
@@ -1639,34 +1659,46 @@ impl HumanEmitter {
                             }
                             line_idx += 1;
                         }
-                        for (label, is_primary) in labels.into_iter() {
+                        if is_cont
+                            && file_idx == annotated_files_len - 1
+                            && annotation_id == annotated_file.lines.len() - 1
+                            && !labels.is_empty()
+                        {
+                            code_window_status = CodeWindowStatus::Closed;
+                        }
+                        let labels_len = labels.len();
+                        for (label_idx, (label, is_primary)) in labels.into_iter().enumerate() {
                             let style = if is_primary {
                                 Style::LabelPrimary
                             } else {
                                 Style::LabelSecondary
                             };
-                            let pipe = self.col_separator();
-                            buffer.prepend(line_idx, &format!(" {pipe}"), Style::LineNumber);
-                            for _ in 0..max_line_num_len {
-                                buffer.prepend(line_idx, " ", Style::NoStyle);
-                            }
+                            self.draw_col_separator_no_space(
+                                &mut buffer,
+                                line_idx,
+                                max_line_num_len + 1,
+                            );
                             line_idx += 1;
-                            let chr = self.note_separator();
-                            buffer.append(line_idx, &format!(" {chr} note: "), style);
-                            for _ in 0..max_line_num_len {
-                                buffer.prepend(line_idx, " ", Style::NoStyle);
-                            }
+                            self.draw_note_separator(
+                                &mut buffer,
+                                line_idx,
+                                max_line_num_len + 1,
+                                label_idx != labels_len - 1,
+                            );
+                            buffer.append(line_idx, "note", Style::MainHeaderMsg);
+                            buffer.append(line_idx, ": ", Style::NoStyle);
                             buffer.append(line_idx, label, style);
                             line_idx += 1;
                         }
                     }
                 }
                 continue;
+            } else {
+                col_sep_before_no_show_source = true;
             }
-
             // print out the span location and spacer before we print the annotated source
             // to do this, we need to know if this span will be primary
-            let is_primary = primary_lo.file.name == annotated_file.file.name;
+            let is_primary = primary_lo.file.stable_id == annotated_file.file.stable_id;
             if is_primary {
                 let loc = primary_lo.clone();
                 if !self.short_message {
@@ -1976,14 +2008,14 @@ impl HumanEmitter {
         // final step: take our styled buffer, render it, then output it
         emit_to_destination(&buffer.render(), level, &mut self.dst, self.short_message)?;
 
-        Ok(())
+        Ok(code_window_status)
     }
 
     fn column_width(&self, code_offset: usize) -> usize {
         if let Some(width) = self.diagnostic_width {
             width.saturating_sub(code_offset)
         } else if self.ui_testing || cfg!(miri) {
-            DEFAULT_COLUMN_WIDTH
+            DEFAULT_COLUMN_WIDTH.saturating_sub(code_offset)
         } else {
             termize::dimensions()
                 .map(|(w, _)| w.saturating_sub(code_offset))
@@ -2116,11 +2148,12 @@ impl HumanEmitter {
 
             assert!(!file_lines.lines.is_empty() || parts[0].span.is_dummy());
 
-            let line_start = sm.lookup_char_pos(parts[0].span.lo()).line;
+            let line_start = sm.lookup_char_pos(parts[0].original_span.lo()).line;
             let mut lines = complete.lines();
+            let lines_len = lines.clone().count();
             if lines.clone().next().is_none() {
                 // Account for a suggestion to completely remove a line(s) with whitespace (#94192).
-                let line_end = sm.lookup_char_pos(parts[0].span.hi()).line;
+                let line_end = sm.lookup_char_pos(parts[0].original_span.hi()).line;
                 for line in line_start..=line_end {
                     self.draw_line_num(
                         &mut buffer,
@@ -2158,6 +2191,7 @@ impl HumanEmitter {
                 if highlight_parts.len() == 1
                     && line.trim().starts_with("#[")
                     && line.trim().ends_with(']')
+                    && lines_len == 1
                 {
                     is_item_attribute = true;
                 }
@@ -2282,11 +2316,6 @@ impl HumanEmitter {
                 show_code_change
             {
                 for part in parts {
-                    let snippet = if let Ok(snippet) = sm.span_to_snippet(part.span) {
-                        snippet
-                    } else {
-                        String::new()
-                    };
                     let span_start_pos = sm.lookup_char_pos(part.span.lo()).col_display;
                     let span_end_pos = sm.lookup_char_pos(part.span.hi()).col_display;
 
@@ -2362,7 +2391,7 @@ impl HumanEmitter {
                         // LL - REMOVED <- row_num - 2 - (newlines - first_i - 1)
                         // LL + NEWER
                         //    |         <- row_num
-
+                        let snippet = sm.span_to_snippet(part.span).unwrap_or_default();
                         let newlines = snippet.lines().count();
                         if newlines > 0 && row_num > newlines {
                             // Account for removals where the part being removed spans multiple
@@ -2375,7 +2404,7 @@ impl HumanEmitter {
                             // too bad to begin with, so we side-step that issue here.
                             for (i, line) in snippet.lines().enumerate() {
                                 let line = normalize_whitespace(line);
-                                let row = row_num - 2 - (newlines - i - 1);
+                                let row = (row_num - 2 - (newlines - i - 1)).max(2);
                                 // On the first line, we highlight between the start of the part
                                 // span, and the end of that line.
                                 // On the last line, we highlight between the start of the line, and
@@ -2491,7 +2520,7 @@ impl HumanEmitter {
             !children.is_empty()
                 || suggestions.iter().any(|s| s.style != SuggestionStyle::CompletelyHidden),
         ) {
-            Ok(()) => {
+            Ok(code_window_status) => {
                 if !children.is_empty()
                     || suggestions.iter().any(|s| s.style != SuggestionStyle::CompletelyHidden)
                 {
@@ -2502,7 +2531,7 @@ impl HumanEmitter {
                         {
                             // We'll continue the vertical bar to point into the next note.
                             self.draw_col_separator_no_space(&mut buffer, 0, max_line_num_len + 1);
-                        } else {
+                        } else if matches!(code_window_status, CodeWindowStatus::Open) {
                             // We'll close the vertical bar to visually end the code window.
                             self.draw_col_separator_end(&mut buffer, 0, max_line_num_len + 1);
                         }
@@ -2665,8 +2694,7 @@ impl HumanEmitter {
                 [SubstitutionHighlight { start: 0, end }] if *end == line_to_add.len() => {
                     buffer.puts(*row_num, max_line_num_len + 1, "+ ", Style::Addition);
                 }
-                [] => {
-                    // FIXME: needed? Doesn't get exercised in any test.
+                [] | [SubstitutionHighlight { start: 0, end: 0 }] => {
                     self.draw_col_separator_no_space(buffer, *row_num, max_line_num_len + 1);
                 }
                 _ => {
@@ -2829,10 +2857,11 @@ impl HumanEmitter {
         }
     }
 
-    fn note_separator(&self) -> char {
+    fn note_separator(&self, is_cont: bool) -> &'static str {
         match self.theme {
-            OutputTheme::Ascii => '=',
-            OutputTheme::Unicode => '╰',
+            OutputTheme::Ascii => "= ",
+            OutputTheme::Unicode if is_cont => "├ ",
+            OutputTheme::Unicode => "╰ ",
         }
     }
 
@@ -2945,11 +2974,7 @@ impl HumanEmitter {
         col: usize,
         is_cont: bool,
     ) {
-        let chr = match self.theme {
-            OutputTheme::Ascii => "= ",
-            OutputTheme::Unicode if is_cont => "├ ",
-            OutputTheme::Unicode => "╰ ",
-        };
+        let chr = self.note_separator(is_cont);
         buffer.puts(line, col, chr, Style::LineNumber);
     }
 
@@ -3050,6 +3075,12 @@ enum DisplaySuggestion {
     Add,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum CodeWindowStatus {
+    Closed,
+    Open,
+}
+
 impl FileWithAnnotatedLines {
     /// Preprocess all the annotations so that they are grouped by file and by line number
     /// This helps us quickly iterate over the whole message (including secondary file spans)
@@ -3066,7 +3097,7 @@ impl FileWithAnnotatedLines {
         ) {
             for slot in file_vec.iter_mut() {
                 // Look through each of our files for the one we're adding to
-                if slot.file.name == file.name {
+                if slot.file.stable_id == file.stable_id {
                     // See if we already have a line for it
                     for line_slot in &mut slot.lines {
                         if line_slot.line_index == line_index {
@@ -3087,7 +3118,6 @@ impl FileWithAnnotatedLines {
                 multiline_depth: 0,
             });
         }
-
         let mut output = vec![];
         let mut multiline_annotations = vec![];
 
@@ -3321,7 +3351,7 @@ const OUTPUT_REPLACEMENTS: &[(char, &str)] = &[
     ('\u{2069}', "�"),
 ];
 
-fn normalize_whitespace(s: &str) -> String {
+pub(crate) fn normalize_whitespace(s: &str) -> String {
     const {
         let mut i = 1;
         while i < OUTPUT_REPLACEMENTS.len() {
@@ -3366,7 +3396,7 @@ fn overlaps(a1: &Annotation, a2: &Annotation, padding: usize) -> bool {
     )
 }
 
-fn emit_to_destination(
+pub(crate) fn emit_to_destination(
     rendered_buffer: &[Vec<StyledString>],
     lvl: &Level,
     dst: &mut Destination,
@@ -3389,10 +3419,8 @@ fn emit_to_destination(
     let _buffer_lock = lock::acquire_global_lock("rustc_errors");
     for (pos, line) in rendered_buffer.iter().enumerate() {
         for part in line {
-            let style = part.style.color_spec(*lvl);
-            dst.set_color(&style)?;
-            write!(dst, "{}", part.text)?;
-            dst.reset()?;
+            let style = part.style.anstyle(*lvl);
+            write!(dst, "{style}{}{style:#}", part.text)?;
         }
         if !short_message && (!lvl.is_failure_note() || pos != rendered_buffer.len() - 1) {
             writeln!(dst)?;
@@ -3402,11 +3430,11 @@ fn emit_to_destination(
     Ok(())
 }
 
-pub type Destination = Box<dyn WriteColor + Send>;
+pub type Destination = AutoStream<Box<dyn Write + Send>>;
 
 struct Buffy {
-    buffer_writer: BufferWriter,
-    buffer: Buffer,
+    buffer_writer: std::io::Stderr,
+    buffer: Vec<u8>,
 }
 
 impl Write for Buffy {
@@ -3415,7 +3443,7 @@ impl Write for Buffy {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.buffer_writer.print(&self.buffer)?;
+        self.buffer_writer.write_all(&self.buffer)?;
         self.buffer.clear();
         Ok(())
     }
@@ -3430,22 +3458,11 @@ impl Drop for Buffy {
     }
 }
 
-impl WriteColor for Buffy {
-    fn supports_color(&self) -> bool {
-        self.buffer.supports_color()
-    }
-
-    fn set_color(&mut self, spec: &ColorSpec) -> io::Result<()> {
-        self.buffer.set_color(spec)
-    }
-
-    fn reset(&mut self) -> io::Result<()> {
-        self.buffer.reset()
-    }
-}
-
 pub fn stderr_destination(color: ColorConfig) -> Destination {
-    let choice = color.to_color_choice();
+    let buffer_writer = std::io::stderr();
+    // We need to resolve `ColorChoice::Auto` before `Box`ing since
+    // `ColorChoice::Auto` on `dyn Write` will always resolve to `Never`
+    let choice = get_stderr_color_choice(color, &buffer_writer);
     // On Windows we'll be performing global synchronization on the entire
     // system for emitting rustc errors, so there's no need to buffer
     // anything.
@@ -3453,60 +3470,47 @@ pub fn stderr_destination(color: ColorConfig) -> Destination {
     // On non-Windows we rely on the atomicity of `write` to ensure errors
     // don't get all jumbled up.
     if cfg!(windows) {
-        Box::new(StandardStream::stderr(choice))
+        AutoStream::new(Box::new(buffer_writer), choice)
     } else {
-        let buffer_writer = BufferWriter::stderr(choice);
-        let buffer = buffer_writer.buffer();
-        Box::new(Buffy { buffer_writer, buffer })
+        let buffer = Vec::new();
+        AutoStream::new(Box::new(Buffy { buffer_writer, buffer }), choice)
     }
+}
+
+pub fn get_stderr_color_choice(color: ColorConfig, stderr: &std::io::Stderr) -> ColorChoice {
+    let choice = color.to_color_choice();
+    if matches!(choice, ColorChoice::Auto) { AutoStream::choice(stderr) } else { choice }
 }
 
 /// On Windows, BRIGHT_BLUE is hard to read on black. Use cyan instead.
 ///
 /// See #36178.
-const BRIGHT_BLUE: Color = if cfg!(windows) { Color::Cyan } else { Color::Blue };
+const BRIGHT_BLUE: anstyle::Style = if cfg!(windows) {
+    AnsiColor::BrightCyan.on_default()
+} else {
+    AnsiColor::BrightBlue.on_default()
+};
 
 impl Style {
-    fn color_spec(&self, lvl: Level) -> ColorSpec {
-        let mut spec = ColorSpec::new();
+    pub(crate) fn anstyle(&self, lvl: Level) -> anstyle::Style {
         match self {
-            Style::Addition => {
-                spec.set_fg(Some(Color::Green)).set_intense(true);
+            Style::Addition => AnsiColor::BrightGreen.on_default(),
+            Style::Removal => AnsiColor::BrightRed.on_default(),
+            Style::LineAndColumn => anstyle::Style::new(),
+            Style::LineNumber => BRIGHT_BLUE.effects(Effects::BOLD),
+            Style::Quotation => anstyle::Style::new(),
+            Style::MainHeaderMsg => if cfg!(windows) {
+                AnsiColor::BrightWhite.on_default()
+            } else {
+                anstyle::Style::new()
             }
-            Style::Removal => {
-                spec.set_fg(Some(Color::Red)).set_intense(true);
-            }
-            Style::LineAndColumn => {}
-            Style::LineNumber => {
-                spec.set_bold(true);
-                spec.set_intense(true);
-                spec.set_fg(Some(BRIGHT_BLUE));
-            }
-            Style::Quotation => {}
-            Style::MainHeaderMsg => {
-                spec.set_bold(true);
-                if cfg!(windows) {
-                    spec.set_intense(true).set_fg(Some(Color::White));
-                }
-            }
-            Style::UnderlinePrimary | Style::LabelPrimary => {
-                spec = lvl.color();
-                spec.set_bold(true);
-            }
-            Style::UnderlineSecondary | Style::LabelSecondary => {
-                spec.set_bold(true).set_intense(true);
-                spec.set_fg(Some(BRIGHT_BLUE));
-            }
-            Style::HeaderMsg | Style::NoStyle => {}
-            Style::Level(lvl) => {
-                spec = lvl.color();
-                spec.set_bold(true);
-            }
-            Style::Highlight => {
-                spec.set_bold(true).set_fg(Some(Color::Magenta));
-            }
+            .effects(Effects::BOLD),
+            Style::UnderlinePrimary | Style::LabelPrimary => lvl.color().effects(Effects::BOLD),
+            Style::UnderlineSecondary | Style::LabelSecondary => BRIGHT_BLUE.effects(Effects::BOLD),
+            Style::HeaderMsg | Style::NoStyle => anstyle::Style::new(),
+            Style::Level(lvl) => lvl.color().effects(Effects::BOLD),
+            Style::Highlight => AnsiColor::Magenta.on_default().effects(Effects::BOLD),
         }
-        spec
     }
 }
 
@@ -3540,6 +3544,8 @@ pub fn detect_confusion_type(sm: &SourceMap, suggested: &str, sp: Span) -> Confu
         let mut has_digit_letter_confusable = false;
         let mut has_other_diff = false;
 
+        // Letters whose lowercase version is very similar to the uppercase
+        // version.
         let ascii_confusables = &['c', 'f', 'i', 'k', 'o', 's', 'u', 'v', 'w', 'x', 'y', 'z'];
 
         let digit_letter_confusables = [('0', 'O'), ('1', 'l'), ('5', 'S'), ('8', 'B'), ('9', 'g')];

@@ -327,7 +327,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             return Err(ConstEvalErrKind::ConstMakeGlobalWithOffset(ptr)).into();
         }
 
-        if matches!(self.tcx.try_get_global_alloc(alloc_id), Some(_)) {
+        if self.tcx.try_get_global_alloc(alloc_id).is_some() {
             // This points to something outside the current interpreter.
             return Err(ConstEvalErrKind::ConstMakeGlobalPtrIsNonHeap(ptr)).into();
         }
@@ -953,6 +953,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
 
         // # Global allocations
         if let Some(global_alloc) = self.tcx.try_get_global_alloc(id) {
+            // NOTE: `static` alignment from attributes has already been applied to the allocation.
             let (size, align) = global_alloc.size_and_align(*self.tcx, self.typing_env);
             let mutbl = global_alloc.mutability(*self.tcx, self.typing_env);
             let kind = match global_alloc {
@@ -980,7 +981,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         msg: CheckInAllocMsg,
     ) -> InterpResult<'tcx, (Size, Align)> {
         let info = self.get_alloc_info(id);
-        if matches!(info.kind, AllocKind::Dead) {
+        if info.kind == AllocKind::Dead {
             throw_ub!(PointerUseAfterFree(id, msg))
         }
         interp_ok((info.size, info.align))
@@ -1071,7 +1072,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             // Recurse, if there is data here.
             // Do this *before* invoking the callback, as the callback might mutate the
             // allocation and e.g. replace all provenance by wildcards!
-            if matches!(info.kind, AllocKind::LiveData) {
+            if info.kind == AllocKind::LiveData {
                 let alloc = self.get_alloc_raw(id)?;
                 for prov in alloc.provenance().provenances() {
                     if let Some(id) = prov.get_alloc_id() {
@@ -1497,12 +1498,10 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
 
         // Prepare getting source provenance.
         let src_bytes = src_alloc.get_bytes_unchecked(src_range).as_ptr(); // raw ptr, so we can also get a ptr to the destination allocation
-        // first copy the provenance to a temporary buffer, because
-        // `get_bytes_mut` will clear the provenance, which is correct,
-        // since we don't want to keep any provenance at the target.
-        // This will also error if copying partial provenance is not supported.
-        let provenance =
-            src_alloc.provenance().prepare_copy(src_range, dest_offset, num_copies, self);
+        // First copy the provenance to a temporary buffer, because
+        // `get_bytes_unchecked_for_overwrite_ptr` will clear the provenance (in preparation for
+        // inserting the new provenance), and that can overlap with the source range.
+        let provenance = src_alloc.provenance_prepare_copy(src_range, self);
         // Prepare a copy of the initialization mask.
         let init = src_alloc.init_mask().prepare_copy(src_range);
 
@@ -1587,7 +1586,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             num_copies,
         );
         // copy the provenance to the destination
-        dest_alloc.provenance_apply_copy(provenance);
+        dest_alloc.provenance_apply_copy(provenance, alloc_range(dest_offset, size), num_copies);
 
         interp_ok(())
     }
@@ -1606,7 +1605,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 match self.ptr_try_get_alloc_id(ptr, 0) {
                     Ok((alloc_id, offset, _)) => {
                         let info = self.get_alloc_info(alloc_id);
-                        if matches!(info.kind, AllocKind::TypeId) {
+                        if info.kind == AllocKind::TypeId {
                             // We *could* actually precisely answer this question since here,
                             // the offset *is* the integer value. But the entire point of making
                             // this a pointer is not to leak the integer value, so we say everything

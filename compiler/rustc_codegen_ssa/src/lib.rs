@@ -1,15 +1,11 @@
 // tidy-alphabetical-start
-#![allow(internal_features)]
 #![allow(rustc::diagnostic_outside_of_impl)]
 #![allow(rustc::untranslatable_diagnostic)]
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![doc(rust_logo)]
 #![feature(assert_matches)]
 #![feature(box_patterns)]
 #![feature(file_buffered)]
 #![feature(if_let_guard)]
 #![feature(negative_impls)]
-#![feature(rustdoc_internals)]
 #![feature(string_from_utf8_lossy_owned)]
 #![feature(trait_alias)]
 #![feature(try_blocks)]
@@ -25,10 +21,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rustc_ast as ast;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_data_structures::unord::UnordMap;
 use rustc_hir::CRATE_HIR_ID;
+use rustc_hir::attrs::{CfgEntry, NativeLibKind, WindowsSubsystemKind};
 use rustc_hir::def_id::CrateNum;
 use rustc_macros::{Decodable, Encodable, HashStable};
 use rustc_metadata::EncodedMetadata;
@@ -45,7 +41,6 @@ use rustc_session::Session;
 use rustc_session::config::{CrateType, OutputFilenames, OutputType, RUST_CGU_EXT};
 use rustc_session::cstore::{self, CrateSource};
 use rustc_session::lint::builtin::LINKER_MESSAGES;
-use rustc_session::utils::NativeLibKind;
 use rustc_span::Symbol;
 
 pub mod assert_module_sources;
@@ -120,7 +115,7 @@ impl<M> ModuleCodegen<M> {
         });
 
         CompiledModule {
-            name: self.name.clone(),
+            name: self.name,
             kind: self.kind,
             object,
             dwarf_object,
@@ -187,7 +182,7 @@ pub struct NativeLib {
     pub kind: NativeLibKind,
     pub name: Symbol,
     pub filename: Option<Symbol>,
-    pub cfg: Option<ast::MetaItemInner>,
+    pub cfg: Option<CfgEntry>,
     pub verbatim: bool,
     pub dll_imports: Vec<cstore::DllImport>,
 }
@@ -230,7 +225,7 @@ pub struct CrateInfo {
     pub used_crate_source: UnordMap<CrateNum, Arc<CrateSource>>,
     pub used_crates: Vec<CrateNum>,
     pub dependency_formats: Arc<Dependencies>,
-    pub windows_subsystem: Option<String>,
+    pub windows_subsystem: Option<WindowsSubsystemKind>,
     pub natvis_debugger_visualizers: BTreeSet<DebuggerVisualizerFile>,
     pub lint_levels: CodegenLintLevels,
     pub metadata_symbol: String,
@@ -271,9 +266,9 @@ pub enum CodegenErrors {
 
 pub fn provide(providers: &mut Providers) {
     crate::back::symbol_export::provide(providers);
-    crate::base::provide(providers);
-    crate::target_features::provide(providers);
-    crate::codegen_attrs::provide(providers);
+    crate::base::provide(&mut providers.queries);
+    crate::target_features::provide(&mut providers.queries);
+    crate::codegen_attrs::provide(&mut providers.queries);
     providers.queries.global_backend_features = |_tcx: TyCtxt<'_>, ()| vec![];
 }
 

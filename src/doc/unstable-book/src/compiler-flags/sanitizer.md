@@ -24,6 +24,8 @@ This feature allows for use of one of following sanitizers:
     AddressSanitizer, but based on partial hardware assistance.
   * [LeakSanitizer](#leaksanitizer) a run-time memory leak detector.
   * [MemorySanitizer](#memorysanitizer) a detector of uninitialized reads.
+  * [RealtimeSanitizer](#realtimesanitizer) a detector of calls to function with
+    non-deterministic execution time in realtime contexts.
   * [ThreadSanitizer](#threadsanitizer) a fast data race detector.
 
 * Those that apart from testing, may be used in production:
@@ -43,11 +45,11 @@ This feature allows for use of one of following sanitizers:
 
 To enable a sanitizer compile with `-Zsanitizer=address`, `-Zsanitizer=cfi`,
 `-Zsanitizer=dataflow`,`-Zsanitizer=hwaddress`, `-Zsanitizer=leak`,
-`-Zsanitizer=memory`, `-Zsanitizer=memtag`, `-Zsanitizer=shadow-call-stack`, or
-`-Zsanitizer=thread`. You might also need the `--target` and `build-std` flags.
-If you're working with other languages that are also instrumented with sanitizers,
-you might need the `external-clangrt` flag. See the section on
-[working with other languages](#working-with-other-languages).
+`-Zsanitizer=memory`, `-Zsanitizer=memtag`, `-Zsanitizer=realtime`,
+`-Zsanitizer=shadow-call-stack` or `-Zsanitizer=thread`. You might also need the
+`--target` and `build-std` flags. If you're working with other languages that are also
+instrumented with sanitizers, you might need the `external-clangrt` flag. See
+the section on [working with other languages](#working-with-other-languages).
 
 Example:
 ```shell
@@ -244,18 +246,16 @@ See the [Clang ControlFlowIntegrity documentation][clang-cfi] for more details.
 
 ## Example 1: Redirecting control flow using an indirect branch/call to an invalid destination
 
-```rust,ignore (making doc tests pass cross-platform is hard)
-use std::arch::naked_asm;
-use std::mem;
-
+```rust
 fn add_one(x: i32) -> i32 {
     x + 1
 }
 
 #[unsafe(naked)]
-pub extern "C" fn add_two(x: i32) {
+# #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub extern "sysv64" fn add_two(x: i32) {
     // x + 2 preceded by a landing pad/nop block
-    naked_asm!(
+    std::arch::naked_asm!(
         "
          nop
          nop
@@ -281,16 +281,18 @@ fn main() {
 
     println!("The answer is: {}", answer);
 
-    println!("With CFI enabled, you should not see the next answer");
-    let f: fn(i32) -> i32 = unsafe {
-        // Offset 0 is a valid branch/call destination (i.e., the function entry
-        // point), but offsets 1-8 within the landing pad/nop block are invalid
-        // branch/call destinations (i.e., within the body of the function).
-        mem::transmute::<*const u8, fn(i32) -> i32>((add_two as *const u8).offset(5))
-    };
-    let next_answer = do_twice(f, 5);
+#   #[cfg(all(target_os = "linux", target_arch = "x86_64"))] {
+        println!("With CFI enabled, you should not see the next answer");
+        let f: fn(i32) -> i32 = unsafe {
+            // Offset 0 is a valid branch/call destination (i.e., the function entry
+            // point), but offsets 1-8 within the landing pad/nop block are invalid
+            // branch/call destinations (i.e., within the body of the function).
+            std::mem::transmute::<*const u8, fn(i32) -> i32>((add_two as *const u8).offset(5))
+        };
+        let next_answer = do_twice(f, 5);
 
-    println!("The next answer is: {}", next_answer);
+        println!("The next answer is: {}", next_answer);
+#   }
 }
 ```
 Fig. 1. Redirecting control flow using an indirect branch/call to an invalid
@@ -865,6 +867,70 @@ WARNING: ThreadSanitizer: data race (pid=10574)
   Location is global 'example::A::h43ac149ddf992709' of size 8 at 0x5632dfe3d030 (example+0x000000bd9030)
 ```
 
+# RealtimeSanitizer
+RealtimeSanitizer detects non-deterministic execution time calls in real-time contexts.
+Functions marked with the `#[sanitize(realtime = "nonblocking")]` attribute are considered real-time functions.
+When RTSan detects a call to a function with a non-deterministic execution time, like `malloc` or `free`
+while in a real-time context, it reports an error.
+
+Besides "nonblocking" the attribute can also be used with "blocking" and "caller".
+- "blocking" allows the programmer to mark their own functions as having a non-deterministic execution time.
+When reaching such a function while in a real-time context a violation will be reported. A typical use
+case is a userland spinlock.
+- functions marked with "caller" will be sanitized if they were called from a real-time context.
+If no attribute is set, this is the default. Between entering a "nonblocking" function and exiting that
+function again the program will get sanitized.
+
+The santizer checks can be disabled using the external functions `__rtsan_disable()` and `__rtsan_enable()`.
+Each call to `__rtsan_disable()` must be paired with one following call to `__rtsan_enable()`, otherwise the behaviour is undefined.
+
+```rust
+unsafe extern "C" {
+  fn __rtsan_disable();
+  fn __rtsan_enable();
+}
+```
+
+```rust,ignore (log is just a example and doesn't exist)
+// in a real-time context
+#[cfg(debug_assertions)]
+{
+    unsafe { __rtsan_disable() };
+    log!("logging xyz");
+    unsafe { __rtsan_enable() };
+}
+```
+
+See the [Clang RealtimeSanitizer documentation][clang-rtsan] for more details.
+
+## Example
+
+```rust,no_run
+#![feature(sanitize)]
+#[sanitize(realtime = "nonblocking")]
+fn real_time() {
+  let vec = vec![0, 1, 2]; // call to malloc is detected and reported as an error
+}
+```
+
+```shell
+==8670==ERROR: RealtimeSanitizer: unsafe-library-call
+Intercepted call to real-time unsafe function `malloc` in real-time context!
+    #0 0x00010107b0d8 in malloc rtsan_interceptors_posix.cpp:792
+    #1 0x000100d94e70 in alloc::alloc::Global::alloc_impl::h9e1fc3206c868eea+0xa0 (realtime_vec:arm64+0x100000e70)
+    #2 0x000100d94d90 in alloc::alloc::exchange_malloc::hd45b5788339eb5c8+0x48 (realtime_vec:arm64+0x100000d90)
+    #3 0x000100d95020 in realtime_vec::main::hea6bd69b03eb9ca1+0x24 (realtime_vec:arm64+0x100001020)
+    #4 0x000100d94a28 in core::ops::function::FnOnce::call_once::h493b6cb9dd87d87c+0xc (realtime_vec:arm64+0x100000a28)
+    #5 0x000100d949b8 in std::sys::backtrace::__rust_begin_short_backtrace::hfcddb06c73c19eea+0x8 (realtime_vec:arm64+0x1000009b8)
+    #6 0x000100d9499c in std::rt::lang_start::_$u7b$$u7b$closure$u7d$$u7d$::h202288c05a2064f0+0xc (realtime_vec:arm64+0x10000099c)
+    #7 0x000100d9fa34 in std::rt::lang_start_internal::h6c763158a05ac05f+0x6c (realtime_vec:arm64+0x10000ba34)
+    #8 0x000100d94980 in std::rt::lang_start::h1c29cc56df0598b4+0x38 (realtime_vec:arm64+0x100000980)
+    #9 0x000100d95118 in main+0x20 (realtime_vec:arm64+0x100001118)
+    #10 0x000183a46b94 in start+0x17b8 (dyld:arm64+0xfffffffffff3ab94)
+
+SUMMARY: RealtimeSanitizer: unsafe-library-call rtsan_interceptors_posix.cpp:792 in malloc
+```
+
 # Instrumentation of external dependencies and std
 
 The sanitizers to varying degrees work correctly with partially instrumented
@@ -918,6 +984,7 @@ Sanitizers produce symbolized stacktraces when llvm-symbolizer binary is in `PAT
 * [MemorySanitizer in Clang][clang-msan]
 * [MemTagSanitizer in LLVM][llvm-memtag]
 * [ThreadSanitizer in Clang][clang-tsan]
+* [RealtimeSanitizer in Clang][clang-rtsan]
 
 [clang-asan]: https://clang.llvm.org/docs/AddressSanitizer.html
 [clang-cfi]: https://clang.llvm.org/docs/ControlFlowIntegrity.html
@@ -926,6 +993,7 @@ Sanitizers produce symbolized stacktraces when llvm-symbolizer binary is in `PAT
 [clang-kcfi]: https://clang.llvm.org/docs/ControlFlowIntegrity.html#fsanitize-kcfi
 [clang-lsan]: https://clang.llvm.org/docs/LeakSanitizer.html
 [clang-msan]: https://clang.llvm.org/docs/MemorySanitizer.html
+[clang-rtsan]: https://clang.llvm.org/docs/RealtimeSanitizer.html
 [clang-safestack]: https://clang.llvm.org/docs/SafeStack.html
 [clang-scs]: https://clang.llvm.org/docs/ShadowCallStack.html
 [clang-tsan]: https://clang.llvm.org/docs/ThreadSanitizer.html

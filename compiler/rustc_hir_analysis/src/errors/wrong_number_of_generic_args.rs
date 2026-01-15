@@ -339,8 +339,7 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
             hir::GenericArg::Lifetime(lt) => Some(lt),
             _ => None,
         }) {
-            return std::iter::repeat(lt.to_string())
-                .take(num_params_to_take)
+            return std::iter::repeat_n(lt.to_string(), num_params_to_take)
                 .collect::<Vec<_>>()
                 .join(", ");
         }
@@ -362,8 +361,7 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
                     matches!(fn_decl.output, hir::FnRetTy::Return(ty) if ty.hir_id == ty_id);
 
                 if in_arg || (in_ret && fn_decl.lifetime_elision_allowed) {
-                    return std::iter::repeat("'_".to_owned())
-                        .take(num_params_to_take)
+                    return std::iter::repeat_n("'_".to_owned(), num_params_to_take)
                         .collect::<Vec<_>>()
                         .join(", ");
                 }
@@ -388,10 +386,12 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
             })
             | hir::Node::AnonConst(..) = node
             {
-                return std::iter::repeat("'static".to_owned())
-                    .take(num_params_to_take.saturating_sub(ret.len()))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                return std::iter::repeat_n(
+                    "'static".to_owned(),
+                    num_params_to_take.saturating_sub(ret.len()),
+                )
+                .collect::<Vec<_>>()
+                .join(", ");
             }
 
             let params = if let Some(generics) = node.generics() {
@@ -763,9 +763,8 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
         &self,
         err: &mut Diag<'_, impl EmissionGuarantee>,
     ) {
-        let trait_ = match self.tcx.trait_of_assoc(self.def_id) {
-            Some(def_id) => def_id,
-            None => return,
+        let Some(trait_) = self.tcx.trait_of_assoc(self.def_id) else {
+            return;
         };
 
         // Skip suggestion when the associated function is itself generic, it is unclear
@@ -989,6 +988,9 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
                     gen_arg_spans[self.num_expected_type_or_const_args() - 1]
                 };
             let span_hi_redundant_type_or_const_args = gen_arg_spans[gen_arg_spans.len() - 1];
+            if !span_lo_redundant_type_or_const_args.eq_ctxt(span_hi_redundant_type_or_const_args) {
+                return;
+            }
             let span_redundant_type_or_const_args = span_lo_redundant_type_or_const_args
                 .shrink_to_hi()
                 .to(span_hi_redundant_type_or_const_args);
@@ -1077,15 +1079,11 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
 
     /// Builds the `type defined here` message.
     fn show_definition(&self, err: &mut Diag<'_, impl EmissionGuarantee>) {
-        let mut spans: MultiSpan = if let Some(def_span) = self.tcx.def_ident_span(self.def_id) {
-            if self.tcx.sess.source_map().is_span_accessible(def_span) {
-                def_span.into()
-            } else {
-                return;
-            }
-        } else {
+        let Some(def_span) = self.tcx.def_ident_span(self.def_id) else { return };
+        if !self.tcx.sess.source_map().is_span_accessible(def_span) {
             return;
         };
+        let mut spans: MultiSpan = def_span.into();
 
         let msg = {
             let def_kind = self.tcx.def_descr(self.def_id);

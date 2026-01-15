@@ -6,25 +6,25 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use rustc_ast::attr::{AttributeExt, MarkedAttrs};
+use rustc_ast::attr::MarkedAttrs;
 use rustc_ast::token::MetaVarKind;
 use rustc_ast::tokenstream::TokenStream;
 use rustc_ast::visit::{AssocCtxt, Visitor};
-use rustc_ast::{self as ast, AttrVec, Attribute, HasAttrs, Item, NodeId, PatKind};
+use rustc_ast::{self as ast, AttrVec, Attribute, HasAttrs, Item, NodeId, PatKind, Safety};
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
 use rustc_data_structures::sync;
 use rustc_errors::{BufferedEarlyLint, DiagCtxtHandle, ErrorGuaranteed, PResult};
 use rustc_feature::Features;
 use rustc_hir as hir;
-use rustc_hir::attrs::{AttributeKind, CfgEntry, Deprecation};
+use rustc_hir::attrs::{AttributeKind, CfgEntry, CollapseMacroDebuginfo, Deprecation};
 use rustc_hir::def::MacroKinds;
+use rustc_hir::limit::Limit;
 use rustc_hir::{Stability, find_attr};
 use rustc_lint_defs::RegisteredTools;
 use rustc_parse::MACRO_ARGUMENTS;
 use rustc_parse::parser::{ForceCollect, Parser};
-use rustc_session::config::CollapseMacroDebuginfo;
+use rustc_session::Session;
 use rustc_session::parse::ParseSess;
-use rustc_session::{Limit, Session};
 use rustc_span::def_id::{CrateNum, DefId, LocalDefId};
 use rustc_span::edition::Edition;
 use rustc_span::hygiene::{AstPass, ExpnData, ExpnKind, LocalExpnId, MacroKind};
@@ -33,7 +33,6 @@ use rustc_span::{DUMMY_SP, FileName, Ident, Span, Symbol, kw, sym};
 use smallvec::{SmallVec, smallvec};
 use thin_vec::ThinVec;
 
-use crate::base::ast::MetaItemInner;
 use crate::errors;
 use crate::expand::{self, AstFragment, Invocation};
 use crate::mbe::macro_rules::ParserAnyMacro;
@@ -323,16 +322,16 @@ pub trait BangProcMacro {
 
 impl<F> BangProcMacro for F
 where
-    F: Fn(TokenStream) -> TokenStream,
+    F: Fn(&mut ExtCtxt<'_>, Span, TokenStream) -> Result<TokenStream, ErrorGuaranteed>,
 {
     fn expand<'cx>(
         &self,
-        _ecx: &'cx mut ExtCtxt<'_>,
-        _span: Span,
+        ecx: &'cx mut ExtCtxt<'_>,
+        span: Span,
         ts: TokenStream,
     ) -> Result<TokenStream, ErrorGuaranteed> {
         // FIXME setup implicit context in TLS before calling self.
-        Ok(self(ts))
+        self(ecx, span, ts)
     }
 }
 
@@ -344,6 +343,21 @@ pub trait AttrProcMacro {
         annotation: TokenStream,
         annotated: TokenStream,
     ) -> Result<TokenStream, ErrorGuaranteed>;
+
+    // Default implementation for safe attributes; override if the attribute can be unsafe.
+    fn expand_with_safety<'cx>(
+        &self,
+        ecx: &'cx mut ExtCtxt<'_>,
+        safety: Safety,
+        span: Span,
+        annotation: TokenStream,
+        annotated: TokenStream,
+    ) -> Result<TokenStream, ErrorGuaranteed> {
+        if let Safety::Unsafe(span) = safety {
+            ecx.dcx().span_err(span, "unnecessary `unsafe` on safe attribute");
+        }
+        self.expand(ecx, span, annotation, annotated)
+    }
 }
 
 impl<F> AttrProcMacro for F
@@ -871,25 +885,6 @@ impl SyntaxExtension {
         }
     }
 
-    fn collapse_debuginfo_by_name(
-        attr: &impl AttributeExt,
-    ) -> Result<CollapseMacroDebuginfo, Span> {
-        let list = attr.meta_item_list();
-        let Some([MetaItemInner::MetaItem(item)]) = list.as_deref() else {
-            return Err(attr.span());
-        };
-        if !item.is_word() {
-            return Err(item.span);
-        }
-
-        match item.name() {
-            Some(sym::no) => Ok(CollapseMacroDebuginfo::No),
-            Some(sym::external) => Ok(CollapseMacroDebuginfo::External),
-            Some(sym::yes) => Ok(CollapseMacroDebuginfo::Yes),
-            _ => Err(item.path.span),
-        }
-    }
-
     /// if-ext - if macro from different crate (related to callsite code)
     /// | cmd \ attr    | no  | (unspecified) | external | yes |
     /// | no            | no  | no            | no       | no  |
@@ -898,21 +893,15 @@ impl SyntaxExtension {
     /// | yes           | yes | yes           | yes      | yes |
     fn get_collapse_debuginfo(sess: &Session, attrs: &[hir::Attribute], ext: bool) -> bool {
         let flag = sess.opts.cg.collapse_macro_debuginfo;
-        let attr = ast::attr::find_by_name(attrs, sym::collapse_debuginfo)
-            .and_then(|attr| {
-                Self::collapse_debuginfo_by_name(attr)
-                    .map_err(|span| {
-                        sess.dcx().emit_err(errors::CollapseMacroDebuginfoIllegal { span })
-                    })
-                    .ok()
-            })
-            .unwrap_or_else(|| {
-                if find_attr!(attrs, AttributeKind::RustcBuiltinMacro { .. }) {
-                    CollapseMacroDebuginfo::Yes
-                } else {
-                    CollapseMacroDebuginfo::Unspecified
-                }
-            });
+        let attr =
+            if let Some(info) = find_attr!(attrs, AttributeKind::CollapseDebugInfo(info) => info) {
+                info.clone()
+            } else if find_attr!(attrs, AttributeKind::RustcBuiltinMacro { .. }) {
+                CollapseMacroDebuginfo::Yes
+            } else {
+                CollapseMacroDebuginfo::Unspecified
+            };
+
         #[rustfmt::skip]
         let collapse_table = [
             [false, false, false, false],
@@ -941,9 +930,9 @@ impl SyntaxExtension {
                 .unwrap_or_default();
         let allow_internal_unsafe = find_attr!(attrs, AttributeKind::AllowInternalUnsafe(_));
 
-        let local_inner_macros = ast::attr::find_by_name(attrs, sym::macro_export)
-            .and_then(|macro_export| macro_export.meta_item_list())
-            .is_some_and(|l| ast::attr::list_contains_name(&l, sym::local_inner_macros));
+        let local_inner_macros =
+            *find_attr!(attrs, AttributeKind::MacroExport {local_inner_macros: l, ..} => l)
+                .unwrap_or(&false);
         let collapse_debuginfo = Self::get_collapse_debuginfo(sess, attrs, !is_local);
         tracing::debug!(?name, ?local_inner_macros, ?collapse_debuginfo, ?allow_internal_unsafe);
 
@@ -998,17 +987,14 @@ impl SyntaxExtension {
 
     /// A dummy bang macro `foo!()`.
     pub fn dummy_bang(edition: Edition) -> SyntaxExtension {
-        fn expander<'cx>(
-            cx: &'cx mut ExtCtxt<'_>,
+        fn expand(
+            ecx: &mut ExtCtxt<'_>,
             span: Span,
-            _: TokenStream,
-        ) -> MacroExpanderResult<'cx> {
-            ExpandResult::Ready(DummyResult::any(
-                span,
-                cx.dcx().span_delayed_bug(span, "expanded a dummy bang macro"),
-            ))
+            _ts: TokenStream,
+        ) -> Result<TokenStream, ErrorGuaranteed> {
+            Err(ecx.dcx().span_delayed_bug(span, "expanded a dummy bang macro"))
         }
-        SyntaxExtension::default(SyntaxExtensionKind::LegacyBang(Arc::new(expander)), edition)
+        SyntaxExtension::default(SyntaxExtensionKind::Bang(Arc::new(expand)), edition)
     }
 
     /// A dummy derive macro `#[derive(Foo)]`.
@@ -1086,6 +1072,9 @@ pub struct Indeterminate;
 pub struct DeriveResolution {
     pub path: ast::Path,
     pub item: Annotatable,
+    // FIXME: currently this field is only used in `is_none`/`is_some` conditions. However, the
+    // `Arc<SyntaxExtension>` will be used if the FIXME in `MacroExpander::fully_expand_fragment`
+    // is completed.
     pub exts: Option<Arc<SyntaxExtension>>,
     pub is_const: bool,
 }

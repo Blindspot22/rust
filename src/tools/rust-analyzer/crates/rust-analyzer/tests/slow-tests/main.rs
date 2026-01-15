@@ -9,6 +9,10 @@
 //! be sure without a real client anyway.
 
 #![allow(clippy::disallowed_types)]
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_driver as _;
 
 mod cli;
 mod ratoml;
@@ -256,7 +260,7 @@ fn main() {}
           {
             "args": {
               "cargoArgs": ["test", "--package", "foo", "--test", "spam"],
-              "executableArgs": ["test_eggs", "--exact", "--show-output"],
+              "executableArgs": ["test_eggs", "--exact", "--nocapture"],
               "overrideCargo": null,
               "cwd": server.path().join("foo"),
               "workspaceRoot": server.path().join("foo")
@@ -289,7 +293,7 @@ fn main() {}
               ],
               "executableArgs": [
                 "",
-                "--show-output"
+                "--nocapture"
               ]
             },
             "kind": "cargo",
@@ -1061,7 +1065,7 @@ fn main() {
         ),
         work_done_progress_params: Default::default(),
     });
-    assert!(res.to_string().contains("&'static str"));
+    assert!(res.to_string().contains("&str"));
 
     let res = server.send_request::<HoverRequest>(HoverParams {
         text_document_position_params: TextDocumentPositionParams::new(
@@ -1070,7 +1074,7 @@ fn main() {
         ),
         work_done_progress_params: Default::default(),
     });
-    assert!(res.to_string().contains("&'static str"));
+    assert!(res.to_string().contains("&str"));
 
     server.request::<GotoTypeDefinition>(
         GotoDefinitionParams {
@@ -1483,4 +1487,43 @@ version = "0.0.0"
     .wait_until_workspace_is_loaded();
 
     server.request::<WorkspaceSymbolRequest>(Default::default(), json!([]));
+}
+
+#[test]
+fn test_get_failed_obligations() {
+    use expect_test::expect;
+    if skip_slow_tests() {
+        return;
+    }
+
+    let server = Project::with_fixture(
+        r#"
+//- /Cargo.toml
+[package]
+name = "foo"
+version = "0.0.0"
+
+//- /src/lib.rs
+trait Trait {}
+fn requires_trait<T: Trait>(x: T) {}
+
+fn test() {
+    requires_trait(0usize);
+}
+"#,
+    )
+    .server()
+    .wait_until_workspace_is_loaded();
+
+    let res = server.send_request::<rust_analyzer::lsp::ext::GetFailedObligations>(
+        rust_analyzer::lsp::ext::GetFailedObligationsParams {
+            text_document: server.doc_id("src/lib.rs"),
+            position: Position::new(4, 19),
+        },
+    );
+
+    let res: serde_json::Value = serde_json::from_str(res.as_str().unwrap()).unwrap();
+    let arr = res.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    expect![[r#"{"goal":"Goal { param_env: ParamEnv { clauses: [] }, predicate: Binder { value: TraitPredicate(usize: Trait, polarity:Positive), bound_vars: [] } }","result":"Err(NoSolution)","depth":0,"candidates":[]}"#]].assert_eq(&arr[0].to_string());
 }

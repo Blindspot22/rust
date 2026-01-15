@@ -38,10 +38,6 @@ pub(crate) struct CguNotRecorded<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag(codegen_ssa_autodiff_without_lto)]
-pub struct AutodiffWithoutLto;
-
-#[derive(Diagnostic)]
 #[diag(codegen_ssa_unknown_reuse_kind)]
 pub(crate) struct UnknownReuseKind {
     #[primary_span]
@@ -136,34 +132,6 @@ pub(crate) struct NoSavedObjectFile<'a> {
 #[derive(Diagnostic)]
 #[diag(codegen_ssa_requires_rust_abi, code = E0737)]
 pub(crate) struct RequiresRustAbi {
-    #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag(codegen_ssa_unsupported_instruction_set, code = E0779)]
-pub(crate) struct UnsupportedInstructionSet {
-    #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag(codegen_ssa_invalid_instruction_set, code = E0779)]
-pub(crate) struct InvalidInstructionSet {
-    #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag(codegen_ssa_bare_instruction_set, code = E0778)]
-pub(crate) struct BareInstructionSet {
-    #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag(codegen_ssa_multiple_instruction_set, code = E0779)]
-pub(crate) struct MultipleInstructionSet {
     #[primary_span]
     pub span: Span,
 }
@@ -693,7 +661,7 @@ pub(crate) struct RlibArchiveBuildFailure {
 }
 
 #[derive(Diagnostic)]
-// Public for rustc_codegen_llvm::back::archive
+// Public for ArchiveBuilderBuilder::extract_bundled_libs
 pub enum ExtractBundledLibsError<'a> {
     #[diag(codegen_ssa_extract_bundled_libs_open_file)]
     OpenFile { rlib: &'a Path, error: Box<dyn std::error::Error> },
@@ -732,18 +700,20 @@ pub(crate) struct UnsupportedLinkSelfContained;
 
 #[derive(Diagnostic)]
 #[diag(codegen_ssa_archive_build_failure)]
-// Public for rustc_codegen_llvm::back::archive
-pub struct ArchiveBuildFailure {
+pub(crate) struct ArchiveBuildFailure {
     pub path: PathBuf,
     pub error: std::io::Error,
 }
 
 #[derive(Diagnostic)]
 #[diag(codegen_ssa_unknown_archive_kind)]
-// Public for rustc_codegen_llvm::back::archive
-pub struct UnknownArchiveKind<'a> {
+pub(crate) struct UnknownArchiveKind<'a> {
     pub kind: &'a str,
 }
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_bpf_staticlib_not_supported)]
+pub(crate) struct BpfStaticlibNotSupported;
 
 #[derive(Diagnostic)]
 #[diag(codegen_ssa_multiple_main_functions)]
@@ -751,12 +721,6 @@ pub struct UnknownArchiveKind<'a> {
 pub(crate) struct MultipleMainFunctions {
     #[primary_span]
     pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag(codegen_ssa_invalid_windows_subsystem)]
-pub(crate) struct InvalidWindowsSubsystem {
-    pub subsystem: Symbol,
 }
 
 #[derive(Diagnostic)]
@@ -1104,6 +1068,14 @@ pub enum InvalidMonomorphization<'tcx> {
         expected_element: Ty<'tcx>,
         vector_type: Ty<'tcx>,
     },
+
+    #[diag(codegen_ssa_invalid_monomorphization_non_scalable_type, code = E0511)]
+    NonScalableType {
+        #[primary_span]
+        span: Span,
+        name: Symbol,
+        ty: Ty<'tcx>,
+    },
 }
 
 pub enum ExpectedPointerMutability {
@@ -1286,14 +1258,6 @@ impl<G: EmissionGuarantee> Diagnostic<'_, G> for TargetFeatureDisableOrEnable<'_
         diag.arg("features", self.features.join(", "));
         diag
     }
-}
-
-#[derive(Diagnostic)]
-#[diag(codegen_ssa_no_mangle_nameless)]
-pub(crate) struct NoMangleNameless {
-    #[primary_span]
-    pub span: Span,
-    pub definition: String,
 }
 
 #[derive(Diagnostic)]

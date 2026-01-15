@@ -1,4 +1,3 @@
-#![cfg_attr(bootstrap, feature(strict_overflow_ops))]
 #![feature(abort_unwind)]
 #![feature(cfg_select)]
 #![feature(rustc_private)]
@@ -39,29 +38,33 @@
     clippy::needless_question_mark,
     clippy::needless_lifetimes,
     clippy::too_long_first_doc_paragraph,
+    clippy::len_zero,
     // We don't use translatable diagnostics
     rustc::diagnostic_outside_of_impl,
     // We are not implementing queries here so it's fine
     rustc::potential_query_instability,
     rustc::untranslatable_diagnostic,
 )]
-#![warn(rust_2018_idioms, unqualified_local_imports, clippy::as_conversions)]
+#![warn(
+    rust_2018_idioms,
+    unqualified_local_imports,
+    clippy::as_conversions,
+    clippy::manual_let_else
+)]
 // Needed for rustdoc from bootstrap (with `-Znormalize-docs`).
 #![recursion_limit = "256"]
-
-// Some "regular" crates we want to share with rustc
-extern crate either;
-extern crate tracing;
 
 // The rustc crates we need
 extern crate rustc_abi;
 extern crate rustc_apfloat;
 extern crate rustc_ast;
+extern crate rustc_codegen_ssa;
 extern crate rustc_const_eval;
 extern crate rustc_data_structures;
 extern crate rustc_errors;
 extern crate rustc_hir;
 extern crate rustc_index;
+extern crate rustc_log;
 extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
@@ -95,8 +98,8 @@ pub use rustc_const_eval::interpret::*;
 // Resolve ambiguity.
 #[doc(no_inline)]
 pub use rustc_const_eval::interpret::{self, AllocMap, Provenance as _};
+use rustc_log::tracing::{self, info, trace};
 use rustc_middle::{bug, span_bug};
-use tracing::{info, trace};
 
 #[cfg(all(unix, feature = "native-lib"))]
 pub mod native_lib {
@@ -109,6 +112,7 @@ pub type StrictPointer = interpret::Pointer<machine::Provenance>;
 pub type Scalar = interpret::Scalar<machine::Provenance>;
 pub type ImmTy<'tcx> = interpret::ImmTy<'tcx, machine::Provenance>;
 pub type OpTy<'tcx> = interpret::OpTy<'tcx, machine::Provenance>;
+pub type FnArg<'tcx> = interpret::FnArg<'tcx, machine::Provenance>;
 pub type PlaceTy<'tcx> = interpret::PlaceTy<'tcx, machine::Provenance>;
 pub type MPlaceTy<'tcx> = interpret::MPlaceTy<'tcx, machine::Provenance>;
 
@@ -119,7 +123,7 @@ pub use crate::borrow_tracker::stacked_borrows::{
 };
 pub use crate::borrow_tracker::tree_borrows::{EvalContextExt as _, Tree};
 pub use crate::borrow_tracker::{
-    BorTag, BorrowTrackerMethod, EvalContextExt as _, RetagFields, TreeBorrowsParams,
+    BorTag, BorrowTrackerMethod, EvalContextExt as _, TreeBorrowsParams,
 };
 pub use crate::clock::{Instant, MonotonicClock};
 pub use crate::concurrency::cpu_affinity::MAX_CPUS;
@@ -132,21 +136,20 @@ pub use crate::concurrency::thread::{
     BlockReason, DynUnblockCallback, EvalContextExt as _, StackEmptyCallback, ThreadId,
     ThreadManager, TimeoutAnchor, TimeoutClock, UnblockKind,
 };
-pub use crate::concurrency::{GenmcConfig, GenmcCtx};
+pub use crate::concurrency::{GenmcConfig, GenmcCtx, run_genmc_mode};
 pub use crate::data_structures::dedup_range_map::DedupRangeMap;
 pub use crate::data_structures::mono_hash_map::MonoHashMap;
 pub use crate::diagnostics::{
-    EvalContextExt as _, NonHaltingDiagnostic, TerminationInfo, report_error,
+    EvalContextExt as _, NonHaltingDiagnostic, TerminationInfo, report_result,
 };
-pub use crate::eval::{
-    AlignmentCheck, BacktraceStyle, IsolatedOp, MiriConfig, MiriEntryFnType, RejectOpWith,
-    ValidationMode, create_ecx, eval_entry,
-};
-pub use crate::helpers::{AccessKind, EvalContextExt as _, ToU64 as _, ToUsize as _};
+pub use crate::eval::{MiriConfig, MiriEntryFnType, create_ecx, eval_entry};
+pub use crate::helpers::{EvalContextExt as _, ToU64 as _, ToUsize as _};
 pub use crate::intrinsics::EvalContextExt as _;
 pub use crate::machine::{
-    AllocExtra, DynMachineCallback, FrameExtra, MachineCallback, MemoryKind, MiriInterpCx,
-    MiriInterpCxExt, MiriMachine, MiriMemoryKind, PrimitiveLayouts, Provenance, ProvenanceExtra,
+    AlignmentCheck, AllocExtra, BacktraceStyle, DynMachineCallback, FloatRoundingErrorMode,
+    FrameExtra, IsolatedOp, MachineCallback, MemoryKind, MiriInterpCx, MiriInterpCxExt,
+    MiriMachine, MiriMemoryKind, PrimitiveLayouts, Provenance, ProvenanceExtra, RejectOpWith,
+    ValidationMode,
 };
 pub use crate::operator::EvalContextExt as _;
 pub use crate::provenance_gc::{EvalContextExt as _, LiveAllocs, VisitProvenance, VisitWith};

@@ -127,21 +127,24 @@ fn check_cargo_toml(path: &Path, text: String) {
 }
 
 fn check_licenses(sh: &Shell) {
-    const EXPECTED: [&str; 20] = [
+    const EXPECTED: &[&str] = &[
         "(MIT OR Apache-2.0) AND Unicode-3.0",
         "0BSD OR MIT OR Apache-2.0",
-        "Apache-2.0",
+        "Apache-2.0 / MIT",
         "Apache-2.0 OR BSL-1.0",
         "Apache-2.0 OR MIT",
-        "Apache-2.0 WITH LLVM-exception",
         "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
+        "Apache-2.0 WITH LLVM-exception",
+        "Apache-2.0",
         "Apache-2.0/MIT",
+        "BSD-2-Clause OR Apache-2.0 OR MIT",
         "CC0-1.0",
         "ISC",
-        "MIT",
         "MIT / Apache-2.0",
+        "MIT OR Apache-2.0 OR LGPL-2.1-or-later",
         "MIT OR Apache-2.0",
         "MIT OR Zlib OR Apache-2.0",
+        "MIT",
         "MIT/Apache-2.0",
         "MPL-2.0",
         "Unicode-3.0",
@@ -159,18 +162,20 @@ fn check_licenses(sh: &Shell) {
         .collect::<Vec<_>>();
     licenses.sort_unstable();
     licenses.dedup();
-    if licenses != EXPECTED {
+    let mut expected = EXPECTED.to_vec();
+    expected.sort_unstable();
+    if licenses != expected {
         let mut diff = String::new();
 
         diff.push_str("New Licenses:\n");
         for &l in licenses.iter() {
-            if !EXPECTED.contains(&l) {
+            if !expected.contains(&l) {
                 diff += &format!("  {l}\n")
             }
         }
 
         diff.push_str("\nMissing Licenses:\n");
-        for l in EXPECTED {
+        for l in expected {
             if !licenses.contains(&l) {
                 diff += &format!("  {l}\n")
             }
@@ -178,7 +183,7 @@ fn check_licenses(sh: &Shell) {
 
         panic!("different set of licenses!\n{diff}");
     }
-    assert_eq!(licenses, EXPECTED);
+    assert_eq!(licenses, expected);
 }
 
 fn check_test_attrs(path: &Path, text: &str) {
@@ -189,6 +194,7 @@ fn check_test_attrs(path: &Path, text: &str) {
         "test-utils/src/fixture.rs",
         // Generated code from lints contains doc tests in string literals.
         "ide-db/src/generated/lints.rs",
+        "proc-macro-srv/src/tests/mod.rs",
     ];
     if need_panic.iter().any(|p| path.ends_with(p)) {
         return;
@@ -235,6 +241,10 @@ impl TidyDocs {
             return;
         }
 
+        if is_ported_from_rustc(path, &["crates/hir-ty/src/next_solver"]) {
+            return;
+        }
+
         let first_line = match text.lines().next() {
             Some(it) => it,
             None => return,
@@ -255,7 +265,7 @@ impl TidyDocs {
         }
 
         fn is_exclude_file(d: &Path) -> bool {
-            let file_names = ["tests.rs", "famous_defs_fixture.rs"];
+            let file_names = ["tests.rs", "famous_defs_fixture.rs", "frontmatter.rs"];
 
             d.file_name()
                 .unwrap_or_default()
@@ -288,6 +298,11 @@ fn is_exclude_dir(p: &Path, dirs_to_exclude: &[&str]) -> bool {
         .skip(1)
         .filter_map(|it| it.as_os_str().to_str())
         .any(|it| dirs_to_exclude.contains(&it))
+}
+
+fn is_ported_from_rustc(p: &Path, dirs_to_exclude: &[&str]) -> bool {
+    let p = p.strip_prefix(project_root()).unwrap();
+    dirs_to_exclude.iter().any(|exclude| p.starts_with(exclude))
 }
 
 #[derive(Default)]

@@ -146,28 +146,7 @@ impl<T: PointeeSized> *const T {
         self as _
     }
 
-    /// Gets the "address" portion of the pointer.
-    ///
-    /// This is similar to `self as usize`, except that the [provenance][crate::ptr#provenance] of
-    /// the pointer is discarded and not [exposed][crate::ptr#exposed-provenance]. This means that
-    /// casting the returned address back to a pointer yields a [pointer without
-    /// provenance][without_provenance], which is undefined behavior to dereference. To properly
-    /// restore the lost information and obtain a dereferenceable pointer, use
-    /// [`with_addr`][pointer::with_addr] or [`map_addr`][pointer::map_addr].
-    ///
-    /// If using those APIs is not possible because there is no way to preserve a pointer with the
-    /// required provenance, then Strict Provenance might not be for you. Use pointer-integer casts
-    /// or [`expose_provenance`][pointer::expose_provenance] and [`with_exposed_provenance`][with_exposed_provenance]
-    /// instead. However, note that this makes your code less portable and less amenable to tools
-    /// that check for compliance with the Rust memory model.
-    ///
-    /// On most platforms this will produce a value with the same bytes as the original
-    /// pointer, because all the bytes are dedicated to describing the address.
-    /// Platforms which need to store additional information in the pointer may
-    /// perform a change of representation to produce a value containing only the address
-    /// portion of the pointer. What that means is up to the platform to define.
-    ///
-    /// This is a [Strict Provenance][crate::ptr#strict-provenance] API.
+    #[doc = include_str!("./docs/addr.md")]
     #[must_use]
     #[inline(always)]
     #[stable(feature = "strict_provenance", since = "1.84.0")]
@@ -254,23 +233,16 @@ impl<T: PointeeSized> *const T {
         (self.cast(), metadata(self))
     }
 
-    /// Returns `None` if the pointer is null, or else returns a shared reference to
-    /// the value wrapped in `Some`. If the value may be uninitialized, [`as_uninit_ref`]
-    /// must be used instead.
+    #[doc = include_str!("./docs/as_ref.md")]
     ///
-    /// [`as_uninit_ref`]: #method.as_uninit_ref
+    /// ```
+    /// let ptr: *const u8 = &10u8 as *const u8;
     ///
-    /// # Safety
-    ///
-    /// When calling this method, you have to ensure that *either* the pointer is null *or*
-    /// the pointer is [convertible to a reference](crate::ptr#pointer-to-reference-conversion).
-    ///
-    /// # Panics during const evaluation
-    ///
-    /// This method will panic during const evaluation if the pointer cannot be
-    /// determined to be null or not. See [`is_null`] for more information.
-    ///
-    /// [`is_null`]: #method.is_null
+    /// unsafe {
+    ///     let val_back = &*ptr;
+    ///     assert_eq!(val_back, &10);
+    /// }
+    /// ```
     ///
     /// # Examples
     ///
@@ -284,20 +256,9 @@ impl<T: PointeeSized> *const T {
     /// }
     /// ```
     ///
-    /// # Null-unchecked version
     ///
-    /// If you are sure the pointer can never be null and are looking for some kind of
-    /// `as_ref_unchecked` that returns the `&T` instead of `Option<&T>`, know that you can
-    /// dereference the pointer directly.
-    ///
-    /// ```
-    /// let ptr: *const u8 = &10u8 as *const u8;
-    ///
-    /// unsafe {
-    ///     let val_back = &*ptr;
-    ///     assert_eq!(val_back, &10);
-    /// }
-    /// ```
+    /// [`is_null`]: #method.is_null
+    /// [`as_uninit_ref`]: #method.as_uninit_ref
     #[stable(feature = "ptr_as_ref", since = "1.9.0")]
     #[rustc_const_stable(feature = "const_ptr_is_null", since = "1.84.0")]
     #[inline]
@@ -338,23 +299,10 @@ impl<T: PointeeSized> *const T {
         unsafe { &*self }
     }
 
-    /// Returns `None` if the pointer is null, or else returns a shared reference to
-    /// the value wrapped in `Some`. In contrast to [`as_ref`], this does not require
-    /// that the value has to be initialized.
-    ///
-    /// [`as_ref`]: #method.as_ref
-    ///
-    /// # Safety
-    ///
-    /// When calling this method, you have to ensure that *either* the pointer is null *or*
-    /// the pointer is [convertible to a reference](crate::ptr#pointer-to-reference-conversion).
-    ///
-    /// # Panics during const evaluation
-    ///
-    /// This method will panic during const evaluation if the pointer cannot be
-    /// determined to be null or not. See [`is_null`] for more information.
+    #[doc = include_str!("./docs/as_uninit_ref.md")]
     ///
     /// [`is_null`]: #method.is_null
+    /// [`as_ref`]: #method.as_ref
     ///
     /// # Examples
     ///
@@ -1514,7 +1462,8 @@ impl<T> *const [T] {
     /// Gets a raw pointer to the underlying array.
     ///
     /// If `N` is not exactly equal to the length of `self`, then this method returns `None`.
-    #[unstable(feature = "slice_as_array", issue = "133508")]
+    #[stable(feature = "core_slice_as_array", since = "1.93.0")]
+    #[rustc_const_stable(feature = "core_slice_as_array", since = "1.93.0")]
     #[inline]
     #[must_use]
     pub const fn as_array<const N: usize>(self) -> Option<*const [T; N]> {
@@ -1618,6 +1567,10 @@ impl<T, const N: usize> *const [T; N] {
 
 /// Pointer equality is by address, as produced by the [`<*const T>::addr`](pointer::addr) method.
 #[stable(feature = "rust1", since = "1.0.0")]
+#[diagnostic::on_const(
+    message = "pointers cannot be reliably compared during const eval",
+    note = "see issue #53020 <https://github.com/rust-lang/rust/issues/53020> for more information"
+)]
 impl<T: PointeeSized> PartialEq for *const T {
     #[inline]
     #[allow(ambiguous_wide_pointer_comparisons)]
@@ -1628,10 +1581,18 @@ impl<T: PointeeSized> PartialEq for *const T {
 
 /// Pointer equality is an equivalence relation.
 #[stable(feature = "rust1", since = "1.0.0")]
+#[diagnostic::on_const(
+    message = "pointers cannot be reliably compared during const eval",
+    note = "see issue #53020 <https://github.com/rust-lang/rust/issues/53020> for more information"
+)]
 impl<T: PointeeSized> Eq for *const T {}
 
 /// Pointer comparison is by address, as produced by the `[`<*const T>::addr`](pointer::addr)` method.
 #[stable(feature = "rust1", since = "1.0.0")]
+#[diagnostic::on_const(
+    message = "pointers cannot be reliably compared during const eval",
+    note = "see issue #53020 <https://github.com/rust-lang/rust/issues/53020> for more information"
+)]
 impl<T: PointeeSized> Ord for *const T {
     #[inline]
     #[allow(ambiguous_wide_pointer_comparisons)]
@@ -1648,6 +1609,10 @@ impl<T: PointeeSized> Ord for *const T {
 
 /// Pointer comparison is by address, as produced by the `[`<*const T>::addr`](pointer::addr)` method.
 #[stable(feature = "rust1", since = "1.0.0")]
+#[diagnostic::on_const(
+    message = "pointers cannot be reliably compared during const eval",
+    note = "see issue #53020 <https://github.com/rust-lang/rust/issues/53020> for more information"
+)]
 impl<T: PointeeSized> PartialOrd for *const T {
     #[inline]
     #[allow(ambiguous_wide_pointer_comparisons)]

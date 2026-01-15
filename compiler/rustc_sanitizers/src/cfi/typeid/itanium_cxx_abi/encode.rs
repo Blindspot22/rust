@@ -11,6 +11,8 @@ use rustc_abi::{ExternAbi, Integer};
 use rustc_data_structures::base_n::{ALPHANUMERIC_ONLY, CASE_INSENSITIVE, ToBaseN};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir as hir;
+use rustc_hir::attrs::AttributeKind;
+use rustc_hir::find_attr;
 use rustc_middle::bug;
 use rustc_middle::ty::layout::IntegerExt;
 use rustc_middle::ty::{
@@ -18,7 +20,6 @@ use rustc_middle::ty::{
     IntTy, List, Region, RegionKind, TermKind, Ty, TyCtxt, TypeFoldable, UintTy,
 };
 use rustc_span::def_id::DefId;
-use rustc_span::sym;
 use tracing::instrument;
 
 use crate::cfi::typeid::TypeIdOptions;
@@ -287,7 +288,7 @@ fn encode_region<'tcx>(region: Region<'tcx>, dict: &mut FxHashMap<DictKey<'tcx>,
     // u6region[I[<region-disambiguator>][<region-index>]E] as vendor extended type
     let mut s = String::new();
     match region.kind() {
-        RegionKind::ReBound(debruijn, r) => {
+        RegionKind::ReBound(ty::BoundVarIndexKind::Bound(debruijn), r) => {
             s.push_str("u6regionI");
             // Debruijn index, which identifies the binder, as region disambiguator
             let num = debruijn.index() as u64;
@@ -303,7 +304,8 @@ fn encode_region<'tcx>(region: Region<'tcx>, dict: &mut FxHashMap<DictKey<'tcx>,
             s.push_str("u6region");
             compress(dict, DictKey::Region(region), &mut s);
         }
-        RegionKind::ReEarlyParam(..)
+        RegionKind::ReBound(ty::BoundVarIndexKind::Canonical, _)
+        | RegionKind::ReEarlyParam(..)
         | RegionKind::ReLateParam(..)
         | RegionKind::ReStatic
         | RegionKind::ReError(_)
@@ -445,36 +447,20 @@ pub(crate) fn encode_ty<'tcx>(
         ty::Adt(adt_def, args) => {
             let mut s = String::new();
             let def_id = adt_def.did();
-            if let Some(cfi_encoding) = tcx.get_attr(def_id, sym::cfi_encoding) {
+            if let Some(encoding) = find_attr!(tcx.get_all_attrs(def_id), AttributeKind::CfiEncoding { encoding } => encoding)
+            {
+                let encoding = encoding.as_str().trim();
                 // Use user-defined CFI encoding for type
-                if let Some(value_str) = cfi_encoding.value_str() {
-                    let value_str = value_str.as_str().trim();
-                    if !value_str.is_empty() {
-                        s.push_str(value_str);
-                        // Don't compress user-defined builtin types (see
-                        // https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangling-builtin and
-                        // https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangling-compression).
-                        let builtin_types = [
-                            "v", "w", "b", "c", "a", "h", "s", "t", "i", "j", "l", "m", "x", "y",
-                            "n", "o", "f", "d", "e", "g", "z", "Dh",
-                        ];
-                        if !builtin_types.contains(&value_str) {
-                            compress(dict, DictKey::Ty(ty, TyQ::None), &mut s);
-                        }
-                    } else {
-                        #[allow(
-                            rustc::diagnostic_outside_of_impl,
-                            rustc::untranslatable_diagnostic
-                        )]
-                        tcx.dcx()
-                            .struct_span_err(
-                                cfi_encoding.span(),
-                                format!("invalid `cfi_encoding` for `{:?}`", ty.kind()),
-                            )
-                            .emit();
-                    }
-                } else {
-                    bug!("encode_ty: invalid `cfi_encoding` for `{:?}`", ty.kind());
+                s.push_str(&encoding);
+                // Don't compress user-defined builtin types (see
+                // https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangling-builtin and
+                // https://itanium-cxx-abi.github.io/cxx-abi/abi.html#mangling-compression).
+                let builtin_types = [
+                    "v", "w", "b", "c", "a", "h", "s", "t", "i", "j", "l", "m", "x", "y", "n", "o",
+                    "f", "d", "e", "g", "z", "Dh",
+                ];
+                if !builtin_types.contains(&encoding) {
+                    compress(dict, DictKey::Ty(ty, TyQ::None), &mut s);
                 }
             } else if options.contains(EncodeTyOptions::GENERALIZE_REPR_C) && adt_def.repr().c() {
                 // For cross-language LLVM CFI support, the encoding must be compatible at the FFI
@@ -507,26 +493,11 @@ pub(crate) fn encode_ty<'tcx>(
         ty::Foreign(def_id) => {
             // <length><name>, where <name> is <unscoped-name>
             let mut s = String::new();
-            if let Some(cfi_encoding) = tcx.get_attr(*def_id, sym::cfi_encoding) {
+
+            if let Some(encoding) = find_attr!(tcx.get_all_attrs(*def_id), AttributeKind::CfiEncoding {encoding} => encoding)
+            {
                 // Use user-defined CFI encoding for type
-                if let Some(value_str) = cfi_encoding.value_str() {
-                    if !value_str.to_string().trim().is_empty() {
-                        s.push_str(value_str.to_string().trim());
-                    } else {
-                        #[allow(
-                            rustc::diagnostic_outside_of_impl,
-                            rustc::untranslatable_diagnostic
-                        )]
-                        tcx.dcx()
-                            .struct_span_err(
-                                cfi_encoding.span(),
-                                format!("invalid `cfi_encoding` for `{:?}`", ty.kind()),
-                            )
-                            .emit();
-                    }
-                } else {
-                    bug!("encode_ty: invalid `cfi_encoding` for `{:?}`", ty.kind());
-                }
+                s.push_str(encoding.as_str().trim());
             } else {
                 let name = tcx.item_name(*def_id).to_string();
                 let _ = write!(s, "{}{}", name.len(), name);
@@ -626,12 +597,10 @@ pub(crate) fn encode_ty<'tcx>(
         }
 
         // Trait types
-        ty::Dynamic(predicates, region, kind) => {
+        ty::Dynamic(predicates, region) => {
             // u3dynI<element-type1[..element-typeN]>E, where <element-type> is <predicate>, as
             // vendor extended type.
-            let mut s = String::from(match kind {
-                ty::Dyn => "u3dynI",
-            });
+            let mut s = String::from("u3dynI");
             s.push_str(&encode_predicates(tcx, predicates, dict, options));
             s.push_str(&encode_region(*region, dict));
             s.push('E');
@@ -713,7 +682,8 @@ fn encode_ty_name(tcx: TyCtxt<'_>, def_id: DefId) -> String {
             hir::definitions::DefPathData::ValueNs(..) => "v",
             hir::definitions::DefPathData::Closure => "C",
             hir::definitions::DefPathData::Ctor => "c",
-            hir::definitions::DefPathData::AnonConst => "k",
+            hir::definitions::DefPathData::AnonConst => "K",
+            hir::definitions::DefPathData::LateAnonConst => "k",
             hir::definitions::DefPathData::OpaqueTy => "i",
             hir::definitions::DefPathData::SyntheticCoroutineBody => "s",
             hir::definitions::DefPathData::NestedStatic => "n",
@@ -723,6 +693,7 @@ fn encode_ty_name(tcx: TyCtxt<'_>, def_id: DefId) -> String {
             | hir::definitions::DefPathData::MacroNs(..)
             | hir::definitions::DefPathData::OpaqueLifetime(..)
             | hir::definitions::DefPathData::LifetimeNs(..)
+            | hir::definitions::DefPathData::DesugaredAnonymousLifetime
             | hir::definitions::DefPathData::AnonAssocTy(..) => {
                 bug!("encode_ty_name: unexpected `{:?}`", disambiguated_data.data);
             }

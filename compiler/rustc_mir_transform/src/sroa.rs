@@ -136,9 +136,7 @@ fn escaping_locals<'tcx>(
         fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
             match statement.kind {
                 // Storage statements are expanded in run_pass.
-                StatementKind::StorageLive(..)
-                | StatementKind::StorageDead(..)
-                | StatementKind::Deinit(..) => return,
+                StatementKind::StorageLive(..) | StatementKind::StorageDead(..) => return,
                 _ => self.super_statement(statement, location),
             }
         }
@@ -318,7 +316,7 @@ impl<'tcx, 'll> MutVisitor<'tcx> for ReplacementVisitor<'tcx, 'll> {
                     for (_, _, fl) in final_locals {
                         self.patch.add_statement(location, StatementKind::StorageLive(fl));
                     }
-                    statement.make_nop();
+                    statement.make_nop(true);
                 }
                 return;
             }
@@ -327,19 +325,9 @@ impl<'tcx, 'll> MutVisitor<'tcx> for ReplacementVisitor<'tcx, 'll> {
                     for (_, _, fl) in final_locals {
                         self.patch.add_statement(location, StatementKind::StorageDead(fl));
                     }
-                    statement.make_nop();
+                    statement.make_nop(true);
                 }
                 return;
-            }
-            StatementKind::Deinit(box place) => {
-                if let Some(final_locals) = self.replacements.place_fragments(place) {
-                    for (_, _, fl) in final_locals {
-                        self.patch
-                            .add_statement(location, StatementKind::Deinit(Box::new(fl.into())));
-                    }
-                    statement.make_nop();
-                    return;
-                }
             }
 
             // We have `a = Struct { 0: x, 1: y, .. }`.
@@ -367,7 +355,7 @@ impl<'tcx, 'll> MutVisitor<'tcx> for ReplacementVisitor<'tcx, 'll> {
                             );
                         }
                     }
-                    statement.make_nop();
+                    statement.make_nop(true);
                     return;
                 }
             }
@@ -404,11 +392,14 @@ impl<'tcx, 'll> MutVisitor<'tcx> for ReplacementVisitor<'tcx, 'll> {
             // a_1 = move? place.1
             // ...
             // ```
-            StatementKind::Assign(box (lhs, Rvalue::Use(ref op))) => {
-                let (rplace, copy) = match *op {
-                    Operand::Copy(rplace) => (rplace, true),
-                    Operand::Move(rplace) => (rplace, false),
-                    Operand::Constant(_) => bug!(),
+            StatementKind::Assign(box (
+                lhs,
+                Rvalue::Use(ref op @ (Operand::Copy(rplace) | Operand::Move(rplace))),
+            )) => {
+                let copy = match *op {
+                    Operand::Copy(_) => true,
+                    Operand::Move(_) => false,
+                    Operand::Constant(_) | Operand::RuntimeChecks(_) => bug!(),
                 };
                 if let Some(final_locals) = self.replacements.place_fragments(lhs) {
                     for (field, ty, new_local) in final_locals {
@@ -429,7 +420,7 @@ impl<'tcx, 'll> MutVisitor<'tcx> for ReplacementVisitor<'tcx, 'll> {
                             StatementKind::Assign(Box::new((new_local.into(), rvalue))),
                         );
                     }
-                    statement.make_nop();
+                    statement.make_nop(true);
                     return;
                 }
             }

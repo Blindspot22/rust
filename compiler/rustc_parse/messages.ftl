@@ -58,7 +58,7 @@ parse_async_use_order_incorrect = the order of `use` and `async` is incorrect
 parse_at_dot_dot_in_struct_pattern = `@ ..` is not supported in struct patterns
     .suggestion = bind to each field separately or, if you don't need them, just remove `{$ident} @`
 
-parse_at_in_struct_pattern = Unexpected `@` in struct pattern
+parse_at_in_struct_pattern = unexpected `@` in struct pattern
     .note = struct patterns use `field: pattern` syntax to bind to fields
     .help = consider replacing `new_name @ field_name` with `field_name: new_name` if that is what you intended
 
@@ -68,19 +68,19 @@ parse_attr_after_generic = trailing attribute after generic parameter
 parse_attr_without_generics = attribute without generic parameters
     .label = attributes are only permitted when preceding parameters
 
+parse_attribute_on_empty_type = attributes cannot be applied here
+    .label = attributes are not allowed here
+
+parse_attribute_on_generic_arg = attributes cannot be applied to generic arguments
+    .label = attributes are not allowed here
+    .suggestion = remove attribute from here
+
 parse_attribute_on_param_type = attributes cannot be applied to a function parameter's type
     .label = attributes are not allowed here
 
 parse_attribute_on_type = attributes cannot be applied to types
     .label = attributes are not allowed here
     .suggestion = remove attribute from here
-
-parse_attribute_on_generic_arg = attributes cannot be applied to generic arguments
-    .label = attributes are not allowed here
-    .suggestion = remove attribute from here
-
-parse_attribute_on_empty_type = attributes cannot be applied here
-    .label = attributes are not allowed here
 
 parse_bad_assoc_type_bounds = bounds on associated types do not belong here
     .label = belongs in `where` clause
@@ -122,7 +122,6 @@ parse_cannot_be_raw_lifetime = `{$ident}` cannot be a raw lifetime
 parse_catch_after_try = keyword `catch` cannot follow a `try` block
     .help = try using `match` on the result of the `try` block instead
 
-parse_cfg_attr_bad_delim = wrong `cfg_attr` delimiters
 parse_colon_as_semi = statements are terminated with a semicolon
     .suggestion = use a semicolon instead
 
@@ -163,6 +162,8 @@ parse_default_not_followed_by_item = `default` is not followed by an item
     .label = the `default` qualifier
     .note = only `fn`, `const`, `type`, or `impl` items may be prefixed by `default`
 
+parse_delegation_non_trait_impl_reuse = only trait impls can be reused
+
 parse_do_catch_syntax_removed = found removed `do catch` syntax
     .note = following RFC #2388, the new non-placeholder syntax is `try`
     .suggestion = replace with the new syntax
@@ -189,6 +190,10 @@ parse_dotdotdot = unexpected token: `...`
 parse_dotdotdot_rest_pattern = unexpected `...`
     .label = not a valid pattern
     .suggestion = for a rest pattern, use `..` instead of `...`
+    .note = only `extern "C"` and `extern "C-unwind"` functions may have a C variable argument list
+
+parse_dotdotdot_rest_type = unexpected `...`
+    .note = only `extern "C"` and `extern "C-unwind"` functions may have a C variable argument list
 
 parse_double_colon_in_bound = expected `:` followed by trait or lifetime
     .suggestion = use single colon
@@ -344,6 +349,7 @@ parse_frontmatter_invalid_opening_preceding_whitespace = invalid preceding white
 parse_frontmatter_length_mismatch = frontmatter close does not match the opening
     .label_opening = the opening here has {$len_opening} dashes...
     .label_close = ...while the close has {$len_close} dashes
+parse_frontmatter_too_many_dashes = too many `-` symbols: frontmatter openings may be delimited by up to 255 `-` symbols, but found {$len_opening}
 parse_frontmatter_unclosed = unclosed frontmatter
     .note = frontmatter opening here was not closed
 
@@ -479,9 +485,6 @@ parse_invalid_identifier_with_leading_number = identifiers cannot start with a n
 
 parse_invalid_literal_suffix_on_tuple_index = suffixes on a tuple index are invalid
     .label = invalid suffix `{$suffix}`
-    .tuple_exception_line_1 = `{$suffix}` is *temporarily* accepted on tuple index fields as it was incorrectly accepted on stable for a few releases
-    .tuple_exception_line_2 = on proc macros, you'll want to use `syn::Index::from` or `proc_macro::Literal::*_unsuffixed` for code that will desugar to tuple field access
-    .tuple_exception_line_3 = see issue #60210 <https://github.com/rust-lang/rust/issues/60210> for more information
 
 parse_invalid_logical_operator = `{$incorrect}` is not a logical operator
     .note = unlike in e.g., Python and PHP, `&&` and `||` are used for logical operators
@@ -512,7 +515,7 @@ parse_keyword_lifetime =
     lifetimes cannot use keyword names
 
 parse_kw_bad_case = keyword `{$kw}` is written in the wrong case
-    .suggestion = write it in the correct case
+    .suggestion = write it in {$case}
 
 parse_label_inner_attr_does_not_annotate_this = the inner attribute doesn't annotate this {$item}
 parse_label_unexpected_token = unexpected token
@@ -572,10 +575,6 @@ parse_macro_rules_missing_bang = expected `!` after `macro_rules`
 parse_macro_rules_visibility = can't qualify macro_rules invocation with `{$vis}`
     .suggestion = try exporting the macro
 
-parse_malformed_cfg_attr = malformed `cfg_attr` attribute input
-    .suggestion = missing condition and attribute
-    .note = for more information, visit <https://doc.rust-lang.org/reference/conditional-compilation.html#the-cfg_attr-attribute>
-
 parse_malformed_loop_label = malformed loop label
     .suggestion = use the correct loop label format
 
@@ -608,8 +607,6 @@ parse_maybe_recover_from_bad_type_plus =
 parse_maybe_report_ambiguous_plus =
     ambiguous `+` in a type
     .suggestion = use parentheses to disambiguate
-
-parse_meta_bad_delim_suggestion = the delimiters should be `(` and `)`
 
 parse_mismatched_closing_delimiter = mismatched closing delimiter: `{$delimiter}`
     .label_unmatched = mismatched closing delimiter
@@ -738,8 +735,6 @@ parse_or_in_let_chain = `||` operators are not supported in let chain conditions
 
 parse_or_pattern_not_allowed_in_fn_parameters = function parameters require top-level or-patterns in parentheses
 parse_or_pattern_not_allowed_in_let_binding = `let` bindings require top-level or-patterns in parentheses
-parse_out_of_range_hex_escape = out of range hex escape
-    .label = must be a character in the range [\x00-\x7f]
 
 parse_outer_attr_explanation = outer attributes, like `#[test]`, annotate the item following them
 
@@ -867,10 +862,8 @@ parse_too_many_hashes = too many `#` symbols: raw strings may be delimited by up
 parse_too_short_hex_escape = numeric character escape is too short
 
 parse_trailing_vert_not_allowed = a trailing `{$token}` is not allowed in an or-pattern
-parse_trailing_vert_not_allowed_suggestion = remove the `{$token}`
 
 parse_trait_alias_cannot_be_auto = trait aliases cannot be `auto`
-parse_trait_alias_cannot_be_const = trait aliases cannot be `const`
 parse_trait_alias_cannot_be_unsafe = trait aliases cannot be `unsafe`
 
 parse_trait_impl_modifier_in_inherent_impl = inherent impls cannot be {$modifier_name}
@@ -974,6 +967,7 @@ parse_unknown_start_of_token = unknown start of token: {$escaped}
     .sugg_quotes = Unicode characters '“' (Left Double Quotation Mark) and '”' (Right Double Quotation Mark) look like '{$ascii_str}' ({$ascii_name}), but are not
     .sugg_other = Unicode character '{$ch}' ({$u_name}) looks like '{$ascii_str}' ({$ascii_name}), but it is not
     .help_null = source files must contain UTF-8 encoded text, unexpected null bytes might occur when a different encoding is used
+    .help_invisible_char = invisible characters like '{$escaped}' are not usually visible in text editors
     .note_repeats = character appears {$repeats ->
         [one] once more
         *[other] {$repeats} more times
@@ -1011,6 +1005,9 @@ parse_use_if_else = use an `if-else` expression instead
 
 parse_use_let_not_auto = write `let` instead of `auto` to introduce a new variable
 parse_use_let_not_var = write `let` instead of `var` to introduce a new variable
+
+parse_varargs_without_pattern = missing pattern for `...` argument
+    .suggestion = name the argument, or use `_` to continue ignoring it
 
 parse_visibility_not_followed_by_item = visibility `{$vis}` is not followed by an item
     .label = the visibility

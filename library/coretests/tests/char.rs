@@ -1,4 +1,3 @@
-use std::char::MAX_LEN_UTF8;
 use std::str::FromStr;
 use std::{char, str};
 
@@ -220,6 +219,7 @@ fn test_escape_default() {
     }
     assert_eq!(string('\n'), "\\n");
     assert_eq!(string('\r'), "\\r");
+    assert_eq!(string('\t'), "\\t");
     assert_eq!(string('\''), "\\'");
     assert_eq!(string('"'), "\\\"");
     assert_eq!(string(' '), " ");
@@ -258,7 +258,7 @@ fn test_escape_unicode() {
 #[test]
 fn test_encode_utf8() {
     fn check(input: char, expect: &[u8]) {
-        let mut buf = [0; MAX_LEN_UTF8];
+        let mut buf = [0; char::MAX_LEN_UTF8];
         let ptr = buf.as_ptr();
         let s = input.encode_utf8(&mut buf);
         assert_eq!(s.as_ptr() as usize, ptr as usize);
@@ -416,4 +416,46 @@ fn eu_iterator_specializations() {
     check('\u{1234}');
     check('\u{12340}');
     check('\u{10FFFF}');
+}
+
+#[test]
+#[should_panic]
+fn test_from_digit_radix_too_high() {
+    let _ = char::from_digit(0, 37);
+}
+
+#[test]
+fn test_from_digit_invalid_radix() {
+    assert!(char::from_digit(10, 9).is_none());
+}
+
+#[test]
+#[should_panic]
+fn test_to_digit_radix_too_low() {
+    let _ = 'a'.to_digit(1);
+}
+
+#[test]
+#[should_panic]
+fn test_to_digit_radix_too_high() {
+    let _ = 'a'.to_digit(37);
+}
+
+#[test]
+fn test_as_ascii_invalid() {
+    assert!('❤'.as_ascii().is_none());
+}
+
+#[test]
+#[should_panic]
+fn test_encode_utf8_raw_buffer_too_small() {
+    let mut buf = [0u8; 1];
+    let _ = char::encode_utf8_raw('ß'.into(), &mut buf);
+}
+
+#[test]
+#[should_panic]
+fn test_encode_utf16_raw_buffer_too_small() {
+    let mut buf = [0u16; 1];
+    let _ = char::encode_utf16_raw('𐐷'.into(), &mut buf);
 }

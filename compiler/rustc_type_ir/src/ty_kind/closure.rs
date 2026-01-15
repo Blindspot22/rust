@@ -1,7 +1,9 @@
 use std::ops::ControlFlow;
 
 use derive_where::derive_where;
-use rustc_type_ir_macros::{Lift_Generic, TypeFoldable_Generic, TypeVisitable_Generic};
+use rustc_type_ir_macros::{
+    GenericTypeVisitable, Lift_Generic, TypeFoldable_Generic, TypeVisitable_Generic,
+};
 
 use crate::data_structures::DelayedMap;
 use crate::fold::{TypeFoldable, TypeFolder, TypeSuperFoldable, shift_region};
@@ -102,7 +104,7 @@ use crate::{self as ty, Interner};
 /// * `GR`: The "return type", which is the type of value returned upon
 ///   completion of the coroutine.
 #[derive_where(Clone, Copy, PartialEq, Hash, Debug; I: Interner)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic, Lift_Generic)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic, Lift_Generic)]
 pub struct ClosureArgs<I: Interner> {
     /// Lifetime and type parameters from the enclosing function,
     /// concatenated with a tuple containing the types of the upvars.
@@ -206,7 +208,7 @@ impl<I: Interner> ClosureArgs<I> {
 }
 
 #[derive_where(Clone, Copy, PartialEq, Hash, Debug; I: Interner)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic, Lift_Generic)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic, Lift_Generic)]
 pub struct CoroutineClosureArgs<I: Interner> {
     pub args: I::GenericArgs,
 }
@@ -344,7 +346,8 @@ impl<I: Interner> TypeVisitor<I> for HasRegionsBoundAt {
     }
 
     fn visit_region(&mut self, r: I::Region) -> Self::Result {
-        if matches!(r.kind(), ty::ReBound(binder, _) if self.binder == binder) {
+        if matches!(r.kind(), ty::ReBound(ty::BoundVarIndexKind::Bound(binder), _) if self.binder == binder)
+        {
             ControlFlow::Break(())
         } else {
             ControlFlow::Continue(())
@@ -353,7 +356,7 @@ impl<I: Interner> TypeVisitor<I> for HasRegionsBoundAt {
 }
 
 #[derive_where(Clone, Copy, PartialEq, Hash, Debug; I: Interner)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic)]
 pub struct CoroutineClosureSignature<I: Interner> {
     pub tupled_inputs_ty: I::Ty,
     pub resume_ty: I::Ty,
@@ -391,7 +394,7 @@ impl<I: Interner> CoroutineClosureSignature<I> {
         cx: I,
         parent_args: I::GenericArgsSlice,
         coroutine_kind_ty: I::Ty,
-        coroutine_def_id: I::DefId,
+        coroutine_def_id: I::CoroutineId,
         tupled_upvars_ty: I::Ty,
     ) -> I::Ty {
         let coroutine_args = ty::CoroutineArgs::new(
@@ -418,7 +421,7 @@ impl<I: Interner> CoroutineClosureSignature<I> {
         self,
         cx: I,
         parent_args: I::GenericArgsSlice,
-        coroutine_def_id: I::DefId,
+        coroutine_def_id: I::CoroutineId,
         goal_kind: ty::ClosureKind,
         env_region: I::Region,
         closure_tupled_upvars_ty: I::Ty,
@@ -531,7 +534,7 @@ impl<I: Interner> TypeFolder<I> for FoldEscapingRegions<I> {
     }
 
     fn fold_region(&mut self, r: <I as Interner>::Region) -> <I as Interner>::Region {
-        if let ty::ReBound(debruijn, _) = r.kind() {
+        if let ty::ReBound(ty::BoundVarIndexKind::Bound(debruijn), _) = r.kind() {
             assert!(
                 debruijn <= self.debruijn,
                 "cannot instantiate binder with escaping bound vars"
@@ -548,7 +551,7 @@ impl<I: Interner> TypeFolder<I> for FoldEscapingRegions<I> {
 }
 
 #[derive_where(Clone, Copy, PartialEq, Hash, Debug; I: Interner)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic)]
 pub struct GenSig<I: Interner> {
     pub resume_ty: I::Ty,
     pub yield_ty: I::Ty,
@@ -558,7 +561,7 @@ pub struct GenSig<I: Interner> {
 impl<I: Interner> Eq for GenSig<I> {}
 /// Similar to `ClosureArgs`; see the above documentation for more.
 #[derive_where(Clone, Copy, PartialEq, Hash, Debug; I: Interner)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic, Lift_Generic)]
+#[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic, Lift_Generic)]
 pub struct CoroutineArgs<I: Interner> {
     pub args: I::GenericArgs,
 }

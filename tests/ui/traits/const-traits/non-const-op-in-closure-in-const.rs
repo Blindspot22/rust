@@ -1,9 +1,8 @@
-#![feature(const_trait_impl, const_from)]
+#![feature(const_trait_impl, const_convert)]
 
 //@ check-pass
 
-#[const_trait]
-trait Convert<T> {
+const trait Convert<T> {
     fn to(self) -> T;
 }
 

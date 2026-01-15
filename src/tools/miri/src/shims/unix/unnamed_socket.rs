@@ -7,18 +7,20 @@ use std::collections::VecDeque;
 use std::io;
 use std::io::ErrorKind;
 
+use rustc_target::spec::Os;
+
 use crate::concurrency::VClock;
 use crate::shims::files::{
-    EvalContextExt as _, FileDescription, FileDescriptionRef, WeakFileDescriptionRef,
+    EvalContextExt as _, FdId, FileDescription, FileDescriptionRef, WeakFileDescriptionRef,
 };
 use crate::shims::unix::UnixFileDescription;
-use crate::shims::unix::linux_like::epoll::{EpollReadyEvents, EvalContextExt as _};
+use crate::shims::unix::linux_like::epoll::{EpollEvents, EvalContextExt as _};
 use crate::*;
 
 /// The maximum capacity of the socketpair buffer in bytes.
 /// This number is arbitrary as the value can always
 /// be configured in the real system.
-const MAX_SOCKETPAIR_BUFFER_CAPACITY: usize = 212992;
+const MAX_SOCKETPAIR_BUFFER_CAPACITY: usize = 0x34000;
 
 #[derive(Debug, PartialEq)]
 enum AnonSocketType {
@@ -82,8 +84,9 @@ impl FileDescription for AnonSocket {
         }
     }
 
-    fn close<'tcx>(
+    fn destroy<'tcx>(
         self,
+        _self_id: FdId,
         _communicate_allowed: bool,
         ecx: &mut MiriInterpCx<'tcx>,
     ) -> InterpResult<'tcx, io::Result<()>> {
@@ -96,7 +99,7 @@ impl FileDescription for AnonSocket {
                 }
             }
             // Notify peer fd that close has happened, since that can unblock reads and writes.
-            ecx.check_and_update_readiness(peer_fd)?;
+            ecx.update_epoll_active_events(peer_fd, /* force_edge */ false)?;
         }
         interp_ok(Ok(()))
     }
@@ -121,6 +124,14 @@ impl FileDescription for AnonSocket {
         finish: DynMachineCallback<'tcx, Result<usize, IoError>>,
     ) -> InterpResult<'tcx> {
         anonsocket_write(self, ptr, len, ecx, finish)
+    }
+
+    fn short_fd_operations(&self) -> bool {
+        // Pipes guarantee that sufficiently small accesses are not broken apart:
+        // <https://pubs.opengroup.org/onlinepubs/9799919799/functions/write.html#tag_17_699_08>.
+        // For now, we don't bother checking for the size, and just entirely disable
+        // short accesses on pipes.
+        matches!(self.fd_type, AnonSocketType::Socketpair)
     }
 
     fn as_unix<'tcx>(&self, _ecx: &MiriInterpCx<'tcx>) -> &dyn UnixFileDescription {
@@ -251,7 +262,7 @@ fn anonsocket_write<'tcx>(
         // Remember this clock so `read` can synchronize with us.
         ecx.release_clock(|clock| {
             writebuf.clock.join(clock);
-        });
+        })?;
         // Do full write / partial write based on the space available.
         let write_size = len.min(available_space);
         let actual_write_size = ecx.write_to_host(&mut writebuf.buf, write_size, ptr)?.unwrap();
@@ -266,9 +277,11 @@ fn anonsocket_write<'tcx>(
         for thread_id in waiting_threads {
             ecx.unblock_thread(thread_id, BlockReason::UnnamedSocket)?;
         }
-        // Notification should be provided for peer fd as it became readable.
-        // The kernel does this even if the fd was already readable before, so we follow suit.
-        ecx.check_and_update_readiness(peer_fd)?;
+        // Notify epoll waiters: we might be no longer writable, peer might now be readable.
+        // The notification to the peer seems to be always sent on Linux, even if the
+        // FD was readable before.
+        ecx.update_epoll_active_events(self_ref, /* force_edge */ false)?;
+        ecx.update_epoll_active_events(peer_fd, /* force_edge */ true)?;
 
         return finish.call(ecx, Ok(write_size));
     }
@@ -337,11 +350,12 @@ fn anonsocket_read<'tcx>(
         // Synchronize with all previous writes to this buffer.
         // FIXME: this over-synchronizes; a more precise approach would be to
         // only sync with the writes whose data we will read.
-        ecx.acquire_clock(&readbuf.clock);
+        ecx.acquire_clock(&readbuf.clock)?;
 
         // Do full read / partial read based on the space available.
         // Conveniently, `read` exists on `VecDeque` and has exactly the desired behavior.
         let read_size = ecx.read_from_host(&mut readbuf.buf, len, ptr)?.unwrap();
+        let readbuf_now_empty = readbuf.buf.is_empty();
 
         // Need to drop before others can access the readbuf again.
         drop(readbuf);
@@ -360,9 +374,14 @@ fn anonsocket_read<'tcx>(
             for thread_id in waiting_threads {
                 ecx.unblock_thread(thread_id, BlockReason::UnnamedSocket)?;
             }
-            // Notify epoll waiters.
-            ecx.check_and_update_readiness(peer_fd)?;
+            // Notify epoll waiters: peer is now writable.
+            // Linux seems to always notify the peer if the read buffer is now empty.
+            // (Linux also does that if this was a "big" read, but to avoid some arbitrary
+            // threshold, we do not match that.)
+            ecx.update_epoll_active_events(peer_fd, /* force_edge */ readbuf_now_empty)?;
         };
+        // Notify epoll waiters: we might be no longer readable.
+        ecx.update_epoll_active_events(self_ref, /* force_edge */ false)?;
 
         return finish.call(ecx, Ok(read_size));
     }
@@ -370,11 +389,11 @@ fn anonsocket_read<'tcx>(
 }
 
 impl UnixFileDescription for AnonSocket {
-    fn get_epoll_ready_events<'tcx>(&self) -> InterpResult<'tcx, EpollReadyEvents> {
+    fn epoll_active_events<'tcx>(&self) -> InterpResult<'tcx, EpollEvents> {
         // We only check the status of EPOLLIN, EPOLLOUT, EPOLLHUP and EPOLLRDHUP flags.
         // If other event flags need to be supported in the future, the check should be added here.
 
-        let mut epoll_ready_events = EpollReadyEvents::new();
+        let mut epoll_ready_events = EpollEvents::new();
 
         // Check if it is readable.
         if let Some(readbuf) = &self.readbuf {
@@ -440,7 +459,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         // Interpret the flag. Every flag we recognize is "subtracted" from `flags`, so
         // if there is anything left at the end, that's an unsupported flag.
-        if this.tcx.sess.target.os == "linux" {
+        if matches!(this.tcx.sess.target.os, Os::Linux | Os::Android) {
             // SOCK_NONBLOCK only exists on Linux.
             let sock_nonblock = this.eval_libc_i32("SOCK_NONBLOCK");
             let sock_cloexec = this.eval_libc_i32("SOCK_CLOEXEC");

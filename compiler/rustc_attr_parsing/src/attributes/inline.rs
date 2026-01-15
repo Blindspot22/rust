@@ -3,6 +3,7 @@
 //                      SingleAttributeParser which is what we have two of here.
 
 use rustc_hir::attrs::{AttributeKind, InlineAttr};
+use rustc_session::lint::builtin::ILL_FORMED_ATTRIBUTE_INPUT;
 
 use super::prelude::*;
 
@@ -33,7 +34,7 @@ impl<S: Stage> SingleAttributeParser<S> for InlineParser {
         "https://doc.rust-lang.org/reference/attributes/codegen.html#the-inline-attribute"
     );
 
-    fn convert(cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser<'_>) -> Option<AttributeKind> {
+    fn convert(cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser) -> Option<AttributeKind> {
         match args {
             ArgParser::NoArgs => Some(AttributeKind::Inline(InlineAttr::Hint, cx.attr_span)),
             ArgParser::List(list) => {
@@ -56,10 +57,7 @@ impl<S: Stage> SingleAttributeParser<S> for InlineParser {
                 }
             }
             ArgParser::NameValue(_) => {
-                let suggestions = <Self as SingleAttributeParser<S>>::TEMPLATE
-                    .suggestions(cx.attr_style, "inline");
-                let span = cx.attr_span;
-                cx.emit_lint(AttributeLintKind::IllFormedAttributeInput { suggestions }, span);
+                cx.warn_ill_formed_attribute_input(ILL_FORMED_ATTRIBUTE_INPUT);
                 return None;
             }
         }
@@ -72,10 +70,14 @@ impl<S: Stage> SingleAttributeParser<S> for RustcForceInlineParser {
     const PATH: &'static [Symbol] = &[sym::rustc_force_inline];
     const ATTRIBUTE_ORDER: AttributeOrder = AttributeOrder::KeepOutermost;
     const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::WarnButFutureError;
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[Allow(Target::Fn)]);
+    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
+        Allow(Target::Fn),
+        Allow(Target::Method(MethodKind::Inherent)),
+    ]);
+
     const TEMPLATE: AttributeTemplate = template!(Word, List: &["reason"], NameValueStr: "reason");
 
-    fn convert(cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser<'_>) -> Option<AttributeKind> {
+    fn convert(cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser) -> Option<AttributeKind> {
         let reason = match args {
             ArgParser::NoArgs => None,
             ArgParser::List(list) => {

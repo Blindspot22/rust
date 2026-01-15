@@ -10,14 +10,37 @@ use rustc_target::callconv::{FnAbi, PassMode};
 
 use crate::errors;
 
-fn uses_vector_registers(mode: &PassMode, repr: &BackendRepr) -> bool {
+/// Are vector registers used?
+enum UsesVectorRegisters {
+    /// e.g. `neon`
+    FixedVector,
+    /// e.g. `sve`
+    ScalableVector,
+    No,
+}
+
+/// Determines whether the combination of `mode` and `repr` will use fixed vector registers,
+/// scalable vector registers or no vector registers.
+fn passes_vectors_by_value(mode: &PassMode, repr: &BackendRepr) -> UsesVectorRegisters {
     match mode {
-        PassMode::Ignore | PassMode::Indirect { .. } => false,
-        PassMode::Cast { pad_i32: _, cast } => {
-            cast.prefix.iter().any(|r| r.is_some_and(|x| x.kind == RegKind::Vector))
-                || cast.rest.unit.kind == RegKind::Vector
+        PassMode::Ignore | PassMode::Indirect { .. } => UsesVectorRegisters::No,
+        PassMode::Cast { pad_i32: _, cast }
+            if cast.prefix.iter().any(|r| r.is_some_and(|x| x.kind == RegKind::Vector))
+                || cast.rest.unit.kind == RegKind::Vector =>
+        {
+            UsesVectorRegisters::FixedVector
         }
-        PassMode::Direct(..) | PassMode::Pair(..) => matches!(repr, BackendRepr::SimdVector { .. }),
+        PassMode::Direct(..) | PassMode::Pair(..)
+            if matches!(repr, BackendRepr::SimdVector { .. }) =>
+        {
+            UsesVectorRegisters::FixedVector
+        }
+        PassMode::Direct(..) | PassMode::Pair(..)
+            if matches!(repr, BackendRepr::ScalableVector { .. }) =>
+        {
+            UsesVectorRegisters::ScalableVector
+        }
+        _ => UsesVectorRegisters::No,
     }
 }
 
@@ -32,37 +55,60 @@ fn do_check_simd_vector_abi<'tcx>(
     is_call: bool,
     loc: impl Fn() -> (Span, HirId),
 ) {
-    let feature_def = tcx.sess.target.features_for_correct_vector_abi();
     let codegen_attrs = tcx.codegen_fn_attrs(def_id);
     let have_feature = |feat: Symbol| {
-        tcx.sess.unstable_target_features.contains(&feat)
-            || codegen_attrs.target_features.iter().any(|x| x.name == feat)
+        let target_feats = tcx.sess.unstable_target_features.contains(&feat);
+        let fn_feats = codegen_attrs.target_features.iter().any(|x| x.name == feat);
+        target_feats || fn_feats
     };
     for arg_abi in abi.args.iter().chain(std::iter::once(&abi.ret)) {
         let size = arg_abi.layout.size;
-        if uses_vector_registers(&arg_abi.mode, &arg_abi.layout.backend_repr) {
-            // Find the first feature that provides at least this vector size.
-            let feature = match feature_def.iter().find(|(bits, _)| size.bits() <= *bits) {
-                Some((_, feature)) => feature,
-                None => {
+        match passes_vectors_by_value(&arg_abi.mode, &arg_abi.layout.backend_repr) {
+            UsesVectorRegisters::FixedVector => {
+                let feature_def = tcx.sess.target.features_for_correct_fixed_length_vector_abi();
+                // Find the first feature that provides at least this vector size.
+                let feature = match feature_def.iter().find(|(bits, _)| size.bits() <= *bits) {
+                    Some((_, feature)) => feature,
+                    None => {
+                        let (span, _hir_id) = loc();
+                        tcx.dcx().emit_err(errors::AbiErrorUnsupportedVectorType {
+                            span,
+                            ty: arg_abi.layout.ty,
+                            is_call,
+                        });
+                        continue;
+                    }
+                };
+                if !feature.is_empty() && !have_feature(Symbol::intern(feature)) {
                     let (span, _hir_id) = loc();
-                    tcx.dcx().emit_err(errors::AbiErrorUnsupportedVectorType {
+                    tcx.dcx().emit_err(errors::AbiErrorDisabledVectorType {
                         span,
+                        required_feature: feature,
                         ty: arg_abi.layout.ty,
                         is_call,
+                        is_scalable: false,
                     });
-                    continue;
                 }
-            };
-            if !have_feature(Symbol::intern(feature)) {
-                // Emit error.
-                let (span, _hir_id) = loc();
-                tcx.dcx().emit_err(errors::AbiErrorDisabledVectorType {
-                    span,
-                    required_feature: feature,
-                    ty: arg_abi.layout.ty,
-                    is_call,
-                });
+            }
+            UsesVectorRegisters::ScalableVector => {
+                let Some(required_feature) =
+                    tcx.sess.target.features_for_correct_scalable_vector_abi()
+                else {
+                    continue;
+                };
+                if !required_feature.is_empty() && !have_feature(Symbol::intern(required_feature)) {
+                    let (span, _) = loc();
+                    tcx.dcx().emit_err(errors::AbiErrorDisabledVectorType {
+                        span,
+                        required_feature,
+                        ty: arg_abi.layout.ty,
+                        is_call,
+                        is_scalable: true,
+                    });
+                }
+            }
+            UsesVectorRegisters::No => {
+                continue;
             }
         }
     }
@@ -78,8 +124,37 @@ fn do_check_simd_vector_abi<'tcx>(
     }
 }
 
-/// Checks that the ABI of a given instance of a function does not contain vector-passed arguments
-/// or return values for which the corresponding target feature is not enabled.
+/// Emit an error when a non-rustic ABI has unsized parameters.
+/// Unsized types do not have a stable layout, so should not be used with stable ABIs.
+/// `is_call` indicates whether this is a call-site check or a definition-site check;
+/// this is only relevant for the wording in the emitted error.
+fn do_check_unsized_params<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
+    is_call: bool,
+    loc: impl Fn() -> (Span, HirId),
+) {
+    // Unsized parameters are allowed with the (unstable) "Rust" (and similar) ABIs.
+    if fn_abi.conv.is_rustic_abi() {
+        return;
+    }
+
+    for arg_abi in fn_abi.args.iter() {
+        if !arg_abi.layout.layout.is_sized() {
+            let (span, _hir_id) = loc();
+            tcx.dcx().emit_err(errors::AbiErrorUnsupportedUnsizedParameter {
+                span,
+                ty: arg_abi.layout.ty,
+                is_call,
+            });
+        }
+    }
+}
+
+/// Checks the ABI of an Instance, emitting an error when:
+///
+/// - a non-rustic ABI uses unsized parameters
+/// - the signature requires target features that are not enabled
 fn check_instance_abi<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) {
     let typing_env = ty::TypingEnv::fully_monomorphized();
     let Ok(abi) = tcx.fn_abi_of_instance(typing_env.as_query_input((instance, ty::List::empty())))
@@ -102,11 +177,14 @@ fn check_instance_abi<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) {
             def_id.as_local().map(|did| tcx.local_def_id_to_hir_id(did)).unwrap_or(CRATE_HIR_ID),
         )
     };
+    do_check_unsized_params(tcx, abi, /*is_call*/ false, loc);
     do_check_simd_vector_abi(tcx, abi, instance.def_id(), /*is_call*/ false, loc);
 }
 
-/// Checks that a call expression does not try to pass a vector-passed argument which requires a
-/// target feature that the caller does not have, as doing so causes UB because of ABI mismatch.
+/// Check the ABI at a call site, emitting an error when:
+///
+/// - a non-rustic ABI uses unsized parameters
+/// - the signature requires target features that are not enabled
 fn check_call_site_abi<'tcx>(
     tcx: TyCtxt<'tcx>,
     callee: Ty<'tcx>,
@@ -140,6 +218,7 @@ fn check_call_site_abi<'tcx>(
         // ABI failed to compute; this will not get through codegen.
         return;
     };
+    do_check_unsized_params(tcx, callee_abi, /*is_call*/ true, loc);
     do_check_simd_vector_abi(tcx, callee_abi, caller.def_id(), /*is_call*/ true, loc);
 }
 

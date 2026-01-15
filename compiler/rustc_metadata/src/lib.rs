@@ -1,7 +1,5 @@
 // tidy-alphabetical-start
 #![allow(internal_features)]
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![doc(rust_logo)]
 #![feature(decl_macro)]
 #![feature(error_iter)]
 #![feature(file_buffered)]
@@ -11,13 +9,15 @@
 #![feature(min_specialization)]
 #![feature(never_type)]
 #![feature(proc_macro_internals)]
-#![feature(rustdoc_internals)]
+#![feature(result_option_map_or_default)]
+#![feature(strip_circumfix)]
 #![feature(trusted_len)]
 // tidy-alphabetical-end
 
 pub use rmeta::provide;
 
 mod dependency_format;
+mod eii;
 mod foreign_modules;
 mod native_libs;
 mod rmeta;

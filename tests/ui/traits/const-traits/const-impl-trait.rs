@@ -1,7 +1,5 @@
+//@ check-pass
 //@ compile-flags: -Znext-solver
-//@ known-bug: #110395
-
-// Broken until `(): const PartialEq`
 
 #![allow(incomplete_features)]
 #![feature(const_trait_impl, const_cmp, const_destruct)]
@@ -18,8 +16,7 @@ const fn wrap(
     x
 }
 
-#[const_trait]
-trait Foo {
+const trait Foo {
     fn huh() -> impl [const] PartialEq + [const] Destruct + Copy;
 }
 
@@ -38,8 +35,7 @@ const _: () = {
     assert!(x == x);
 };
 
-#[const_trait]
-trait T {}
+const trait T {}
 struct S;
 impl const T for S {}
 

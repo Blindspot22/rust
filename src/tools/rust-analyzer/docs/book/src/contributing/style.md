@@ -101,7 +101,7 @@ Including a description and GIF suitable for the changelog means less work for t
 
 ## Clippy
 
-We use Clippy to improve the code, but if some lints annoy you, allow them in the [Cargo.toml](../../Cargo.toml) [workspace.lints.clippy] section.
+We use Clippy to improve the code, but if some lints annoy you, allow them in the [Cargo.toml](https://github.com/rust-lang/rust-analyzer/blob/master/Cargo.toml) [workspace.lints.clippy] section.
 
 # Code
 
@@ -235,22 +235,6 @@ In the "Bad" version, the precondition that `1` and `s.len() - 1` are valid stri
 In the "Good" version, the precondition check and usage are checked in the same block, and then encoded in the types.
 
 **Rationale:** non-local code properties degrade under change.
-
-When checking a boolean precondition, prefer `if !invariant` to `if negated_invariant`:
-
-```rust
-// GOOD
-if !(idx < len) {
-    return None;
-}
-
-// BAD
-if idx >= len {
-    return None;
-}
-```
-
-**Rationale:** it's useful to see the invariant relied upon by the rest of the function clearly spelled out.
 
 ## Control Flow
 

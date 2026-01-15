@@ -11,7 +11,6 @@
 
 use std::cell::RefCell;
 use std::num::NonZero;
-use std::str;
 
 use super::*;
 
@@ -78,10 +77,7 @@ impl Symbol {
 
     // Mimics the behavior of `Symbol::can_be_raw` from `rustc_span`
     fn can_be_raw(string: &str) -> bool {
-        match string {
-            "_" | "super" | "self" | "Self" | "crate" | "$crate" => false,
-            _ => true,
-        }
+        !matches!(string, "_" | "super" | "self" | "Self" | "crate" | "$crate")
     }
 }
 
@@ -103,7 +99,7 @@ impl<S> Encode<S> for Symbol {
     }
 }
 
-impl<S: server::Server> DecodeMut<'_, '_, server::HandleStore<server::MarkedTypes<S>>>
+impl<S: server::Server> Decode<'_, '_, server::HandleStore<server::MarkedTypes<S>>>
     for Marked<S::Symbol, Symbol>
 {
     fn decode(r: &mut Reader<'_>, s: &mut server::HandleStore<server::MarkedTypes<S>>) -> Self {
@@ -119,7 +115,7 @@ impl<S: server::Server> Encode<server::HandleStore<server::MarkedTypes<S>>>
     }
 }
 
-impl<S> DecodeMut<'_, '_, S> for Symbol {
+impl<S> Decode<'_, '_, S> for Symbol {
     fn decode(r: &mut Reader<'_>, s: &mut S) -> Self {
         Symbol::new(<&str>::decode(r, s))
     }

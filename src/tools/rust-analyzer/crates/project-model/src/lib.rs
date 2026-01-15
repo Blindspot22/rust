@@ -1,7 +1,7 @@
 //! In rust-analyzer, we maintain a strict separation between pure abstract
 //! semantic project model and a concrete model of a particular build system.
 //!
-//! Pure model is represented by the [`base_db::CrateGraph`] from another crate.
+//! Pure model is represented by the `base_db::CrateGraph` from another crate.
 //!
 //! In this crate, we are concerned with "real world" project models.
 //!
@@ -13,12 +13,19 @@
 //! * Project discovery (where's the relevant Cargo.toml for the current dir).
 //! * Custom build steps (`build.rs` code generation and compilation of
 //!   procedural macros).
-//! * Lowering of concrete model to a [`base_db::CrateGraph`]
+//! * Lowering of concrete model to a `base_db::CrateGraph`
+
+// It's useful to refer to code that is private in doc comments.
+#![allow(rustdoc::private_intra_doc_links)]
+#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+
+#[cfg(feature = "in-rust-tree")]
+extern crate rustc_driver as _;
 
 pub mod project_json;
 pub mod toolchain_info {
     pub mod rustc_cfg;
-    pub mod target_data_layout;
+    pub mod target_data;
     pub mod target_tuple;
     pub mod version;
 
@@ -62,7 +69,7 @@ pub use crate::{
     build_dependencies::{ProcMacroDylibPath, WorkspaceBuildScripts},
     cargo_workspace::{
         CargoConfig, CargoFeatures, CargoMetadataConfig, CargoWorkspace, Package, PackageData,
-        PackageDependency, RustLibSource, Target, TargetData, TargetKind,
+        PackageDependency, RustLibSource, Target, TargetData, TargetDirectoryConfig, TargetKind,
     },
     manifest_path::ManifestPath,
     project_json::{ProjectJson, ProjectJsonData},

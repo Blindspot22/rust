@@ -10,12 +10,8 @@ use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::lang_items::LangItem;
 use rustc_hir::{self as hir, HirId, find_attr};
 use rustc_middle::bug;
-use rustc_middle::middle::region;
 use rustc_middle::thir::*;
-use rustc_middle::ty::{self, RvalueScopes, TyCtxt};
-use tracing::instrument;
-
-use crate::thir::pattern::pat_from_hir;
+use rustc_middle::ty::{self, TyCtxt};
 
 /// Query implementation for [`TyCtxt::thir_body`].
 pub(crate) fn thir_body(
@@ -60,9 +56,7 @@ struct ThirBuildCx<'tcx> {
 
     typing_env: ty::TypingEnv<'tcx>,
 
-    region_scope_tree: &'tcx region::ScopeTree,
     typeck_results: &'tcx ty::TypeckResults<'tcx>,
-    rvalue_scopes: &'tcx RvalueScopes,
 
     /// False to indicate that adjustments should not be applied. Only used for `custom_mir`
     apply_adjustments: bool,
@@ -107,18 +101,29 @@ impl<'tcx> ThirBuildCx<'tcx> {
             // FIXME(#132279): We're in a body, we should use a typing
             // mode which reveals the opaque types defined by that body.
             typing_env: ty::TypingEnv::non_body_analysis(tcx, def),
-            region_scope_tree: tcx.region_scope_tree(def),
             typeck_results,
-            rvalue_scopes: &typeck_results.rvalue_scopes,
             body_owner: def.to_def_id(),
             apply_adjustments:
                 !find_attr!(tcx.hir_attrs(hir_id), AttributeKind::CustomMir(..) => ()).is_some(),
         }
     }
 
-    #[instrument(level = "debug", skip(self))]
-    fn pattern_from_hir(&mut self, p: &'tcx hir::Pat<'tcx>) -> Box<Pat<'tcx>> {
-        pat_from_hir(self.tcx, self.typing_env, self.typeck_results, p)
+    fn pattern_from_hir(&mut self, pat: &'tcx hir::Pat<'tcx>) -> Box<Pat<'tcx>> {
+        self.pattern_from_hir_with_annotation(pat, None)
+    }
+
+    fn pattern_from_hir_with_annotation(
+        &mut self,
+        pat: &'tcx hir::Pat<'tcx>,
+        let_stmt_type: Option<&hir::Ty<'tcx>>,
+    ) -> Box<Pat<'tcx>> {
+        crate::thir::pattern::pat_from_hir(
+            self.tcx,
+            self.typing_env,
+            self.typeck_results,
+            pat,
+            let_stmt_type,
+        )
     }
 
     fn closure_env_param(&self, owner_def: LocalDefId, expr_id: HirId) -> Option<Param<'tcx>> {

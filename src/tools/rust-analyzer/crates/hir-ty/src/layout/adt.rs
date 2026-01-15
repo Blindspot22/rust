@@ -4,27 +4,26 @@ use std::{cmp, ops::Bound};
 
 use hir_def::{
     AdtId, VariantId,
-    layout::{Integer, ReprOptions, TargetDataLayout},
+    attrs::AttrFlags,
     signatures::{StructFlags, VariantFields},
 };
-use intern::sym;
+use rustc_abi::{Integer, ReprOptions, TargetDataLayout};
 use rustc_index::IndexVec;
 use smallvec::SmallVec;
 use triomphe::Arc;
 
 use crate::{
-    Substitution, TraitEnvironment,
     db::HirDatabase,
-    layout::{Layout, LayoutError, field_ty},
+    layout::{Layout, LayoutCx, LayoutError, field_ty},
+    next_solver::StoredGenericArgs,
+    traits::StoredParamEnvAndCrate,
 };
-
-use super::LayoutCx;
 
 pub fn layout_of_adt_query(
     db: &dyn HirDatabase,
     def: AdtId,
-    subst: Substitution,
-    trait_env: Arc<TraitEnvironment>,
+    args: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
 ) -> Result<Arc<Layout>, LayoutError> {
     let krate = trait_env.krate;
     let Ok(target) = db.target_data_layout(krate) else {
@@ -35,7 +34,9 @@ pub fn layout_of_adt_query(
     let handle_variant = |def: VariantId, var: &VariantFields| {
         var.fields()
             .iter()
-            .map(|(fd, _)| db.layout_of_ty(field_ty(db, def, fd, &subst), trait_env.clone()))
+            .map(|(fd, _)| {
+                db.layout_of_ty(field_ty(db, def, fd, args.as_ref()).store(), trait_env.clone())
+            })
             .collect::<Result<Vec<_>, _>>()
     };
     let (variants, repr, is_special_no_niche) = match def {
@@ -45,15 +46,15 @@ pub fn layout_of_adt_query(
             r.push(handle_variant(s.into(), s.fields(db))?);
             (
                 r,
-                sig.repr.unwrap_or_default(),
+                AttrFlags::repr(db, s.into()).unwrap_or_default(),
                 sig.flags.intersects(StructFlags::IS_UNSAFE_CELL | StructFlags::IS_UNSAFE_PINNED),
             )
         }
         AdtId::UnionId(id) => {
-            let data = db.union_signature(id);
+            let repr = AttrFlags::repr(db, id.into());
             let mut r = SmallVec::new();
             r.push(handle_variant(id.into(), id.fields(db))?);
-            (r, data.repr.unwrap_or_default(), false)
+            (r, repr.unwrap_or_default(), false)
         }
         AdtId::EnumId(e) => {
             let variants = e.enum_variants(db);
@@ -62,7 +63,7 @@ pub fn layout_of_adt_query(
                 .iter()
                 .map(|&(v, _, _)| handle_variant(v.into(), v.fields(db)))
                 .collect::<Result<SmallVec<_>, _>>()?;
-            (r, db.enum_signature(e).repr.unwrap_or_default(), false)
+            (r, AttrFlags::repr(db, e.into()).unwrap_or_default(), false)
         }
     };
     let variants = variants
@@ -96,37 +97,23 @@ pub fn layout_of_adt_query(
     Ok(Arc::new(result))
 }
 
-fn layout_scalar_valid_range(db: &dyn HirDatabase, def: AdtId) -> (Bound<u128>, Bound<u128>) {
-    let attrs = db.attrs(def.into());
-    let get = |name| {
-        let attr = attrs.by_key(name).tt_values();
-        for tree in attr {
-            if let Some(it) = tree.iter().next_as_view() {
-                let text = it.to_string().replace('_', "");
-                let (text, base) = match text.as_bytes() {
-                    [b'0', b'x', ..] => (&text[2..], 16),
-                    [b'0', b'o', ..] => (&text[2..], 8),
-                    [b'0', b'b', ..] => (&text[2..], 2),
-                    _ => (&*text, 10),
-                };
-
-                if let Ok(it) = u128::from_str_radix(text, base) {
-                    return Bound::Included(it);
-                }
-            }
-        }
-        Bound::Unbounded
-    };
-    (get(sym::rustc_layout_scalar_valid_range_start), get(sym::rustc_layout_scalar_valid_range_end))
-}
-
 pub(crate) fn layout_of_adt_cycle_result(
     _: &dyn HirDatabase,
-    _: AdtId,
-    _: Substitution,
-    _: Arc<TraitEnvironment>,
+    _: salsa::Id,
+    _def: AdtId,
+    _args: StoredGenericArgs,
+    _trait_env: StoredParamEnvAndCrate,
 ) -> Result<Arc<Layout>, LayoutError> {
     Err(LayoutError::RecursiveTypeWithoutIndirection)
+}
+
+fn layout_scalar_valid_range(db: &dyn HirDatabase, def: AdtId) -> (Bound<u128>, Bound<u128>) {
+    let range = AttrFlags::rustc_layout_scalar_valid_range(db, def);
+    let get = |value| match value {
+        Some(it) => Bound::Included(it),
+        None => Bound::Unbounded,
+    };
+    (get(range.start), get(range.end))
 }
 
 /// Finds the appropriate Integer type and signedness for the given

@@ -1,43 +1,57 @@
-use hir_def::db::DefDatabase;
+use hir_def::{HasModule, db::DefDatabase};
 use hir_expand::EditionedFileId;
 use span::Edition;
 use syntax::{TextRange, TextSize};
 use test_fixture::WithFixture;
 
-use crate::display::DisplayTarget;
-use crate::{Interner, Substitution, db::HirDatabase, mir::MirLowerError, test_db::TestDB};
+use crate::{
+    db::HirDatabase,
+    display::DisplayTarget,
+    mir::MirLowerError,
+    next_solver::{DbInterner, GenericArgs},
+    setup_tracing,
+    test_db::TestDB,
+};
 
 use super::{MirEvalError, interpret_mir};
 
 fn eval_main(db: &TestDB, file_id: EditionedFileId) -> Result<(String, String), MirEvalError> {
-    let module_id = db.module_for_file(file_id.file_id(db));
-    let def_map = module_id.def_map(db);
-    let scope = &def_map[module_id.local_id].scope;
-    let func_id = scope
-        .declarations()
-        .find_map(|x| match x {
-            hir_def::ModuleDefId::FunctionId(x) => {
-                if db.function_signature(x).name.display(db, Edition::CURRENT).to_string() == "main"
-                {
-                    Some(x)
-                } else {
-                    None
+    crate::attach_db(db, || {
+        let interner = DbInterner::new_no_crate(db);
+        let module_id = db.module_for_file(file_id.file_id(db));
+        let def_map = module_id.def_map(db);
+        let scope = &def_map[module_id].scope;
+        let func_id = scope
+            .declarations()
+            .find_map(|x| match x {
+                hir_def::ModuleDefId::FunctionId(x) => {
+                    if db.function_signature(x).name.display(db, Edition::CURRENT).to_string()
+                        == "main"
+                    {
+                        Some(x)
+                    } else {
+                        None
+                    }
                 }
-            }
-            _ => None,
-        })
-        .expect("no main function found");
-    let body = db
-        .monomorphized_mir_body(
-            func_id.into(),
-            Substitution::empty(Interner),
-            db.trait_environment(func_id.into()),
-        )
-        .map_err(|e| MirEvalError::MirLowerError(func_id, e))?;
+                _ => None,
+            })
+            .expect("no main function found");
+        let body = db
+            .monomorphized_mir_body(
+                func_id.into(),
+                GenericArgs::empty(interner).store(),
+                crate::ParamEnvAndCrate {
+                    param_env: db.trait_environment(func_id.into()),
+                    krate: func_id.krate(db),
+                }
+                .store(),
+            )
+            .map_err(|e| MirEvalError::MirLowerError(func_id, e))?;
 
-    let (result, output) = interpret_mir(db, body, false, None)?;
-    result?;
-    Ok((output.stdout().into_owned(), output.stderr().into_owned()))
+        let (result, output) = interpret_mir(db, body, false, None)?;
+        result?;
+        Ok((output.stdout().into_owned(), output.stderr().into_owned()))
+    })
 }
 
 fn check_pass(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
@@ -49,44 +63,62 @@ fn check_pass_and_stdio(
     expected_stdout: &str,
     expected_stderr: &str,
 ) {
+    let _tracing = setup_tracing();
     let (db, file_ids) = TestDB::with_many_files(ra_fixture);
-    let file_id = *file_ids.last().unwrap();
-    let x = eval_main(&db, file_id);
-    match x {
-        Err(e) => {
-            let mut err = String::new();
-            let line_index = |size: TextSize| {
-                let mut size = u32::from(size) as usize;
-                let lines = ra_fixture.lines().enumerate();
-                for (i, l) in lines {
-                    if let Some(x) = size.checked_sub(l.len()) {
-                        size = x;
-                    } else {
-                        return (i, size);
+    crate::attach_db(&db, || {
+        let file_id = *file_ids.last().unwrap();
+        let x = eval_main(&db, file_id);
+        match x {
+            Err(e) => {
+                let mut err = String::new();
+                let line_index = |size: TextSize| {
+                    let mut size = u32::from(size) as usize;
+                    let lines = ra_fixture.lines().enumerate();
+                    for (i, l) in lines {
+                        if let Some(x) = size.checked_sub(l.len()) {
+                            size = x;
+                        } else {
+                            return (i, size);
+                        }
                     }
-                }
-                (usize::MAX, size)
-            };
-            let span_formatter = |file, range: TextRange| {
-                format!("{:?} {:?}..{:?}", file, line_index(range.start()), line_index(range.end()))
-            };
-            let krate = db.module_for_file(file_id.file_id(&db)).krate();
-            e.pretty_print(&mut err, &db, span_formatter, DisplayTarget::from_crate(&db, krate))
+                    (usize::MAX, size)
+                };
+                let span_formatter = |file, range: TextRange| {
+                    format!(
+                        "{:?} {:?}..{:?}",
+                        file,
+                        line_index(range.start()),
+                        line_index(range.end())
+                    )
+                };
+                let krate = db.module_for_file(file_id.file_id(&db)).krate(&db);
+                e.pretty_print(
+                    &mut err,
+                    &db,
+                    span_formatter,
+                    DisplayTarget::from_crate(&db, krate),
+                )
                 .unwrap();
-            panic!("Error in interpreting: {err}");
+                panic!("Error in interpreting: {err}");
+            }
+            Ok((stdout, stderr)) => {
+                assert_eq!(stdout, expected_stdout);
+                assert_eq!(stderr, expected_stderr);
+            }
         }
-        Ok((stdout, stderr)) => {
-            assert_eq!(stdout, expected_stdout);
-            assert_eq!(stderr, expected_stderr);
-        }
-    }
+    })
 }
 
 fn check_panic(#[rust_analyzer::rust_fixture] ra_fixture: &str, expected_panic: &str) {
     let (db, file_ids) = TestDB::with_many_files(ra_fixture);
-    let file_id = *file_ids.last().unwrap();
-    let e = eval_main(&db, file_id).unwrap_err();
-    assert_eq!(e.is_panic().unwrap_or_else(|| panic!("unexpected error: {e:?}")), expected_panic);
+    crate::attach_db(&db, || {
+        let file_id = *file_ids.last().unwrap();
+        let e = eval_main(&db, file_id).unwrap_err();
+        assert_eq!(
+            e.is_panic().unwrap_or_else(|| panic!("unexpected error: {e:?}")),
+            expected_panic
+        );
+    })
 }
 
 fn check_error_with(
@@ -94,9 +126,11 @@ fn check_error_with(
     expect_err: impl FnOnce(MirEvalError) -> bool,
 ) {
     let (db, file_ids) = TestDB::with_many_files(ra_fixture);
-    let file_id = *file_ids.last().unwrap();
-    let e = eval_main(&db, file_id).unwrap_err();
-    assert!(expect_err(e));
+    crate::attach_db(&db, || {
+        let file_id = *file_ids.last().unwrap();
+        let e = eval_main(&db, file_id).unwrap_err();
+        assert!(expect_err(e));
+    })
 }
 
 #[test]
@@ -489,7 +523,7 @@ fn main() {
 fn from_fn() {
     check_pass(
         r#"
-//- minicore: fn, iterator
+//- minicore: fn, iterator, sized
 struct FromFn<F>(F);
 
 impl<T, F: FnMut() -> Option<T>> Iterator for FromFn<F> {
@@ -514,7 +548,7 @@ fn main() {
 fn for_loop() {
     check_pass(
         r#"
-//- minicore: iterator, add
+//- minicore: iterator, add, builtin_impls
 fn should_not_reach() {
     _ // FIXME: replace this function with panic when that works
 }
@@ -610,7 +644,9 @@ fn main() {
 fn specialization_array_clone() {
     check_pass(
         r#"
-//- minicore: copy, derive, slice, index, coerce_unsized
+//- minicore: copy, derive, slice, index, coerce_unsized, panic
+#![feature(min_specialization)]
+
 impl<T: Clone, const N: usize> Clone for [T; N] {
     #[inline]
     fn clone(&self) -> Self {
@@ -625,8 +661,7 @@ trait SpecArrayClone: Clone {
 impl<T: Clone> SpecArrayClone for T {
     #[inline]
     default fn clone<const N: usize>(array: &[T; N]) -> [T; N] {
-        // FIXME: panic here when we actually implement specialization.
-        from_slice(array)
+        panic!("should go to the specialized impl")
     }
 }
 
@@ -675,7 +710,7 @@ fn main() {
 fn closure_state() {
     check_pass(
         r#"
-//- minicore: fn, add, copy
+//- minicore: fn, add, copy, builtin_impls
 fn should_not_reach() {
     _ // FIXME: replace this function with panic when that works
 }

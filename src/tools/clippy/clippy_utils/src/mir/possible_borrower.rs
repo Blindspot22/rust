@@ -15,7 +15,6 @@ use std::ops::ControlFlow;
 /// Collects the possible borrowers of each local.
 /// For example, `b = &a; c = &a;` will make `b` and (transitively) `c`
 /// possible borrowers of `a`.
-#[allow(clippy::module_name_repetitions)]
 struct PossibleBorrowerVisitor<'a, 'b, 'tcx> {
     possible_borrower: TransitiveRelation,
     body: &'b mir::Body<'tcx>,
@@ -111,7 +110,7 @@ impl<'tcx> mir::visit::Visitor<'tcx> for PossibleBorrowerVisitor<'_, '_, 'tcx> {
                             immutable_borrowers.push(p.local);
                         }
                     },
-                    mir::Operand::Constant(..) => (),
+                    mir::Operand::Constant(..) | mir::Operand::RuntimeChecks(..) => (),
                 }
             }
 
@@ -152,7 +151,7 @@ fn rvalue_locals(rvalue: &mir::Rvalue<'_>, mut visit: impl FnMut(mir::Local)) {
 
     let mut visit_op = |op: &mir::Operand<'_>| match op {
         mir::Operand::Copy(p) | mir::Operand::Move(p) => visit(p.local),
-        mir::Operand::Constant(..) => (),
+        mir::Operand::Constant(..) | mir::Operand::RuntimeChecks(..) => (),
     };
 
     match rvalue {
@@ -167,7 +166,6 @@ fn rvalue_locals(rvalue: &mir::Rvalue<'_>, mut visit: impl FnMut(mir::Local)) {
 }
 
 /// Result of `PossibleBorrowerVisitor`.
-#[allow(clippy::module_name_repetitions)]
 pub struct PossibleBorrowerMap<'b, 'tcx> {
     /// Mapping `Local -> its possible borrowers`
     pub map: FxHashMap<mir::Local, DenseBitSet<mir::Local>>,

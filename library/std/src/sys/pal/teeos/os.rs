@@ -3,14 +3,9 @@
 use core::marker::PhantomData;
 
 use super::unsupported;
-use crate::error::Error as StdError;
 use crate::ffi::{OsStr, OsString};
 use crate::path::PathBuf;
 use crate::{fmt, io, path};
-
-pub fn errno() -> i32 {
-    unsafe { (*libc::__errno_location()) as i32 }
-}
 
 // Hardcoded to return 4096, since `sysconf` is only implemented as a stub.
 pub fn page_size() -> usize {
@@ -19,10 +14,6 @@ pub fn page_size() -> usize {
 }
 
 // Everything below are stubs and copied from unsupported.rs
-
-pub fn error_string(_errno: i32) -> String {
-    "error string unimplemented".to_string()
-}
 
 pub fn getcwd() -> io::Result<PathBuf> {
     unsupported()
@@ -62,12 +53,7 @@ impl fmt::Display for JoinPathsError {
     }
 }
 
-impl StdError for JoinPathsError {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        "not supported on this platform yet"
-    }
-}
+impl crate::error::Error for JoinPathsError {}
 
 pub fn current_exe() -> io::Result<PathBuf> {
     unsupported()

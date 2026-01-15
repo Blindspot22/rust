@@ -219,21 +219,16 @@ enum FloatErrorKind {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl Error for ParseFloatError {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        match self.kind {
-            FloatErrorKind::Empty => "cannot parse float from empty string",
-            FloatErrorKind::Invalid => "invalid float literal",
-        }
-    }
-}
+impl Error for ParseFloatError {}
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl fmt::Display for ParseFloatError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        #[allow(deprecated)]
-        self.description().fmt(f)
+        match self.kind {
+            FloatErrorKind::Empty => "cannot parse float from empty string",
+            FloatErrorKind::Invalid => "invalid float literal",
+        }
+        .fmt(f)
     }
 }
 
@@ -260,11 +255,7 @@ fn biased_fp_to_float<F: RawFloat>(x: BiasedFp) -> F {
 #[inline(always)] // Will be inlined into a function with `#[inline(never)]`, see above
 pub fn dec2flt<F: RawFloat>(s: &str) -> Result<F, ParseFloatError> {
     let mut s = s.as_bytes();
-    let c = if let Some(&c) = s.first() {
-        c
-    } else {
-        return Err(pfe_empty());
-    };
+    let Some(&c) = s.first() else { return Err(pfe_empty()) };
     let negative = c == b'-';
     if c == b'-' || c == b'+' {
         s = &s[1..];

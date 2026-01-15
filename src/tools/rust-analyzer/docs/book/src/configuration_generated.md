@@ -610,6 +610,13 @@ The warnings will be indicated by a blue squiggly underline in code and a blue i
 the `Problems Panel`.
 
 
+## rust-analyzer.document.symbol.search.excludeLocals {#document.symbol.search.excludeLocals}
+
+Default: `true`
+
+Exclude all locals from document symbol search.
+
+
 ## rust-analyzer.files.exclude {#files.exclude}
 
 Default: `[]`
@@ -626,6 +633,13 @@ Code's `files.watcherExclude`.
 Default: `"client"`
 
 Controls file watching implementation.
+
+
+## rust-analyzer.gotoImplementations.filterAdjacentDerives {#gotoImplementations.filterAdjacentDerives}
+
+Default: `false`
+
+If this is `true`, when "Goto Implementations" and in "Implementations" lens, are triggered on a `struct` or `enum` or `union`, we filter out trait implementations that originate from `derive`s above the type.
 
 
 ## rust-analyzer.highlightRelated.branchExitPoints.enable {#highlightRelated.branchExitPoints.enable}
@@ -952,6 +966,17 @@ Default: `"never"`
 Show enum variant discriminant hints.
 
 
+## rust-analyzer.inlayHints.expressionAdjustmentHints.disableReborrows {#inlayHints.expressionAdjustmentHints.disableReborrows}
+
+Default: `true`
+
+Disable reborrows in expression adjustments inlay hints.
+
+Reborrows are a pair of a builtin deref then borrow, i.e. `&*`. They are inserted by the compiler but are mostly useless to the programmer.
+
+Note: if the deref is not builtin (an overloaded deref), or the borrow is `&raw const`/`&raw mut`, they are not removed.
+
+
 ## rust-analyzer.inlayHints.expressionAdjustmentHints.enable {#inlayHints.expressionAdjustmentHints.enable}
 
 Default: `"never"`
@@ -1008,6 +1033,13 @@ Default: `false`
 Show inlay hints for the implied type parameter `Sized` bound.
 
 
+## rust-analyzer.inlayHints.impliedDynTraitHints.enable {#inlayHints.impliedDynTraitHints.enable}
+
+Default: `true`
+
+Show inlay hints for the implied `dyn` keyword in trait object types.
+
+
 ## rust-analyzer.inlayHints.lifetimeElisionHints.enable {#inlayHints.lifetimeElisionHints.enable}
 
 Default: `"never"`
@@ -1028,12 +1060,21 @@ Default: `25`
 
 Maximum length for inlay hints. Set to null to have an unlimited length.
 
+**Note:** This is mostly a hint, and we don't guarantee to strictly follow the limit.
+
 
 ## rust-analyzer.inlayHints.parameterHints.enable {#inlayHints.parameterHints.enable}
 
 Default: `true`
 
 Show function parameter name inlay hints at the call site.
+
+
+## rust-analyzer.inlayHints.parameterHints.missingArguments.enable {#inlayHints.parameterHints.missingArguments.enable}
+
+Default: `false`
+
+Show parameter name inlay hints for missing arguments at the call site.
 
 
 ## rust-analyzer.inlayHints.rangeExclusiveHints.enable {#inlayHints.rangeExclusiveHints.enable}
@@ -1082,6 +1123,13 @@ Only applies to closures with blocks, same as
 Default: `false`
 
 Hide inlay parameter type hints for closures.
+
+
+## rust-analyzer.inlayHints.typeHints.hideInferredTypes {#inlayHints.typeHints.hideInferredTypes}
+
+Default: `false`
+
+Hide inlay type hints for inferred types.
 
 
 ## rust-analyzer.inlayHints.typeHints.hideNamedConstructor {#inlayHints.typeHints.hideNamedConstructor}
@@ -1269,6 +1317,16 @@ Default: `null`
 Internal config, path to proc-macro server executable.
 
 
+## rust-analyzer.profiling.memoryProfile {#profiling.memoryProfile}
+
+Default: `null`
+
+The path where to save memory profiling output.
+
+**Note:** Memory profiling is not enabled by default in rust-analyzer builds, you need to build
+from source for it.
+
+
 ## rust-analyzer.references.excludeImports {#references.excludeImports}
 
 Default: `false`
@@ -1283,11 +1341,49 @@ Default: `false`
 Exclude tests from find-all-references and call-hierarchy.
 
 
+## rust-analyzer.rename.showConflicts {#rename.showConflicts}
+
+Default: `true`
+
+Whether to warn when a rename will cause conflicts (change the meaning of the code).
+
+
+## rust-analyzer.runnables.bench.command {#runnables.bench.command}
+
+Default: `"bench"`
+
+Subcommand used for bench runnables instead of `bench`.
+
+
+## rust-analyzer.runnables.bench.overrideCommand {#runnables.bench.overrideCommand}
+
+Default: `null`
+
+Override the command used for bench runnables.
+The first element of the array should be the program to execute (for example, `cargo`).
+
+Use the placeholders `${package}`, `${target_arg}`, `${target}`, `${test_name}` to dynamically
+replace the package name, target option (such as `--bin` or `--example`), the target name and
+the test name (name of test function or test mod path).
+
+
 ## rust-analyzer.runnables.command {#runnables.command}
 
 Default: `null`
 
 Command to be executed instead of 'cargo' for runnables.
+
+
+## rust-analyzer.runnables.doctest.overrideCommand {#runnables.doctest.overrideCommand}
+
+Default: `null`
+
+Override the command used for bench runnables.
+The first element of the array should be the program to execute (for example, `cargo`).
+
+Use the placeholders `${package}`, `${target_arg}`, `${target}`, `${test_name}` to dynamically
+replace the package name, target option (such as `--bin` or `--example`), the target name and
+the test name (name of test function or test mod path).
 
 
 ## rust-analyzer.runnables.extraArgs {#runnables.extraArgs}
@@ -1303,7 +1399,7 @@ tests or binaries. For example, it may be `--release`.
 Default:
 ```json
 [
-  "--show-output"
+  "--nocapture"
 ]
 ```
 
@@ -1314,6 +1410,25 @@ Unless the launched target uses a
 [custom test harness](https://doc.rust-lang.org/cargo/reference/cargo-targets.html#the-harness-field),
 they will end up being interpreted as options to
 [`rustc`’s built-in test harness (“libtest”)](https://doc.rust-lang.org/rustc/tests/index.html#cli-arguments).
+
+
+## rust-analyzer.runnables.test.command {#runnables.test.command}
+
+Default: `"test"`
+
+Subcommand used for test runnables instead of `test`.
+
+
+## rust-analyzer.runnables.test.overrideCommand {#runnables.test.overrideCommand}
+
+Default: `null`
+
+Override the command used for test runnables.
+The first element of the array should be the program to execute (for example, `cargo`).
+
+Use the placeholders `${package}`, `${target_arg}`, `${target}`, `${test_name}` to dynamically
+replace the package name, target option (such as `--bin` or `--example`), the target name and
+the test name (name of test function or test mod path).
 
 
 ## rust-analyzer.rustc.source {#rustc.source}
@@ -1358,6 +1473,17 @@ Default: `false`
 Enables the use of rustfmt's unstable range formatting command for the
 `textDocument/rangeFormatting` request. The rustfmt option is unstable and only
 available on a nightly build.
+
+
+## rust-analyzer.semanticHighlighting.comments.enable {#semanticHighlighting.comments.enable}
+
+Default: `true`
+
+Use semantic tokens for comments.
+
+In some editors (e.g. vscode) semantic tokens override other highlighting grammars.
+By disabling semantic tokens for comments, other grammars can be used to highlight
+their contents.
 
 
 ## rust-analyzer.semanticHighlighting.doc.comment.inject.enable {#semanticHighlighting.doc.comment.inject.enable}
@@ -1575,7 +1701,7 @@ Similarly, the JSON representation of `DiscoverArgument::Buildfile` is:
 `DiscoverArgument::Path` is used to find and generate a `rust-project.json`, and
 therefore, a workspace, whereas `DiscoverArgument::buildfile` is used to to update an
 existing workspace. As a reference for implementors, buck2's `rust-project` will likely
-be useful: https://github.com/facebook/buck2/tree/main/integrations/rust-project.
+be useful: <https://github.com/facebook/buck2/tree/main/integrations/rust-project>.
 
 
 ## rust-analyzer.workspace.symbol.search.excludeImports {#workspace.symbol.search.excludeImports}

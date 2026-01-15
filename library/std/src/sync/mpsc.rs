@@ -1108,19 +1108,16 @@ impl<T> fmt::Display for SendError<T> {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T> error::Error for SendError<T> {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        "sending on a closed channel"
-    }
-}
+impl<T> error::Error for SendError<T> {}
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T> fmt::Debug for TrySendError<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            TrySendError::Full(..) => "Full(..)".fmt(f),
-            TrySendError::Disconnected(..) => "Disconnected(..)".fmt(f),
+            TrySendError::Full(..) => f.debug_tuple("TrySendError::Full").finish_non_exhaustive(),
+            TrySendError::Disconnected(..) => {
+                f.debug_tuple("TrySendError::Disconnected").finish_non_exhaustive()
+            }
         }
     }
 }
@@ -1136,15 +1133,7 @@ impl<T> fmt::Display for TrySendError<T> {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T> error::Error for TrySendError<T> {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        match *self {
-            TrySendError::Full(..) => "sending on a full channel",
-            TrySendError::Disconnected(..) => "sending on a closed channel",
-        }
-    }
-}
+impl<T> error::Error for TrySendError<T> {}
 
 #[stable(feature = "mpsc_error_conversions", since = "1.24.0")]
 impl<T> From<SendError<T>> for TrySendError<T> {
@@ -1168,12 +1157,7 @@ impl fmt::Display for RecvError {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl error::Error for RecvError {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        "receiving on a closed channel"
-    }
-}
+impl error::Error for RecvError {}
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl fmt::Display for TryRecvError {
@@ -1186,15 +1170,7 @@ impl fmt::Display for TryRecvError {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl error::Error for TryRecvError {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        match *self {
-            TryRecvError::Empty => "receiving on an empty channel",
-            TryRecvError::Disconnected => "receiving on a closed channel",
-        }
-    }
-}
+impl error::Error for TryRecvError {}
 
 #[stable(feature = "mpsc_error_conversions", since = "1.24.0")]
 impl From<RecvError> for TryRecvError {
@@ -1221,15 +1197,7 @@ impl fmt::Display for RecvTimeoutError {
 }
 
 #[stable(feature = "mpsc_recv_timeout_error", since = "1.15.0")]
-impl error::Error for RecvTimeoutError {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        match *self {
-            RecvTimeoutError::Timeout => "timed out waiting on channel",
-            RecvTimeoutError::Disconnected => "channel is empty and sending half is closed",
-        }
-    }
-}
+impl error::Error for RecvTimeoutError {}
 
 #[stable(feature = "mpsc_error_conversions", since = "1.24.0")]
 impl From<RecvError> for RecvTimeoutError {

@@ -7,18 +7,16 @@
 #![allow(rustc::diagnostic_outside_of_impl)]
 #![allow(rustc::direct_use_of_rustc_type_ir)]
 #![allow(rustc::untranslatable_diagnostic)]
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![doc(rust_logo)]
-#![feature(array_windows)]
+#![cfg_attr(bootstrap, feature(array_windows))]
 #![feature(assert_matches)]
 #![feature(associated_type_defaults)]
 #![feature(box_patterns)]
 #![feature(default_field_values)]
 #![feature(error_reporter)]
+#![feature(macro_metavar_expr_concat)]
 #![feature(negative_impls)]
 #![feature(never_type)]
 #![feature(rustc_attrs)]
-#![feature(rustdoc_internals)]
 #![feature(try_blocks)]
 #![feature(yeet_expr)]
 // tidy-alphabetical-end
@@ -39,6 +37,12 @@ use std::path::{Path, PathBuf};
 use std::{fmt, panic};
 
 use Level::*;
+// Used by external projects such as `rust-gpu`.
+// See https://github.com/rust-lang/rust/pull/115393.
+pub use anstream::{AutoStream, ColorChoice};
+pub use anstyle::{
+    Ansi256Color, AnsiColor, Color, EffectIter, Effects, Reset, RgbColor, Style as Anstyle,
+};
 pub use codes::*;
 pub use decorate_diag::{BufferedEarlyLint, DecorateDiagCompat, LintBuffer};
 pub use diagnostic::{
@@ -61,17 +65,14 @@ pub use rustc_error_messages::{
     fallback_fluent_bundle, fluent_bundle, into_diag_arg_using_display,
 };
 use rustc_hashes::Hash128;
+use rustc_lint_defs::LintExpectationId;
 pub use rustc_lint_defs::{Applicability, listify, pluralize};
-use rustc_lint_defs::{Lint, LintExpectationId};
 use rustc_macros::{Decodable, Encodable};
 pub use rustc_span::ErrorGuaranteed;
 pub use rustc_span::fatal_error::{FatalError, FatalErrorMarker};
 use rustc_span::source_map::SourceMap;
 use rustc_span::{BytePos, DUMMY_SP, Loc, Span};
 pub use snippet::Style;
-// Used by external projects such as `rust-gpu`.
-// See https://github.com/rust-lang/rust/pull/115393.
-pub use termcolor::{Color, ColorSpec, WriteColor};
 use tracing::debug;
 
 use crate::emitter::TimingEvent;
@@ -105,20 +106,6 @@ rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
 rustc_data_structures::static_assert_size!(PResult<'_, ()>, 24);
 #[cfg(target_pointer_width = "64")]
 rustc_data_structures::static_assert_size!(PResult<'_, bool>, 24);
-
-/// Used to avoid depending on `rustc_middle` in `rustc_attr_parsing`.
-/// Always the `TyCtxt`.
-pub trait LintEmitter: Copy {
-    type Id: Copy;
-    #[track_caller]
-    fn emit_node_span_lint(
-        self,
-        lint: &'static Lint,
-        hir_id: Self::Id,
-        span: impl Into<MultiSpan>,
-        decorator: impl for<'a> LintDiagnostic<'a, ()> + DynSend + 'static,
-    );
-}
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Encodable, Decodable)]
 pub enum SuggestionStyle {
@@ -224,6 +211,13 @@ pub struct SubstitutionPart {
     pub snippet: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Hash, Encodable, Decodable)]
+pub struct TrimmedSubstitutionPart {
+    pub original_span: Span,
+    pub span: Span,
+    pub snippet: String,
+}
+
 /// Used to translate between `Span`s and byte positions within a single output line in highlighted
 /// code of structured suggestions.
 #[derive(Debug, Clone, Copy)]
@@ -233,6 +227,35 @@ pub(crate) struct SubstitutionHighlight {
 }
 
 impl SubstitutionPart {
+    /// Try to turn a replacement into an addition when the span that is being
+    /// overwritten matches either the prefix or suffix of the replacement.
+    fn trim_trivial_replacements(self, sm: &SourceMap) -> TrimmedSubstitutionPart {
+        let mut trimmed_part = TrimmedSubstitutionPart {
+            original_span: self.span,
+            span: self.span,
+            snippet: self.snippet,
+        };
+        if trimmed_part.snippet.is_empty() {
+            return trimmed_part;
+        }
+        let Ok(snippet) = sm.span_to_snippet(trimmed_part.span) else {
+            return trimmed_part;
+        };
+
+        if let Some((prefix, substr, suffix)) = as_substr(&snippet, &trimmed_part.snippet) {
+            trimmed_part.span = Span::new(
+                trimmed_part.span.lo() + BytePos(prefix as u32),
+                trimmed_part.span.hi() - BytePos(suffix as u32),
+                trimmed_part.span.ctxt(),
+                trimmed_part.span.parent(),
+            );
+            trimmed_part.snippet = substr.to_string();
+        }
+        trimmed_part
+    }
+}
+
+impl TrimmedSubstitutionPart {
     pub fn is_addition(&self, sm: &SourceMap) -> bool {
         !self.snippet.is_empty() && !self.replaces_meaningful_content(sm)
     }
@@ -259,27 +282,6 @@ impl SubstitutionPart {
     fn replaces_meaningful_content(&self, sm: &SourceMap) -> bool {
         sm.span_to_snippet(self.span)
             .map_or(!self.span.is_empty(), |snippet| !snippet.trim().is_empty())
-    }
-
-    /// Try to turn a replacement into an addition when the span that is being
-    /// overwritten matches either the prefix or suffix of the replacement.
-    fn trim_trivial_replacements(&mut self, sm: &SourceMap) {
-        if self.snippet.is_empty() {
-            return;
-        }
-        let Ok(snippet) = sm.span_to_snippet(self.span) else {
-            return;
-        };
-
-        if let Some((prefix, substr, suffix)) = as_substr(&snippet, &self.snippet) {
-            self.span = Span::new(
-                self.span.lo() + BytePos(prefix as u32),
-                self.span.hi() - BytePos(suffix as u32),
-                self.span.ctxt(),
-                self.span.parent(),
-            );
-            self.snippet = substr.to_string();
-        }
     }
 }
 
@@ -310,7 +312,8 @@ impl CodeSuggestion {
     pub(crate) fn splice_lines(
         &self,
         sm: &SourceMap,
-    ) -> Vec<(String, Vec<SubstitutionPart>, Vec<Vec<SubstitutionHighlight>>, ConfusionType)> {
+    ) -> Vec<(String, Vec<TrimmedSubstitutionPart>, Vec<Vec<SubstitutionHighlight>>, ConfusionType)>
+    {
         // For the `Vec<Vec<SubstitutionHighlight>>` value, the first level of the vector
         // corresponds to the output snippet's lines, while the second level corresponds to the
         // substrings within that line that should be highlighted.
@@ -332,7 +335,7 @@ impl CodeSuggestion {
             hi_opt: Option<&Loc>,
         ) -> usize {
             let mut line_count = 0;
-            // Convert CharPos to Usize, as CharPose is character offset
+            // Convert `CharPos` to `usize`, as `CharPos` is character offset
             // Extract low index and high index
             let (lo, hi_opt) = (lo.col.to_usize(), hi_opt.map(|hi| hi.col.to_usize()));
             if let Some(line) = line_opt {
@@ -417,12 +420,17 @@ impl CodeSuggestion {
                 // or deleted code in order to point at the correct column *after* substitution.
                 let mut acc = 0;
                 let mut confusion_type = ConfusionType::None;
-                for part in &mut substitution.parts {
+
+                let trimmed_parts = substitution
+                    .parts
+                    .into_iter()
                     // If this is a replacement of, e.g. `"a"` into `"ab"`, adjust the
                     // suggestion and snippet to look as if we just suggested to add
                     // `"b"`, which is typically much easier for the user to understand.
-                    part.trim_trivial_replacements(sm);
+                    .map(|part| part.trim_trivial_replacements(sm))
+                    .collect::<Vec<_>>();
 
+                for part in &trimmed_parts {
                     let part_confusion = detect_confusion_type(sm, &part.snippet, part.span);
                     confusion_type = confusion_type.combine(part_confusion);
                     let cur_lo = sm.lookup_char_pos(part.span.lo());
@@ -514,7 +522,7 @@ impl CodeSuggestion {
                 if highlights.iter().all(|parts| parts.is_empty()) {
                     None
                 } else {
-                    Some((buf, substitution.parts, highlights, confusion_type))
+                    Some((buf, trimmed_parts, highlights, confusion_type))
                 }
             })
             .collect()
@@ -1160,7 +1168,7 @@ impl<'a> DiagCtxtHandle<'a> {
         // - It's only produce with JSON output.
         // - It's not emitted the usual way, via `emit_diagnostic`.
         // - The `$message_type` field is "unused_externs" rather than the usual
-        //   "diagnosic".
+        //   "diagnostic".
         //
         // We count it as a lint error because it has a lint level. The value
         // of `loud` (which comes from "unused-externs" or
@@ -1184,6 +1192,10 @@ impl<'a> DiagCtxtHandle<'a> {
         std::mem::take(&mut self.inner.borrow_mut().fulfilled_expectations)
     }
 
+    /// Trigger an ICE if there are any delayed bugs and no hard errors.
+    ///
+    /// This will panic if there are any stashed diagnostics. You can call
+    /// `emit_stashed_diagnostics` to emit those before calling `flush_delayed`.
     pub fn flush_delayed(&self) {
         self.inner.borrow_mut().flush_delayed();
     }
@@ -1341,7 +1353,7 @@ impl<'a> DiagCtxtHandle<'a> {
         self.create_err(err).emit()
     }
 
-    /// Ensures that an error is printed. See `Level::DelayedBug`.
+    /// Ensures that an error is printed. See [`Level::DelayedBug`].
     //
     // No `#[rustc_lint_diagnostics]` and no `impl Into<DiagMessage>` because bug messages aren't
     // user-facing.
@@ -1954,25 +1966,21 @@ impl fmt::Display for Level {
 }
 
 impl Level {
-    fn color(self) -> ColorSpec {
-        let mut spec = ColorSpec::new();
+    fn color(self) -> anstyle::Style {
         match self {
-            Bug | Fatal | Error | DelayedBug => {
-                spec.set_fg(Some(Color::Red)).set_intense(true);
-            }
+            Bug | Fatal | Error | DelayedBug => AnsiColor::BrightRed.on_default(),
             ForceWarning | Warning => {
-                spec.set_fg(Some(Color::Yellow)).set_intense(cfg!(windows));
+                if cfg!(windows) {
+                    AnsiColor::BrightYellow.on_default()
+                } else {
+                    AnsiColor::Yellow.on_default()
+                }
             }
-            Note | OnceNote => {
-                spec.set_fg(Some(Color::Green)).set_intense(true);
-            }
-            Help | OnceHelp => {
-                spec.set_fg(Some(Color::Cyan)).set_intense(true);
-            }
-            FailureNote => {}
+            Note | OnceNote => AnsiColor::BrightGreen.on_default(),
+            Help | OnceHelp => AnsiColor::BrightCyan.on_default(),
+            FailureNote => anstyle::Style::new(),
             Allow | Expect => unreachable!(),
         }
-        spec
     }
 
     pub fn to_str(self) -> &'static str {
@@ -2026,22 +2034,6 @@ pub fn elided_lifetime_in_path_suggestion(
     });
 
     ElidedLifetimeInPathSubdiag { expected, indicate }
-}
-
-pub fn report_ambiguity_error<'a, G: EmissionGuarantee>(
-    diag: &mut Diag<'a, G>,
-    ambiguity: rustc_lint_defs::AmbiguityErrorDiag,
-) {
-    diag.span_label(ambiguity.label_span, ambiguity.label_msg);
-    diag.note(ambiguity.note_msg);
-    diag.span_note(ambiguity.b1_span, ambiguity.b1_note_msg);
-    for help_msg in ambiguity.b1_help_msgs {
-        diag.help(help_msg);
-    }
-    diag.span_note(ambiguity.b2_span, ambiguity.b2_note_msg);
-    for help_msg in ambiguity.b2_help_msgs {
-        diag.help(help_msg);
-    }
 }
 
 /// Grammatical tool for displaying messages to end users in a nice form.

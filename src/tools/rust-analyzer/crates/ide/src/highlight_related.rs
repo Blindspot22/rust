@@ -7,8 +7,8 @@ use ide_db::{
     helpers::pick_best_token,
     search::{FileReference, ReferenceCategory, SearchScope},
     syntax_helpers::node_ext::{
-        eq_label_lt, for_each_tail_expr, full_path_of_name_ref, is_closure_or_blk_with_modif,
-        preorder_expr_with_ctx_checker,
+        eq_label_lt, find_loops, for_each_tail_expr, full_path_of_name_ref,
+        is_closure_or_blk_with_modif, preorder_expr_with_ctx_checker,
     },
 };
 use syntax::{
@@ -60,9 +60,7 @@ pub(crate) fn highlight_related(
     ide_db::FilePosition { offset, file_id }: ide_db::FilePosition,
 ) -> Option<Vec<HighlightedRange>> {
     let _p = tracing::info_span!("highlight_related").entered();
-    let file_id = sema
-        .attach_first_edition(file_id)
-        .unwrap_or_else(|| EditionedFileId::current_edition(sema.db, file_id));
+    let file_id = sema.attach_first_edition(file_id);
     let syntax = sema.parse(file_id).syntax().clone();
 
     let token = pick_best_token(syntax.token_at_offset(offset), |kind| match kind {
@@ -277,7 +275,7 @@ fn highlight_references(
                     Definition::Module(module) => {
                         NavigationTarget::from_module_to_decl(sema.db, module)
                     }
-                    def => match def.try_to_nav(sema.db) {
+                    def => match def.try_to_nav(sema) {
                         Some(it) => it,
                         None => continue,
                     },
@@ -564,7 +562,7 @@ pub(crate) fn highlight_break_points(
         Some(highlights)
     }
 
-    let Some(loops) = goto_definition::find_loops(sema, &token) else {
+    let Some(loops) = find_loops(sema, &token) else {
         return FxHashMap::default();
     };
 
@@ -805,10 +803,8 @@ pub(crate) fn highlight_unsafe_points(
         push_to_highlights(unsafe_token_file_id, Some(unsafe_token.text_range()));
 
         // highlight unsafe operations
-        if let Some(block) = block_expr
-            && let Some(body) = sema.body_for(InFile::new(unsafe_token_file_id, block.syntax()))
-        {
-            let unsafe_ops = sema.get_unsafe_ops(body);
+        if let Some(block) = block_expr {
+            let unsafe_ops = sema.get_unsafe_ops_for_unsafe_block(block);
             for unsafe_op in unsafe_ops {
                 push_to_highlights(unsafe_op.file_id, Some(unsafe_op.value.text_range()));
             }
@@ -2533,6 +2529,23 @@ fn foo() {
     };
 }
 "#,
+        );
+    }
+
+    #[test]
+    fn different_unsafe_block() {
+        check(
+            r#"
+fn main() {
+    unsafe$0 {
+ // ^^^^^^
+        *(0 as *const u8)
+     // ^^^^^^^^^^^^^^^^^
+    };
+    unsafe { *(1 as *const u8) };
+    unsafe { *(2 as *const u8) };
+}
+        "#,
         );
     }
 }

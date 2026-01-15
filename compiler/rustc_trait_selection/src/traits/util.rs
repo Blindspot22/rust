@@ -220,9 +220,9 @@ pub fn with_replaced_escaping_bound_vars<
 /// The inverse of [`BoundVarReplacer`]: replaces placeholders with the bound vars from which they came.
 pub struct PlaceholderReplacer<'a, 'tcx> {
     infcx: &'a InferCtxt<'tcx>,
-    mapped_regions: FxIndexMap<ty::PlaceholderRegion, ty::BoundRegion>,
-    mapped_types: FxIndexMap<ty::PlaceholderType, ty::BoundTy>,
-    mapped_consts: FxIndexMap<ty::PlaceholderConst, ty::BoundConst>,
+    mapped_regions: FxIndexMap<ty::PlaceholderRegion<'tcx>, ty::BoundRegion>,
+    mapped_types: FxIndexMap<ty::PlaceholderType<'tcx>, ty::BoundTy>,
+    mapped_consts: FxIndexMap<ty::PlaceholderConst<'tcx>, ty::BoundConst>,
     universe_indices: &'a [Option<ty::UniverseIndex>],
     current_index: ty::DebruijnIndex,
 }
@@ -230,9 +230,9 @@ pub struct PlaceholderReplacer<'a, 'tcx> {
 impl<'a, 'tcx> PlaceholderReplacer<'a, 'tcx> {
     pub fn replace_placeholders<T: TypeFoldable<TyCtxt<'tcx>>>(
         infcx: &'a InferCtxt<'tcx>,
-        mapped_regions: FxIndexMap<ty::PlaceholderRegion, ty::BoundRegion>,
-        mapped_types: FxIndexMap<ty::PlaceholderType, ty::BoundTy>,
-        mapped_consts: FxIndexMap<ty::PlaceholderConst, ty::BoundConst>,
+        mapped_regions: FxIndexMap<ty::PlaceholderRegion<'tcx>, ty::BoundRegion>,
+        mapped_types: FxIndexMap<ty::PlaceholderType<'tcx>, ty::BoundTy>,
+        mapped_consts: FxIndexMap<ty::PlaceholderConst<'tcx>, ty::BoundConst>,
         universe_indices: &'a [Option<ty::UniverseIndex>],
         value: T,
     ) -> T {
@@ -382,13 +382,6 @@ pub fn sizedness_fast_path<'tcx>(
             Some(LangItem::MetaSized) => SizedTraitKind::MetaSized,
             _ => return false,
         };
-
-        // FIXME(sized_hierarchy): this temporarily reverts the `sized_hierarchy` feature
-        // while a proper fix for `tests/ui/sized-hierarchy/incomplete-inference-issue-143992.rs`
-        // is pending a proper fix
-        if !tcx.features().sized_hierarchy() && matches!(sizedness, SizedTraitKind::MetaSized) {
-            return true;
-        }
 
         if trait_pred.self_ty().has_trivial_sizedness(tcx, sizedness) {
             debug!("fast path -- trivial sizedness");

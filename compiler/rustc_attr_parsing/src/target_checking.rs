@@ -1,14 +1,16 @@
 use std::borrow::Cow;
 
+use rustc_ast::AttrStyle;
 use rustc_errors::DiagArgValue;
 use rustc_feature::Features;
-use rustc_hir::lints::{AttributeLint, AttributeLintKind};
-use rustc_hir::{AttrPath, MethodKind, Target};
-use rustc_span::Span;
+use rustc_hir::lints::AttributeLintKind;
+use rustc_hir::{MethodKind, Target};
+use rustc_span::sym;
 
 use crate::AttributeParser;
-use crate::context::Stage;
+use crate::context::{AcceptContext, Stage};
 use crate::session_diagnostics::InvalidTarget;
+use crate::target_checking::Policy::Allow;
 
 #[derive(Debug)]
 pub(crate) enum AllowedTargets {
@@ -26,7 +28,9 @@ impl AllowedTargets {
     pub(crate) fn is_allowed(&self, target: Target) -> AllowedResult {
         match self {
             AllowedTargets::AllowList(list) => {
-                if list.contains(&Policy::Allow(target)) {
+                if list.contains(&Policy::Allow(target))
+                    || list.contains(&Policy::AllowSilent(target))
+                {
                     AllowedResult::Allowed
                 } else if list.contains(&Policy::Warn(target)) {
                     AllowedResult::Warn
@@ -35,7 +39,9 @@ impl AllowedTargets {
                 }
             }
             AllowedTargets::AllowListWarnRest(list) => {
-                if list.contains(&Policy::Allow(target)) {
+                if list.contains(&Policy::Allow(target))
+                    || list.contains(&Policy::AllowSilent(target))
+                {
                     AllowedResult::Allowed
                 } else if list.contains(&Policy::Error(target)) {
                     AllowedResult::Error
@@ -54,6 +60,7 @@ impl AllowedTargets {
         .iter()
         .filter_map(|target| match target {
             Policy::Allow(target) => Some(*target),
+            Policy::AllowSilent(_) => None, // Not listed in possible targets
             Policy::Warn(_) => None,
             Policy::Error(_) => None,
         })
@@ -61,47 +68,76 @@ impl AllowedTargets {
     }
 }
 
+/// This policy determines what diagnostics should be emitted based on the `Target` of the attribute.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum Policy {
+    /// A target that is allowed.
     Allow(Target),
+    /// A target that is allowed and not listed in the possible targets.
+    /// This is useful if the target is checked elsewhere.
+    AllowSilent(Target),
+    /// Emits a FCW on this target.
+    /// This is useful if the target was previously allowed but should not be.
     Warn(Target),
+    /// Emits an error on this target.
     Error(Target),
 }
 
-impl<S: Stage> AttributeParser<'_, S> {
+impl<'sess, S: Stage> AttributeParser<'sess, S> {
     pub(crate) fn check_target(
-        &self,
-        attr_name: AttrPath,
-        attr_span: Span,
         allowed_targets: &AllowedTargets,
         target: Target,
-        target_id: S::Id,
-        mut emit_lint: impl FnMut(AttributeLint<S::Id>),
+        cx: &mut AcceptContext<'_, 'sess, S>,
     ) {
+        // For crate-level attributes we emit a specific set of lints to warn
+        // people about accidentally not using them on the crate.
+        if let &AllowedTargets::AllowList(&[Allow(Target::Crate)]) = allowed_targets {
+            Self::check_crate_level(target, cx);
+            return;
+        }
+
         match allowed_targets.is_allowed(target) {
             AllowedResult::Allowed => {}
             AllowedResult::Warn => {
                 let allowed_targets = allowed_targets.allowed_targets();
-                let (applied, only) =
-                    allowed_targets_applied(allowed_targets, target, self.features);
-                emit_lint(AttributeLint {
-                    id: target_id,
-                    span: attr_span,
-                    kind: AttributeLintKind::InvalidTarget {
-                        name: attr_name,
-                        target,
+                let (applied, only) = allowed_targets_applied(allowed_targets, target, cx.features);
+                let name = cx.attr_path.clone();
+
+                let lint = if name.segments[0] == sym::deprecated
+                    && ![
+                        Target::Closure,
+                        Target::Expression,
+                        Target::Statement,
+                        Target::Arm,
+                        Target::MacroCall,
+                    ]
+                    .contains(&target)
+                {
+                    rustc_session::lint::builtin::USELESS_DEPRECATED
+                } else {
+                    rustc_session::lint::builtin::UNUSED_ATTRIBUTES
+                };
+
+                let attr_span = cx.attr_span;
+                cx.emit_lint(
+                    lint,
+                    AttributeLintKind::InvalidTarget {
+                        name: name.to_string(),
+                        target: target.plural_name(),
                         only: if only { "only " } else { "" },
                         applied,
+                        attr_span,
                     },
-                });
+                    attr_span,
+                );
             }
             AllowedResult::Error => {
                 let allowed_targets = allowed_targets.allowed_targets();
-                let (applied, only) =
-                    allowed_targets_applied(allowed_targets, target, self.features);
-                self.dcx().emit_err(InvalidTarget {
-                    span: attr_span,
-                    name: attr_name,
+                let (applied, only) = allowed_targets_applied(allowed_targets, target, cx.features);
+                let name = cx.attr_path.clone();
+                cx.dcx().emit_err(InvalidTarget {
+                    span: cx.attr_span.clone(),
+                    name,
                     target: target.plural_name(),
                     only: if only { "only " } else { "" },
                     applied: DiagArgValue::StrListSepByAnd(
@@ -110,6 +146,22 @@ impl<S: Stage> AttributeParser<'_, S> {
                 });
             }
         }
+    }
+
+    pub(crate) fn check_crate_level(target: Target, cx: &mut AcceptContext<'_, 'sess, S>) {
+        if target == Target::Crate {
+            return;
+        }
+
+        let kind = AttributeLintKind::InvalidStyle {
+            name: cx.attr_path.to_string(),
+            is_used_as_inner: cx.attr_style == AttrStyle::Inner,
+            target: target.name(),
+            target_span: cx.target_span,
+        };
+        let attr_span = cx.attr_span;
+
+        cx.emit_lint(rustc_session::lint::builtin::UNUSED_ATTRIBUTES, kind, attr_span);
     }
 }
 
@@ -167,16 +219,20 @@ pub(crate) fn allowed_targets_applied(
     filter_targets(&mut allowed_targets, IMPL_LIKE, "impl blocks", target, &mut added_fake_targets);
     filter_targets(&mut allowed_targets, ADT_LIKE, "data types", target, &mut added_fake_targets);
 
+    let mut target_strings: Vec<_> = added_fake_targets
+        .iter()
+        .copied()
+        .chain(allowed_targets.iter().map(|t| t.plural_name()))
+        .map(|i| i.to_string())
+        .collect();
+
+    // ensure a consistent order
+    target_strings.sort();
+
     // If there is now only 1 target left, show that as the only possible target
-    (
-        added_fake_targets
-            .iter()
-            .copied()
-            .chain(allowed_targets.iter().map(|t| t.plural_name()))
-            .map(|i| i.to_string())
-            .collect(),
-        allowed_targets.len() + added_fake_targets.len() == 1,
-    )
+    let only_target = target_strings.len() == 1;
+
+    (target_strings, only_target)
 }
 
 fn filter_targets(
@@ -243,5 +299,29 @@ pub(crate) const ALL_TARGETS: &'static [Policy] = {
         Allow(Target::Crate),
         Allow(Target::Delegation { mac: false }),
         Allow(Target::Delegation { mac: true }),
+        Allow(Target::GenericParam {
+            kind: rustc_hir::target::GenericParamKind::Const,
+            has_default: false,
+        }),
+        Allow(Target::GenericParam {
+            kind: rustc_hir::target::GenericParamKind::Const,
+            has_default: true,
+        }),
+        Allow(Target::GenericParam {
+            kind: rustc_hir::target::GenericParamKind::Lifetime,
+            has_default: false,
+        }),
+        Allow(Target::GenericParam {
+            kind: rustc_hir::target::GenericParamKind::Lifetime,
+            has_default: true,
+        }),
+        Allow(Target::GenericParam {
+            kind: rustc_hir::target::GenericParamKind::Type,
+            has_default: false,
+        }),
+        Allow(Target::GenericParam {
+            kind: rustc_hir::target::GenericParamKind::Type,
+            has_default: true,
+        }),
     ]
 };

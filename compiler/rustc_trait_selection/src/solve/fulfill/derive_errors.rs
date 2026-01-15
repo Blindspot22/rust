@@ -15,7 +15,7 @@ use rustc_next_trait_solver::solve::{GoalEvaluation, SolverDelegateEvalExt as _}
 use tracing::{instrument, trace};
 
 use crate::solve::delegate::SolverDelegate;
-use crate::solve::inspect::{self, ProofTreeInferCtxtExt, ProofTreeVisitor};
+use crate::solve::inspect::{self, InferCtxtProofTreeExt, ProofTreeVisitor};
 use crate::solve::{Certainty, deeply_normalize_for_diagnostics};
 use crate::traits::{FulfillmentError, FulfillmentErrorCode, wf};
 
@@ -95,15 +95,17 @@ pub(super) fn fulfillment_error_for_stalled<'tcx>(
             root_obligation.cause.span,
             None,
         ) {
-            Ok(GoalEvaluation { certainty: Certainty::Maybe(MaybeCause::Ambiguity), .. }) => {
-                (FulfillmentErrorCode::Ambiguity { overflow: None }, true)
-            }
+            Ok(GoalEvaluation {
+                certainty: Certainty::Maybe { cause: MaybeCause::Ambiguity, .. },
+                ..
+            }) => (FulfillmentErrorCode::Ambiguity { overflow: None }, true),
             Ok(GoalEvaluation {
                 certainty:
-                    Certainty::Maybe(MaybeCause::Overflow {
-                        suggest_increasing_limit,
-                        keep_constraints: _,
-                    }),
+                    Certainty::Maybe {
+                        cause:
+                            MaybeCause::Overflow { suggest_increasing_limit, keep_constraints: _ },
+                        ..
+                    },
                 ..
             }) => (
                 FulfillmentErrorCode::Ambiguity { overflow: Some(suggest_increasing_limit) },
@@ -175,7 +177,11 @@ fn find_best_leaf_obligation<'tcx>(
                 )
                 .break_value()
                 .ok_or(())
+                // walk around the fact that the cause in `Obligation` is ignored by folders so that
+                // we can properly fudge the infer vars in cause code.
+                .map(|o| (o.cause.clone(), o))
         })
+        .map(|(cause, o)| PredicateObligation { cause, ..o })
         .unwrap_or(obligation);
     deeply_normalize_for_diagnostics(infcx, obligation.param_env, obligation)
 }
@@ -229,7 +235,6 @@ impl<'tcx> BestObligation<'tcx> {
                                         nested_goal.source(),
                                         GoalSource::ImplWhereBound
                                             | GoalSource::AliasBoundConstCondition
-                                            | GoalSource::InstantiateHigherRanked
                                             | GoalSource::AliasWellFormed
                                     ) && nested_goal.result().is_err()
                                 },
@@ -266,7 +271,8 @@ impl<'tcx> BestObligation<'tcx> {
             );
             // Skip nested goals that aren't the *reason* for our goal's failure.
             match (self.consider_ambiguities, nested_goal.result()) {
-                (true, Ok(Certainty::Maybe(MaybeCause::Ambiguity))) | (false, Err(_)) => {}
+                (true, Ok(Certainty::Maybe { cause: MaybeCause::Ambiguity, .. }))
+                | (false, Err(_)) => {}
                 _ => continue,
             }
 
@@ -407,7 +413,8 @@ impl<'tcx> ProofTreeVisitor<'tcx> for BestObligation<'tcx> {
         let tcx = goal.infcx().tcx;
         // Skip goals that aren't the *reason* for our goal's failure.
         match (self.consider_ambiguities, goal.result()) {
-            (true, Ok(Certainty::Maybe(MaybeCause::Ambiguity))) | (false, Err(_)) => {}
+            (true, Ok(Certainty::Maybe { cause: MaybeCause::Ambiguity, .. })) | (false, Err(_)) => {
+            }
             _ => return ControlFlow::Continue(()),
         }
 
@@ -518,10 +525,6 @@ impl<'tcx> ProofTreeVisitor<'tcx> for BestObligation<'tcx> {
                         parent_host_pred,
                     ));
                     impl_where_bound_count += 1;
-                }
-                // Skip over a higher-ranked predicate.
-                (_, GoalSource::InstantiateHigherRanked) => {
-                    obligation = self.obligation.clone();
                 }
                 (ChildMode::PassThrough, _)
                 | (_, GoalSource::AliasWellFormed | GoalSource::AliasBoundConstCondition) => {

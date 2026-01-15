@@ -2,7 +2,7 @@
 #![allow(
     unused,
     clippy::diverging_sub_expression,
-    clippy::needless_if,
+    clippy::needless_ifs,
     clippy::redundant_pattern_matching
 )]
 #![warn(clippy::nonminimal_bool)]
@@ -182,13 +182,11 @@ fn issue_5794() {
     if !b == true {}
     //~^ nonminimal_bool
     //~| bool_comparison
-    //~| bool_comparison
     if !b != true {}
     //~^ nonminimal_bool
     //~| bool_comparison
     if true == !b {}
     //~^ nonminimal_bool
-    //~| bool_comparison
     //~| bool_comparison
     if true != !b {}
     //~^ nonminimal_bool

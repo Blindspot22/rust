@@ -1,14 +1,15 @@
 // ignore-tidy-filelength
 
 use std::borrow::Cow;
+use std::path::PathBuf;
 
 use rustc_ast::token::Token;
 use rustc_ast::util::parser::ExprPrecedence;
 use rustc_ast::{Path, Visibility};
 use rustc_errors::codes::*;
 use rustc_errors::{
-    Applicability, Diag, DiagCtxtHandle, Diagnostic, EmissionGuarantee, Level, Subdiagnostic,
-    SuggestionStyle,
+    Applicability, Diag, DiagArgValue, DiagCtxtHandle, Diagnostic, EmissionGuarantee, IntoDiagArg,
+    Level, Subdiagnostic, SuggestionStyle,
 };
 use rustc_macros::{Diagnostic, LintDiagnostic, Subdiagnostic};
 use rustc_session::errors::ExprParenthesesNeeded;
@@ -823,6 +824,12 @@ pub(crate) struct FrontmatterLengthMismatch {
 }
 
 #[derive(Diagnostic)]
+#[diag(parse_frontmatter_too_many_dashes)]
+pub(crate) struct FrontmatterTooManyDashes {
+    pub len_opening: usize,
+}
+
+#[derive(Diagnostic)]
 #[diag(parse_leading_plus_not_supported)]
 pub(crate) struct LeadingPlusNotSupported {
     #[primary_span]
@@ -1017,10 +1024,6 @@ pub(crate) struct InvalidLiteralSuffixOnTupleIndex {
     #[label]
     pub span: Span,
     pub suffix: Symbol,
-    #[help(parse_tuple_exception_line_1)]
-    #[help(parse_tuple_exception_line_2)]
-    #[help(parse_tuple_exception_line_3)]
-    pub exception: bool,
 }
 
 #[derive(Diagnostic)]
@@ -2004,14 +2007,6 @@ pub(crate) struct TraitAliasCannotBeAuto {
 }
 
 #[derive(Diagnostic)]
-#[diag(parse_trait_alias_cannot_be_const)]
-pub(crate) struct TraitAliasCannotBeConst {
-    #[primary_span]
-    #[label(parse_trait_alias_cannot_be_const)]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
 #[diag(parse_trait_alias_cannot_be_unsafe)]
 pub(crate) struct TraitAliasCannotBeUnsafe {
     #[primary_span]
@@ -2374,6 +2369,8 @@ pub(crate) struct UnknownTokenStart {
     pub null: Option<UnknownTokenNull>,
     #[subdiagnostic]
     pub repeat: Option<UnknownTokenRepeat>,
+    #[subdiagnostic]
+    pub invisible: Option<InvisibleCharacter>,
 }
 
 #[derive(Subdiagnostic)]
@@ -2413,6 +2410,10 @@ pub(crate) enum TokenSubstitution {
 pub(crate) struct UnknownTokenRepeat {
     pub repeats: usize,
 }
+
+#[derive(Subdiagnostic)]
+#[help(parse_help_invisible_char)]
+pub(crate) struct InvisibleCharacter;
 
 #[derive(Subdiagnostic)]
 #[help(parse_help_null)]
@@ -2467,12 +2468,6 @@ pub(crate) enum UnescapeError {
         is_hex: bool,
         ch: String,
     },
-    #[diag(parse_out_of_range_hex_escape)]
-    OutOfRangeHexEscape(
-        #[primary_span]
-        #[label]
-        Span,
-    ),
     #[diag(parse_leading_underscore_unicode_escape)]
     LeadingUnderscoreUnicodeEscape {
         #[primary_span]
@@ -2727,7 +2722,9 @@ pub(crate) struct DotDotDotRestPattern {
     #[label]
     pub span: Span,
     #[suggestion(style = "verbose", code = "", applicability = "machine-applicable")]
-    pub suggestion: Span,
+    pub suggestion: Option<Span>,
+    #[note]
+    pub var_args: Option<()>,
 }
 
 #[derive(Diagnostic)]
@@ -3030,6 +3027,14 @@ pub(crate) struct FnPointerCannotBeAsync {
 #[derive(Diagnostic)]
 #[diag(parse_nested_c_variadic_type, code = E0743)]
 pub(crate) struct NestedCVariadicType {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(parse_dotdotdot_rest_type)]
+#[note]
+pub(crate) struct InvalidCVariadicType {
     #[primary_span]
     pub span: Span,
 }
@@ -3343,34 +3348,24 @@ pub(crate) struct KwBadCase<'a> {
     #[suggestion(code = "{kw}", style = "verbose", applicability = "machine-applicable")]
     pub span: Span,
     pub kw: &'a str,
+    pub case: Case,
 }
 
-#[derive(Diagnostic)]
-#[diag(parse_cfg_attr_bad_delim)]
-pub(crate) struct CfgAttrBadDelim {
-    #[primary_span]
-    pub span: Span,
-    #[subdiagnostic]
-    pub sugg: MetaBadDelimSugg,
+pub(crate) enum Case {
+    Upper,
+    Lower,
+    Mixed,
 }
 
-#[derive(Subdiagnostic)]
-#[multipart_suggestion(parse_meta_bad_delim_suggestion, applicability = "machine-applicable")]
-pub(crate) struct MetaBadDelimSugg {
-    #[suggestion_part(code = "(")]
-    pub open: Span,
-    #[suggestion_part(code = ")")]
-    pub close: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag(parse_malformed_cfg_attr)]
-#[note]
-pub(crate) struct MalformedCfgAttr {
-    #[primary_span]
-    #[suggestion(style = "verbose", code = "{sugg}")]
-    pub span: Span,
-    pub sugg: &'static str,
+impl IntoDiagArg for Case {
+    fn into_diag_arg(self, path: &mut Option<PathBuf>) -> DiagArgValue {
+        match self {
+            Case::Upper => "uppercase",
+            Case::Lower => "lowercase",
+            Case::Mixed => "the correct case",
+        }
+        .into_diag_arg(path)
+    }
 }
 
 #[derive(Diagnostic)]
@@ -3674,4 +3669,18 @@ impl Subdiagnostic for HiddenUnicodeCodepointsDiagSub {
             }
         }
     }
+}
+
+#[derive(LintDiagnostic)]
+#[diag(parse_varargs_without_pattern)]
+pub(crate) struct VarargsWithoutPattern {
+    #[suggestion(code = "_: ...", applicability = "machine-applicable")]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(parse_delegation_non_trait_impl_reuse)]
+pub(crate) struct ImplReuseInherentImpl {
+    #[primary_span]
+    pub span: Span,
 }

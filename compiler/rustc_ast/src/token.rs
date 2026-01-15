@@ -16,14 +16,37 @@ use rustc_span::{Ident, Symbol};
 use crate::ast;
 use crate::util::case::Case;
 
-#[derive(Clone, Copy, PartialEq, Encodable, Decodable, Debug, HashStable_Generic)]
+/// Represents the kind of doc comment it is, ie `///` or `#[doc = ""]`.
+#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Debug, HashStable_Generic)]
+pub enum DocFragmentKind {
+    /// A sugared doc comment: `///` or `//!` or `/**` or `/*!`.
+    Sugared(CommentKind),
+    /// A "raw" doc comment: `#[doc = ""]`. The `Span` represents the string literal.
+    Raw(Span),
+}
+
+impl DocFragmentKind {
+    pub fn is_sugared(self) -> bool {
+        matches!(self, Self::Sugared(_))
+    }
+
+    /// If it is `Sugared`, it will return its associated `CommentKind`, otherwise it will return
+    /// `CommentKind::Line`.
+    pub fn comment_kind(self) -> CommentKind {
+        match self {
+            Self::Sugared(kind) => kind,
+            Self::Raw(_) => CommentKind::Line,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Encodable, Decodable, Debug, HashStable_Generic)]
 pub enum CommentKind {
     Line,
     Block,
 }
 
-// This type must not implement `Hash` due to the unusual `PartialEq` impl below.
-#[derive(Copy, Clone, Debug, Encodable, Decodable, HashStable_Generic)]
+#[derive(Copy, Clone, PartialEq, Debug, Encodable, Decodable, HashStable_Generic)]
 pub enum InvisibleOrigin {
     // From the expansion of a metavariable in a declarative macro.
     MetaVar(MetaVarKind),
@@ -42,20 +65,6 @@ impl InvisibleOrigin {
             InvisibleOrigin::MetaVar(_) => false,
             InvisibleOrigin::ProcMacro => true,
         }
-    }
-}
-
-impl PartialEq for InvisibleOrigin {
-    #[inline]
-    fn eq(&self, _other: &InvisibleOrigin) -> bool {
-        // When we had AST-based nonterminals we couldn't compare them, and the
-        // old `Nonterminal` type had an `eq` that always returned false,
-        // resulting in this restriction:
-        // https://doc.rust-lang.org/nightly/reference/macros-by-example.html#forwarding-a-matched-fragment
-        // This `eq` emulates that behaviour. We could consider lifting this
-        // restriction now but there are still cases involving invisible
-        // delimiters that make it harder than it first appears.
-        false
     }
 }
 
@@ -142,7 +151,8 @@ impl Delimiter {
         }
     }
 
-    // This exists because `InvisibleOrigin`s should be compared. It is only used for assertions.
+    // This exists because `InvisibleOrigin`s should not be compared. It is only used for
+    // assertions.
     pub fn eq_ignoring_invisible_origin(&self, other: &Delimiter) -> bool {
         match (self, other) {
             (Delimiter::Parenthesis, Delimiter::Parenthesis) => true,
@@ -895,11 +905,11 @@ impl Token {
     }
 
     pub fn is_qpath_start(&self) -> bool {
-        self == &Lt || self == &Shl
+        matches!(self.kind, Lt | Shl)
     }
 
     pub fn is_path_start(&self) -> bool {
-        self == &PathSep
+        self.kind == PathSep
             || self.is_qpath_start()
             || matches!(self.is_metavar_seq(), Some(MetaVarKind::Path))
             || self.is_path_segment_keyword()

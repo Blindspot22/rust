@@ -6,10 +6,11 @@ use std::io::ErrorKind;
 
 use rand::Rng;
 use rustc_abi::Size;
+use rustc_target::spec::Os;
 
 use crate::shims::files::FileDescription;
 use crate::shims::sig::check_min_vararg_count;
-use crate::shims::unix::linux_like::epoll::EpollReadyEvents;
+use crate::shims::unix::linux_like::epoll::EpollEvents;
 use crate::shims::unix::*;
 use crate::*;
 
@@ -61,8 +62,8 @@ pub trait UnixFileDescription: FileDescription {
         throw_unsup_format!("cannot flock {}", self.name());
     }
 
-    /// Check the readiness of file description.
-    fn get_epoll_ready_events<'tcx>(&self) -> InterpResult<'tcx, EpollReadyEvents> {
+    /// Return which epoll events are currently active.
+    fn epoll_active_events<'tcx>(&self) -> InterpResult<'tcx, EpollEvents> {
         throw_unsup_format!("{}: epoll does not support this file description", self.name());
     }
 }
@@ -197,7 +198,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
                 fd.set_flags(flag, this)
             }
-            cmd if this.tcx.sess.target.os == "macos"
+            cmd if this.tcx.sess.target.os == Os::MacOs
                 && cmd == this.eval_libc_i32("F_FULLFSYNC") =>
             {
                 // Reject if isolation is enabled.
@@ -264,14 +265,25 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             return this.set_last_error_and_return(LibcError("EBADF"), dest);
         };
 
+        // Handle the zero-sized case. The man page says:
+        // > If count is zero, read() may detect the errors described below.  In the absence of any
+        // > errors, or if read() does not check for errors, a read() with a count of 0 returns zero
+        // > and has no other effects.
+        if count == 0 {
+            this.write_null(dest)?;
+            return interp_ok(());
+        }
         // Non-deterministically decide to further reduce the count, simulating a partial read (but
-        // never to 0, that has different behavior).
-        let count =
-            if fd.nondet_short_accesses() && count >= 2 && this.machine.rng.get_mut().random() {
-                count / 2
-            } else {
-                count
-            };
+        // never to 0, that would indicate EOF).
+        let count = if this.machine.short_fd_operations
+            && fd.short_fd_operations()
+            && count >= 2
+            && this.machine.rng.get_mut().random()
+        {
+            count / 2 // since `count` is at least 2, the result is still at least 1
+        } else {
+            count
+        };
 
         trace!("read: FD mapped to {fd:?}");
         // We want to read at most `count` bytes. We are sure that `count` is not negative
@@ -338,14 +350,29 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             return this.set_last_error_and_return(LibcError("EBADF"), dest);
         };
 
-        // Non-deterministically decide to further reduce the count, simulating a partial write (but
-        // never to 0, that has different behavior).
-        let count =
-            if fd.nondet_short_accesses() && count >= 2 && this.machine.rng.get_mut().random() {
-                count / 2
-            } else {
-                count
-            };
+        // Handle the zero-sized case. The man page says:
+        // > If count is zero and fd refers to a regular file, then write() may return a failure
+        // > status if one of the errors below is detected.  If no errors are detected, or error
+        // > detection is not performed, 0 is returned without causing any other effect.   If  count
+        // > is  zero  and  fd refers to a file other than a regular file, the results are not
+        // > specified.
+        if count == 0 {
+            // For now let's not open the can of worms of what exactly "not specified" could mean...
+            this.write_null(dest)?;
+            return interp_ok(());
+        }
+        // Non-deterministically decide to further reduce the count, simulating a partial write.
+        // We avoid reducing the write size to 0: the docs seem to be entirely fine with that,
+        // but the standard library is not (https://github.com/rust-lang/rust/issues/145959).
+        let count = if this.machine.short_fd_operations
+            && fd.short_fd_operations()
+            && count >= 2
+            && this.machine.rng.get_mut().random()
+        {
+            count / 2
+        } else {
+            count
+        };
 
         let finish = {
             let dest = dest.clone();

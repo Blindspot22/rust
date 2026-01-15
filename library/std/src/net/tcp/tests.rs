@@ -1,5 +1,5 @@
 use crate::io::prelude::*;
-use crate::io::{BorrowedBuf, IoSlice, IoSliceMut};
+use crate::io::{BorrowedBuf, ErrorKind, IoSlice, IoSliceMut};
 use crate::mem::MaybeUninit;
 use crate::net::test::{next_test_ip4, next_test_ip6};
 use crate::net::*;
@@ -37,7 +37,8 @@ fn connect_error() {
             e.kind() == ErrorKind::ConnectionRefused
                 || e.kind() == ErrorKind::InvalidInput
                 || e.kind() == ErrorKind::AddrInUse
-                || e.kind() == ErrorKind::AddrNotAvailable,
+                || e.kind() == ErrorKind::AddrNotAvailable
+                || e.kind() == ErrorKind::NetworkUnreachable,
             "bad error: {} {:?}",
             e,
             e.kind()

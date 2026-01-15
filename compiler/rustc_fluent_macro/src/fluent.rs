@@ -8,6 +8,9 @@ use fluent_syntax::ast::{
     Attribute, Entry, Expression, Identifier, InlineExpression, Message, Pattern, PatternElement,
 };
 use fluent_syntax::parser::ParserError;
+#[cfg(not(bootstrap))]
+use proc_macro::tracked::path;
+#[cfg(bootstrap)]
 use proc_macro::tracked_path::path;
 use proc_macro::{Diagnostic, Level, Span};
 use proc_macro2::TokenStream;
@@ -265,7 +268,7 @@ pub(crate) fn fluent_messages(input: proc_macro::TokenStream) -> proc_macro::Tok
                 Level::Error,
                 format!("referenced message `{mref}` does not exist (in message `{name}`)"),
             )
-            .help(&format!("you may have meant to use a variable reference (`{{${mref}}}`)"))
+            .help(format!("you may have meant to use a variable reference (`{{${mref}}}`)"))
             .emit();
         }
     }

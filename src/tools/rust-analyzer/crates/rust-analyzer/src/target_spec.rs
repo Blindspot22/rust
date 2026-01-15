@@ -2,12 +2,14 @@
 
 use std::mem;
 
+use cargo_metadata::PackageId;
 use cfg::{CfgAtom, CfgExpr};
 use hir::sym;
 use ide::{Cancellable, Crate, FileId, RunnableKind, TestId};
 use project_model::project_json::Runnable;
 use project_model::{CargoFeatures, ManifestPath, TargetKind};
 use rustc_hash::FxHashSet;
+use triomphe::Arc;
 use vfs::AbsPathBuf;
 
 use crate::global_state::GlobalStateSnapshot;
@@ -52,6 +54,7 @@ pub(crate) struct CargoTargetSpec {
     pub(crate) workspace_root: AbsPathBuf,
     pub(crate) cargo_toml: ManifestPath,
     pub(crate) package: String,
+    pub(crate) package_id: Arc<PackageId>,
     pub(crate) target: String,
     pub(crate) target_kind: TargetKind,
     pub(crate) crate_id: Crate,
@@ -120,7 +123,7 @@ impl CargoTargetSpec {
 
         match kind {
             RunnableKind::Test { test_id, attr } => {
-                cargo_args.push("test".to_owned());
+                cargo_args.push(config.test_command);
                 executable_args.push(test_id.to_string());
                 if let TestId::Path(_) = test_id {
                     executable_args.push("--exact".to_owned());
@@ -131,12 +134,12 @@ impl CargoTargetSpec {
                 }
             }
             RunnableKind::TestMod { path } => {
-                cargo_args.push("test".to_owned());
+                cargo_args.push(config.test_command);
                 executable_args.push(path.clone());
                 executable_args.extend(extra_test_binary_args);
             }
             RunnableKind::Bench { test_id } => {
-                cargo_args.push("bench".to_owned());
+                cargo_args.push(config.bench_command);
                 executable_args.push(test_id.to_string());
                 if let TestId::Path(_) = test_id {
                     executable_args.push("--exact".to_owned());
@@ -151,10 +154,12 @@ impl CargoTargetSpec {
             }
             RunnableKind::Bin => {
                 let subcommand = match spec {
-                    Some(CargoTargetSpec { target_kind: TargetKind::Test, .. }) => "test",
-                    _ => "run",
+                    Some(CargoTargetSpec { target_kind: TargetKind::Test, .. }) => {
+                        config.test_command
+                    }
+                    _ => "run".to_owned(),
                 };
-                cargo_args.push(subcommand.to_owned());
+                cargo_args.push(subcommand);
             }
         }
 
@@ -201,6 +206,53 @@ impl CargoTargetSpec {
         }
         cargo_args.extend(config.cargo_extra_args.iter().cloned());
         (cargo_args, executable_args)
+    }
+
+    pub(crate) fn override_command(
+        snap: &GlobalStateSnapshot,
+        spec: Option<CargoTargetSpec>,
+        kind: &RunnableKind,
+    ) -> Option<Vec<String>> {
+        let config = snap.config.runnables(None);
+        let (args, test_name) = match kind {
+            RunnableKind::Test { test_id, .. } => {
+                (config.test_override_command, Some(test_id.to_string()))
+            }
+            RunnableKind::TestMod { path } => (config.test_override_command, Some(path.clone())),
+            RunnableKind::Bench { test_id } => {
+                (config.bench_override_command, Some(test_id.to_string()))
+            }
+            RunnableKind::DocTest { test_id } => {
+                (config.doc_test_override_command, Some(test_id.to_string()))
+            }
+            RunnableKind::Bin => match spec {
+                Some(CargoTargetSpec { target_kind: TargetKind::Test, .. }) => {
+                    (config.test_override_command, None)
+                }
+                _ => (None, None),
+            },
+        };
+        let test_name = test_name.unwrap_or_default();
+
+        let target_arg = |kind| match kind {
+            TargetKind::Bin => "--bin",
+            TargetKind::Test => "--test",
+            TargetKind::Bench => "--bench",
+            TargetKind::Example => "--example",
+            TargetKind::Lib { .. } => "--lib",
+            TargetKind::BuildScript | TargetKind::Other => "",
+        };
+
+        let replace_placeholders = |arg: String| match &spec {
+            Some(spec) => arg
+                .replace("${package}", &spec.package)
+                .replace("${target_arg}", target_arg(spec.target_kind))
+                .replace("${target}", &spec.target)
+                .replace("${test_name}", &test_name),
+            _ => arg,
+        };
+
+        args.map(|args| args.into_iter().map(replace_placeholders).collect())
     }
 
     pub(crate) fn push_to(self, buf: &mut Vec<String>, kind: &RunnableKind) {

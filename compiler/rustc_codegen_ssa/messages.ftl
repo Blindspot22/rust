@@ -8,11 +8,9 @@ codegen_ssa_aix_strip_not_used = using host's `strip` binary to cross-compile to
 
 codegen_ssa_archive_build_failure = failed to build archive at `{$path}`: {$error}
 
-codegen_ssa_autodiff_without_lto = using the autodiff feature requires using fat-lto
-
-codegen_ssa_bare_instruction_set = `#[instruction_set]` requires an argument
-
 codegen_ssa_binary_output_to_tty = option `-o` or `--emit` is used to write binary output type `{$shorthand}` to stdout, but stdout is a tty
+
+codegen_ssa_bpf_staticlib_not_supported = linking static libraries is not supported for BPF
 
 codegen_ssa_cgu_not_recorded =
     CGU-reuse for `{$cgu_user_name}` is (mangled: `{$cgu_name}`) was not recorded
@@ -31,7 +29,7 @@ codegen_ssa_cpu_required = target requires explicitly specifying a cpu with `-C 
 codegen_ssa_create_temp_dir = couldn't create a temp dir: {$error}
 
 codegen_ssa_dlltool_fail_import_library =
-    Dlltool could not create import library with {$dlltool_path} {$dlltool_args}:
+    dlltool could not create import library with {$dlltool_path} {$dlltool_args}:
     {$stdout}
     {$stderr}
 
@@ -40,15 +38,15 @@ codegen_ssa_dynamic_linking_with_lto =
     .note = only 'staticlib', 'bin', and 'cdylib' outputs are supported with LTO
 
 codegen_ssa_error_calling_dlltool =
-    Error calling dlltool '{$dlltool_path}': {$error}
+    error calling dlltool '{$dlltool_path}': {$error}
 
 codegen_ssa_error_creating_import_library =
-    Error creating import library for {$lib_name}: {$error}
+    error creating import library for {$lib_name}: {$error}
 
 codegen_ssa_error_creating_remark_dir = failed to create remark directory: {$error}
 
 codegen_ssa_error_writing_def_file =
-    Error writing .DEF file: {$error}
+    error writing .DEF file: {$error}
 
 codegen_ssa_expected_name_value_pair = expected name value pair
 
@@ -92,16 +90,14 @@ codegen_ssa_incorrect_cgu_reuse_type =
 
 codegen_ssa_insufficient_vs_code_product = VS Code is a different product, and is not sufficient.
 
-codegen_ssa_invalid_instruction_set = invalid instruction set specified
-
 codegen_ssa_invalid_literal_value = invalid literal value
     .label = value must be an integer between `0` and `255`
 
 codegen_ssa_invalid_monomorphization_basic_float_type = invalid monomorphization of `{$name}` intrinsic: expected basic float type, found `{$ty}`
 
-codegen_ssa_invalid_monomorphization_basic_integer_type = invalid monomorphization of `{$name}` intrinsic: expected basic integer type, found `{$ty}`
-
 codegen_ssa_invalid_monomorphization_basic_integer_or_ptr_type = invalid monomorphization of `{$name}` intrinsic: expected basic integer or pointer type, found `{$ty}`
+
+codegen_ssa_invalid_monomorphization_basic_integer_type = invalid monomorphization of `{$name}` intrinsic: expected basic integer type, found `{$ty}`
 
 codegen_ssa_invalid_monomorphization_cannot_return = invalid monomorphization of `{$name}` intrinsic: cannot return `{$ret_ty}`, expected `u{$expected_int_bits}` or `[u8; {$expected_bytes}]`
 
@@ -131,6 +127,7 @@ codegen_ssa_invalid_monomorphization_mask_wrong_element_type = invalid monomorph
 
 codegen_ssa_invalid_monomorphization_mismatched_lengths = invalid monomorphization of `{$name}` intrinsic: mismatched lengths: mask length `{$m_len}` != other vector length `{$v_len}`
 
+codegen_ssa_invalid_monomorphization_non_scalable_type = invalid monomorphization of `{$name}` intrinsic: expected non-scalable type, found scalable type `{$ty}`
 codegen_ssa_invalid_monomorphization_return_element = invalid monomorphization of `{$name}` intrinsic: expected return element type `{$in_elem}` (element of input `{$in_ty}`), found `{$ret_ty}` with element type `{$out_ty}`
 
 codegen_ssa_invalid_monomorphization_return_integer_type = invalid monomorphization of `{$name}` intrinsic: expected return type with integer elements, found `{$ret_ty}` with non-integer `{$out_ty}`
@@ -170,8 +167,6 @@ codegen_ssa_invalid_monomorphization_unsupported_operation = invalid monomorphiz
 codegen_ssa_invalid_monomorphization_unsupported_symbol = invalid monomorphization of `{$name}` intrinsic: unsupported {$symbol} from `{$in_ty}` with element `{$in_elem}` to `{$ret_ty}`
 
 codegen_ssa_invalid_monomorphization_unsupported_symbol_of_size = invalid monomorphization of `{$name}` intrinsic: unsupported {$symbol} from `{$in_ty}` with element `{$in_elem}` of size `{$size}` to `{$ret_ty}`
-
-codegen_ssa_invalid_windows_subsystem = invalid windows subsystem `{$subsystem}`, only `windows` and `console` are allowed
 
 codegen_ssa_ld64_unimplemented_modifier = `as-needed` modifier not implemented yet for ld64
 
@@ -218,14 +213,10 @@ codegen_ssa_msvc_missing_linker = the msvc targets depend on the msvc linker but
 
 codegen_ssa_multiple_external_func_decl = multiple declarations of external function `{$function}` from library `{$library_name}` have different calling conventions
 
-codegen_ssa_multiple_instruction_set = cannot specify more than one instruction set
-
 codegen_ssa_multiple_main_functions = entry symbol `main` declared multiple times
     .help = did you use `#[no_mangle]` on `fn main`? Use `#![no_main]` to suppress the usual Rust-generated entry point
 
 codegen_ssa_no_field = no field `{$name}`
-
-codegen_ssa_no_mangle_nameless = `#[no_mangle]` cannot be used on {$definition} as it has no name
 
 codegen_ssa_no_module_named =
     no module named `{$user_path}` (mangled: {$cgu_name}). available modules: {$cgu_names}
@@ -264,9 +255,9 @@ codegen_ssa_shuffle_indices_evaluation = could not evaluate shuffle_indices at c
 
 codegen_ssa_specify_libraries_to_link = use the `-l` flag to specify native libraries to link
 
-codegen_ssa_static_library_native_artifacts = Link against the following native artifacts when linking against this static library. The order and any duplication can be significant on some platforms.
+codegen_ssa_static_library_native_artifacts = link against the following native artifacts when linking against this static library. The order and any duplication can be significant on some platforms.
 
-codegen_ssa_static_library_native_artifacts_to_file = Native artifacts to link against have been written to {$path}. The order and any duplication can be significant on some platforms.
+codegen_ssa_static_library_native_artifacts_to_file = native artifacts to link against have been written to {$path}. The order and any duplication can be significant on some platforms.
 
 codegen_ssa_stripping_debug_info_failed = stripping debug info with `{$util}` failed: {$status}
     .note = {$output}
@@ -364,13 +355,13 @@ codegen_ssa_unable_to_run = unable to run `{$util}`: {$error}
 
 codegen_ssa_unable_to_run_dsymutil = unable to run `dsymutil`: {$error}
 
-codegen_ssa_unable_to_write_debugger_visualizer = Unable to write debugger visualizer file `{$path}`: {$error}
+codegen_ssa_unable_to_write_debugger_visualizer = unable to write debugger visualizer file `{$path}`: {$error}
 
 codegen_ssa_unexpected_parameter_name = unexpected parameter name
     .label = expected `{$prefix_nops}` or `{$entry_nops}`
 
 codegen_ssa_unknown_archive_kind =
-    Don't know how to build archive of type: {$kind}
+    don't know how to build archive of type: {$kind}
 
 codegen_ssa_unknown_ctarget_feature =
     unknown and unstable feature specified for `-Ctarget-feature`: `{$feature}`
@@ -387,8 +378,6 @@ codegen_ssa_unknown_reuse_kind = unknown cgu-reuse-kind `{$kind}` specified
 codegen_ssa_unstable_ctarget_feature =
     unstable feature specified for `-Ctarget-feature`: `{$feature}`
     .note = this feature is not stably supported; its behavior can change in the future
-
-codegen_ssa_unsupported_instruction_set = target does not support `#[instruction_set]`
 
 codegen_ssa_unsupported_link_self_contained = option `-C link-self-contained` is not supported on this target
 

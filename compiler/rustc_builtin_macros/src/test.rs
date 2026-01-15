@@ -11,7 +11,7 @@ use rustc_errors::{Applicability, Diag, Level};
 use rustc_expand::base::*;
 use rustc_hir::Attribute;
 use rustc_hir::attrs::AttributeKind;
-use rustc_span::{ErrorGuaranteed, FileNameDisplayPreference, Ident, Span, Symbol, sym};
+use rustc_span::{ErrorGuaranteed, Ident, RemapPathScopeComponents, Span, Symbol, sym};
 use thin_vec::{ThinVec, thin_vec};
 use tracing::debug;
 
@@ -34,10 +34,6 @@ pub(crate) fn expand_test_case(
     check_builtin_macro_attribute(ecx, meta_item, sym::test_case);
     warn_on_duplicate_attribute(ecx, &anno_item, sym::test_case);
 
-    if !ecx.ecfg.should_test {
-        return vec![];
-    }
-
     let sp = ecx.with_def_site_ctxt(attr_sp);
     let (mut item, is_stmt) = match anno_item {
         Annotatable::Item(item) => (item, false),
@@ -53,6 +49,10 @@ pub(crate) fn expand_test_case(
             return vec![];
         }
     };
+
+    if !ecx.ecfg.should_test {
+        return vec![];
+    }
 
     // `#[test_case]` is valid on functions, consts, and statics. Only modify
     // the item in those cases.
@@ -113,28 +113,28 @@ pub(crate) fn expand_test_or_bench(
     item: Annotatable,
     is_bench: bool,
 ) -> Vec<Annotatable> {
-    // If we're not in test configuration, remove the annotated item
-    if !cx.ecfg.should_test {
-        return vec![];
-    }
-
     let (item, is_stmt) = match item {
         Annotatable::Item(i) => (i, false),
         Annotatable::Stmt(box ast::Stmt { kind: ast::StmtKind::Item(i), .. }) => (i, true),
         other => {
-            not_testable_error(cx, attr_sp, None);
+            not_testable_error(cx, is_bench, attr_sp, None);
             return vec![other];
         }
     };
 
     let ast::ItemKind::Fn(fn_) = &item.kind else {
-        not_testable_error(cx, attr_sp, Some(&item));
+        not_testable_error(cx, is_bench, attr_sp, Some(&item));
         return if is_stmt {
             vec![Annotatable::Stmt(Box::new(cx.stmt_item(item.span, item)))]
         } else {
             vec![Annotatable::Item(item)]
         };
     };
+
+    // If we're not in test configuration, remove the annotated item
+    if !cx.ecfg.should_test {
+        return vec![];
+    }
 
     if let Some(attr) = attr::find_by_name(&item.attrs, sym::naked) {
         cx.dcx().emit_err(errors::NakedFunctionTestingAttribute {
@@ -207,30 +207,30 @@ pub(crate) fn expand_test_or_bench(
     };
 
     let test_fn = if is_bench {
-        // A simple ident for a lambda
-        let b = Ident::from_str_and_span("b", attr_sp);
-
+        // avoid name collisions by using the function name within the identifier, see bug #148275
+        let bencher_param =
+            Ident::from_str_and_span(&format!("__bench_{}", fn_.ident.name), attr_sp);
         cx.expr_call(
             sp,
             cx.expr_path(test_path("StaticBenchFn")),
             thin_vec![
                 // #[coverage(off)]
-                // |b| self::test::assert_test_result(
+                // |__bench_fn_name| self::test::assert_test_result(
                 coverage_off(cx.lambda1(
                     sp,
                     cx.expr_call(
                         sp,
                         cx.expr_path(test_path("assert_test_result")),
                         thin_vec![
-                            // super::$test_fn(b)
+                            // super::$test_fn(__bench_fn_name)
                             cx.expr_call(
                                 ret_ty_sp,
                                 cx.expr_path(cx.path(sp, vec![fn_.ident])),
-                                thin_vec![cx.expr_ident(sp, b)],
+                                thin_vec![cx.expr_ident(sp, bencher_param)],
                             ),
                         ],
                     ),
-                    b,
+                    bencher_param,
                 )), // )
             ],
         )
@@ -289,7 +289,7 @@ pub(crate) fn expand_test_or_bench(
                     ty: cx.ty(sp, ast::TyKind::Path(None, test_path("TestDescAndFn"))),
                     define_opaque: None,
                     // test::TestDescAndFn {
-                    expr: Some(
+                    rhs: Some(ast::ConstItemRhs::Body(
                         cx.expr_struct(
                             sp,
                             test_path("TestDescAndFn"),
@@ -371,7 +371,7 @@ pub(crate) fn expand_test_or_bench(
                         field("testfn", test_fn), // }
                     ],
                         ), // }
-                    ),
+                    )),
                 }
                 .into(),
             ),
@@ -405,9 +405,10 @@ pub(crate) fn expand_test_or_bench(
     }
 }
 
-fn not_testable_error(cx: &ExtCtxt<'_>, attr_sp: Span, item: Option<&ast::Item>) {
+fn not_testable_error(cx: &ExtCtxt<'_>, is_bench: bool, attr_sp: Span, item: Option<&ast::Item>) {
     let dcx = cx.dcx();
-    let msg = "the `#[test]` attribute may only be used on a non-associated function";
+    let name = if is_bench { "bench" } else { "test" };
+    let msg = format!("the `#[{name}]` attribute may only be used on a free function");
     let level = match item.map(|i| &i.kind) {
         // These were a warning before #92959 and need to continue being that to avoid breaking
         // stable user code (#94508).
@@ -426,12 +427,16 @@ fn not_testable_error(cx: &ExtCtxt<'_>, attr_sp: Span, item: Option<&ast::Item>)
             ),
         );
     }
-    err.with_span_label(attr_sp, "the `#[test]` macro causes a function to be run as a test and has no effect on non-functions")
-        .with_span_suggestion(attr_sp,
+    err.span_label(attr_sp, format!("the `#[{name}]` macro causes a function to be run as a test and has no effect on non-functions"));
+
+    if !is_bench {
+        err.with_span_suggestion(attr_sp,
             "replace with conditional compilation to make the item only exist when tests are being run",
             "#[cfg(test)]",
-            Applicability::MaybeIncorrect)
-        .emit();
+            Applicability::MaybeIncorrect).emit();
+    } else {
+        err.emit();
+    }
 }
 
 fn get_location_info(cx: &ExtCtxt<'_>, fn_: &ast::Fn) -> (Symbol, usize, usize, usize, usize) {
@@ -440,7 +445,7 @@ fn get_location_info(cx: &ExtCtxt<'_>, fn_: &ast::Fn) -> (Symbol, usize, usize, 
         cx.sess.source_map().span_to_location_info(span);
 
     let file_name = match source_file {
-        Some(sf) => sf.name.display(FileNameDisplayPreference::Remapped).to_string(),
+        Some(sf) => sf.name.display(RemapPathScopeComponents::MACRO).to_string(),
         None => "no-location".to_string(),
     };
 

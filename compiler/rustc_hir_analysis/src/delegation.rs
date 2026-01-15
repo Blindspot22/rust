@@ -135,9 +135,6 @@ fn build_generics<'tcx>(
     // }
     own_params.sort_by_key(|key| key.kind.is_ty_or_const());
 
-    let param_def_id_to_index =
-        own_params.iter().map(|param| (param.def_id, param.index)).collect();
-
     let (parent_count, has_self) = if let Some(def_id) = parent {
         let parent_generics = tcx.generics_of(def_id);
         let parent_kind = tcx.def_kind(def_id);
@@ -161,6 +158,9 @@ fn build_generics<'tcx>(
             *has_default = false;
         }
     }
+
+    let param_def_id_to_index =
+        own_params.iter().map(|param| (param.def_id, param.index)).collect();
 
     ty::Generics {
         parent,
@@ -272,8 +272,7 @@ fn create_generic_args<'tcx>(
         (FnKind::AssocTraitImpl, FnKind::AssocTrait) => {
             let callee_generics = tcx.generics_of(sig_id);
             let parent = tcx.parent(def_id.into());
-            let parent_args =
-                tcx.impl_trait_header(parent).unwrap().trait_ref.instantiate_identity().args;
+            let parent_args = tcx.impl_trait_header(parent).trait_ref.instantiate_identity().args;
 
             let trait_args = ty::GenericArgs::identity_for_item(tcx, sig_id);
             let method_args = tcx.mk_args(&trait_args[callee_generics.parent_count..]);
@@ -401,12 +400,6 @@ fn check_constraints<'tcx>(
             callee_span: tcx.def_span(sig_id),
         }));
     };
-
-    if let Some(local_sig_id) = sig_id.as_local()
-        && tcx.hir_opt_delegation_sig_id(local_sig_id).is_some()
-    {
-        emit("recursive delegation is not supported yet");
-    }
 
     if tcx.fn_sig(sig_id).skip_binder().skip_binder().c_variadic {
         // See issue #127443 for explanation.

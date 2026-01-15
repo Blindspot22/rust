@@ -45,7 +45,7 @@ pub fn walk_expr<'thir, 'tcx: 'thir, V: Visitor<'thir, 'tcx>>(
     expr: &'thir Expr<'tcx>,
 ) {
     use ExprKind::*;
-    let Expr { kind, ty: _, temp_lifetime: _, span: _ } = expr;
+    let Expr { kind, ty: _, temp_scope_id: _, span: _ } = expr;
     match *kind {
         Scope { value, region_scope: _, lint_level: _ } => {
             visitor.visit_expr(&visitor.thir()[value])
@@ -188,7 +188,6 @@ pub fn walk_expr<'thir, 'tcx: 'thir, V: Visitor<'thir, 'tcx>>(
                 }
             }
         }
-        OffsetOf { container: _, fields: _ } => {}
         ThreadLocalRef(_) => {}
         Yield { value } => visitor.visit_expr(&visitor.thir()[value]),
     }
@@ -260,7 +259,7 @@ pub(crate) fn for_each_immediate_subpat<'a, 'tcx>(
     pat: &'a Pat<'tcx>,
     mut callback: impl FnMut(&'a Pat<'tcx>),
 ) {
-    let Pat { kind, ty: _, span: _ } = pat;
+    let Pat { kind, ty: _, span: _, extra: _ } = pat;
     match kind {
         PatKind::Missing
         | PatKind::Wild
@@ -270,11 +269,9 @@ pub(crate) fn for_each_immediate_subpat<'a, 'tcx>(
         | PatKind::Never
         | PatKind::Error(_) => {}
 
-        PatKind::AscribeUserType { subpattern, .. }
-        | PatKind::Binding { subpattern: Some(subpattern), .. }
+        PatKind::Binding { subpattern: Some(subpattern), .. }
         | PatKind::Deref { subpattern }
-        | PatKind::DerefPattern { subpattern, .. }
-        | PatKind::ExpandedConstant { subpattern, .. } => callback(subpattern),
+        | PatKind::DerefPattern { subpattern, .. } => callback(subpattern),
 
         PatKind::Variant { subpatterns, .. } | PatKind::Leaf { subpatterns } => {
             for field_pat in subpatterns {

@@ -1,4 +1,3 @@
-use std::assert_matches::assert_matches;
 use std::ffi::CStr;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
@@ -37,15 +36,10 @@ impl OwnedTargetMachine {
         use_init_array: bool,
         split_dwarf_file: &CStr,
         output_obj_file: &CStr,
-        debug_info_compression: &CStr,
+        debug_info_compression: llvm::CompressionKind,
         use_emulated_tls: bool,
-        args_cstr_buff: &[u8],
         use_wasm_eh: bool,
     ) -> Result<Self, LlvmError<'static>> {
-        // The argument list is passed as the concatenation of one or more C strings.
-        // This implies that there must be a last byte, and it must be 0.
-        assert_matches!(args_cstr_buff, [.., b'\0'], "the last byte must be a NUL terminator");
-
         // SAFETY: llvm::LLVMRustCreateTargetMachine copies pointed to data
         let tm_ptr = unsafe {
             llvm::LLVMRustCreateTargetMachine(
@@ -68,10 +62,8 @@ impl OwnedTargetMachine {
                 use_init_array,
                 split_dwarf_file.as_ptr(),
                 output_obj_file.as_ptr(),
-                debug_info_compression.as_ptr(),
+                debug_info_compression,
                 use_emulated_tls,
-                args_cstr_buff.as_ptr(),
-                args_cstr_buff.len(),
                 use_wasm_eh,
             )
         };
@@ -97,8 +89,6 @@ impl Drop for OwnedTargetMachine {
         // SAFETY: constructing ensures we have a valid pointer created by
         // llvm::LLVMRustCreateTargetMachine OwnedTargetMachine is not copyable so there is no
         // double free or use after free.
-        unsafe {
-            llvm::LLVMRustDisposeTargetMachine(self.tm_unique.as_ptr());
-        }
+        unsafe { llvm::LLVMDisposeTargetMachine(self.tm_unique) };
     }
 }

@@ -1,10 +1,12 @@
-use crate::common::{Config, KNOWN_CRATE_TYPES, KNOWN_TARGET_HAS_ATOMIC_WIDTHS, Sanitizer};
-use crate::directives::{IgnoreDecision, llvm_has_libzstd};
+use crate::common::{
+    Config, KNOWN_CRATE_TYPES, KNOWN_TARGET_HAS_ATOMIC_WIDTHS, Sanitizer, query_rustc_output,
+};
+use crate::directives::{DirectiveLine, IgnoreDecision};
 
 pub(super) fn handle_needs(
     cache: &CachedNeedsConditions,
     config: &Config,
-    ln: &str,
+    ln: &DirectiveLine<'_>,
 ) -> IgnoreDecision {
     // Note that we intentionally still put the needs- prefix here to make the file show up when
     // grepping for a directive name, even though we could technically strip that.
@@ -70,6 +72,11 @@ pub(super) fn handle_needs(
             ignore_reason: "ignored on targets without memory tagging sanitizer",
         },
         Need {
+            name: "needs-sanitizer-realtime",
+            condition: cache.sanitizer_realtime,
+            ignore_reason: "ignored on targets without realtime sanitizer",
+        },
+        Need {
             name: "needs-sanitizer-shadow-call-stack",
             condition: cache.sanitizer_shadow_call_stack,
             ignore_reason: "ignored on targets without shadow call stacks",
@@ -81,8 +88,13 @@ pub(super) fn handle_needs(
         },
         Need {
             name: "needs-enzyme",
-            condition: config.has_enzyme,
-            ignore_reason: "ignored when LLVM Enzyme is disabled",
+            condition: config.has_enzyme && config.default_codegen_backend.is_llvm(),
+            ignore_reason: "ignored when LLVM Enzyme is disabled or LLVM is not the default codegen backend",
+        },
+        Need {
+            name: "needs-offload",
+            condition: config.has_offload && config.default_codegen_backend.is_llvm(),
+            ignore_reason: "ignored when LLVM Offload is disabled or LLVM is not the default codegen backend",
         },
         Need {
             name: "needs-run-enabled",
@@ -161,8 +173,8 @@ pub(super) fn handle_needs(
         },
         Need {
             name: "needs-llvm-zstd",
-            condition: cache.llvm_zstd,
-            ignore_reason: "ignored if LLVM wasn't build with zstd for ELF section compression",
+            condition: cache.llvm_zstd && config.default_codegen_backend.is_llvm(),
+            ignore_reason: "ignored if LLVM wasn't build with zstd for ELF section compression or LLVM is not the default codegen backend",
         },
         Need {
             name: "needs-rustc-debug-assertions",
@@ -175,21 +187,21 @@ pub(super) fn handle_needs(
             ignore_reason: "ignored if std wasn't built with debug assertions",
         },
         Need {
+            name: "needs-std-remap-debuginfo",
+            condition: config.with_std_remap_debuginfo,
+            ignore_reason: "ignored if std wasn't built with remapping of debuginfo",
+        },
+        Need {
             name: "needs-target-std",
             condition: build_helper::targets::target_supports_std(&config.target),
             ignore_reason: "ignored if target does not support std",
         },
     ];
 
-    let (name, rest) = match ln.split_once([':', ' ']) {
-        Some((name, rest)) => (name, Some(rest)),
-        None => (ln, None),
-    };
+    let &DirectiveLine { name, .. } = ln;
 
-    // FIXME(jieyouxu): tighten up this parsing to reject using both `:` and ` ` as means to
-    // delineate value.
     if name == "needs-target-has-atomic" {
-        let Some(rest) = rest else {
+        let Some(rest) = ln.value_after_colon() else {
             return IgnoreDecision::Error {
                 message: "expected `needs-target-has-atomic` to have a comma-separated list of atomic widths".to_string(),
             };
@@ -231,7 +243,7 @@ pub(super) fn handle_needs(
 
     // FIXME(jieyouxu): share multi-value directive logic with `needs-target-has-atomic` above.
     if name == "needs-crate-type" {
-        let Some(rest) = rest else {
+        let Some(rest) = ln.value_after_colon() else {
             return IgnoreDecision::Error {
                 message:
                     "expected `needs-crate-type` to have a comma-separated list of crate types"
@@ -290,7 +302,7 @@ pub(super) fn handle_needs(
                 break;
             } else {
                 return IgnoreDecision::Ignore {
-                    reason: if let Some(comment) = rest {
+                    reason: if let Some(comment) = ln.remark_after_space() {
                         format!("{} ({})", need.ignore_reason, comment.trim())
                     } else {
                         need.ignore_reason.into()
@@ -325,6 +337,7 @@ pub(super) struct CachedNeedsConditions {
     sanitizer_thread: bool,
     sanitizer_hwaddress: bool,
     sanitizer_memtag: bool,
+    sanitizer_realtime: bool,
     sanitizer_shadow_call_stack: bool,
     sanitizer_safestack: bool,
     xray: bool,
@@ -351,6 +364,7 @@ impl CachedNeedsConditions {
             sanitizer_thread: sanitizers.contains(&Sanitizer::Thread),
             sanitizer_hwaddress: sanitizers.contains(&Sanitizer::Hwaddress),
             sanitizer_memtag: sanitizers.contains(&Sanitizer::Memtag),
+            sanitizer_realtime: sanitizers.contains(&Sanitizer::Realtime),
             sanitizer_shadow_call_stack: sanitizers.contains(&Sanitizer::ShadowCallStack),
             sanitizer_safestack: sanitizers.contains(&Sanitizer::Safestack),
             xray: config.target_cfg().xray,
@@ -365,7 +379,7 @@ impl CachedNeedsConditions {
             //
             // However, `rust-lld` is only located under the lib path, so we look for it there.
             rust_lld: config
-                .compile_lib_path
+                .host_compile_lib_path
                 .parent()
                 .expect("couldn't traverse to the parent of the specified --compile-lib-path")
                 .join("lib")
@@ -375,7 +389,7 @@ impl CachedNeedsConditions {
                 .join(if config.host.contains("windows") { "rust-lld.exe" } else { "rust-lld" })
                 .exists(),
 
-            llvm_zstd: llvm_has_libzstd(&config),
+            llvm_zstd: llvm_has_zstd(&config),
             dlltool: find_dlltool(&config),
             symlinks: has_symlinks(),
         }
@@ -425,4 +439,23 @@ fn has_symlinks() -> bool {
 #[cfg(not(windows))]
 fn has_symlinks() -> bool {
     true
+}
+
+fn llvm_has_zstd(config: &Config) -> bool {
+    // FIXME(#149764): This actually queries the compiler's _default_ backend,
+    // which is usually LLVM, but can be another backend depending on the value
+    // of `rust.codegen-backends` in bootstrap.toml.
+
+    // The compiler already knows whether LLVM was built with zstd or not,
+    // so compiletest can just ask the compiler.
+    let output = query_rustc_output(
+        config,
+        &["-Zunstable-options", "--print=backend-has-zstd"],
+        Default::default(),
+    );
+    match output.trim() {
+        "true" => true,
+        "false" => false,
+        _ => panic!("unexpected output from `--print=backend-has-zstd`: {output:?}"),
+    }
 }

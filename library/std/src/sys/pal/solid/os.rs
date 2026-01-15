@@ -1,5 +1,4 @@
-use super::{error, itron, unsupported};
-use crate::error::Error as StdError;
+use super::{itron, unsupported};
 use crate::ffi::{OsStr, OsString};
 use crate::path::{self, PathBuf};
 use crate::{fmt, io};
@@ -10,14 +9,6 @@ impl itron::error::ItronError {
     pub(crate) fn as_io_error(self) -> crate::io::Error {
         crate::io::Error::from_raw_os_error(self.as_raw())
     }
-}
-
-pub fn errno() -> i32 {
-    0
-}
-
-pub fn error_string(errno: i32) -> String {
-    if let Some(name) = error::error_name(errno) { name.to_owned() } else { format!("{errno}") }
 }
 
 pub fn getcwd() -> io::Result<PathBuf> {
@@ -58,12 +49,7 @@ impl fmt::Display for JoinPathsError {
     }
 }
 
-impl StdError for JoinPathsError {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        "not supported on this platform yet"
-    }
-}
+impl crate::error::Error for JoinPathsError {}
 
 pub fn current_exe() -> io::Result<PathBuf> {
     unsupported()

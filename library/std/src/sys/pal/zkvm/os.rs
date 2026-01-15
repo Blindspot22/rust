@@ -1,17 +1,8 @@
 use super::unsupported;
-use crate::error::Error as StdError;
 use crate::ffi::{OsStr, OsString};
 use crate::marker::PhantomData;
 use crate::path::{self, PathBuf};
 use crate::{fmt, io};
-
-pub fn errno() -> i32 {
-    0
-}
-
-pub fn error_string(_errno: i32) -> String {
-    "operation successful".to_string()
-}
 
 pub fn getcwd() -> io::Result<PathBuf> {
     unsupported()
@@ -51,12 +42,7 @@ impl fmt::Display for JoinPathsError {
     }
 }
 
-impl StdError for JoinPathsError {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        "not supported on this platform yet"
-    }
-}
+impl crate::error::Error for JoinPathsError {}
 
 pub fn current_exe() -> io::Result<PathBuf> {
     unsupported()

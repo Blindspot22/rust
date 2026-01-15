@@ -1,5 +1,4 @@
-//! Tidy check to ensure that rustdoc templates didn't forget a `{# #}` to strip extra whitespace
-//! characters.
+//! Tidy check specific to the Javascript file that make up the static part of the generated rustdoc site.
 
 use std::ffi::OsStr;
 use std::io;
@@ -22,6 +21,11 @@ fn spawn_cmd(cmd: &mut Command) -> Result<Child, io::Error> {
     })
 }
 
+pub(super) fn has_tool(outdir: &Path, name: &str) -> bool {
+    let bin_path = node_module_bin(outdir, name);
+    Command::new(bin_path).arg("--version").status().is_ok()
+}
+
 /// install all js dependencies from package.json.
 pub(super) fn npm_install(root_path: &Path, outdir: &Path, npm: &Path) -> Result<(), super::Error> {
     npm::install(root_path, outdir, npm)?;
@@ -40,19 +44,24 @@ fn rustdoc_js_files(librustdoc_path: &Path) -> Vec<PathBuf> {
     return files;
 }
 
-fn run_eslint(outdir: &Path, args: &[PathBuf], config_folder: PathBuf) -> Result<(), super::Error> {
-    let mut child = spawn_cmd(
-        Command::new(node_module_bin(outdir, "eslint"))
-            .arg("-c")
-            .arg(config_folder.join(".eslintrc.js"))
-            .args(args),
-    )?;
+fn run_eslint(
+    outdir: &Path,
+    args: &[PathBuf],
+    config_folder: PathBuf,
+    bless: bool,
+) -> Result<(), super::Error> {
+    let mut cmd = Command::new(node_module_bin(outdir, "eslint"));
+    if bless {
+        cmd.arg("--fix");
+    }
+    cmd.arg("-c").arg(config_folder.join(".eslintrc.js")).args(args);
+    let mut child = spawn_cmd(&mut cmd)?;
     match child.wait() {
         Ok(exit_status) => {
             if exit_status.success() {
                 return Ok(());
             }
-            Err(super::Error::FailedCheck("eslint command failed"))
+            Err(super::Error::FailedCheck("eslint"))
         }
         Err(error) => Err(super::Error::Generic(format!("eslint command failed: {error:?}"))),
     }
@@ -62,16 +71,17 @@ pub(super) fn lint(
     outdir: &Path,
     librustdoc_path: &Path,
     tools_path: &Path,
+    bless: bool,
 ) -> Result<(), super::Error> {
     let files_to_check = rustdoc_js_files(librustdoc_path);
     println!("Running eslint on rustdoc JS files");
-    run_eslint(outdir, &files_to_check, librustdoc_path.join("html/static"))?;
+    run_eslint(outdir, &files_to_check, librustdoc_path.join("html/static"), bless)?;
 
-    run_eslint(outdir, &[tools_path.join("rustdoc-js/tester.js")], tools_path.join("rustdoc-js"))?;
     run_eslint(
         outdir,
-        &[tools_path.join("rustdoc-gui/tester.js")],
-        tools_path.join("rustdoc-gui"),
+        &[tools_path.join("rustdoc-js/tester.js")],
+        tools_path.join("rustdoc-js"),
+        bless,
     )?;
     Ok(())
 }
@@ -88,7 +98,7 @@ pub(super) fn typecheck(outdir: &Path, librustdoc_path: &Path) -> Result<(), sup
             if exit_status.success() {
                 return Ok(());
             }
-            Err(super::Error::FailedCheck("tsc command failed"))
+            Err(super::Error::FailedCheck("tsc"))
         }
         Err(error) => Err(super::Error::Generic(format!("tsc command failed: {error:?}"))),
     }
@@ -106,7 +116,7 @@ pub(super) fn es_check(outdir: &Path, librustdoc_path: &Path) -> Result<(), supe
             if exit_status.success() {
                 return Ok(());
             }
-            Err(super::Error::FailedCheck("es-check command failed"))
+            Err(super::Error::FailedCheck("es-check"))
         }
         Err(error) => Err(super::Error::Generic(format!("es-check command failed: {error:?}"))),
     }

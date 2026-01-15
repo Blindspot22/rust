@@ -46,6 +46,14 @@ fn from_weeks_overflow() {
 }
 
 #[test]
+#[should_panic]
+fn from_nanos_u128_overflow() {
+    let nanos_per_sec: u128 = 1_000_000_000;
+    let overflow = (u64::MAX as u128 * nanos_per_sec) + (nanos_per_sec - 1) + 1;
+    let _ = Duration::from_nanos_u128(overflow);
+}
+
+#[test]
 fn constructor_weeks() {
     assert_eq!(Duration::from_weeks(1), Duration::from_secs(7 * 24 * 60 * 60));
     assert_eq!(Duration::from_weeks(0), Duration::ZERO);
@@ -81,6 +89,8 @@ fn secs() {
     assert_eq!(Duration::from_micros(1_000_001).as_secs(), 1);
     assert_eq!(Duration::from_nanos(999_999_999).as_secs(), 0);
     assert_eq!(Duration::from_nanos(1_000_000_001).as_secs(), 1);
+    assert_eq!(Duration::from_nanos_u128(999_999_999).as_secs(), 0);
+    assert_eq!(Duration::from_nanos_u128(1_000_000_001).as_secs(), 1);
 }
 
 #[test]
@@ -95,6 +105,8 @@ fn millis() {
     assert_eq!(Duration::from_micros(1_001_000).subsec_millis(), 1);
     assert_eq!(Duration::from_nanos(999_999_999).subsec_millis(), 999);
     assert_eq!(Duration::from_nanos(1_001_000_000).subsec_millis(), 1);
+    assert_eq!(Duration::from_nanos_u128(999_999_999).subsec_millis(), 999);
+    assert_eq!(Duration::from_nanos_u128(1_001_000_001).subsec_millis(), 1);
 }
 
 #[test]
@@ -109,6 +121,8 @@ fn micros() {
     assert_eq!(Duration::from_micros(1_000_001).subsec_micros(), 1);
     assert_eq!(Duration::from_nanos(999_999_999).subsec_micros(), 999_999);
     assert_eq!(Duration::from_nanos(1_000_001_000).subsec_micros(), 1);
+    assert_eq!(Duration::from_nanos_u128(999_999_999).subsec_micros(), 999_999);
+    assert_eq!(Duration::from_nanos_u128(1_000_001_000).subsec_micros(), 1);
 }
 
 #[test]
@@ -123,6 +137,8 @@ fn nanos() {
     assert_eq!(Duration::from_micros(1_000_001).subsec_nanos(), 1000);
     assert_eq!(Duration::from_nanos(999_999_999).subsec_nanos(), 999_999_999);
     assert_eq!(Duration::from_nanos(1_000_000_001).subsec_nanos(), 1);
+    assert_eq!(Duration::from_nanos_u128(999_999_999).subsec_nanos(), 999_999_999);
+    assert_eq!(Duration::from_nanos_u128(1_000_000_001).subsec_nanos(), 1);
 }
 
 #[test]
@@ -423,7 +439,6 @@ fn debug_formatting_precision_two() {
     assert_eq!(format!("{:.2?}", Duration::new(4, 001_000_000)), "4.00s");
     assert_eq!(format!("{:.2?}", Duration::new(2, 100_000_000)), "2.10s");
     assert_eq!(format!("{:.2?}", Duration::new(2, 104_990_000)), "2.10s");
-    assert_eq!(format!("{:.2?}", Duration::new(2, 105_000_000)), "2.11s");
     assert_eq!(format!("{:.2?}", Duration::new(8, 999_999_999)), "9.00s");
 }
 
@@ -462,6 +477,15 @@ fn debug_formatting_precision_high() {
     assert_eq!(format!("{:.9?}", Duration::new(1, 000_000_000)), "1.000000000s");
     assert_eq!(format!("{:.10?}", Duration::new(4, 001_000_000)), "4.0010000000s");
     assert_eq!(format!("{:.20?}", Duration::new(4, 001_000_000)), "4.00100000000000000000s");
+}
+
+#[test]
+fn debug_formatting_round_to_even() {
+    assert_eq!(format!("{:.0?}", Duration::new(1, 500_000_000)), "2s");
+    assert_eq!(format!("{:.0?}", Duration::new(2, 500_000_000)), "2s");
+    assert_eq!(format!("{:.0?}", Duration::new(0, 1_500_000)), "2ms");
+    assert_eq!(format!("{:.0?}", Duration::new(0, 2_500_000)), "2ms");
+    assert_eq!(format!("{:.2?}", Duration::new(2, 105_000_000)), "2.10s");
 }
 
 #[test]
@@ -519,6 +543,9 @@ fn duration_const() {
 
     const FROM_NANOS: Duration = Duration::from_nanos(1_000_000_000);
     assert_eq!(FROM_NANOS, Duration::SECOND);
+
+    const FROM_NANOS_U128: Duration = Duration::from_nanos_u128(NANOS);
+    assert_eq!(FROM_NANOS_U128, Duration::SECOND);
 
     const MAX: Duration = Duration::new(u64::MAX, 999_999_999);
 

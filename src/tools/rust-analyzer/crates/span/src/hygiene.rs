@@ -19,9 +19,8 @@
 //! # The Call-site Hierarchy
 //!
 //! `ExpnData::call_site` in rustc, [`MacroCallLoc::call_site`] in rust-analyzer.
-use std::fmt;
-
 use crate::Edition;
+use std::fmt;
 
 /// A syntax context describes a hierarchy tracking order of macro definitions.
 #[cfg(feature = "salsa")]
@@ -47,7 +46,7 @@ const _: () = {
         edition: Edition,
         parent: SyntaxContext,
         opaque: SyntaxContext,
-        opaque_and_semitransparent: SyntaxContext,
+        opaque_and_semiopaque: SyntaxContext,
     }
 
     impl PartialEq for SyntaxContextData {
@@ -67,6 +66,16 @@ const _: () = {
             self.parent.hash(state);
         }
     }
+
+    impl zalsa_::HasJar for SyntaxContext {
+        type Jar = zalsa_struct_::JarImpl<SyntaxContext>;
+        const KIND: zalsa_::JarKind = zalsa_::JarKind::Struct;
+    }
+
+    zalsa_::register_jar! {
+        zalsa_::ErasedJar::erase::<SyntaxContext>()
+    }
+
     /// Key to use during hash lookups. Each field is some type that implements `Lookup<T>`
     /// for the owned type. This permits interning with an `&str` when a `String` is required and so forth.
     #[derive(Hash)]
@@ -98,21 +107,38 @@ const _: () = {
             salsa::plumbing::Location { file: file!(), line: line!() };
         const DEBUG_NAME: &'static str = "SyntaxContextData";
         const REVISIONS: std::num::NonZeroUsize = std::num::NonZeroUsize::MAX;
+        const PERSIST: bool = false;
+
         type Fields<'a> = SyntaxContextData;
         type Struct<'a> = SyntaxContext;
-    }
-    impl SyntaxContext {
-        pub fn ingredient<Db>(db: &Db) -> &zalsa_struct_::IngredientImpl<Self>
+
+        fn serialize<S>(_: &Self::Fields<'_>, _: S) -> Result<S::Ok, S::Error>
         where
-            Db: ?Sized + zalsa_::Database,
+            S: zalsa_::serde::Serializer,
         {
+            unimplemented!("attempted to serialize value that set `PERSIST` to false")
+        }
+
+        fn deserialize<'de, D>(_: D) -> Result<Self::Fields<'static>, D::Error>
+        where
+            D: zalsa_::serde::Deserializer<'de>,
+        {
+            unimplemented!("attempted to deserialize value that cannot set `PERSIST` to false");
+        }
+    }
+
+    impl SyntaxContext {
+        pub fn ingredient(zalsa: &zalsa_::Zalsa) -> &zalsa_struct_::IngredientImpl<Self> {
             static CACHE: zalsa_::IngredientCache<zalsa_struct_::IngredientImpl<SyntaxContext>> =
                 zalsa_::IngredientCache::new();
-            CACHE.get_or_create(db.zalsa(), || {
-                db.zalsa()
-                    .lookup_jar_by_type::<zalsa_struct_::JarImpl<SyntaxContext>>()
-                    .get_or_create()
-            })
+
+            // SAFETY: `lookup_jar_by_type` returns a valid ingredient index, and the only
+            // ingredient created by our jar is the struct ingredient.
+            unsafe {
+                CACHE.get_or_create(zalsa, || {
+                    zalsa.lookup_jar_by_type::<zalsa_struct_::JarImpl<SyntaxContext>>()
+                })
+            }
         }
     }
     impl zalsa_::AsId for SyntaxContext {
@@ -132,13 +158,14 @@ const _: () = {
     impl zalsa_::SalsaStructInDb for SyntaxContext {
         type MemoIngredientMap = salsa::plumbing::MemoIngredientSingletonIndex;
 
-        fn lookup_or_create_ingredient_index(
-            zalsa: &salsa::plumbing::Zalsa,
-        ) -> salsa::plumbing::IngredientIndices {
-            zalsa
-                .lookup_jar_by_type::<zalsa_struct_::JarImpl<SyntaxContext>>()
-                .get_or_create()
-                .into()
+        fn lookup_ingredient_index(aux: &zalsa_::Zalsa) -> salsa::plumbing::IngredientIndices {
+            aux.lookup_jar_by_type::<zalsa_struct_::JarImpl<SyntaxContext>>().into()
+        }
+
+        fn entries(zalsa: &zalsa_::Zalsa) -> impl Iterator<Item = zalsa_::DatabaseKeyIndex> + '_ {
+            let _ingredient_index =
+                zalsa.lookup_jar_by_type::<zalsa_struct_::JarImpl<SyntaxContext>>();
+            <SyntaxContext>::ingredient(zalsa).entries(zalsa).map(|entry| entry.key())
         }
 
         #[inline]
@@ -147,6 +174,18 @@ const _: () = {
                 Some(<Self as salsa::plumbing::FromId>::from_id(id))
             } else {
                 None
+            }
+        }
+
+        #[inline]
+        unsafe fn memo_table(
+            zalsa: &zalsa_::Zalsa,
+            id: zalsa_::Id,
+            current_revision: zalsa_::Revision,
+        ) -> zalsa_::MemoTableWithTypes<'_> {
+            // SAFETY: Guaranteed by caller.
+            unsafe {
+                zalsa.table().memos::<zalsa_struct_::Value<SyntaxContext>>(id, current_revision)
             }
         }
     }
@@ -175,7 +214,7 @@ const _: () = {
             edition: T2,
             parent: T3,
             opaque: impl FnOnce(SyntaxContext) -> SyntaxContext,
-            opaque_and_semitransparent: impl FnOnce(SyntaxContext) -> SyntaxContext,
+            opaque_and_semiopaque: impl FnOnce(SyntaxContext) -> SyntaxContext,
         ) -> Self
         where
             Db: ?Sized + salsa::Database,
@@ -184,8 +223,11 @@ const _: () = {
             Edition: zalsa_::interned::HashEqLike<T2>,
             SyntaxContext: zalsa_::interned::HashEqLike<T3>,
         {
-            SyntaxContext::ingredient(db).intern(
-                db.as_dyn_database(),
+            let (zalsa, zalsa_local) = db.zalsas();
+
+            SyntaxContext::ingredient(zalsa).intern(
+                zalsa,
+                zalsa_local,
                 StructKey::<'db>(
                     outer_expn,
                     outer_transparency,
@@ -199,14 +241,14 @@ const _: () = {
                     edition: zalsa_::interned::Lookup::into_owned(data.2),
                     parent: zalsa_::interned::Lookup::into_owned(data.3),
                     opaque: opaque(zalsa_::FromId::from_id(id)),
-                    opaque_and_semitransparent: opaque_and_semitransparent(
+                    opaque_and_semiopaque: opaque_and_semiopaque(
                         zalsa_::FromId::from_id(id),
                     ),
                 },
             )
         }
 
-        /// Invariant: Only [`SyntaxContext::ROOT`] has a [`None`] outer expansion.
+        /// Invariant: Only the root [`SyntaxContext`] has a [`None`] outer expansion.
         // FIXME: The None case needs to encode the context crate id. We can encode that as the MSB of
         // MacroCallId is reserved anyways so we can do bit tagging here just fine.
         // The bigger issue is that this will cause interning to now create completely separate chains
@@ -216,7 +258,8 @@ const _: () = {
             Db: ?Sized + zalsa_::Database,
         {
             let id = self.as_salsa_id()?;
-            let fields = SyntaxContext::ingredient(db).data(db.as_dyn_database(), id);
+            let zalsa = db.zalsa();
+            let fields = SyntaxContext::ingredient(zalsa).data(zalsa, id);
             fields.outer_expn
         }
 
@@ -225,7 +268,8 @@ const _: () = {
             Db: ?Sized + zalsa_::Database,
         {
             let Some(id) = self.as_salsa_id() else { return Transparency::Opaque };
-            let fields = SyntaxContext::ingredient(db).data(db.as_dyn_database(), id);
+            let zalsa = db.zalsa();
+            let fields = SyntaxContext::ingredient(zalsa).data(zalsa, id);
             fields.outer_transparency
         }
 
@@ -235,7 +279,8 @@ const _: () = {
         {
             match self.as_salsa_id() {
                 Some(id) => {
-                    let fields = SyntaxContext::ingredient(db).data(db.as_dyn_database(), id);
+                    let zalsa = db.zalsa();
+                    let fields = SyntaxContext::ingredient(zalsa).data(zalsa, id);
                     fields.edition
                 }
                 None => Edition::from_u32(SyntaxContext::MAX_ID - self.into_u32()),
@@ -248,21 +293,23 @@ const _: () = {
         {
             match self.as_salsa_id() {
                 Some(id) => {
-                    let fields = SyntaxContext::ingredient(db).data(db.as_dyn_database(), id);
+                    let zalsa = db.zalsa();
+                    let fields = SyntaxContext::ingredient(zalsa).data(zalsa, id);
                     fields.parent
                 }
                 None => self,
             }
         }
 
-        /// This context, but with all transparent and semi-transparent expansions filtered away.
+        /// This context, but with all transparent and semi-opaque expansions filtered away.
         pub fn opaque<Db>(self, db: &'db Db) -> SyntaxContext
         where
             Db: ?Sized + zalsa_::Database,
         {
             match self.as_salsa_id() {
                 Some(id) => {
-                    let fields = SyntaxContext::ingredient(db).data(db.as_dyn_database(), id);
+                    let zalsa = db.zalsa();
+                    let fields = SyntaxContext::ingredient(zalsa).data(zalsa, id);
                     fields.opaque
                 }
                 None => self,
@@ -270,14 +317,15 @@ const _: () = {
         }
 
         /// This context, but with all transparent expansions filtered away.
-        pub fn opaque_and_semitransparent<Db>(self, db: &'db Db) -> SyntaxContext
+        pub fn opaque_and_semiopaque<Db>(self, db: &'db Db) -> SyntaxContext
         where
             Db: ?Sized + zalsa_::Database,
         {
             match self.as_salsa_id() {
                 Some(id) => {
-                    let fields = SyntaxContext::ingredient(db).data(db.as_dyn_database(), id);
-                    fields.opaque_and_semitransparent
+                    let zalsa = db.zalsa();
+                    let fields = SyntaxContext::ingredient(zalsa).data(zalsa, id);
+                    fields.opaque_and_semiopaque
                 }
                 None => self,
             }
@@ -299,7 +347,7 @@ impl SyntaxContext {
         }
     }
 
-    /// The root context, which is the parent of all other contexts. All [`FileId`]s have this context.
+    /// The root context, which is the parent of all other contexts. All `FileId`s have this context.
     #[inline]
     pub const fn root(edition: Edition) -> Self {
         let edition = edition as u32;
@@ -357,7 +405,7 @@ impl<'db> SyntaxContext {
 
     #[inline]
     pub fn normalize_to_macro_rules(self, db: &'db dyn salsa::Database) -> SyntaxContext {
-        self.opaque_and_semitransparent(db)
+        self.opaque_and_semiopaque(db)
     }
 
     pub fn is_opaque(self, db: &'db dyn salsa::Database) -> bool {
@@ -428,13 +476,13 @@ pub enum Transparency {
     /// Identifier produced by a transparent expansion is always resolved at call-site.
     /// Call-site spans in procedural macros, hygiene opt-out in `macro` should use this.
     Transparent,
-    /// Identifier produced by a semi-transparent expansion may be resolved
+    /// Identifier produced by a semi-opaque expansion may be resolved
     /// either at call-site or at definition-site.
     /// If it's a local variable, label or `$crate` then it's resolved at def-site.
     /// Otherwise it's resolved at call-site.
     /// `macro_rules` macros behave like this, built-in macros currently behave like this too,
     /// but that's an implementation detail.
-    SemiTransparent,
+    SemiOpaque,
     /// Identifier produced by an opaque expansion is always resolved at definition-site.
     /// Def-site spans in procedural macros, identifiers from `macro` by default use this.
     Opaque,

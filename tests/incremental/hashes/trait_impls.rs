@@ -11,6 +11,7 @@
 //@ [cfail1]compile-flags: -Zincremental-ignore-spans
 //@ [cfail2]compile-flags: -Zincremental-ignore-spans
 //@ [cfail3]compile-flags: -Zincremental-ignore-spans
+//@ ignore-backends: gcc
 
 #![allow(warnings)]
 #![feature(rustc_attrs)]
@@ -568,7 +569,7 @@ impl AddNoMangleToMethod for Foo {
     // -------------------------
     // -------------------------
     // -------------------------
-    // ---------
+    // -----------------
     fn add_no_mangle_to_method(&self) { }
 }
 
@@ -582,7 +583,7 @@ impl AddNoMangleToMethod for Foo {
     #[rustc_clean(cfg="cfail3")]
     #[rustc_clean(cfg="cfail5")]
     #[rustc_clean(cfg="cfail6")]
-    #[no_mangle]
+    #[unsafe(no_mangle)]
     fn add_no_mangle_to_method(&self) { }
 }
 

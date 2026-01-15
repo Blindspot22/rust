@@ -366,8 +366,10 @@ macro_rules! common_visitor_and_walkers {
             crate::token::LitKind,
             crate::tokenstream::LazyAttrTokenStream,
             crate::tokenstream::TokenStream,
+            EarlyParsedAttribute,
             Movability,
             Mutability,
+            Pinnedness,
             Result<(), rustc_span::ErrorGuaranteed>,
             rustc_data_structures::fx::FxHashMap<Symbol, usize>,
             rustc_span::ErrorGuaranteed,
@@ -389,9 +391,10 @@ macro_rules! common_visitor_and_walkers {
             ThinVec<(NodeId, Path)>,
             ThinVec<PathSegment>,
             ThinVec<PreciseCapturingArg>,
-            ThinVec<Box<Pat>>,
+            ThinVec<Pat>,
             ThinVec<Box<Ty>>,
-            ThinVec<Box<TyPat>>,
+            ThinVec<TyPat>,
+            ThinVec<EiiImpl>,
         );
 
         // This macro generates `impl Visitable` and `impl MutVisitable` that forward to `Walkable`
@@ -414,6 +417,7 @@ macro_rules! common_visitor_and_walkers {
             UnsafeBinderCastKind,
             BinOpKind,
             BlockCheckMode,
+            MgcaDisambiguation,
             BorrowKind,
             BoundAsyncness,
             BoundConstness,
@@ -422,6 +426,7 @@ macro_rules! common_visitor_and_walkers {
             Closure,
             Const,
             ConstItem,
+            ConstItemRhs,
             Defaultness,
             Delegation,
             DelegationMac,
@@ -453,6 +458,7 @@ macro_rules! common_visitor_and_walkers {
             ModSpans,
             MutTy,
             NormalAttr,
+            AttrItemKind,
             Parens,
             ParenthesizedArgs,
             PatFieldsRest,
@@ -471,8 +477,6 @@ macro_rules! common_visitor_and_walkers {
             TraitBoundModifiers,
             TraitObjectSyntax,
             TyAlias,
-            TyAliasWhereClause,
-            TyAliasWhereClauses,
             TyKind,
             TyPatKind,
             UnOp,
@@ -485,6 +489,8 @@ macro_rules! common_visitor_and_walkers {
             WhereEqPredicate,
             WhereRegionPredicate,
             YieldKind,
+            EiiDecl,
+            EiiImpl,
         );
 
         /// Each method of this trait is a hook to be potentially
@@ -645,8 +651,9 @@ macro_rules! common_visitor_and_walkers {
             fn visit_fn(
                 &mut self,
                 fk: FnKind<$($lt)? $(${ignore($mut)} '_)?>,
+                _: &AttrVec,
                 _: Span,
-                _: NodeId
+                _: NodeId,
             ) -> Self::Result {
                 walk_fn(self, fk)
             }
@@ -740,6 +747,7 @@ macro_rules! common_visitor_and_walkers {
             type Ctxt;
             fn walk<$($lt,)? V: $Visitor$(<$lt>)?>(
                 &$($lt)? $($mut)? self,
+                attrs: &AttrVec,
                 span: Span,
                 id: NodeId,
                 visibility: &$($lt)? $($mut)? Visibility,
@@ -773,7 +781,7 @@ macro_rules! common_visitor_and_walkers {
         ) -> V::Result {
             let Item { attrs, id, kind, vis, span, tokens: _ } = item;
             visit_visitable!($($mut)? visitor, id, attrs, vis);
-            try_visit!(kind.walk(*span, *id, vis, ctxt, visitor));
+            try_visit!(kind.walk(attrs, *span, *id, vis, ctxt, visitor));
             visit_visitable!($($mut)? visitor, span);
             V::Result::output()
         }
@@ -799,6 +807,7 @@ macro_rules! common_visitor_and_walkers {
             type Ctxt = ();
             fn walk<$($lt,)? V: $Visitor$(<$lt>)?>(
                 &$($lt)? $($mut)? self,
+                attrs: &AttrVec,
                 span: Span,
                 id: NodeId,
                 visibility: &$($lt)? $($mut)? Visibility,
@@ -808,7 +817,7 @@ macro_rules! common_visitor_and_walkers {
                 match self {
                     ItemKind::Fn(func) => {
                         let kind = FnKind::Fn(FnCtxt::Free, visibility, &$($mut)? *func);
-                        try_visit!(vis.visit_fn(kind, span, id));
+                        try_visit!(vis.visit_fn(kind, attrs, span, id));
                     }
                     ItemKind::ExternCrate(orig_name, ident) =>
                         visit_visitable!($($mut)? vis, orig_name, ident),
@@ -835,8 +844,8 @@ macro_rules! common_visitor_and_walkers {
                         visit_visitable!($($mut)? vis, impl_),
                     ItemKind::Trait(trait_) =>
                         visit_visitable!($($mut)? vis, trait_),
-                    ItemKind::TraitAlias(ident, generics, bounds) => {
-                        visit_visitable!($($mut)? vis, ident, generics);
+                    ItemKind::TraitAlias(box TraitAlias { constness, ident, generics, bounds}) => {
+                        visit_visitable!($($mut)? vis, constness, ident, generics);
                         visit_visitable_with!($($mut)? vis, bounds, BoundKind::Bound)
                     }
                     ItemKind::MacCall(m) =>
@@ -856,6 +865,7 @@ macro_rules! common_visitor_and_walkers {
             type Ctxt = AssocCtxt;
             fn walk<$($lt,)? V: $Visitor$(<$lt>)?>(
                 &$($lt)? $($mut)? self,
+                attrs: &AttrVec,
                 span: Span,
                 id: NodeId,
                 visibility: &$($lt)? $($mut)? Visibility,
@@ -867,7 +877,7 @@ macro_rules! common_visitor_and_walkers {
                         visit_visitable!($($mut)? vis, item),
                     AssocItemKind::Fn(func) => {
                         let kind = FnKind::Fn(FnCtxt::Assoc(ctxt), visibility, &$($mut)? *func);
-                        try_visit!(vis.visit_fn(kind, span, id))
+                        try_visit!(vis.visit_fn(kind, attrs, span, id))
                     }
                     AssocItemKind::Type(alias) =>
                         visit_visitable!($($mut)? vis, alias),
@@ -886,6 +896,7 @@ macro_rules! common_visitor_and_walkers {
             type Ctxt = ();
             fn walk<$($lt,)? V: $Visitor$(<$lt>)?>(
                 &$($lt)? $($mut)? self,
+                attrs: &AttrVec,
                 span: Span,
                 id: NodeId,
                 visibility: &$($lt)? $($mut)? Visibility,
@@ -897,7 +908,7 @@ macro_rules! common_visitor_and_walkers {
                         visit_visitable!($($mut)? vis, item),
                     ForeignItemKind::Fn(func) => {
                         let kind = FnKind::Fn(FnCtxt::Foreign, visibility, &$($mut)?*func);
-                        try_visit!(vis.visit_fn(kind, span, id))
+                        try_visit!(vis.visit_fn(kind, attrs, span, id))
                     }
                     ForeignItemKind::TyAlias(alias) =>
                         visit_visitable!($($mut)? vis, alias),
@@ -914,13 +925,13 @@ macro_rules! common_visitor_and_walkers {
                     _ctxt,
                     // Visibility is visited as a part of the item.
                     _vis,
-                    Fn { defaultness, ident, sig, generics, contract, body, define_opaque },
+                    Fn { defaultness, ident, sig, generics, contract, body, define_opaque, eii_impls },
                 ) => {
                     let FnSig { header, decl, span } = sig;
                     visit_visitable!($($mut)? vis,
                         defaultness, ident, header, generics, decl,
-                        contract, body, span, define_opaque
-                    )
+                        contract, body, span, define_opaque, eii_impls
+                    );
                 }
                 FnKind::Closure(binder, coroutine_kind, decl, body) =>
                     visit_visitable!($($mut)? vis, binder, coroutine_kind, decl, body),
@@ -929,11 +940,11 @@ macro_rules! common_visitor_and_walkers {
         }
 
         impl_walkable!(|&$($mut)? $($lt)? self: Impl, vis: &mut V| {
-            let Impl { generics, of_trait, self_ty, items } = self;
+            let Impl { generics, of_trait, self_ty, items, constness: _ } = self;
             try_visit!(vis.visit_generics(generics));
             if let Some(box of_trait) = of_trait {
-                let TraitImplHeader { defaultness, safety, constness, polarity, trait_ref } = of_trait;
-                visit_visitable!($($mut)? vis, defaultness, safety, constness, polarity, trait_ref);
+                let TraitImplHeader { defaultness, safety, polarity, trait_ref } = of_trait;
+                visit_visitable!($($mut)? vis, defaultness, safety, polarity, trait_ref);
             }
             try_visit!(vis.visit_ty(self_ty));
             visit_visitable_with!($($mut)? vis, items, AssocCtxt::Impl { of_trait: of_trait.is_some() });
@@ -999,7 +1010,7 @@ macro_rules! common_visitor_and_walkers {
                 }) => {
                     visit_visitable!($($mut)? vis, constness, movability, capture_clause);
                     let kind = FnKind::Closure(binder, coroutine_kind, fn_decl, body);
-                    try_visit!(vis.visit_fn(kind, *span, *id));
+                    try_visit!(vis.visit_fn(kind, attrs, *span, *id));
                     visit_visitable!($($mut)? vis, fn_decl_span, fn_arg_span);
                 }
                 ExprKind::Block(block, opt_label) =>
@@ -1043,8 +1054,8 @@ macro_rules! common_visitor_and_walkers {
                     visit_visitable!($($mut)? vis, kind),
                 ExprKind::Try(subexpression) =>
                     visit_visitable!($($mut)? vis, subexpression),
-                ExprKind::TryBlock(body) =>
-                    visit_visitable!($($mut)? vis, body),
+                ExprKind::TryBlock(body, optional_type) =>
+                    visit_visitable!($($mut)? vis, body, optional_type),
                 ExprKind::Lit(token) =>
                     visit_visitable!($($mut)? vis, token),
                 ExprKind::IncludedBytes(bytes) =>

@@ -28,7 +28,7 @@ use crate::abi::conv_to_fn_attribute;
 use crate::callee::get_fn;
 use crate::common::SignType;
 
-#[cfg_attr(not(feature = "master"), allow(dead_code))]
+#[cfg_attr(not(feature = "master"), expect(dead_code))]
 pub struct CodegenCx<'gcc, 'tcx> {
     /// A cache of converted ConstAllocs
     pub const_cache: RefCell<HashMap<Allocation, RValue<'gcc>>>,
@@ -92,6 +92,8 @@ pub struct CodegenCx<'gcc, 'tcx> {
     pub instances: RefCell<FxHashMap<Instance<'tcx>, LValue<'gcc>>>,
     /// Cache function instances of monomorphic and polymorphic items
     pub function_instances: RefCell<FxHashMap<Instance<'tcx>, Function<'gcc>>>,
+    /// Cache function instances of intrinsics
+    pub intrinsic_instances: RefCell<FxHashMap<Instance<'tcx>, Function<'gcc>>>,
     /// Cache generated vtables
     pub vtables:
         RefCell<FxHashMap<(Ty<'tcx>, Option<ty::ExistentialTraitRef<'tcx>>), RValue<'gcc>>>,
@@ -132,7 +134,7 @@ pub struct CodegenCx<'gcc, 'tcx> {
 }
 
 impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         context: &'gcc Context<'gcc>,
         codegen_unit: &'tcx CodegenUnit<'tcx>,
@@ -147,7 +149,7 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
             let layout = tcx
                 .layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(rust_type))
                 .unwrap();
-            let align = layout.align.abi.bytes();
+            let align = layout.align.bytes();
             // For types with size 1, the alignment can be 1 and only 1
             // So, we can skip the call to ``get_aligned`.
             // In the future, we can add a GCC API to query the type align,
@@ -186,9 +188,9 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
             (i128_type, u128_type)
         } else {
             /*let layout = tcx.layout_of(ParamEnv::reveal_all().and(tcx.types.i128)).unwrap();
-            let i128_align = layout.align.abi.bytes();
+            let i128_align = layout.align.bytes();
             let layout = tcx.layout_of(ParamEnv::reveal_all().and(tcx.types.u128)).unwrap();
-            let u128_align = layout.align.abi.bytes();*/
+            let u128_align = layout.align.bytes();*/
 
             // TODO(antoyo): re-enable the alignment when libgccjit fixed the issue in
             // gcc_jit_context_new_array_constructor (it should not use reinterpret_cast).
@@ -280,6 +282,7 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
             linkage: Cell::new(FunctionType::Internal),
             instances: Default::default(),
             function_instances: Default::default(),
+            intrinsic_instances: Default::default(),
             on_stack_params: Default::default(),
             on_stack_function_params: Default::default(),
             vtables: Default::default(),
@@ -391,17 +394,13 @@ impl<'gcc, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'gcc, 'tcx> {
     }
 
     fn get_fn(&self, instance: Instance<'tcx>) -> Function<'gcc> {
-        let func = get_fn(self, instance);
-        *self.current_func.borrow_mut() = Some(func);
-        func
+        get_fn(self, instance)
     }
 
     fn get_fn_addr(&self, instance: Instance<'tcx>) -> RValue<'gcc> {
         let func_name = self.tcx.symbol_name(instance).name;
 
-        let func = if self.intrinsics.borrow().contains_key(func_name) {
-            self.intrinsics.borrow()[func_name]
-        } else if let Some(variable) = self.get_declared_value(func_name) {
+        let func = if let Some(variable) = self.get_declared_value(func_name) {
             return variable;
         } else {
             get_fn(self, instance)
@@ -529,7 +528,10 @@ impl<'gcc, 'tcx> HasX86AbiOpt for CodegenCx<'gcc, 'tcx> {
 impl<'gcc, 'tcx> LayoutOfHelpers<'tcx> for CodegenCx<'gcc, 'tcx> {
     #[inline]
     fn handle_layout_err(&self, err: LayoutError<'tcx>, span: Span, ty: Ty<'tcx>) -> ! {
-        if let LayoutError::SizeOverflow(_) | LayoutError::ReferencesError(_) = err {
+        if let LayoutError::SizeOverflow(_)
+        | LayoutError::InvalidSimd { .. }
+        | LayoutError::ReferencesError(_) = err
+        {
             self.tcx.dcx().emit_fatal(respan(span, err.into_diagnostic()))
         } else {
             self.tcx.dcx().emit_fatal(ssa_errors::FailedToGetLayout { span, ty, err })
@@ -545,7 +547,9 @@ impl<'gcc, 'tcx> FnAbiOfHelpers<'tcx> for CodegenCx<'gcc, 'tcx> {
         span: Span,
         fn_abi_request: FnAbiRequest<'tcx>,
     ) -> ! {
-        if let FnAbiError::Layout(LayoutError::SizeOverflow(_)) = err {
+        if let FnAbiError::Layout(LayoutError::SizeOverflow(_) | LayoutError::InvalidSimd { .. }) =
+            err
+        {
             self.tcx.dcx().emit_fatal(respan(span, err))
         } else {
             match fn_abi_request {

@@ -28,6 +28,25 @@ fn foo(n: i32) -> i32 {
 }
 
 #[test]
+fn doctest_add_braces_1() {
+    check_doc_test(
+        "add_braces",
+        r#####"
+fn foo(n: i32) -> i32 {
+    let x =$0 n + 2;
+}
+"#####,
+        r#####"
+fn foo(n: i32) -> i32 {
+    let x = {
+        n + 2
+    };
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_add_explicit_enum_discriminant() {
     check_doc_test(
         "add_explicit_enum_discriminant",
@@ -45,6 +64,27 @@ enum TheEnum {
     Bar = 1,
     Baz = 42,
     Quux = 43,
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_add_explicit_method_call_deref() {
+    check_doc_test(
+        "add_explicit_method_call_deref",
+        r#####"
+struct Foo;
+impl Foo { fn foo(&self) {} }
+fn test() {
+    Foo$0.$0foo();
+}
+"#####,
+        r#####"
+struct Foo;
+impl Foo { fn foo(&self) {} }
+fn test() {
+    (&Foo).foo();
 }
 "#####,
     )
@@ -164,9 +204,9 @@ fn main() {
 "#####,
         r#####"
 fn main() {
-    'l: loop {
-        break 'l;
-        continue 'l;
+    ${1:'l}: loop {
+        break ${2:'l};
+        continue ${0:'l};
     }
 }
 "#####,
@@ -401,6 +441,19 @@ fn main() {
         println!("foo");
     }
 }
+"#####,
+    )
+}
+
+#[test]
+fn doctest_convert_char_literal() {
+    check_doc_test(
+        "convert_char_literal",
+        r#####"
+const _: char = 'a'$0;
+"#####,
+        r#####"
+const _: char = '\x61';
 "#####,
     )
 }
@@ -713,6 +766,29 @@ fn main() {
 }
 
 #[test]
+fn doctest_convert_range_for_to_while() {
+    check_doc_test(
+        "convert_range_for_to_while",
+        r#####"
+fn foo() {
+    $0for i in 3..7 {
+        foo(i);
+    }
+}
+"#####,
+        r#####"
+fn foo() {
+    let mut i = 3;
+    while i < 7 {
+        foo(i);
+        i += 1;
+    }
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_convert_to_guarded_return() {
     check_doc_test(
         "convert_to_guarded_return",
@@ -731,6 +807,26 @@ fn main() {
     }
     foo();
     bar();
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_convert_to_guarded_return_1() {
+    check_doc_test(
+        "convert_to_guarded_return",
+        r#####"
+//- minicore: option
+fn foo() -> Option<i32> { None }
+fn main() {
+    $0let x = foo();
+}
+"#####,
+        r#####"
+fn foo() -> Option<i32> { None }
+fn main() {
+    let Some(x) = foo() else { return };
 }
 "#####,
     )
@@ -1035,7 +1131,41 @@ fn foo(bar: Bar) {
 struct Bar { y: Y, z: Z }
 
 fn foo(bar: Bar) {
-    let Bar { y, z  } = bar;
+    let Bar { y, z } = bar;
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_expand_slice_rest_pattern() {
+    check_doc_test(
+        "expand_slice_rest_pattern",
+        r#####"
+fn foo(bar: [i32; 3]) {
+    let [first, ..$0] = bar;
+}
+"#####,
+        r#####"
+fn foo(bar: [i32; 3]) {
+    let [first, _1, _2] = bar;
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_expand_tuple_rest_pattern() {
+    check_doc_test(
+        "expand_tuple_rest_pattern",
+        r#####"
+fn foo(bar: (char, i32, i32)) {
+    let (ch, ..$0) = bar;
+}
+"#####,
+        r#####"
+fn foo(bar: (char, i32, i32)) {
+    let (ch, _1, _2) = bar;
 }
 "#####,
     )
@@ -1299,6 +1429,40 @@ fn foo() {
 }
 
 #[test]
+fn doctest_flip_range_expr() {
+    check_doc_test(
+        "flip_range_expr",
+        r#####"
+fn main() {
+    let _ = 90..$02;
+}
+"#####,
+        r#####"
+fn main() {
+    let _ = 2..90;
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_flip_range_expr_1() {
+    check_doc_test(
+        "flip_range_expr",
+        r#####"
+fn main() {
+    let _ = 90..$0;
+}
+"#####,
+        r#####"
+fn main() {
+    let _ = ..90;
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_flip_trait_bound() {
     check_doc_test(
         "flip_trait_bound",
@@ -1307,6 +1471,46 @@ fn foo<T: Clone +$0 Copy>() { }
 "#####,
         r#####"
 fn foo<T: Copy + Clone>() { }
+"#####,
+    )
+}
+
+#[test]
+fn doctest_generate_blanket_trait_impl() {
+    check_doc_test(
+        "generate_blanket_trait_impl",
+        r#####"
+trait $0Foo<T: Send>: ToOwned
+where
+    Self::Owned: Default,
+{
+    fn foo(&self) -> T;
+
+    fn print_foo(&self) {
+        println!("{}", self.foo());
+    }
+}
+"#####,
+        r#####"
+trait Foo<T: Send>: ToOwned
+where
+    Self::Owned: Default,
+{
+    fn foo(&self) -> T;
+
+    fn print_foo(&self) {
+        println!("{}", self.foo());
+    }
+}
+
+impl<T: Send, T1: ToOwned + ?Sized> Foo<T> for $0T1
+where
+    Self::Owned: Default,
+{
+    fn foo(&self) -> T {
+        todo!()
+    }
+}
 "#####,
     )
 }
@@ -2784,6 +2988,46 @@ fn main() {
         r#####"
 fn main() {
     let x = 42 * (4 + 2);
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_remove_else_branches() {
+    check_doc_test(
+        "remove_else_branches",
+        r#####"
+fn main() {
+    if true {
+        let _ = 2;
+    } $0else {
+        unreachable!();
+    }
+}
+"#####,
+        r#####"
+fn main() {
+    if true {
+        let _ = 2;
+    }
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_remove_else_branches_1() {
+    check_doc_test(
+        "remove_else_branches",
+        r#####"
+fn main() {
+    let _x = 2 $0else { unreachable!() };
+}
+"#####,
+        r#####"
+fn main() {
+    let _x = 2;
 }
 "#####,
     )

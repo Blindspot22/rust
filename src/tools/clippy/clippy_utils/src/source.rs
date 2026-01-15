@@ -13,7 +13,7 @@ use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
 use rustc_span::source_map::{SourceMap, original_sp};
 use rustc_span::{
-    BytePos, DUMMY_SP, FileNameDisplayPreference, Pos, RelativeBytePos, SourceFile, SourceFileAndLine, Span, SpanData,
+    BytePos, DUMMY_SP, DesugaringKind, Pos, RelativeBytePos, SourceFile, SourceFileAndLine, Span, SpanData,
     SyntaxContext, hygiene,
 };
 use std::borrow::Cow;
@@ -143,7 +143,6 @@ pub trait SpanRangeExt: SpanRange {
         map_range(cx.sess().source_map(), self.into_range(), f)
     }
 
-    #[allow(rustdoc::invalid_rust_codeblocks, reason = "The codeblock is intentionally broken")]
     /// Extends the range to include all preceding whitespace characters.
     ///
     /// The range will not be expanded if it would cross a line boundary, the line the range would
@@ -215,6 +214,11 @@ impl fmt::Display for SourceText {
         self.as_str().fmt(f)
     }
 }
+impl fmt::Debug for SourceText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_str().fmt(f)
+    }
+}
 
 fn get_source_range(sm: &SourceMap, sp: Range<BytePos>) -> Option<SourceFileRange> {
     let start = sm.lookup_byte_offset(sp.start);
@@ -264,7 +268,7 @@ fn map_range(
         debug_assert!(
             range.start <= text.len() && range.end <= text.len(),
             "Range `{range:?}` is outside the source file (file `{}`, length `{}`)",
-            src.sf.name.display(FileNameDisplayPreference::Local),
+            src.sf.name.prefer_local_unconditionally(),
             text.len(),
         );
         debug_assert!(range.start <= range.end, "Range `{range:?}` has overlapping bounds");
@@ -666,6 +670,14 @@ fn snippet_with_context_sess<'a>(
     default: &'a str,
     applicability: &mut Applicability,
 ) -> (Cow<'a, str>, bool) {
+    // If it is just range desugaring, use the desugaring span since it may include parenthesis.
+    if span.desugaring_kind() == Some(DesugaringKind::RangeExpr) && span.parent_callsite().unwrap().ctxt() == outer {
+        return (
+            snippet_with_applicability_sess(sess, span, default, applicability),
+            false,
+        );
+    }
+
     let (span, is_macro_call) = walk_span_to_context(span, outer).map_or_else(
         || {
             // The span is from a macro argument, and the outer context is the macro using the argument

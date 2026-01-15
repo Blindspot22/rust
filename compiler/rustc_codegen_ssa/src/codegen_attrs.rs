@@ -3,23 +3,25 @@ use std::str::FromStr;
 use rustc_abi::{Align, ExternAbi};
 use rustc_ast::expand::autodiff_attrs::{AutoDiffAttrs, DiffActivity, DiffMode};
 use rustc_ast::{LitKind, MetaItem, MetaItemInner, attr};
-use rustc_hir::attrs::{AttributeKind, InlineAttr, InstructionSetAttr, UsedBy};
+use rustc_hir::attrs::{
+    AttributeKind, EiiImplResolution, InlineAttr, Linkage, RtsanSetting, UsedBy,
+};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::{self as hir, Attribute, LangItem, find_attr, lang_items};
 use rustc_middle::middle::codegen_fn_attrs::{
-    CodegenFnAttrFlags, CodegenFnAttrs, PatchableFunctionEntry,
+    CodegenFnAttrFlags, CodegenFnAttrs, PatchableFunctionEntry, SanitizerFnAttrs,
 };
+use rustc_middle::mir::mono::Visibility;
 use rustc_middle::query::Providers;
 use rustc_middle::span_bug;
 use rustc_middle::ty::{self as ty, TyCtxt};
 use rustc_session::lint;
 use rustc_session::parse::feature_err;
-use rustc_span::{Ident, Span, sym};
-use rustc_target::spec::SanitizerSet;
+use rustc_span::{Span, sym};
+use rustc_target::spec::Os;
 
 use crate::errors;
-use crate::errors::NoMangleNameless;
 use crate::target_features::{
     check_target_feature_trait_unsafe, check_tied_features, from_target_feature_attr,
 };
@@ -42,37 +44,6 @@ fn try_fn_sig<'tcx>(
     } else {
         tcx.dcx().span_delayed_bug(attr_span, "this attribute can only be applied to functions");
         None
-    }
-}
-
-// FIXME(jdonszelmann): remove when instruction_set becomes a parsed attr
-fn parse_instruction_set_attr(tcx: TyCtxt<'_>, attr: &Attribute) -> Option<InstructionSetAttr> {
-    let list = attr.meta_item_list()?;
-
-    match &list[..] {
-        [MetaItemInner::MetaItem(set)] => {
-            let segments = set.path.segments.iter().map(|x| x.ident.name).collect::<Vec<_>>();
-            match segments.as_slice() {
-                [sym::arm, sym::a32 | sym::t32] if !tcx.sess.target.has_thumb_interworking => {
-                    tcx.dcx().emit_err(errors::UnsupportedInstructionSet { span: attr.span() });
-                    None
-                }
-                [sym::arm, sym::a32] => Some(InstructionSetAttr::ArmA32),
-                [sym::arm, sym::t32] => Some(InstructionSetAttr::ArmT32),
-                _ => {
-                    tcx.dcx().emit_err(errors::InvalidInstructionSet { span: attr.span() });
-                    None
-                }
-            }
-        }
-        [] => {
-            tcx.dcx().emit_err(errors::BareInstructionSet { span: attr.span() });
-            None
-        }
-        _ => {
-            tcx.dcx().emit_err(errors::MultipleInstructionSet { span: attr.span() });
-            None
-        }
     }
 }
 
@@ -182,14 +153,10 @@ fn process_builtin_attrs(
                     if tcx.opt_item_name(did.to_def_id()).is_some() {
                         codegen_fn_attrs.flags |= CodegenFnAttrFlags::NO_MANGLE;
                     } else {
-                        tcx.dcx().emit_err(NoMangleNameless {
-                            span: *attr_span,
-                            definition: format!(
-                                "{} {}",
-                                tcx.def_descr_article(did.to_def_id()),
-                                tcx.def_descr(did.to_def_id())
-                            ),
-                        });
+                        tcx.dcx().span_delayed_bug(
+                            *attr_span,
+                            "no_mangle should be on a named function",
+                        );
                     }
                 }
                 AttributeKind::Optimize(optimize, _) => codegen_fn_attrs.optimize = *optimize,
@@ -263,6 +230,19 @@ fn process_builtin_attrs(
                 AttributeKind::Used { used_by, .. } => match used_by {
                     UsedBy::Compiler => codegen_fn_attrs.flags |= CodegenFnAttrFlags::USED_COMPILER,
                     UsedBy::Linker => codegen_fn_attrs.flags |= CodegenFnAttrFlags::USED_LINKER,
+                    UsedBy::Default => {
+                        let used_form = if tcx.sess.target.os == Os::Illumos {
+                            // illumos' `ld` doesn't support a section header that would represent
+                            // `#[used(linker)]`, see
+                            // https://github.com/rust-lang/rust/issues/146169. For that target,
+                            // downgrade as if `#[used(compiler)]` was requested and hope for the
+                            // best.
+                            CodegenFnAttrFlags::USED_COMPILER
+                        } else {
+                            CodegenFnAttrFlags::USED_LINKER
+                        };
+                        codegen_fn_attrs.flags |= used_form;
+                    }
                 },
                 AttributeKind::FfiConst(_) => {
                     codegen_fn_attrs.flags |= CodegenFnAttrFlags::FFI_CONST
@@ -271,7 +251,7 @@ fn process_builtin_attrs(
                 AttributeKind::StdInternalSymbol(_) => {
                     codegen_fn_attrs.flags |= CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL
                 }
-                AttributeKind::Linkage(linkage, _) => {
+                AttributeKind::Linkage(linkage, span) => {
                     let linkage = Some(*linkage);
 
                     if tcx.is_foreign_item(did) {
@@ -279,7 +259,7 @@ fn process_builtin_attrs(
 
                         if tcx.is_mutable_static(did.into()) {
                             let mut diag = tcx.dcx().struct_span_err(
-                                attr.span(),
+                                *span,
                                 "extern mutable statics are not allowed with `#[linkage]`",
                             );
                             diag.note(
@@ -296,11 +276,70 @@ fn process_builtin_attrs(
                 AttributeKind::Sanitize { span, .. } => {
                     interesting_spans.sanitize = Some(*span);
                 }
+                AttributeKind::ObjcClass { classname, .. } => {
+                    codegen_fn_attrs.objc_class = Some(*classname);
+                }
+                AttributeKind::ObjcSelector { methname, .. } => {
+                    codegen_fn_attrs.objc_selector = Some(*methname);
+                }
+                AttributeKind::EiiForeignItem => {
+                    codegen_fn_attrs.flags |= CodegenFnAttrFlags::EXTERNALLY_IMPLEMENTABLE_ITEM;
+                }
+                AttributeKind::EiiImpls(impls) => {
+                    for i in impls {
+                        let foreign_item = match i.resolution {
+                            EiiImplResolution::Macro(def_id) => {
+                                let Some(extern_item) = find_attr!(
+                                    tcx.get_all_attrs(def_id),
+                                    AttributeKind::EiiDeclaration(target) => target.foreign_item
+                                ) else {
+                                    tcx.dcx().span_delayed_bug(
+                                        i.span,
+                                        "resolved to something that's not an EII",
+                                    );
+                                    continue;
+                                };
+                                extern_item
+                            }
+                            EiiImplResolution::Known(decl) => decl.foreign_item,
+                            EiiImplResolution::Error(_eg) => continue,
+                        };
+
+                        // this is to prevent a bug where a single crate defines both the default and explicit implementation
+                        // for an EII. In that case, both of them may be part of the same final object file. I'm not 100% sure
+                        // what happens, either rustc deduplicates the symbol or llvm, or it's random/order-dependent.
+                        // However, the fact that the default one of has weak linkage isn't considered and you sometimes get that
+                        // the default implementation is used while an explicit implementation is given.
+                        if
+                        // if this is a default impl
+                        i.is_default
+                            // iterate over all implementations *in the current crate*
+                            // (this is ok since we generate codegen fn attrs in the local crate)
+                            // if any of them is *not default* then don't emit the alias.
+                            && tcx.externally_implementable_items(LOCAL_CRATE).get(&foreign_item).expect("at least one").1.iter().any(|(_, imp)| !imp.is_default)
+                        {
+                            continue;
+                        }
+
+                        codegen_fn_attrs.foreign_item_symbol_aliases.push((
+                            foreign_item,
+                            if i.is_default { Linkage::LinkOnceAny } else { Linkage::External },
+                            Visibility::Default,
+                        ));
+                        codegen_fn_attrs.flags |= CodegenFnAttrFlags::EXTERNALLY_IMPLEMENTABLE_ITEM;
+                    }
+                }
+                AttributeKind::ThreadLocal => {
+                    codegen_fn_attrs.flags |= CodegenFnAttrFlags::THREAD_LOCAL
+                }
+                AttributeKind::InstructionSet(instruction_set) => {
+                    codegen_fn_attrs.instruction_set = Some(*instruction_set)
+                }
                 _ => {}
             }
         }
 
-        let Some(Ident { name, .. }) = attr.ident() else {
+        let Some(name) = attr.name() else {
             continue;
         };
 
@@ -312,13 +351,12 @@ fn process_builtin_attrs(
             sym::rustc_allocator_zeroed => {
                 codegen_fn_attrs.flags |= CodegenFnAttrFlags::ALLOCATOR_ZEROED
             }
-            sym::thread_local => codegen_fn_attrs.flags |= CodegenFnAttrFlags::THREAD_LOCAL,
-            sym::instruction_set => {
-                codegen_fn_attrs.instruction_set = parse_instruction_set_attr(tcx, attr)
-            }
             sym::patchable_function_entry => {
                 codegen_fn_attrs.patchable_function_entry =
                     parse_patchable_function_entry(tcx, attr);
+            }
+            sym::rustc_offload_kernel => {
+                codegen_fn_attrs.flags |= CodegenFnAttrFlags::OFFLOAD_KERNEL
             }
             _ => {}
         }
@@ -336,8 +374,10 @@ fn apply_overrides(tcx: TyCtxt<'_>, did: LocalDefId, codegen_fn_attrs: &mut Code
     codegen_fn_attrs.alignment =
         Ord::max(codegen_fn_attrs.alignment, tcx.sess.opts.unstable_opts.min_function_alignment);
 
-    // Compute the disabled sanitizers.
-    codegen_fn_attrs.no_sanitize |= tcx.disabled_sanitizers_for(did);
+    // Passed in sanitizer settings are always the default.
+    assert!(codegen_fn_attrs.sanitizers == SanitizerFnAttrs::default());
+    // Replace with #[sanitize] value
+    codegen_fn_attrs.sanitizers = tcx.sanitizer_settings_for(did);
     // On trait methods, inherit the `#[align]` of the trait's method prototype.
     codegen_fn_attrs.alignment = Ord::max(codegen_fn_attrs.alignment, tcx.inherited_align(did));
 
@@ -385,11 +425,19 @@ fn apply_overrides(tcx: TyCtxt<'_>, did: LocalDefId, codegen_fn_attrs: &mut Code
 
     // Foreign items by default use no mangling for their symbol name.
     if tcx.is_foreign_item(did) {
+        codegen_fn_attrs.flags |= CodegenFnAttrFlags::FOREIGN_ITEM;
+
         // There's a few exceptions to this rule though:
         if codegen_fn_attrs.flags.contains(CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL) {
             // * `#[rustc_std_internal_symbol]` mangles the symbol name in a special way
             //   both for exports and imports through foreign items. This is handled further,
             //   during symbol mangling logic.
+        } else if codegen_fn_attrs.flags.contains(CodegenFnAttrFlags::EXTERNALLY_IMPLEMENTABLE_ITEM)
+        {
+            // * externally implementable items keep their mangled symbol name.
+            //   multiple EIIs can have the same name, so not mangling them would be a bug.
+            //   Implementing an EII does the appropriate name resolution to make sure the implementations
+            //   get the same symbol name as the *mangled* foreign item they refer to so that's all good.
         } else if codegen_fn_attrs.symbol_name.is_some() {
             // * This can be overridden with the `#[link_name]` attribute
         } else {
@@ -426,22 +474,53 @@ fn check_result(
     // llvm/llvm-project#70563).
     if !codegen_fn_attrs.target_features.is_empty()
         && matches!(codegen_fn_attrs.inline, InlineAttr::Always)
+        && !tcx.features().target_feature_inline_always()
         && let Some(span) = interesting_spans.inline
     {
-        tcx.dcx().span_err(span, "cannot use `#[inline(always)]` with `#[target_feature]`");
+        feature_err(
+            tcx.sess,
+            sym::target_feature_inline_always,
+            span,
+            "cannot use `#[inline(always)]` with `#[target_feature]`",
+        )
+        .emit();
     }
 
     // warn that inline has no effect when no_sanitize is present
-    if !codegen_fn_attrs.no_sanitize.is_empty()
+    if codegen_fn_attrs.sanitizers != SanitizerFnAttrs::default()
         && codegen_fn_attrs.inline.always()
-        && let (Some(no_sanitize_span), Some(inline_span)) =
+        && let (Some(sanitize_span), Some(inline_span)) =
             (interesting_spans.sanitize, interesting_spans.inline)
     {
         let hir_id = tcx.local_def_id_to_hir_id(did);
-        tcx.node_span_lint(lint::builtin::INLINE_NO_SANITIZE, hir_id, no_sanitize_span, |lint| {
-            lint.primary_message("setting `sanitize` off will have no effect after inlining");
+        tcx.node_span_lint(lint::builtin::INLINE_NO_SANITIZE, hir_id, sanitize_span, |lint| {
+            lint.primary_message("non-default `sanitize` will have no effect after inlining");
             lint.span_note(inline_span, "inlining requested here");
         })
+    }
+
+    // warn for nonblocking async functions, blocks and closures.
+    // This doesn't behave as expected, because the executor can run blocking code without the sanitizer noticing.
+    if codegen_fn_attrs.sanitizers.rtsan_setting == RtsanSetting::Nonblocking
+        && let Some(sanitize_span) = interesting_spans.sanitize
+        // async fn
+        && (tcx.asyncness(did).is_async()
+            // async block
+            || tcx.is_coroutine(did.into())
+            // async closure
+            || (tcx.is_closure_like(did.into())
+                && tcx.hir_node_by_def_id(did).expect_closure().kind
+                    != rustc_hir::ClosureKind::Closure))
+    {
+        let hir_id = tcx.local_def_id_to_hir_id(did);
+        tcx.node_span_lint(
+            lint::builtin::RTSAN_NONBLOCKING_ASYNC,
+            hir_id,
+            sanitize_span,
+            |lint| {
+                lint.primary_message(r#"the async executor can run blocking code, without realtime sanitizer catching it"#);
+            }
+        );
     }
 
     // error when specifying link_name together with link_ordinal
@@ -553,52 +632,49 @@ fn codegen_fn_attrs(tcx: TyCtxt<'_>, did: LocalDefId) -> CodegenFnAttrs {
     codegen_fn_attrs
 }
 
-/// If the provided DefId is a method in a trait impl, return the DefId of the method prototype.
-fn opt_trait_item(tcx: TyCtxt<'_>, def_id: DefId) -> Option<DefId> {
-    let impl_item = tcx.opt_associated_item(def_id)?;
-    match impl_item.container {
-        ty::AssocItemContainer::Impl => impl_item.trait_item_def_id,
-        _ => None,
-    }
-}
-
-fn disabled_sanitizers_for(tcx: TyCtxt<'_>, did: LocalDefId) -> SanitizerSet {
+fn sanitizer_settings_for(tcx: TyCtxt<'_>, did: LocalDefId) -> SanitizerFnAttrs {
     // Backtrack to the crate root.
-    let mut disabled = match tcx.opt_local_parent(did) {
+    let mut settings = match tcx.opt_local_parent(did) {
         // Check the parent (recursively).
-        Some(parent) => tcx.disabled_sanitizers_for(parent),
+        Some(parent) => tcx.sanitizer_settings_for(parent),
         // We reached the crate root without seeing an attribute, so
         // there is no sanitizers to exclude.
-        None => SanitizerSet::empty(),
+        None => SanitizerFnAttrs::default(),
     };
 
     // Check for a sanitize annotation directly on this def.
-    if let Some((on_set, off_set)) = find_attr!(tcx.get_all_attrs(did), AttributeKind::Sanitize {on_set, off_set, ..} => (on_set, off_set))
+    if let Some((on_set, off_set, rtsan)) = find_attr!(tcx.get_all_attrs(did), AttributeKind::Sanitize {on_set, off_set, rtsan, ..} => (on_set, off_set, rtsan))
     {
         // the on set is the set of sanitizers explicitly enabled.
         // we mask those out since we want the set of disabled sanitizers here
-        disabled &= !*on_set;
+        settings.disabled &= !*on_set;
         // the off set is the set of sanitizers explicitly disabled.
         // we or those in here.
-        disabled |= *off_set;
+        settings.disabled |= *off_set;
         // the on set and off set are distjoint since there's a third option: unset.
         // a node may not set the sanitizer setting in which case it inherits from parents.
         // the code above in this function does this backtracking
+
+        // if rtsan was specified here override the parent
+        if let Some(rtsan) = rtsan {
+            settings.rtsan_setting = *rtsan;
+        }
     }
-    disabled
+    settings
 }
 
 /// Checks if the provided DefId is a method in a trait impl for a trait which has track_caller
 /// applied to the method prototype.
 fn should_inherit_track_caller(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
-    let Some(trait_item) = opt_trait_item(tcx, def_id) else { return false };
-    tcx.codegen_fn_attrs(trait_item).flags.intersects(CodegenFnAttrFlags::TRACK_CALLER)
+    tcx.trait_item_of(def_id).is_some_and(|id| {
+        tcx.codegen_fn_attrs(id).flags.intersects(CodegenFnAttrFlags::TRACK_CALLER)
+    })
 }
 
 /// If the provided DefId is a method in a trait impl, return the value of the `#[align]`
 /// attribute on the method prototype (if any).
 fn inherited_align<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<Align> {
-    tcx.codegen_fn_attrs(opt_trait_item(tcx, def_id)?).alignment
+    tcx.codegen_fn_attrs(tcx.trait_item_of(def_id)?).alignment
 }
 
 /// We now check the #\[rustc_autodiff\] attributes which we generated from the #[autodiff(...)]
@@ -672,11 +748,10 @@ pub fn autodiff_attrs(tcx: TyCtxt<'_>, id: DefId) -> Option<AutoDiffAttrs> {
     };
 
     // First read the ret symbol from the attribute
-    let ret_symbol = if let MetaItemInner::MetaItem(MetaItem { path: p1, .. }) = ret_activity {
-        p1.segments.first().unwrap().ident
-    } else {
+    let MetaItemInner::MetaItem(MetaItem { path: p1, .. }) = ret_activity else {
         span_bug!(attr.span(), "rustc_autodiff attribute must contain the return activity");
     };
+    let ret_symbol = p1.segments.first().unwrap().ident;
 
     // Then parse it into an actual DiffActivity
     let Ok(ret_activity) = DiffActivity::from_str(ret_symbol.as_str()) else {
@@ -716,7 +791,7 @@ pub(crate) fn provide(providers: &mut Providers) {
         codegen_fn_attrs,
         should_inherit_track_caller,
         inherited_align,
-        disabled_sanitizers_for,
+        sanitizer_settings_for,
         ..*providers
     };
 }

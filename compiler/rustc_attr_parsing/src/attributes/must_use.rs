@@ -1,7 +1,4 @@
-use rustc_errors::DiagArgValue;
-
 use super::prelude::*;
-use crate::session_diagnostics::IllFormedAttributeInputLint;
 
 pub(crate) struct MustUseParser;
 
@@ -29,7 +26,7 @@ impl<S: Stage> SingleAttributeParser<S> for MustUseParser {
         "https://doc.rust-lang.org/reference/attributes/diagnostics.html#the-must_use-attribute"
     );
 
-    fn convert(cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser<'_>) -> Option<AttributeKind> {
+    fn convert(cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser) -> Option<AttributeKind> {
         Some(AttributeKind::MustUse {
             span: cx.attr_span,
             reason: match args {
@@ -44,16 +41,8 @@ impl<S: Stage> SingleAttributeParser<S> for MustUseParser {
                     };
                     Some(value_str)
                 }
-                ArgParser::List(_) => {
-                    let suggestions = <Self as SingleAttributeParser<S>>::TEMPLATE
-                        .suggestions(cx.attr_style, "must_use");
-                    cx.emit_err(IllFormedAttributeInputLint {
-                        num_suggestions: suggestions.len(),
-                        suggestions: DiagArgValue::StrListSepByAnd(
-                            suggestions.into_iter().map(|s| format!("`{s}`").into()).collect(),
-                        ),
-                        span: cx.attr_span,
-                    });
+                ArgParser::List(list) => {
+                    cx.expected_nv_or_no_args(list.span);
                     return None;
                 }
             },

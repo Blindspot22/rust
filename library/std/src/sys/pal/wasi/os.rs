@@ -1,13 +1,12 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use crate::error::Error as StdError;
 use crate::ffi::{CStr, OsStr, OsString};
 use crate::marker::PhantomData;
 use crate::os::wasi::prelude::*;
 use crate::path::{self, PathBuf};
-use crate::sys::common::small_c_string::run_path_with_cstr;
+use crate::sys::helpers::run_path_with_cstr;
 use crate::sys::unsupported;
-use crate::{fmt, io, str};
+use crate::{fmt, io};
 
 // Add a few symbols not in upstream `libc` just yet.
 pub mod libc {
@@ -17,27 +16,6 @@ pub mod libc {
         pub fn getcwd(buf: *mut c_char, size: size_t) -> *mut c_char;
         pub fn chdir(dir: *const c_char) -> c_int;
         pub fn __wasilibc_get_environ() -> *mut *mut c_char;
-    }
-}
-
-pub fn errno() -> i32 {
-    unsafe extern "C" {
-        #[thread_local]
-        static errno: libc::c_int;
-    }
-
-    unsafe { errno as i32 }
-}
-
-pub fn error_string(errno: i32) -> String {
-    let mut buf = [0 as libc::c_char; 1024];
-
-    let p = buf.as_mut_ptr();
-    unsafe {
-        if libc::strerror_r(errno as libc::c_int, p, buf.len()) < 0 {
-            panic!("strerror_r failure");
-        }
-        str::from_utf8(CStr::from_ptr(p).to_bytes()).unwrap().to_owned()
     }
 }
 
@@ -105,12 +83,7 @@ impl fmt::Display for JoinPathsError {
     }
 }
 
-impl StdError for JoinPathsError {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        "not supported on wasm yet"
-    }
-}
+impl crate::error::Error for JoinPathsError {}
 
 pub fn current_exe() -> io::Result<PathBuf> {
     unsupported()
@@ -154,4 +127,17 @@ impl_is_minus_one! { i8 i16 i32 i64 isize }
 
 pub fn cvt<T: IsMinusOne>(t: T) -> io::Result<T> {
     if t.is_minus_one() { Err(io::Error::last_os_error()) } else { Ok(t) }
+}
+
+pub fn cvt_r<T, F>(mut f: F) -> io::Result<T>
+where
+    T: IsMinusOne,
+    F: FnMut() -> T,
+{
+    loop {
+        match cvt(f()) {
+            Err(ref e) if e.is_interrupted() => {}
+            other => return other,
+        }
+    }
 }

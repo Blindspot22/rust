@@ -1,4 +1,4 @@
-//@ add-core-stubs
+//@ add-minicore
 //@ assembly-output: emit-asm
 //@ revisions: rv32i rv64i rv32e
 //@[rv32i] compile-flags: --target riscv32i-unknown-none-elf
@@ -17,7 +17,7 @@ extern crate minicore;
 use minicore::*;
 
 // CHECK-LABEL: @flags_clobber
-// CHECK: call void asm sideeffect "", "~{vtype},~{vl},~{vxsat},~{vxrm}"()
+// CHECK: call void asm sideeffect "", "~{fflags},~{vtype},~{vl},~{vxsat},~{vxrm}"()
 #[no_mangle]
 pub unsafe fn flags_clobber() {
     asm!("", options(nostack, nomem));

@@ -24,7 +24,7 @@ use crate::github::JobInfoResolver;
 use crate::jobs::RunType;
 use crate::metrics::{JobMetrics, download_auto_job_metrics, download_job_metrics, load_metrics};
 use crate::test_dashboard::generate_test_dashboard;
-use crate::utils::{load_env_var, output_details};
+use crate::utils::{init_submodule_if_needed, load_env_var, output_details};
 
 const CI_DIRECTORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
 pub const DOCKER_DIRECTORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../docker");
@@ -41,13 +41,13 @@ impl GitHubContext {
         match (self.event_name.as_str(), self.branch_ref.as_str()) {
             ("pull_request", _) => Some(RunType::PullRequest),
             ("push", "refs/heads/try-perf") => Some(RunType::TryJob { job_patterns: None }),
-            ("push", "refs/heads/try" | "refs/heads/automation/bors/try") => {
+            ("push", "refs/heads/automation/bors/try") => {
                 let patterns = self.get_try_job_patterns();
                 let patterns = if !patterns.is_empty() { Some(patterns) } else { None };
                 Some(RunType::TryJob { job_patterns: patterns })
             }
-            ("push", "refs/heads/auto") => Some(RunType::AutoJob),
-            ("push", "refs/heads/master") => Some(RunType::MasterJob),
+            ("push", "refs/heads/automation/bors/auto") => Some(RunType::AutoJob),
+            ("push", "refs/heads/main") => Some(RunType::MainJob),
             _ => None,
         }
     }
@@ -120,6 +120,8 @@ fn run_workflow_locally(db: JobDatabase, job_type: JobType, name: String) -> any
         };
         (key.clone(), value)
     }));
+
+    init_submodule_if_needed("src/llvm-project/")?;
 
     let mut cmd = Command::new(Path::new(DOCKER_DIRECTORY).join("run.sh"));
     cmd.arg(job.image());

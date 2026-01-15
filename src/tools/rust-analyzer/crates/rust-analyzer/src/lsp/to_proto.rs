@@ -16,7 +16,9 @@ use ide::{
     SnippetEdit, SourceChange, StructureNodeKind, SymbolKind, TextEdit, TextRange, TextSize,
     UpdateTest,
 };
-use ide_db::{FxHasher, assists, rust_doc::format_docs, source_change::ChangeAnnotationId};
+use ide_db::{
+    FxHasher, MiniCore, assists, rust_doc::format_docs, source_change::ChangeAnnotationId,
+};
 use itertools::Itertools;
 use paths::{Utf8Component, Utf8Prefix};
 use semver::VersionReq;
@@ -24,7 +26,7 @@ use serde_json::to_value;
 use vfs::AbsPath;
 
 use crate::{
-    config::{CallInfoConfig, Config},
+    config::{CallInfoConfig, ClientCommandsConfig, Config},
     global_state::GlobalStateSnapshot,
     line_index::{LineEndings, LineIndex, PositionEncoding},
     lsp::{
@@ -61,7 +63,7 @@ pub(crate) fn symbol_kind(symbol_kind: SymbolKind) -> lsp_types::SymbolKind {
         SymbolKind::Struct => lsp_types::SymbolKind::STRUCT,
         SymbolKind::Enum => lsp_types::SymbolKind::ENUM,
         SymbolKind::Variant => lsp_types::SymbolKind::ENUM_MEMBER,
-        SymbolKind::Trait | SymbolKind::TraitAlias => lsp_types::SymbolKind::INTERFACE,
+        SymbolKind::Trait => lsp_types::SymbolKind::INTERFACE,
         SymbolKind::Macro
         | SymbolKind::ProcMacro
         | SymbolKind::BuiltinAttr
@@ -117,7 +119,7 @@ pub(crate) fn diagnostic_severity(severity: Severity) -> lsp_types::DiagnosticSe
     }
 }
 
-pub(crate) fn documentation(documentation: Documentation) -> lsp_types::Documentation {
+pub(crate) fn documentation(documentation: Documentation<'_>) -> lsp_types::Documentation {
     let value = format_docs(&documentation);
     let markup_content = lsp_types::MarkupContent { kind: lsp_types::MarkupKind::Markdown, value };
     lsp_types::Documentation::MarkupContent(markup_content)
@@ -156,7 +158,6 @@ pub(crate) fn completion_item_kind(
             SymbolKind::Static => lsp_types::CompletionItemKind::VALUE,
             SymbolKind::Struct => lsp_types::CompletionItemKind::STRUCT,
             SymbolKind::Trait => lsp_types::CompletionItemKind::INTERFACE,
-            SymbolKind::TraitAlias => lsp_types::CompletionItemKind::INTERFACE,
             SymbolKind::TypeAlias => lsp_types::CompletionItemKind::STRUCT,
             SymbolKind::TypeParam => lsp_types::CompletionItemKind::TYPE_PARAMETER,
             SymbolKind::Union => lsp_types::CompletionItemKind::STRUCT,
@@ -257,10 +258,12 @@ pub(crate) fn completion_items(
 
     let max_relevance = items.iter().map(|it| it.relevance.score()).max().unwrap_or_default();
     let mut res = Vec::with_capacity(items.len());
+    let client_commands = config.client_commands();
     for item in items {
         completion_item(
             &mut res,
             config,
+            &client_commands,
             fields_to_resolve,
             line_index,
             version,
@@ -271,7 +274,7 @@ pub(crate) fn completion_items(
         );
     }
 
-    if let Some(limit) = config.completion(None).limit {
+    if let Some(limit) = config.completion(None, MiniCore::default()).limit {
         res.sort_by(|item1, item2| item1.sort_text.cmp(&item2.sort_text));
         res.truncate(limit);
     }
@@ -282,6 +285,7 @@ pub(crate) fn completion_items(
 fn completion_item(
     acc: &mut Vec<lsp_types::CompletionItem>,
     config: &Config,
+    client_commands: &ClientCommandsConfig,
     fields_to_resolve: &CompletionFieldsToResolve,
     line_index: &LineIndex,
     version: Option<i32>,
@@ -341,7 +345,7 @@ fn completion_item(
     } else {
         item.deprecated.then(|| vec![lsp_types::CompletionItemTag::DEPRECATED])
     };
-    let command = if item.trigger_call_info && config.client_commands().trigger_parameter_hints {
+    let command = if item.trigger_call_info && client_commands.trigger_parameter_hints {
         if fields_to_resolve.resolve_command {
             something_to_resolve |= true;
             None
@@ -401,16 +405,17 @@ fn completion_item(
 
     set_score(&mut lsp_item, max_relevance, item.relevance);
 
-    let imports =
-        if config.completion(None).enable_imports_on_the_fly && !item.import_to_add.is_empty() {
-            item.import_to_add
-                .clone()
-                .into_iter()
-                .map(|import_path| lsp_ext::CompletionImport { full_import_path: import_path })
-                .collect()
-        } else {
-            Vec::new()
-        };
+    let imports = if config.completion(None, MiniCore::default()).enable_imports_on_the_fly
+        && !item.import_to_add.is_empty()
+    {
+        item.import_to_add
+            .clone()
+            .into_iter()
+            .map(|import_path| lsp_ext::CompletionImport { full_import_path: import_path })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let (ref_resolve_data, resolve_data) = if something_to_resolve || !imports.is_empty() {
         let ref_resolve_data = if ref_match.is_some() {
             let ref_resolve_data = lsp_ext::CompletionResolveData {
@@ -494,8 +499,15 @@ pub(crate) fn signature_help(
                 .parameter_ranges()
                 .iter()
                 .map(|it| {
-                    let start = call_info.signature[..it.start().into()].chars().count() as u32;
-                    let end = call_info.signature[..it.end().into()].chars().count() as u32;
+                    let start = call_info.signature[..it.start().into()]
+                        .chars()
+                        .map(|c| c.len_utf16())
+                        .sum::<usize>() as u32;
+                    let end = start
+                        + call_info.signature[it.start().into()..it.end().into()]
+                            .chars()
+                            .map(|c| c.len_utf16())
+                            .sum::<usize>() as u32;
                     [start, end]
                 })
                 .map(|label_offsets| lsp_types::ParameterInformation {
@@ -514,9 +526,9 @@ pub(crate) fn signature_help(
                     label.push_str(", ");
                 }
                 first = false;
-                let start = label.chars().count() as u32;
+                let start = label.len() as u32;
                 label.push_str(param);
-                let end = label.chars().count() as u32;
+                let end = label.len() as u32;
                 params.push(lsp_types::ParameterInformation {
                     label: lsp_types::ParameterLabel::LabelOffsets([start, end]),
                     documentation: None,
@@ -817,7 +829,6 @@ fn semantic_token_type_and_modifiers(
             SymbolKind::Union => types::UNION,
             SymbolKind::TypeAlias => types::TYPE_ALIAS,
             SymbolKind::Trait => types::INTERFACE,
-            SymbolKind::TraitAlias => types::INTERFACE,
             SymbolKind::Macro => types::MACRO,
             SymbolKind::ProcMacro => types::PROC_MACRO,
             SymbolKind::BuiltinAttr => types::BUILTIN_ATTRIBUTE,
@@ -839,6 +850,7 @@ fn semantic_token_type_and_modifiers(
             HlOperator::Bitwise => types::BITWISE,
             HlOperator::Arithmetic => types::ARITHMETIC,
             HlOperator::Logical => types::LOGICAL,
+            HlOperator::Negation => types::NEGATION,
             HlOperator::Comparison => types::COMPARISON,
             HlOperator::Other => types::OPERATOR,
         },
@@ -870,6 +882,7 @@ fn semantic_token_type_and_modifiers(
             HlMod::ControlFlow => mods::CONTROL_FLOW,
             HlMod::CrateRoot => mods::CRATE_ROOT,
             HlMod::DefaultLibrary => mods::DEFAULT_LIBRARY,
+            HlMod::Deprecated => mods::DEPRECATED,
             HlMod::Definition => mods::DECLARATION,
             HlMod::Documentation => mods::DOCUMENTATION,
             HlMod::Injected => mods::INJECTED,
@@ -909,7 +922,6 @@ pub(crate) fn folding_range(
         | FoldKind::WhereClause
         | FoldKind::ReturnType
         | FoldKind::Array
-        | FoldKind::TraitAliases
         | FoldKind::ExternCrates
         | FoldKind::MatchArm
         | FoldKind::Function => None,
@@ -1492,6 +1504,7 @@ pub(crate) fn code_action_kind(kind: AssistKind) -> lsp_types::CodeActionKind {
 
 pub(crate) fn code_action(
     snap: &GlobalStateSnapshot,
+    commands: &ClientCommandsConfig,
     assist: Assist,
     resolve_data: Option<(usize, lsp_types::CodeActionParams, Option<i32>)>,
 ) -> Cancellable<lsp_ext::CodeAction> {
@@ -1505,7 +1518,6 @@ pub(crate) fn code_action(
         command: None,
     };
 
-    let commands = snap.config.client_commands();
     res.command = match assist.command {
         Some(assists::Command::TriggerParameterHints) if commands.trigger_parameter_hints => {
             Some(command::trigger_parameter_hints())
@@ -1549,6 +1561,9 @@ pub(crate) fn runnable(
 
             let target = spec.target.clone();
 
+            let override_command =
+                CargoTargetSpec::override_command(snap, Some(spec.clone()), &runnable.kind);
+
             let (cargo_args, executable_args) = CargoTargetSpec::runnable_args(
                 snap,
                 Some(spec.clone()),
@@ -1564,23 +1579,41 @@ pub(crate) fn runnable(
             let label = runnable.label(Some(&target));
             let location = location_link(snap, None, runnable.nav)?;
 
-            Ok(Some(lsp_ext::Runnable {
-                label,
-                location: Some(location),
-                kind: lsp_ext::RunnableKind::Cargo,
-                args: lsp_ext::RunnableArgs::Cargo(lsp_ext::CargoRunnableArgs {
-                    workspace_root: Some(workspace_root.into()),
-                    override_cargo: config.override_cargo,
-                    cargo_args,
-                    cwd: cwd.into(),
-                    executable_args,
-                    environment: spec
-                        .sysroot_root
-                        .map(|root| ("RUSTC_TOOLCHAIN".to_owned(), root.to_string()))
-                        .into_iter()
-                        .collect(),
+            let environment = spec
+                .sysroot_root
+                .map(|root| ("RUSTC_TOOLCHAIN".to_owned(), root.to_string()))
+                .into_iter()
+                .collect();
+
+            Ok(match override_command {
+                Some(override_command) => match override_command.split_first() {
+                    Some((program, args)) => Some(lsp_ext::Runnable {
+                        label,
+                        location: Some(location),
+                        kind: lsp_ext::RunnableKind::Shell,
+                        args: lsp_ext::RunnableArgs::Shell(lsp_ext::ShellRunnableArgs {
+                            environment,
+                            cwd: cwd.into(),
+                            program: program.to_string(),
+                            args: args.to_vec(),
+                        }),
+                    }),
+                    _ => None,
+                },
+                None => Some(lsp_ext::Runnable {
+                    label,
+                    location: Some(location),
+                    kind: lsp_ext::RunnableKind::Cargo,
+                    args: lsp_ext::RunnableArgs::Cargo(lsp_ext::CargoRunnableArgs {
+                        workspace_root: Some(workspace_root.into()),
+                        override_cargo: config.override_cargo,
+                        cargo_args,
+                        cwd: cwd.into(),
+                        executable_args,
+                        environment,
+                    }),
                 }),
-            }))
+            })
         }
         Some(TargetSpec::ProjectJson(spec)) => {
             let label = runnable.label(Some(&spec.label));
@@ -1963,7 +1996,7 @@ pub(crate) fn markup_content(
         ide::HoverDocFormat::Markdown => lsp_types::MarkupKind::Markdown,
         ide::HoverDocFormat::PlainText => lsp_types::MarkupKind::PlainText,
     };
-    let value = format_docs(&Documentation::new(markup.into()));
+    let value = format_docs(&Documentation::new_owned(markup.into()));
     lsp_types::MarkupContent { kind, value }
 }
 

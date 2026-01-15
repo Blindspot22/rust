@@ -209,10 +209,16 @@ impl<'a, 'gcc, 'tcx> AsmBuilderMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
                                 }
                                 ("r", dummy_output_type(self.cx, reg.reg_class()))
                             } else {
-                                // `clobber_abi` can add lots of clobbers that are not supported by the target,
-                                // such as AVX-512 registers, so we just ignore unsupported registers
-                                let is_target_supported =
-                                    reg.reg_class().supported_types(asm_arch, true).iter().any(
+                                let is_target_supported = match reg.reg_class() {
+                                    // `clobber_abi` clobbers spe_acc on all PowerPC targets. This
+                                    // register is unique to the powerpc*spe target, and the target
+                                    // is not supported by gcc. Ignore it.
+                                    InlineAsmRegClass::PowerPC(
+                                        PowerPCInlineAsmRegClass::spe_acc,
+                                    ) => false,
+                                    // `clobber_abi` can add lots of clobbers that are not supported by the target,
+                                    // such as AVX-512 registers, so we just ignore unsupported registers
+                                    x => x.supported_types(asm_arch, true).iter().any(
                                         |&(_, feature)| {
                                             if let Some(feature) = feature {
                                                 self.tcx
@@ -222,7 +228,8 @@ impl<'a, 'gcc, 'tcx> AsmBuilderMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
                                                 true // Register class is unconditionally supported
                                             }
                                         },
-                                    );
+                                    ),
+                                };
 
                                 if is_target_supported && !clobbers.contains(&reg_name) {
                                     clobbers.push(reg_name);
@@ -546,9 +553,16 @@ impl<'a, 'gcc, 'tcx> AsmBuilderMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
         }
 
         if !options.contains(InlineAsmOptions::PRESERVES_FLAGS) {
-            // TODO(@Commeownist): I'm not 100% sure this one clobber is sufficient
-            // on all architectures. For instance, what about FP stack?
-            extended_asm.add_clobber("cc");
+            match asm_arch {
+                InlineAsmArch::PowerPC | InlineAsmArch::PowerPC64 => {
+                    // "cc" is cr0 on powerpc.
+                }
+                // TODO(@Commeownist): I'm not 100% sure this one clobber is sufficient
+                // on all architectures. For instance, what about FP stack?
+                _ => {
+                    extended_asm.add_clobber("cc");
+                }
+            }
         }
         if !options.contains(InlineAsmOptions::NOMEM) {
             extended_asm.add_clobber("memory");
@@ -698,8 +712,14 @@ fn reg_class_to_gcc(reg_class: InlineAsmRegClass) -> &'static str {
         InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::reg_nonzero) => "b",
         InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::freg) => "f",
         InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::vreg) => "v",
-        InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::cr)
-        | InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::xer) => {
+        InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::vsreg) => "wa",
+        InlineAsmRegClass::PowerPC(
+            PowerPCInlineAsmRegClass::cr
+            | PowerPCInlineAsmRegClass::ctr
+            | PowerPCInlineAsmRegClass::lr
+            | PowerPCInlineAsmRegClass::xer
+            | PowerPCInlineAsmRegClass::spe_acc,
+        ) => {
             unreachable!("clobber-only")
         }
         InlineAsmRegClass::RiscV(RiscVInlineAsmRegClass::reg) => "r",
@@ -774,11 +794,16 @@ fn dummy_output_type<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, reg: InlineAsmRegCl
         InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::reg) => cx.type_i32(),
         InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::reg_nonzero) => cx.type_i32(),
         InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::freg) => cx.type_f64(),
-        InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::vreg) => {
-            cx.type_vector(cx.type_i32(), 4)
-        }
-        InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::cr)
-        | InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::xer) => {
+        InlineAsmRegClass::PowerPC(
+            PowerPCInlineAsmRegClass::vreg | PowerPCInlineAsmRegClass::vsreg,
+        ) => cx.type_vector(cx.type_i32(), 4),
+        InlineAsmRegClass::PowerPC(
+            PowerPCInlineAsmRegClass::cr
+            | PowerPCInlineAsmRegClass::ctr
+            | PowerPCInlineAsmRegClass::lr
+            | PowerPCInlineAsmRegClass::xer
+            | PowerPCInlineAsmRegClass::spe_acc,
+        ) => {
             unreachable!("clobber-only")
         }
         InlineAsmRegClass::RiscV(RiscVInlineAsmRegClass::reg) => cx.type_i32(),
@@ -949,6 +974,13 @@ fn modifier_to_gcc(
         InlineAsmRegClass::LoongArch(_) => None,
         InlineAsmRegClass::Mips(_) => None,
         InlineAsmRegClass::Nvptx(_) => None,
+        InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::vsreg) => {
+            if modifier.is_none() {
+                Some('x')
+            } else {
+                modifier
+            }
+        }
         InlineAsmRegClass::PowerPC(_) => None,
         InlineAsmRegClass::RiscV(RiscVInlineAsmRegClass::reg)
         | InlineAsmRegClass::RiscV(RiscVInlineAsmRegClass::freg) => None,

@@ -74,7 +74,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 bug!("{cast_kind:?} casts are for borrowck only, not runtime MIR");
             }
 
-            CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer, _) => {
+            CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer(_), _) => {
                 // All reifications must be monomorphic, bail out otherwise.
                 ensure_monomorphic_enough(*self.tcx, src.layout.ty)?;
 
@@ -133,7 +133,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 }
             }
 
-            CastKind::Transmute => {
+            CastKind::Transmute | CastKind::Subtype => {
                 assert!(src.layout.is_sized());
                 assert!(dest.layout.is_sized());
                 assert_eq!(cast_ty, dest.layout.ty); // we otherwise ignore `cast_ty` enirely...
@@ -386,7 +386,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 );
                 self.write_immediate(val, dest)
             }
-            (ty::Dynamic(data_a, _, ty::Dyn), ty::Dynamic(data_b, _, ty::Dyn)) => {
+            (ty::Dynamic(data_a, _), ty::Dynamic(data_b, _)) => {
                 let val = self.read_immediate(src)?;
                 // MIR building generates odd NOP casts, prevent them from causing unexpected trouble.
                 // See <https://github.com/rust-lang/rust/issues/128880>.
@@ -436,7 +436,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 let new_vptr = self.get_vtable_ptr(ty, data_b)?;
                 self.write_immediate(Immediate::new_dyn_trait(old_data, new_vptr, self), dest)
             }
-            (_, &ty::Dynamic(data, _, ty::Dyn)) => {
+            (_, &ty::Dynamic(data, _)) => {
                 // Initial cast from sized to dyn trait
                 let vtable = self.get_vtable_ptr(src_pointee_ty, data)?;
                 let ptr = self.read_pointer(src)?;
@@ -466,6 +466,12 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     ) -> InterpResult<'tcx> {
         trace!("Unsizing {:?} of type {} into {}", *src, src.layout.ty, cast_ty.ty);
         match (src.layout.ty.kind(), cast_ty.ty.kind()) {
+            (&ty::Pat(_, s_pat), &ty::Pat(cast_ty, c_pat)) if s_pat == c_pat => {
+                let src = self.project_field(src, FieldIdx::ZERO)?;
+                let dest = self.project_field(dest, FieldIdx::ZERO)?;
+                let cast_ty = self.layout_of(cast_ty)?;
+                self.unsize_into(&src, cast_ty, &dest)
+            }
             (&ty::Ref(_, s, _), &ty::Ref(_, c, _) | &ty::RawPtr(c, _))
             | (&ty::RawPtr(s, _), &ty::RawPtr(c, _)) => self.unsize_into_ptr(src, dest, s, c),
             (&ty::Adt(def_a, _), &ty::Adt(def_b, _)) => {

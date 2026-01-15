@@ -48,6 +48,7 @@ impl Project<'_> {
                         "enable": false,
                     },
                 },
+                "checkOnSave": false,
                 "procMacro": {
                     "enable": false,
                 }
@@ -97,6 +98,7 @@ impl Project<'_> {
             proc_macro_names,
             toolchain,
             target_data_layout: _,
+            target_arch: _,
         } = FixtureWithProjectMeta::parse(self.fixture);
         assert!(proc_macro_names.is_empty());
         assert!(mini_core.is_none());
@@ -112,7 +114,8 @@ impl Project<'_> {
         let mut buf = Vec::new();
         flags::Lsif::run(
             flags::Lsif {
-                path: tmp_dir_path.join(self.roots.iter().exactly_one().unwrap()).into(),
+                // FIXME: rewrite in terms of `#![feature(exact_length_collection)]`. See: #149266
+                path: tmp_dir_path.join(Itertools::exactly_one(self.roots.iter()).unwrap()).into(),
                 exclude_vendored_libraries: false,
             },
             &mut buf,
@@ -177,6 +180,7 @@ impl Project<'_> {
             proc_macro_names,
             toolchain,
             target_data_layout: _,
+            target_arch: _,
         } = FixtureWithProjectMeta::parse(self.fixture);
         assert!(proc_macro_names.is_empty());
         assert!(mini_core.is_none());

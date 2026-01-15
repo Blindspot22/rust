@@ -1,6 +1,6 @@
 #![warn(clippy::incompatible_msrv)]
 #![feature(custom_inner_attributes)]
-#![allow(stable_features, clippy::diverging_sub_expression)]
+#![allow(stable_features)]
 #![feature(strict_provenance)] // For use in test
 #![clippy::msrv = "1.3.0"]
 
@@ -166,6 +166,23 @@ fn enum_variant_not_ok() {
 fn enum_variant_ok() {
     let _ = std::io::ErrorKind::InvalidFilename;
     let _ = const { std::io::ErrorKind::InvalidFilename };
+}
+
+#[clippy::msrv = "1.38.0"]
+const fn uncalled_len() {
+    let _ = Vec::<usize>::len;
+    let x = str::len;
+    let _ = x("");
+    //~^ incompatible_msrv
+    let _ = "".len();
+    //~^ incompatible_msrv
+}
+
+#[clippy::msrv = "1.0.0"]
+fn vec_macro() {
+    let _: Vec<u32> = vec![];
+    let _: Vec<u32> = vec![1; 3];
+    let _: Vec<u32> = vec![1, 2];
 }
 
 fn main() {}

@@ -54,7 +54,7 @@ pub(super) fn mangle<'tcx>(
 
     // Erase regions because they may not be deterministic when hashed
     // and should not matter anyhow.
-    let instance_ty = tcx.erase_regions(instance_ty);
+    let instance_ty = tcx.erase_and_anonymize_regions(instance_ty);
 
     let hash = get_symbol_hash(tcx, instance, instance_ty, instantiating_crate);
 
@@ -293,7 +293,7 @@ impl<'tcx> Printer<'tcx> for LegacySymbolMangler<'tcx> {
             ty::ConstKind::Value(cv) if cv.ty.is_integral() => {
                 // The `pretty_print_const` formatting depends on -Zverbose-internals
                 // flag, so we cannot reuse it here.
-                let scalar = cv.valtree.unwrap_leaf();
+                let scalar = cv.to_leaf();
                 let signed = matches!(cv.ty.kind(), ty::Int(_));
                 write!(
                     self,
@@ -403,7 +403,7 @@ impl<'tcx> Printer<'tcx> for LegacySymbolMangler<'tcx> {
         args: &'tcx [GenericArg<'tcx>],
     ) -> Result<(), PrintError> {
         let self_ty = self.tcx.type_of(impl_def_id);
-        let impl_trait_ref = self.tcx.impl_trait_ref(impl_def_id);
+        let impl_trait_ref = self.tcx.impl_opt_trait_ref(impl_def_id);
         let generics = self.tcx.generics_of(impl_def_id);
         // We have two cases to worry about here:
         // 1. We're printing a nested item inside of an impl item, like an inner
@@ -422,7 +422,10 @@ impl<'tcx> Printer<'tcx> for LegacySymbolMangler<'tcx> {
             || &args[..generics.count()]
                 == self
                     .tcx
-                    .erase_regions(ty::GenericArgs::identity_for_item(self.tcx, impl_def_id))
+                    .erase_and_anonymize_regions(ty::GenericArgs::identity_for_item(
+                        self.tcx,
+                        impl_def_id,
+                    ))
                     .as_slice()
         {
             (

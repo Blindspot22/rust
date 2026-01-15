@@ -10,13 +10,13 @@
 //! themselves having support libraries. All data over the TCP sockets is in a
 //! basically custom format suiting our needs.
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "motor")))]
 use std::fs::Permissions;
 use std::fs::{self, File};
 use std::io::prelude::*;
 use std::io::{self, BufReader};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "motor")))]
 use std::os::unix::prelude::*;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -53,6 +53,10 @@ impl Config {
             batch: false,
             bind: if cfg!(target_os = "android") || cfg!(windows) {
                 ([0, 0, 0, 0], 12345).into()
+            } else if cfg!(target_env = "sim") {
+                // iOS/tvOS/watchOS/visionOS simulators share network device
+                // with the host machine.
+                ([127, 0, 0, 1], 12345).into()
             } else {
                 ([10, 0, 2, 15], 12345).into()
             },
@@ -262,10 +266,17 @@ fn handle_run(socket: TcpStream, work: &Path, tmp: &Path, lock: &Mutex<()>, conf
     cmd.args(args);
     cmd.envs(env);
 
-    // On windows, libraries are just searched in the executable directory,
-    // system directories, PWD, and PATH, in that order. PATH is the only one
-    // we can change for this.
-    let library_path = if cfg!(windows) { "PATH" } else { "LD_LIBRARY_PATH" };
+    let library_path = if cfg!(windows) {
+        // On windows, libraries are just searched in the executable directory,
+        // system directories, PWD, and PATH, in that order. PATH is the only
+        // one we can change for this.
+        "PATH"
+    } else if cfg!(target_vendor = "apple") {
+        // On Apple platforms, the environment variable is named differently.
+        "DYLD_LIBRARY_PATH"
+    } else {
+        "LD_LIBRARY_PATH"
+    };
 
     // Support libraries were uploaded to `work` earlier, so make sure that's
     // in `LD_LIBRARY_PATH`. Also include our own current dir which may have
@@ -314,7 +325,7 @@ fn handle_run(socket: TcpStream, work: &Path, tmp: &Path, lock: &Mutex<()>, conf
     ]));
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "motor")))]
 fn get_status_code(status: &ExitStatus) -> (u8, i32) {
     match status.code() {
         Some(n) => (0, n),
@@ -322,7 +333,7 @@ fn get_status_code(status: &ExitStatus) -> (u8, i32) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "motor"))]
 fn get_status_code(status: &ExitStatus) -> (u8, i32) {
     (0, status.code().unwrap())
 }
@@ -348,11 +359,11 @@ fn recv<B: BufRead>(dir: &Path, io: &mut B) -> PathBuf {
     dst
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "motor")))]
 fn set_permissions(path: &Path) {
     t!(fs::set_permissions(&path, Permissions::from_mode(0o755)));
 }
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "motor"))]
 fn set_permissions(_path: &Path) {}
 
 fn my_copy(src: &mut dyn Read, which: u8, dst: &Mutex<dyn Write>) {

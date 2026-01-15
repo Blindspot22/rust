@@ -22,7 +22,6 @@
     arm_target_feature,
     mips_target_feature,
     powerpc_target_feature,
-    s390x_target_feature,
     loongarch_target_feature,
     wasm_target_feature,
     abi_unadjusted,
@@ -33,7 +32,12 @@
     x86_amx_intrinsics,
     f16,
     aarch64_unstable_target_feature,
-    bigint_helper_methods
+    bigint_helper_methods,
+    funnel_shifts,
+    avx10_target_feature,
+    const_trait_impl,
+    const_cmp,
+    const_eval_select
 )]
 #![cfg_attr(test, feature(test, abi_vectorcall, stdarch_internal))]
 #![deny(clippy::missing_inline_in_public_items)]
@@ -63,11 +67,7 @@
 )]
 #![cfg_attr(
     test,
-    feature(
-        stdarch_arm_feature_detection,
-        stdarch_powerpc_feature_detection,
-        stdarch_s390x_feature_detection
-    )
+    feature(stdarch_arm_feature_detection, stdarch_powerpc_feature_detection,)
 )]
 
 #[cfg(test)]

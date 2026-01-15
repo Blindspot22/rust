@@ -33,6 +33,7 @@ define_config! {
         channel: Option<String> = "channel",
         musl_root: Option<String> = "musl-root",
         rpath: Option<bool> = "rpath",
+        rustflags: Option<Vec<String>> = "rustflags",
         strip: Option<bool> = "strip",
         frame_pointers: Option<bool> = "frame-pointers",
         stack_protector: Option<String> = "stack-protector",
@@ -45,7 +46,9 @@ define_config! {
         codegen_backends: Option<Vec<String>> = "codegen-backends",
         llvm_bitcode_linker: Option<bool> = "llvm-bitcode-linker",
         lld: Option<bool> = "lld",
-        lld_mode: Option<LldMode> = "use-lld",
+        bootstrap_override_lld: Option<BootstrapOverrideLld> = "bootstrap-override-lld",
+        // FIXME: Remove this option in Spring 2026
+        bootstrap_override_lld_legacy: Option<BootstrapOverrideLld> = "use-lld",
         llvm_tools: Option<bool> = "llvm-tools",
         deny_warnings: Option<bool> = "deny-warnings",
         backtrace_on_ice: Option<bool> = "backtrace-on-ice",
@@ -58,6 +61,7 @@ define_config! {
         control_flow_guard: Option<bool> = "control-flow-guard",
         ehcont_guard: Option<bool> = "ehcont-guard",
         new_symbol_mangling: Option<bool> = "new-symbol-mangling",
+        annotate_moves_size_limit: Option<u64> = "annotate-moves-size-limit",
         profile_generate: Option<String> = "profile-generate",
         profile_use: Option<String> = "profile-use",
         // ignored; this is set from an env var set by bootstrap.py
@@ -65,25 +69,38 @@ define_config! {
         lto: Option<String> = "lto",
         validate_mir_opts: Option<u32> = "validate-mir-opts",
         std_features: Option<BTreeSet<String>> = "std-features",
+        break_on_ice: Option<bool> = "break-on-ice",
+        parallel_frontend_threads: Option<u32> = "parallel-frontend-threads",
     }
 }
 
-/// LLD in bootstrap works like this:
-/// - Self-contained lld: use `rust-lld` from the compiler's sysroot
+/// Determines if we should override the linker used for linking Rust code built
+/// during the bootstrapping process to be LLD.
+///
+/// The primary use-case for this is to make local (re)builds of Rust code faster
+/// when using bootstrap.
+///
+/// This does not affect the *behavior* of the built/distributed compiler when invoked
+/// outside of bootstrap.
+/// It might affect its performance/binary size though, as that can depend on the
+/// linker that links rustc.
+///
+/// There are two ways of overriding the linker to be LLD:
+/// - Self-contained LLD: use `rust-lld` from the compiler's sysroot
 /// - External: use an external `lld` binary
 ///
 /// It is configured depending on the target:
 /// 1) Everything except MSVC
-/// - Self-contained: `-Clinker-flavor=gnu-lld-cc -Clink-self-contained=+linker`
-/// - External: `-Clinker-flavor=gnu-lld-cc`
+/// - Self-contained: `-Clinker-features=+lld -Clink-self-contained=+linker`
+/// - External: `-Clinker-features=+lld`
 /// 2) MSVC
 /// - Self-contained: `-Clinker=<path to rust-lld>`
 /// - External: `-Clinker=lld`
 #[derive(Copy, Clone, Default, Debug, PartialEq)]
-pub enum LldMode {
-    /// Do not use LLD
+pub enum BootstrapOverrideLld {
+    /// Do not override the linker LLD
     #[default]
-    Unused,
+    None,
     /// Use `rust-lld` from the compiler's sysroot
     SelfContained,
     /// Use an externally provided `lld` binary.
@@ -92,16 +109,16 @@ pub enum LldMode {
     External,
 }
 
-impl LldMode {
+impl BootstrapOverrideLld {
     pub fn is_used(&self) -> bool {
         match self {
-            LldMode::SelfContained | LldMode::External => true,
-            LldMode::Unused => false,
+            BootstrapOverrideLld::SelfContained | BootstrapOverrideLld::External => true,
+            BootstrapOverrideLld::None => false,
         }
     }
 }
 
-impl<'de> Deserialize<'de> for LldMode {
+impl<'de> Deserialize<'de> for BootstrapOverrideLld {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -109,7 +126,7 @@ impl<'de> Deserialize<'de> for LldMode {
         struct LldModeVisitor;
 
         impl serde::de::Visitor<'_> for LldModeVisitor {
-            type Value = LldMode;
+            type Value = BootstrapOverrideLld;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str("one of true, 'self-contained' or 'external'")
@@ -119,7 +136,7 @@ impl<'de> Deserialize<'de> for LldMode {
             where
                 E: serde::de::Error,
             {
-                Ok(if v { LldMode::External } else { LldMode::Unused })
+                Ok(if v { BootstrapOverrideLld::External } else { BootstrapOverrideLld::None })
             }
 
             fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
@@ -127,8 +144,8 @@ impl<'de> Deserialize<'de> for LldMode {
                 E: serde::de::Error,
             {
                 match v {
-                    "external" => Ok(LldMode::External),
-                    "self-contained" => Ok(LldMode::SelfContained),
+                    "external" => Ok(BootstrapOverrideLld::External),
+                    "self-contained" => Ok(BootstrapOverrideLld::SelfContained),
                     _ => Err(E::custom(format!("unknown mode {v}"))),
                 }
             }
@@ -269,9 +286,9 @@ pub fn check_incompatible_options_for_ci_rustc(
     err!(current_profiler, profiler, "build");
 
     let current_optimized_compiler_builtins =
-        current_config_toml.build.as_ref().and_then(|b| b.optimized_compiler_builtins);
+        current_config_toml.build.as_ref().and_then(|b| b.optimized_compiler_builtins.clone());
     let optimized_compiler_builtins =
-        ci_config_toml.build.as_ref().and_then(|b| b.optimized_compiler_builtins);
+        ci_config_toml.build.as_ref().and_then(|b| b.optimized_compiler_builtins.clone());
     err!(current_optimized_compiler_builtins, optimized_compiler_builtins, "build");
 
     // We always build the in-tree compiler on cross targets, so we only care
@@ -306,10 +323,8 @@ pub fn check_incompatible_options_for_ci_rustc(
         debuginfo_level_rustc,
         llvm_tools,
         llvm_bitcode_linker,
-        lto,
         stack_protector,
         strip,
-        lld_mode,
         jemalloc,
         rpath,
         channel,
@@ -340,6 +355,7 @@ pub fn check_incompatible_options_for_ci_rustc(
         save_toolstates: _,
         codegen_backends: _,
         lld: _,
+        lto: _,
         deny_warnings: _,
         backtrace_on_ice: _,
         verify_llvm_ir: _,
@@ -350,11 +366,17 @@ pub fn check_incompatible_options_for_ci_rustc(
         control_flow_guard: _,
         ehcont_guard: _,
         new_symbol_mangling: _,
+        annotate_moves_size_limit: _,
         profile_generate: _,
         profile_use: _,
         download_rustc: _,
         validate_mir_opts: _,
         frame_pointers: _,
+        break_on_ice: _,
+        parallel_frontend_threads: _,
+        bootstrap_override_lld: _,
+        bootstrap_override_lld_legacy: _,
+        rustflags: _,
     } = ci_rust_config;
 
     // There are two kinds of checks for CI rustc incompatible options:
@@ -370,13 +392,11 @@ pub fn check_incompatible_options_for_ci_rustc(
     err!(current_rust_config.debuginfo_level_rustc, debuginfo_level_rustc, "rust");
     err!(current_rust_config.rpath, rpath, "rust");
     err!(current_rust_config.strip, strip, "rust");
-    err!(current_rust_config.lld_mode, lld_mode, "rust");
     err!(current_rust_config.llvm_tools, llvm_tools, "rust");
     err!(current_rust_config.llvm_bitcode_linker, llvm_bitcode_linker, "rust");
     err!(current_rust_config.jemalloc, jemalloc, "rust");
     err!(current_rust_config.default_linker, default_linker, "rust");
     err!(current_rust_config.stack_protector, stack_protector, "rust");
-    err!(current_rust_config.lto, lto, "rust");
     err!(current_rust_config.std_features, std_features, "rust");
 
     warn!(current_rust_config.channel, channel, "rust");
@@ -415,30 +435,9 @@ pub(crate) fn parse_codegen_backends(
         };
         found_backends.push(backend);
     }
+    if found_backends.is_empty() {
+        eprintln!("ERROR: `{section}.codegen-backends` should not be set to `[]`");
+        exit!(1);
+    }
     found_backends
-}
-
-#[cfg(not(test))]
-pub fn default_lld_opt_in_targets() -> Vec<String> {
-    vec!["x86_64-unknown-linux-gnu".to_string()]
-}
-
-#[cfg(test)]
-thread_local! {
-    static TEST_LLD_OPT_IN_TARGETS: std::cell::RefCell<Option<Vec<String>>> = std::cell::RefCell::new(None);
-}
-
-#[cfg(test)]
-pub fn default_lld_opt_in_targets() -> Vec<String> {
-    TEST_LLD_OPT_IN_TARGETS.with(|cell| cell.borrow().clone()).unwrap_or_default()
-}
-
-#[cfg(test)]
-pub fn with_lld_opt_in_targets<R>(targets: Vec<String>, f: impl FnOnce() -> R) -> R {
-    TEST_LLD_OPT_IN_TARGETS.with(|cell| {
-        let prev = cell.replace(Some(targets));
-        let result = f();
-        cell.replace(prev);
-        result
-    })
 }

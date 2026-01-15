@@ -64,7 +64,7 @@ pub(crate) fn convert_from_to_tryfrom(acc: &mut Assists, ctx: &AssistContext<'_>
     let tail_expr = from_fn.body()?.tail_expr()?;
 
     if resolve_target_trait(&ctx.sema, &impl_)?
-        != FamousDefs(&ctx.sema, module.krate()).core_convert_From()?
+        != FamousDefs(&ctx.sema, module.krate(ctx.db())).core_convert_From()?
     {
         return None;
     }
@@ -96,6 +96,7 @@ pub(crate) fn convert_from_to_tryfrom(acc: &mut Assists, ctx: &AssistContext<'_>
             }
 
             let error_type = ast::AssocItem::TypeAlias(make::ty_alias(
+                None,
                 "Error",
                 None,
                 None,

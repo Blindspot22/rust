@@ -1,26 +1,16 @@
-//! System bindings for the wasm/web platform
+//! System bindings for the WASI platforms.
 //!
 //! This module contains the facade (aka platform-specific) implementations of
-//! OS level functionality for wasm.
-//!
-//! This is all super highly experimental and not actually intended for
-//! wide/production use yet, it's still all in the experimental category. This
-//! will likely change over time.
-//!
-//! Currently all functions here are basically stubs that immediately return
-//! errors. The hope is that with a portability lint we can turn actually just
-//! remove all this and just omit parts of the standard library if we're
-//! compiling for wasm. That way it's a compile time error for something that's
-//! guaranteed to be a runtime error!
+//! OS level functionality for WASI. Currently this includes both WASIp1 and
+//! WASIp2.
 
 #[allow(unused)]
 #[path = "../wasm/atomics/futex.rs"]
 pub mod futex;
 
 pub mod os;
-#[path = "../unsupported/pipe.rs"]
-pub mod pipe;
-pub mod thread;
+pub mod stack_overflow;
+#[path = "../unix/time.rs"]
 pub mod time;
 
 #[path = "../unsupported/common.rs"]
@@ -36,4 +26,12 @@ mod helpers;
 // import conflict rules. If we glob export `helpers` and `common` together,
 // then the compiler complains about conflicts.
 
-pub(crate) use helpers::{abort_internal, decode_error_kind, err2io, is_interrupted};
+pub(crate) use helpers::abort_internal;
+#[cfg(target_env = "p1")]
+pub(crate) use helpers::err2io;
+#[cfg(not(target_env = "p1"))]
+pub use os::IsMinusOne;
+pub use os::{cvt, cvt_r};
+
+#[cfg(not(target_env = "p1"))]
+mod cabi_realloc;

@@ -1,8 +1,8 @@
 use std::marker::PhantomData;
 use std::num::NonZero;
 
+use decoder::LazyDecoder;
 pub(crate) use decoder::{CrateMetadata, CrateNumMap, MetadataBlob, TargetModifiers};
-use decoder::{DecodeContext, Metadata};
 use def_path_hash_map::DefPathHashMapRef;
 use encoder::EncodeContext;
 pub use encoder::{EncodedMetadata, encode_metadata, rendered_const};
@@ -19,17 +19,19 @@ use rustc_hir::{PreciseCapturingArgKind, attrs};
 use rustc_index::IndexVec;
 use rustc_index::bit_set::DenseBitSet;
 use rustc_macros::{
-    Decodable, Encodable, MetadataDecodable, MetadataEncodable, TyDecodable, TyEncodable,
+    BlobDecodable, Decodable, Encodable, LazyDecodable, MetadataEncodable, TyDecodable, TyEncodable,
 };
-use rustc_middle::metadata::ModChild;
+use rustc_middle::metadata::{AmbigModChild, ModChild};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
 use rustc_middle::middle::debugger_visualizer::DebuggerVisualizerFile;
+use rustc_middle::middle::deduced_param_attrs::DeducedParamAttrs;
 use rustc_middle::middle::exported_symbols::{ExportedSymbol, SymbolExportInfo};
 use rustc_middle::middle::lib_features::FeatureStability;
 use rustc_middle::middle::resolve_bound_vars::ObjectLifetimeDefault;
 use rustc_middle::mir;
+use rustc_middle::mir::ConstValue;
 use rustc_middle::ty::fast_reject::SimplifiedType;
-use rustc_middle::ty::{self, DeducedParamAttrs, Ty, TyCtxt, UnusedGenericParams};
+use rustc_middle::ty::{self, Ty, TyCtxt, UnusedGenericParams};
 use rustc_middle::util::Providers;
 use rustc_serialize::opaque::FileEncoder;
 use rustc_session::config::{SymbolManglingVersion, TargetModifier};
@@ -42,6 +44,7 @@ use table::TableBuilder;
 use {rustc_ast as ast, rustc_hir as hir};
 
 use crate::creader::CrateMetadataRef;
+use crate::eii::EiiMapEncodedKeyValue;
 
 mod decoder;
 mod def_path_hash_map;
@@ -185,7 +188,7 @@ type SyntaxContextTable = LazyTable<u32, Option<LazyValue<SyntaxContextKey>>>;
 type ExpnDataTable = LazyTable<ExpnIndex, Option<LazyValue<ExpnData>>>;
 type ExpnHashTable = LazyTable<ExpnIndex, Option<LazyValue<ExpnHash>>>;
 
-#[derive(MetadataEncodable, MetadataDecodable)]
+#[derive(MetadataEncodable, LazyDecodable)]
 pub(crate) struct ProcMacroData {
     proc_macro_decls_static: DefIndex,
     stability: Option<hir::Stability>,
@@ -199,7 +202,7 @@ pub(crate) struct ProcMacroData {
 /// See #76720 for more details.
 ///
 /// If you do modify this struct, also bump the [`METADATA_VERSION`] constant.
-#[derive(MetadataEncodable, MetadataDecodable)]
+#[derive(MetadataEncodable, BlobDecodable)]
 pub(crate) struct CrateHeader {
     pub(crate) triple: TargetTuple,
     pub(crate) hash: Svh,
@@ -234,7 +237,7 @@ pub(crate) struct CrateHeader {
 /// compilation session. If we were to serialize a proc-macro crate like
 /// a normal crate, much of what we serialized would be unusable in addition
 /// to being unused.
-#[derive(MetadataEncodable, MetadataDecodable)]
+#[derive(MetadataEncodable, LazyDecodable)]
 pub(crate) struct CrateRoot {
     /// A header used to detect if this is the right crate to load.
     header: CrateHeader,
@@ -248,6 +251,7 @@ pub(crate) struct CrateRoot {
     has_alloc_error_handler: bool,
     has_panic_handler: bool,
     has_default_lib_allocator: bool,
+    externally_implementable_items: LazyArray<EiiMapEncodedKeyValue>,
 
     crate_deps: LazyArray<CrateDep>,
     dylib_dependency_formats: LazyArray<Option<LinkagePreference>>,
@@ -321,7 +325,7 @@ impl RawDefId {
     }
 }
 
-#[derive(Encodable, Decodable)]
+#[derive(Encodable, BlobDecodable)]
 pub(crate) struct CrateDep {
     pub name: Symbol,
     pub hash: Svh,
@@ -331,15 +335,15 @@ pub(crate) struct CrateDep {
     pub is_private: bool,
 }
 
-#[derive(MetadataEncodable, MetadataDecodable)]
+#[derive(MetadataEncodable, LazyDecodable)]
 pub(crate) struct TraitImpls {
     trait_id: (u32, DefIndex),
     impls: LazyArray<(DefIndex, Option<SimplifiedType>)>,
 }
 
-#[derive(MetadataEncodable, MetadataDecodable)]
+#[derive(MetadataEncodable, LazyDecodable)]
 pub(crate) struct IncoherentImpls {
-    self_ty: SimplifiedType,
+    self_ty: LazyValue<SimplifiedType>,
     impls: LazyArray<DefIndex>,
 }
 
@@ -349,7 +353,7 @@ macro_rules! define_tables {
         - defaulted: $($name1:ident: Table<$IDX1:ty, $T1:ty>,)+
         - optional: $($name2:ident: Table<$IDX2:ty, $T2:ty>,)+
     ) => {
-        #[derive(MetadataEncodable, MetadataDecodable)]
+        #[derive(MetadataEncodable, LazyDecodable)]
         pub(crate) struct LazyTables {
             $($name1: LazyTable<$IDX1, $T1>,)+
             $($name2: LazyTable<$IDX2, Option<$T2>>,)+
@@ -397,7 +401,12 @@ define_tables! {
     // That's why the encoded list needs to contain `ModChild` structures describing all the names
     // individually instead of `DefId`s.
     module_children_reexports: Table<DefIndex, LazyArray<ModChild>>,
+    ambig_module_children: Table<DefIndex, LazyArray<AmbigModChild>>,
     cross_crate_inlinable: Table<DefIndex, bool>,
+    asyncness: Table<DefIndex, ty::Asyncness>,
+    constness: Table<DefIndex, hir::Constness>,
+    safety: Table<DefIndex, hir::Safety>,
+    defaultness: Table<DefIndex, hir::Defaultness>,
 
 - optional:
     attributes: Table<DefIndex, LazyArray<hir::Attribute>>,
@@ -407,7 +416,6 @@ define_tables! {
     associated_item_or_field_def_ids: Table<DefIndex, LazyArray<DefIndex>>,
     def_kind: Table<DefIndex, DefKind>,
     visibility: Table<DefIndex, LazyValue<ty::Visibility<DefIndex>>>,
-    safety: Table<DefIndex, hir::Safety>,
     def_span: Table<DefIndex, LazyValue<Span>>,
     def_ident_span: Table<DefIndex, LazyValue<Span>>,
     lookup_stability: Table<DefIndex, LazyValue<hir::Stability>>,
@@ -425,20 +433,18 @@ define_tables! {
     object_lifetime_default: Table<DefIndex, LazyValue<ObjectLifetimeDefault>>,
     optimized_mir: Table<DefIndex, LazyValue<mir::Body<'static>>>,
     mir_for_ctfe: Table<DefIndex, LazyValue<mir::Body<'static>>>,
+    trivial_const: Table<DefIndex, LazyValue<(ConstValue, Ty<'static>)>>,
     closure_saved_names_of_captured_variables: Table<DefIndex, LazyValue<IndexVec<FieldIdx, Symbol>>>,
     mir_coroutine_witnesses: Table<DefIndex, LazyValue<mir::CoroutineLayout<'static>>>,
     promoted_mir: Table<DefIndex, LazyValue<IndexVec<mir::Promoted, mir::Body<'static>>>>,
     thir_abstract_const: Table<DefIndex, LazyValue<ty::EarlyBinder<'static, ty::Const<'static>>>>,
     impl_parent: Table<DefIndex, RawDefId>,
-    constness: Table<DefIndex, hir::Constness>,
     const_conditions: Table<DefIndex, LazyValue<ty::ConstConditions<'static>>>,
-    defaultness: Table<DefIndex, hir::Defaultness>,
     // FIXME(eddyb) perhaps compute this on the fly if cheap enough?
     coerce_unsized_info: Table<DefIndex, LazyValue<ty::adjustment::CoerceUnsizedInfo>>,
     mir_const_qualif: Table<DefIndex, LazyValue<mir::ConstQualifs>>,
     rendered_const: Table<DefIndex, LazyValue<String>>,
     rendered_precise_capturing_args: Table<DefIndex, LazyArray<PreciseCapturingArgKind<Symbol, Symbol>>>,
-    asyncness: Table<DefIndex, ty::Asyncness>,
     fn_arg_idents: Table<DefIndex, LazyArray<Option<Ident>>>,
     coroutine_kind: Table<DefIndex, hir::CoroutineKind>,
     coroutine_for_closure: Table<DefIndex, RawDefId>,
@@ -447,7 +453,6 @@ define_tables! {
     coroutine_by_move_body_def_id: Table<DefIndex, RawDefId>,
     eval_static_initializer: Table<DefIndex, LazyValue<mir::interpret::ConstAllocation<'static>>>,
     trait_def: Table<DefIndex, LazyValue<ty::TraitDef>>,
-    trait_item_def_id: Table<DefIndex, RawDefId>,
     expn_that_defined: Table<DefIndex, LazyValue<ExpnId>>,
     default_fields: Table<DefIndex, LazyValue<DefId>>,
     params_in_repr: Table<DefIndex, LazyValue<DenseBitSet<u32>>>,
@@ -459,7 +464,7 @@ define_tables! {
     def_keys: Table<DefIndex, LazyValue<DefKey>>,
     proc_macro_quoted_spans: Table<usize, LazyValue<Span>>,
     variant_data: Table<DefIndex, LazyValue<VariantData>>,
-    assoc_container: Table<DefIndex, ty::AssocItemContainer>,
+    assoc_container: Table<DefIndex, LazyValue<ty::AssocContainer>>,
     macro_definition: Table<DefIndex, LazyValue<ast::DelimArgs>>,
     proc_macro: Table<DefIndex, MacroKind>,
     deduced_param_attrs: Table<DefIndex, LazyArray<DeducedParamAttrs>>,
@@ -469,6 +474,7 @@ define_tables! {
     assumed_wf_types_for_rpitit: Table<DefIndex, LazyArray<(Ty<'static>, Span)>>,
     opaque_ty_origin: Table<DefIndex, LazyValue<hir::OpaqueTyOrigin<DefId>>>,
     anon_const_kind: Table<DefIndex, LazyValue<ty::AnonConstKind>>,
+    const_of_item: Table<DefIndex, LazyValue<ty::EarlyBinder<'static, ty::Const<'static>>>>,
     associated_types_for_impl_traits_in_trait_or_impl: Table<DefIndex, LazyValue<DefIdMap<Vec<DefId>>>>,
 }
 
@@ -579,6 +585,6 @@ const SYMBOL_OFFSET: u8 = 1;
 const SYMBOL_PREDEFINED: u8 = 2;
 
 pub fn provide(providers: &mut Providers) {
-    encoder::provide(providers);
+    encoder::provide(&mut providers.queries);
     decoder::provide(providers);
 }

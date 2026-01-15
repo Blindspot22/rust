@@ -209,7 +209,6 @@ pub(crate) fn def_to_kind(db: &RootDatabase, def: Definition) -> SymbolInformati
         Definition::Const(..) => Constant,
         Definition::Static(..) => StaticVariable,
         Definition::Trait(..) => Trait,
-        Definition::TraitAlias(..) => Trait,
         Definition::TypeAlias(it) => {
             if it.as_assoc_item(db).is_some() {
                 AssociatedType
@@ -285,10 +284,10 @@ fn def_to_non_local_moniker(
     from_crate: Crate,
 ) -> Option<Moniker> {
     let module = match definition {
-        Definition::Module(module) if module.is_crate_root() => module,
+        Definition::Module(module) if module.is_crate_root(db) => module,
         _ => definition.module(db)?,
     };
-    let krate = module.krate();
+    let krate = module.krate(db);
     let edition = krate.edition(db);
 
     // Add descriptors for this definition and every enclosing definition.
@@ -322,7 +321,7 @@ fn def_to_non_local_moniker(
                     });
                 } else {
                     match def {
-                        Definition::Module(module) if module.is_crate_root() => {
+                        Definition::Module(module) if module.is_crate_root(db) => {
                             // only include `crate` namespace by itself because we prefer
                             // `rust-analyzer cargo foo . bar/` over `rust-analyzer cargo foo . crate/bar/`
                             if reverse_description.is_empty() {
@@ -385,12 +384,13 @@ fn def_to_non_local_moniker(
     })
 }
 
-fn display<T: HirDisplay>(db: &RootDatabase, module: hir::Module, it: T) -> String {
+fn display<'db, T: HirDisplay<'db>>(db: &'db RootDatabase, module: hir::Module, it: T) -> String {
     match it.display_source_code(db, module.into(), true) {
         Ok(result) => result,
         // Fallback on display variant that always succeeds
         Err(_) => {
-            let fallback_result = it.display(db, module.krate().to_display_target(db)).to_string();
+            let fallback_result =
+                it.display(db, module.krate(db).to_display_target(db)).to_string();
             tracing::error!(
                 display = %fallback_result, "`display_source_code` failed; falling back to using display"
             );

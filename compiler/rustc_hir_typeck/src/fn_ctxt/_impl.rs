@@ -14,8 +14,8 @@ use rustc_hir_analysis::hir_ty_lowering::generics::{
     check_generic_arg_count_for_call, lower_generic_args,
 };
 use rustc_hir_analysis::hir_ty_lowering::{
-    ExplicitLateBound, FeedConstTy, GenericArgCountMismatch, GenericArgCountResult,
-    GenericArgsLowerer, GenericPathSegment, HirTyLowerer, IsMethodCall, RegionInferReason,
+    ExplicitLateBound, GenericArgCountMismatch, GenericArgCountResult, GenericArgsLowerer,
+    GenericPathSegment, HirTyLowerer, IsMethodCall, RegionInferReason,
 };
 use rustc_infer::infer::canonical::{Canonical, OriginalQueryValues, QueryResponse};
 use rustc_infer::infer::{DefineOpaqueTypes, InferResult};
@@ -40,7 +40,7 @@ use tracing::{debug, instrument};
 use crate::callee::{self, DeferredCallResolution};
 use crate::errors::{self, CtorIsPrivate};
 use crate::method::{self, MethodCallee};
-use crate::{BreakableCtxt, Diverges, Expectation, FnCtxt, LoweredTy, rvalue_scopes};
+use crate::{BreakableCtxt, Diverges, Expectation, FnCtxt, LoweredTy};
 
 impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// Produces warning on the given node, if the current point in the
@@ -216,7 +216,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // Don't write user type annotations for const param types, since we give them
         // identity args just so that we can trivially substitute their `EarlyBinder`.
         // We enforce that they match their type in MIR later on.
-        if matches!(self.tcx.def_kind(def_id), DefKind::ConstParam) {
+        if self.tcx.def_kind(def_id) == DefKind::ConstParam {
             return;
         }
 
@@ -424,6 +424,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         if !ty.references_error() {
             let tail = self.tcx.struct_tail_raw(
                 ty,
+                &self.misc(span),
                 |ty| {
                     if self.next_trait_solver() {
                         self.try_structurally_resolve_type(span, ty)
@@ -524,9 +525,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub(crate) fn lower_const_arg(
         &self,
         const_arg: &'tcx hir::ConstArg<'tcx>,
-        feed: FeedConstTy<'_, 'tcx>,
+        ty: Ty<'tcx>,
     ) -> ty::Const<'tcx> {
-        let ct = self.lowerer().lower_const_arg(const_arg, feed);
+        let ct = self.lowerer().lower_const_arg(const_arg, ty);
         self.register_wf_obligation(
             ct.into(),
             self.tcx.hir_span(const_arg.hir_id),
@@ -603,26 +604,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         self.normalize(span, field.ty(self.tcx, args))
     }
 
-    pub(crate) fn resolve_rvalue_scopes(&self, def_id: DefId) {
-        let scope_tree = self.tcx.region_scope_tree(def_id);
-        let rvalue_scopes = { rvalue_scopes::resolve_rvalue_scopes(self, scope_tree, def_id) };
-        let mut typeck_results = self.typeck_results.borrow_mut();
-        typeck_results.rvalue_scopes = rvalue_scopes;
-    }
-
-    /// Unify the inference variables corresponding to coroutine witnesses, and save all the
-    /// predicates that were stalled on those inference variables.
-    ///
-    /// This process allows to conservatively save all predicates that do depend on the coroutine
-    /// interior types, for later processing by `check_coroutine_obligations`.
-    ///
-    /// We must not attempt to select obligations after this method has run, or risk query cycle
-    /// ICE.
+    /// Drain all obligations that are stalled on coroutines defined in this body.
     #[instrument(level = "debug", skip(self))]
-    pub(crate) fn resolve_coroutine_interiors(&self) {
-        // Try selecting all obligations that are not blocked on inference variables.
-        // Once we start unifying coroutine witnesses, trying to select obligations on them will
-        // trigger query cycle ICEs, as doing so requires MIR.
+    pub(crate) fn drain_stalled_coroutine_obligations(&self) {
+        // Make as much inference progress as possible before
+        // draining the stalled coroutine obligations as this may
+        // change obligations from being stalled on infer vars to
+        // being stalled on a coroutine.
         self.select_obligations_where_possible(|_| {});
 
         let ty::TypingMode::Analysis { defining_opaque_types_and_generators } = self.typing_mode()
@@ -659,7 +647,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         &self,
         mutate_fulfillment_errors: impl Fn(&mut Vec<traits::FulfillmentError<'tcx>>),
     ) {
-        let mut result = self.fulfillment_cx.borrow_mut().select_where_possible(self);
+        let mut result = self.fulfillment_cx.borrow_mut().try_evaluate_obligations(self);
         if !result.is_empty() {
             mutate_fulfillment_errors(&mut result);
             self.adjust_fulfillment_errors_for_expr_obligation(&mut result);
@@ -696,53 +684,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         vec![ty_error; len]
     }
 
-    pub(crate) fn resolve_lang_item_path(
-        &self,
-        lang_item: hir::LangItem,
-        span: Span,
-        hir_id: HirId,
-    ) -> (Res, Ty<'tcx>) {
-        let def_id = self.tcx.require_lang_item(lang_item, span);
-        let def_kind = self.tcx.def_kind(def_id);
-
-        let item_ty = if let DefKind::Variant = def_kind {
-            self.tcx.type_of(self.tcx.parent(def_id))
-        } else {
-            self.tcx.type_of(def_id)
-        };
-        let args = self.fresh_args_for_item(span, def_id);
-        let ty = item_ty.instantiate(self.tcx, args);
-
-        self.write_args(hir_id, args);
-        self.write_resolution(hir_id, Ok((def_kind, def_id)));
-
-        let code = match lang_item {
-            hir::LangItem::IntoFutureIntoFuture => {
-                if let hir::Node::Expr(into_future_call) = self.tcx.parent_hir_node(hir_id)
-                    && let hir::ExprKind::Call(_, [arg0]) = &into_future_call.kind
-                {
-                    Some(ObligationCauseCode::AwaitableExpr(arg0.hir_id))
-                } else {
-                    None
-                }
-            }
-            hir::LangItem::IteratorNext | hir::LangItem::IntoIterIntoIter => {
-                Some(ObligationCauseCode::ForLoopIterator)
-            }
-            hir::LangItem::TryTraitFromOutput
-            | hir::LangItem::TryTraitFromResidual
-            | hir::LangItem::TryTraitBranch => Some(ObligationCauseCode::QuestionMark),
-            _ => None,
-        };
-        if let Some(code) = code {
-            self.add_required_obligations_with_code(span, def_id, args, move |_, _| code.clone());
-        } else {
-            self.add_required_obligations_for_hir(span, def_id, args, hir_id);
-        }
-
-        (Res::Def(def_kind, def_id), ty)
-    }
-
     /// Resolves an associated value path into a base type and associated constant, or method
     /// resolution. The newly resolved definition is written into `type_dependent_defs`.
     #[instrument(level = "trace", skip(self), ret)]
@@ -772,9 +713,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // below.
                 let ty = self.lowerer().lower_ty(qself);
                 (LoweredTy::from_raw(self, span, ty), qself, segment)
-            }
-            QPath::LangItem(..) => {
-                bug!("`resolve_ty_and_res_fully_qualified_call` called on `LangItem`")
             }
         };
 
@@ -1021,7 +959,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 let container_id = assoc_item.container_id(tcx);
                 debug!(?def_id, ?container, ?container_id);
                 match container {
-                    ty::AssocItemContainer::Trait => {
+                    ty::AssocContainer::Trait => {
                         if let Err(e) = callee::check_legal_trait_for_method_call(
                             tcx,
                             path_span,
@@ -1033,15 +971,18 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             self.set_tainted_by_errors(e);
                         }
                     }
-                    ty::AssocItemContainer::Impl => {
+                    ty::AssocContainer::InherentImpl | ty::AssocContainer::TraitImpl(_) => {
                         if segments.len() == 1 {
                             // `<T>::assoc` will end up here, and so
                             // can `T::assoc`. If this came from an
                             // inherent impl, we need to record the
                             // `T` for posterity (see `UserSelfTy` for
                             // details).
-                            let self_ty = self_ty.expect("UFCS sugared assoc missing Self").raw;
-                            user_self_ty = Some(UserSelfTy { impl_def_id: container_id, self_ty });
+                            // Generated desugaring code may have a path without a self.
+                            user_self_ty = self_ty.map(|self_ty| UserSelfTy {
+                                impl_def_id: container_id,
+                                self_ty: self_ty.raw,
+                            });
                         }
                     }
                 }
@@ -1062,6 +1003,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }),
             err_extend,
         );
+
+        if let Err(e) = self.lowerer().check_param_res_if_mcg_for_instantiate_value_path(res, span)
+        {
+            return (Ty::new_error(self.tcx, e), res);
+        }
 
         if let Res::Local(hid) = res {
             let ty = self.local_ty(span, hid);
@@ -1146,11 +1092,21 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     span: path_span,
                     name: self.tcx.item_name(def.did()).to_ident_string(),
                 });
+                let item = match self
+                    .tcx
+                    .hir_node_by_def_id(self.tcx.hir_get_parent_item(hir_id).def_id)
+                {
+                    hir::Node::Item(item) => Some(errors::InnerItem {
+                        span: item.kind.ident().map(|i| i.span).unwrap_or(item.span),
+                    }),
+                    _ => None,
+                };
                 if ty.raw.has_param() {
                     let guar = self.dcx().emit_err(errors::SelfCtorFromOuterItem {
                         span: path_span,
                         impl_span: tcx.def_span(impl_def_id),
                         sugg,
+                        item,
                     });
                     return (Ty::new_error(self.tcx, guar), res);
                 } else {
@@ -1161,6 +1117,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         errors::SelfCtorFromOuterItemLint {
                             impl_span: tcx.def_span(impl_def_id),
                             sugg,
+                            item,
                         },
                     );
                 }
@@ -1271,7 +1228,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         // Ambiguous parts of `ConstArg` are handled in the match arms below
                         .lower_const_arg(
                             ct.as_unambig_ct(),
-                            FeedConstTy::Param(param.def_id, preceding_args),
+                            self.fcx
+                                .tcx
+                                .type_of(param.def_id)
+                                .instantiate(self.fcx.tcx, preceding_args),
                         )
                         .into(),
                     (&GenericParamDefKind::Const { .. }, GenericArg::Infer(inf)) => {
@@ -1379,7 +1339,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     }
 
     #[instrument(level = "debug", skip(self, code, span, args))]
-    fn add_required_obligations_with_code(
+    pub(crate) fn add_required_obligations_with_code(
         &self,
         span: Span,
         def_id: DefId,
@@ -1469,24 +1429,25 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub(crate) fn structurally_resolve_type(&self, sp: Span, ty: Ty<'tcx>) -> Ty<'tcx> {
         let ty = self.try_structurally_resolve_type(sp, ty);
 
-        if !ty.is_ty_var() {
-            ty
-        } else {
-            let e = self.tainted_by_errors().unwrap_or_else(|| {
-                self.err_ctxt()
-                    .emit_inference_failure_err(
-                        self.body_id,
-                        sp,
-                        ty.into(),
-                        TypeAnnotationNeeded::E0282,
-                        true,
-                    )
-                    .emit()
-            });
-            let err = Ty::new_error(self.tcx, e);
-            self.demand_suptype(sp, err, ty);
-            err
-        }
+        if !ty.is_ty_var() { ty } else { self.type_must_be_known_at_this_point(sp, ty) }
+    }
+
+    #[cold]
+    pub(crate) fn type_must_be_known_at_this_point(&self, sp: Span, ty: Ty<'tcx>) -> Ty<'tcx> {
+        let guar = self.tainted_by_errors().unwrap_or_else(|| {
+            self.err_ctxt()
+                .emit_inference_failure_err(
+                    self.body_id,
+                    sp,
+                    ty.into(),
+                    TypeAnnotationNeeded::E0282,
+                    true,
+                )
+                .emit()
+        });
+        let err = Ty::new_error(self.tcx, guar);
+        self.demand_suptype(sp, err, ty);
+        err
     }
 
     pub(crate) fn structurally_resolve_const(

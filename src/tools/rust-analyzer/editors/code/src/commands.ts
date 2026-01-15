@@ -71,32 +71,9 @@ export function analyzerStatus(ctx: CtxInit): Cmd {
 }
 
 export function memoryUsage(ctx: CtxInit): Cmd {
-    const tdcp = new (class implements vscode.TextDocumentContentProvider {
-        readonly uri = vscode.Uri.parse("rust-analyzer-memory://memory");
-        readonly eventEmitter = new vscode.EventEmitter<vscode.Uri>();
-
-        provideTextDocumentContent(_uri: vscode.Uri): vscode.ProviderResult<string> {
-            if (!vscode.window.activeTextEditor) return "";
-
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            return ctx.client.sendRequest(ra.memoryUsage).then((mem: any) => {
-                return "Per-query memory usage:\n" + mem + "\n(note: database has been cleared)";
-            });
-        }
-
-        get onDidChange(): vscode.Event<vscode.Uri> {
-            return this.eventEmitter.event;
-        }
-    })();
-
-    ctx.pushExtCleanup(
-        vscode.workspace.registerTextDocumentContentProvider("rust-analyzer-memory", tdcp),
-    );
-
     return async () => {
-        tdcp.eventEmitter.fire(tdcp.uri);
-        const document = await vscode.workspace.openTextDocument(tdcp.uri);
-        return vscode.window.showTextDocument(document, vscode.ViewColumn.Two, true);
+        const response = await ctx.client.sendRequest(ra.memoryUsage);
+        vscode.window.showInformationMessage(response);
     };
 }
 
@@ -620,6 +597,18 @@ export function viewHir(ctx: CtxInit): Cmd {
 // The contents of the file come from the `TextDocumentContentProvider`
 export function viewMir(ctx: CtxInit): Cmd {
     return viewHirOrMir(ctx, "mir");
+}
+
+export function getFailedObligations(ctx: CtxInit): Cmd {
+    const uri = `rust-analyzer-failed-obligations://getFailedObligations/failedObligations.rs`;
+    const scheme = `rust-analyzer-failed-obligations`;
+    return viewFileUsingTextDocumentContentProvider(
+        ctx,
+        ra.getFailedObligations,
+        uri,
+        scheme,
+        true,
+    );
 }
 
 // Opens the virtual file that will show the MIR of the function containing the cursor position

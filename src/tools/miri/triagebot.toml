@@ -20,7 +20,7 @@ contributing_url = "https://github.com/rust-lang/miri/blob/master/CONTRIBUTING.m
 [assign.custom_welcome_messages]
 welcome-message = "(unused)"
 welcome-message-no-reviewer = """
-Thank you for contributing to Miri!
+Thank you for contributing to Miri! A reviewer will take a look at your PR, typically within a week or two.
 Please remember to not force-push to the PR branch except when you need to rebase due to a conflict or when the reviewer asks you for it.
 """
 
@@ -52,9 +52,6 @@ new_draft = true
 
 # Canonicalize issue numbers to avoid closing the wrong issue when upstreaming this subtree.
 [canonicalize-issue-links]
-
-# Prevents mentions in commits to avoid users being spammed.
-[no-mentions]
 
 # Show range-diff links on force pushes.
 [range-diff]

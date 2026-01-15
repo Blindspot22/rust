@@ -27,12 +27,7 @@ enum Mode {
 }
 
 fn miri_path() -> PathBuf {
-    PathBuf::from(env::var("MIRI").unwrap_or_else(|_| env!("CARGO_BIN_EXE_miri").into()))
-}
-
-pub fn flagsplit(flags: &str) -> Vec<String> {
-    // This code is taken from `RUSTFLAGS` handling in cargo.
-    flags.split(' ').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect()
+    env!("CARGO_BIN_EXE_miri").into()
 }
 
 // Build the shared object file for testing native function calls.
@@ -60,6 +55,7 @@ fn build_native_lib(target: &str) -> PathBuf {
             native_lib_path.to_str().unwrap(),
             // FIXME: Automate gathering of all relevant C source files in the directory.
             "tests/native-lib/scalar_arguments.c",
+            "tests/native-lib/aggregate_arguments.c",
             "tests/native-lib/ptr_read_access.c",
             "tests/native-lib/ptr_write_access.c",
             // Ensure we notice serious problems in the C code.
@@ -137,7 +133,11 @@ fn miri_config(
                     program: miri_path()
                         .with_file_name(format!("cargo-miri{}", env::consts::EXE_SUFFIX)),
                     // There is no `cargo miri build` so we just use `cargo miri run`.
-                    args: ["miri", "run"].into_iter().map(Into::into).collect(),
+                    // Add `-Zbinary-dep-depinfo` since it is needed for bootstrap builds (and doesn't harm otherwise).
+                    args: ["miri", "run", "--quiet", "-Zbinary-dep-depinfo"]
+                        .into_iter()
+                        .map(Into::into)
+                        .collect(),
                     // Reset `RUSTFLAGS` to work around <https://github.com/rust-lang/rust/pull/119574#issuecomment-1876878344>.
                     envs: vec![("RUSTFLAGS".into(), None)],
                     ..CommandBuilder::cargo()
@@ -255,8 +255,6 @@ regexes! {
     "<[0-9]+="                       => "<TAG=",
     // normalize width of Tree Borrows diagnostic borders (which otherwise leak borrow tag info)
     "(─{50})─+"                      => "$1",
-    // erase whitespace that differs between platforms
-    r" +at (.*\.rs)"                 => " at $1",
     // erase generics in backtraces
     "([0-9]+: .*)::<.*>"             => "$1",
     // erase long hexadecimals
@@ -276,6 +274,8 @@ regexes! {
     r"\bsys/([a-z_]+)/[a-z]+\b"     => "sys/$1/PLATFORM",
     // erase paths into the crate registry
     r"[^ ]*/\.?cargo/registry/.*/(.*\.rs)"  => "CARGO_REGISTRY/.../$1",
+    // remove time print from GenMC estimation mode output.
+    "\nExpected verification time: .* ± .*" => "\nExpected verification time: [MEAN] ± [SD]",
 }
 
 enum Dependencies {
@@ -340,8 +340,8 @@ fn main() -> Result<()> {
     }
 
     // We only enable GenMC tests when the `genmc` feature is enabled, but also only on platforms we support:
-    // FIXME(genmc,macos): Add `target_os = "macos"` once `https://github.com/dtolnay/cxx/issues/1535` is fixed.
-    // FIXME(genmc,cross-platform): remove `host == target` check once cross-platform support with GenMC is possible.
+    // FIXME(genmc,cross-platform): Technically we do support cross-target execution as long as the
+    // target is also 64bit little-endian, so `host == target` is too strict.
     if cfg!(all(
         feature = "genmc",
         target_os = "linux",

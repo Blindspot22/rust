@@ -9,9 +9,8 @@ use hir::{ChangeWithProcMacros, Crate};
 use ide::{AnalysisHost, DiagnosticCode, DiagnosticsConfig};
 use ide_db::base_db;
 use itertools::Either;
-use paths::Utf8PathBuf;
 use profile::StopWatch;
-use project_model::toolchain_info::{QueryConfig, target_data_layout};
+use project_model::toolchain_info::{QueryConfig, target_data};
 use project_model::{
     CargoConfig, ManifestPath, ProjectWorkspace, ProjectWorkspaceKind, RustLibSource,
     RustSourceWorkspaceConfig, Sysroot,
@@ -19,7 +18,6 @@ use project_model::{
 
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace};
 use rustc_hash::FxHashMap;
-use triomphe::Arc;
 use vfs::{AbsPathBuf, FileId};
 use walkdir::WalkDir;
 
@@ -76,18 +74,13 @@ impl Tester {
         };
 
         let mut sysroot = Sysroot::discover(tmp_file.parent().unwrap(), &cargo_config.extra_env);
-        let loaded_sysroot = sysroot.load_workspace(
-            &RustSourceWorkspaceConfig::default_cargo(),
-            false,
-            &path,
-            &Utf8PathBuf::default(),
-            &|_| (),
-        );
+        let loaded_sysroot =
+            sysroot.load_workspace(&RustSourceWorkspaceConfig::default_cargo(), false, &|_| ());
         if let Some(loaded_sysroot) = loaded_sysroot {
             sysroot.set_workspace(loaded_sysroot);
         }
 
-        let data_layout = target_data_layout::get(
+        let target_data = target_data::get(
             QueryConfig::Rustc(&sysroot, tmp_file.parent().unwrap().as_ref()),
             None,
             &cargo_config.extra_env,
@@ -101,7 +94,7 @@ impl Tester {
             sysroot,
             rustc_cfg: vec![],
             toolchain: None,
-            target_layout: data_layout.map(Arc::from).map_err(|it| Arc::from(it.to_string())),
+            target: target_data.map_err(|it| it.to_string().into()),
             cfg_overrides: Default::default(),
             extra_includes: vec![],
             set_test: true,
@@ -192,7 +185,7 @@ impl Tester {
 
             if !worker.is_finished() {
                 // attempt to cancel the worker, won't work for chalk hangs unfortunately
-                self.host.request_cancellation();
+                self.host.trigger_garbage_collection();
             }
             worker.join().and_then(identity)
         });

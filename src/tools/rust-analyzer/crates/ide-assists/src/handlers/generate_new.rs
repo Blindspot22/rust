@@ -77,13 +77,16 @@ pub(crate) fn generate_new(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option
 
                 let item_in_ns = hir::ItemInNs::from(hir::ModuleDef::from(ty.as_adt()?));
 
+                let cfg = ctx
+                    .config
+                    .find_path_config(ctx.sema.is_nightly(current_module.krate(ctx.sema.db)));
                 let type_path = current_module.find_path(
                     ctx.sema.db,
                     item_for_path_search(ctx.sema.db, item_in_ns)?,
-                    ctx.config.import_path_config(),
+                    cfg,
                 )?;
 
-                let edition = current_module.krate().edition(ctx.db());
+                let edition = current_module.krate(ctx.db()).edition(ctx.db());
 
                 let expr = use_trivial_constructor(
                     ctx.sema.db,
@@ -134,6 +137,7 @@ pub(crate) fn generate_new(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option
         let ret_type = make::ret_type(make::ty_path(make::ext::ident_path("Self")));
 
         let fn_ = make::fn_(
+            None,
             strukt.visibility(),
             make::name("new"),
             None,

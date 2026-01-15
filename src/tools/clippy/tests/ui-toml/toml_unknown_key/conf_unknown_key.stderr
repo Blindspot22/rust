@@ -9,6 +9,7 @@ error: error reading Clippy's configuration file: unknown field `foobar`, expect
            allow-expect-in-consts
            allow-expect-in-tests
            allow-indexing-slicing-in-tests
+           allow-large-stack-frames-in-tests
            allow-mixed-uninlined-format-args
            allow-one-hash-in-raw-strings
            allow-panic-in-tests
@@ -35,6 +36,7 @@ error: error reading Clippy's configuration file: unknown field `foobar`, expect
            check-inconsistent-struct-field-initializers
            check-private-items
            cognitive-complexity-threshold
+           const-literal-digits-threshold
            disallowed-macros
            disallowed-methods
            disallowed-names
@@ -48,6 +50,8 @@ error: error reading Clippy's configuration file: unknown field `foobar`, expect
            excessive-nesting-threshold
            future-size-threshold
            ignore-interior-mutability
+           inherent-impl-lint-scope
+           large-error-ignored
            large-error-threshold
            lint-commented-code
            literal-representation-threshold
@@ -65,6 +69,7 @@ error: error reading Clippy's configuration file: unknown field `foobar`, expect
            msrv
            pass-by-value-size-limit
            pub-underscore-fields-behavior
+           recursive-self-in-type-definitions
            semicolon-inside-block-ignore-singleline
            semicolon-outside-block-ignore-multiline
            single-char-binding-names-threshold
@@ -103,6 +108,7 @@ error: error reading Clippy's configuration file: unknown field `barfoo`, expect
            allow-expect-in-consts
            allow-expect-in-tests
            allow-indexing-slicing-in-tests
+           allow-large-stack-frames-in-tests
            allow-mixed-uninlined-format-args
            allow-one-hash-in-raw-strings
            allow-panic-in-tests
@@ -129,6 +135,7 @@ error: error reading Clippy's configuration file: unknown field `barfoo`, expect
            check-inconsistent-struct-field-initializers
            check-private-items
            cognitive-complexity-threshold
+           const-literal-digits-threshold
            disallowed-macros
            disallowed-methods
            disallowed-names
@@ -142,6 +149,8 @@ error: error reading Clippy's configuration file: unknown field `barfoo`, expect
            excessive-nesting-threshold
            future-size-threshold
            ignore-interior-mutability
+           inherent-impl-lint-scope
+           large-error-ignored
            large-error-threshold
            lint-commented-code
            literal-representation-threshold
@@ -159,6 +168,7 @@ error: error reading Clippy's configuration file: unknown field `barfoo`, expect
            msrv
            pass-by-value-size-limit
            pub-underscore-fields-behavior
+           recursive-self-in-type-definitions
            semicolon-inside-block-ignore-singleline
            semicolon-outside-block-ignore-multiline
            single-char-binding-names-threshold
@@ -197,6 +207,7 @@ error: error reading Clippy's configuration file: unknown field `allow_mixed_uni
            allow-expect-in-consts
            allow-expect-in-tests
            allow-indexing-slicing-in-tests
+           allow-large-stack-frames-in-tests
            allow-mixed-uninlined-format-args
            allow-one-hash-in-raw-strings
            allow-panic-in-tests
@@ -223,6 +234,7 @@ error: error reading Clippy's configuration file: unknown field `allow_mixed_uni
            check-inconsistent-struct-field-initializers
            check-private-items
            cognitive-complexity-threshold
+           const-literal-digits-threshold
            disallowed-macros
            disallowed-methods
            disallowed-names
@@ -236,6 +248,8 @@ error: error reading Clippy's configuration file: unknown field `allow_mixed_uni
            excessive-nesting-threshold
            future-size-threshold
            ignore-interior-mutability
+           inherent-impl-lint-scope
+           large-error-ignored
            large-error-threshold
            lint-commented-code
            literal-representation-threshold
@@ -253,6 +267,7 @@ error: error reading Clippy's configuration file: unknown field `allow_mixed_uni
            msrv
            pass-by-value-size-limit
            pub-underscore-fields-behavior
+           recursive-self-in-type-definitions
            semicolon-inside-block-ignore-singleline
            semicolon-outside-block-ignore-multiline
            single-char-binding-names-threshold

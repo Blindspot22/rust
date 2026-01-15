@@ -72,19 +72,16 @@ hir_analysis_cannot_capture_late_bound_ty =
 hir_analysis_closure_implicit_hrtb = implicit types in closure signatures are forbidden when `for<...>` is present
     .label = `for<...>` is here
 
-hir_analysis_cmse_call_generic =
-    function pointers with the `"cmse-nonsecure-call"` ABI cannot contain generics in their type
+hir_analysis_cmse_generic =
+    generics are not allowed in `extern {$abi}` signatures
 
-hir_analysis_cmse_entry_generic =
-    functions with the `"cmse-nonsecure-entry"` ABI cannot contain generics in their type
+hir_analysis_cmse_impl_trait =
+    `impl Trait` is not allowed in `extern {$abi}` signatures
 
 hir_analysis_cmse_inputs_stack_spill =
     arguments for `{$abi}` function too large to pass via registers
-    .label = {$plural ->
-        [false] this argument doesn't
-        *[true] these arguments don't
-    } fit in the available registers
-    .note = functions with the `{$abi}` ABI must pass all their arguments via the 4 32-bit available argument registers
+    .label = does not fit in the available registers
+    .note = functions with the `{$abi}` ABI must pass all their arguments via the 4 32-bit argument registers
 
 hir_analysis_cmse_output_stack_spill =
     return value of `{$abi}` function too large to pass via registers
@@ -105,6 +102,8 @@ hir_analysis_coerce_pointee_not_concrete_ty = `derive(CoercePointee)` is only ap
 hir_analysis_coerce_pointee_not_struct = `derive(CoercePointee)` is only applicable to `struct`, instead of `{$kind}`
 
 hir_analysis_coerce_pointee_not_transparent = `derive(CoercePointee)` is only applicable to `struct` with `repr(transparent)` layout
+
+hir_analysis_coerce_same_pat_kind = only pattern types with the same pattern can be coerced between each other
 
 hir_analysis_coerce_unsized_field_validity = for `{$ty}` to have a valid implementation of `{$trait_name}`, it must be possible to coerce the field of type `{$field_ty}`
     .label = `{$field_ty}` must be a pointer, reference, or smart pointer that is allowed to be unsized
@@ -166,6 +165,11 @@ hir_analysis_drop_impl_reservation = reservation `Drop` impls are not supported
 hir_analysis_duplicate_precise_capture = cannot capture parameter `{$name}` twice
     .label = parameter captured again here
 
+hir_analysis_eii_with_generics =
+    `{$impl_name}` cannot have generic parameters other than lifetimes
+    .label = required by this attribute
+    .help = `#[{$eii_name}]` marks the implementation of an "externally implementable item"
+
 hir_analysis_empty_specialization = specialization impl does not specialize any associated items
     .note = impl is a specialization of this impl
 
@@ -204,14 +208,6 @@ hir_analysis_field_already_declared_previous_nested =
     .label = field already declared
     .previous_decl_label = `{$field_name}` first declared here in this unnamed field
     .previous_nested_field_decl_note = field `{$field_name}` first declared here
-
-hir_analysis_function_not_found_in_trait = function not found in this trait
-
-hir_analysis_function_not_have_default_implementation = function doesn't have a default implementation
-    .note = required by this annotation
-
-hir_analysis_functions_names_duplicated = functions names are duplicated
-    .note = all `#[rustc_must_implement_one_of]` arguments must be unique
 
 hir_analysis_generic_args_on_overridden_impl = could not resolve generic parameters on overridden impl
 
@@ -301,6 +297,13 @@ hir_analysis_lifetime_not_captured = `impl Trait` captures lifetime parameter, b
     .label = lifetime captured due to being mentioned in the bounds of the `impl Trait`
     .param_label = this lifetime parameter is captured
 
+hir_analysis_lifetimes_or_bounds_mismatch_on_eii =
+    lifetime parameters or bounds of `{$ident}` do not match the declaration
+    .label = lifetimes do not match
+    .generics_label = lifetimes in impl do not match this signature
+    .where_label = this `where` clause might not match the one in the declaration
+    .bounds_label = this bound might be missing in the implementation
+
 hir_analysis_lifetimes_or_bounds_mismatch_on_trait =
     lifetime parameters or bounds on {$item_kind} `{$ident}` do not match the trait declaration
     .label = lifetimes do not match {$item_kind} in trait
@@ -370,16 +373,6 @@ hir_analysis_missing_type_params =
         [one] parameter
         *[other] parameters
     } must be specified on the object type
-
-hir_analysis_must_be_name_of_associated_function = must be a name of an associated function
-
-hir_analysis_must_implement_not_function = not a function
-
-hir_analysis_must_implement_not_function_note = all `#[rustc_must_implement_one_of]` arguments must be associated function names
-
-hir_analysis_must_implement_not_function_span_note = required by this annotation
-
-hir_analysis_must_implement_one_of_attribute = the `#[rustc_must_implement_one_of]` attribute must be used with at least 2 args
 
 hir_analysis_no_variant_named = no variant named `{$ident}` found for enum `{$ty}`
 
@@ -552,11 +545,6 @@ hir_analysis_ty_param_some = type parameter `{$param}` must be used as the type 
     .only_note = only traits defined in the current crate can be implemented for a type parameter
 
 hir_analysis_type_of = {$ty}
-
-hir_analysis_typeof_reserved_keyword_used =
-    `typeof` is a reserved keyword but unimplemented
-    .suggestion = consider replacing `typeof(...)` with an actual type
-    .label = reserved keyword
 
 hir_analysis_unconstrained_generic_parameter = the {$param_def_kind} `{$param_name}` is not constrained by the impl trait, self type, or predicates
     .label = unconstrained {$param_def_kind}

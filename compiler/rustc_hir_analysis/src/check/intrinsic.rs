@@ -4,7 +4,7 @@ use rustc_abi::ExternAbi;
 use rustc_errors::DiagMessage;
 use rustc_hir::{self as hir, LangItem};
 use rustc_middle::traits::{ObligationCause, ObligationCauseCode};
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::ty::{self, Const, Ty, TyCtxt};
 use rustc_span::def_id::LocalDefId;
 use rustc_span::{Span, Symbol, sym};
 
@@ -64,83 +64,164 @@ fn intrinsic_operation_unsafety(tcx: TyCtxt<'_>, intrinsic_id: LocalDefId) -> hi
         // it's usually worth updating that intrinsic's documentation
         // to note that it's safe to call, since
         // safe extern fns are otherwise unprecedented.
-        sym::abort
+
+        // tidy-alphabetical-start
+        | sym::abort
+        | sym::add_with_overflow
+        | sym::aggregate_raw_ptr
+        | sym::align_of
         | sym::assert_inhabited
-        | sym::assert_zero_valid
         | sym::assert_mem_uninitialized_valid
+        | sym::assert_zero_valid
+        | sym::autodiff
+        | sym::bitreverse
+        | sym::black_box
         | sym::box_new
         | sym::breakpoint
-        | sym::size_of
-        | sym::align_of
-        | sym::needs_drop
-        | sym::caller_location
-        | sym::add_with_overflow
-        | sym::sub_with_overflow
-        | sym::mul_with_overflow
-        | sym::carrying_mul_add
-        | sym::wrapping_add
-        | sym::wrapping_sub
-        | sym::wrapping_mul
-        | sym::saturating_add
-        | sym::saturating_sub
-        | sym::rotate_left
-        | sym::rotate_right
-        | sym::ctpop
-        | sym::ctlz
-        | sym::cttz
         | sym::bswap
-        | sym::bitreverse
-        | sym::three_way_compare
-        | sym::discriminant_value
-        | sym::type_id
-        | sym::type_id_eq
-        | sym::select_unpredictable
+        | sym::caller_location
+        | sym::carrying_mul_add
+        | sym::ceilf16
+        | sym::ceilf32
+        | sym::ceilf64
+        | sym::ceilf128
         | sym::cold_path
-        | sym::ptr_guaranteed_cmp
-        | sym::minnumf16
-        | sym::minnumf32
-        | sym::minnumf64
-        | sym::minnumf128
-        | sym::minimumf16
-        | sym::minimumf32
-        | sym::minimumf64
-        | sym::minimumf128
-        | sym::maxnumf16
-        | sym::maxnumf32
-        | sym::maxnumf64
-        | sym::maxnumf128
+        | sym::const_eval_select
+        | sym::contract_check_ensures
+        | sym::contract_check_requires
+        | sym::contract_checks
+        | sym::copysignf16
+        | sym::copysignf32
+        | sym::copysignf64
+        | sym::copysignf128
+        | sym::cosf16
+        | sym::cosf32
+        | sym::cosf64
+        | sym::cosf128
+        | sym::ctlz
+        | sym::ctpop
+        | sym::cttz
+        | sym::discriminant_value
+        | sym::exp2f16
+        | sym::exp2f32
+        | sym::exp2f64
+        | sym::exp2f128
+        | sym::expf16
+        | sym::expf32
+        | sym::expf64
+        | sym::expf128
+        | sym::fabsf16
+        | sym::fabsf32
+        | sym::fabsf64
+        | sym::fabsf128
+        | sym::fadd_algebraic
+        | sym::fdiv_algebraic
+        | sym::floorf16
+        | sym::floorf32
+        | sym::floorf64
+        | sym::floorf128
+        | sym::fmaf16
+        | sym::fmaf32
+        | sym::fmaf64
+        | sym::fmaf128
+        | sym::fmul_algebraic
+        | sym::fmuladdf16
+        | sym::fmuladdf32
+        | sym::fmuladdf64
+        | sym::fmuladdf128
+        | sym::forget
+        | sym::frem_algebraic
+        | sym::fsub_algebraic
+        | sym::is_val_statically_known
+        | sym::log2f16
+        | sym::log2f32
+        | sym::log2f64
+        | sym::log2f128
+        | sym::log10f16
+        | sym::log10f32
+        | sym::log10f64
+        | sym::log10f128
+        | sym::logf16
+        | sym::logf32
+        | sym::logf64
+        | sym::logf128
         | sym::maximumf16
         | sym::maximumf32
         | sym::maximumf64
         | sym::maximumf128
-        | sym::rustc_peek
-        | sym::type_name
-        | sym::forget
-        | sym::black_box
-        | sym::variant_count
-        | sym::is_val_statically_known
+        | sym::maxnumf16
+        | sym::maxnumf32
+        | sym::maxnumf64
+        | sym::maxnumf128
+        | sym::minimumf16
+        | sym::minimumf32
+        | sym::minimumf64
+        | sym::minimumf128
+        | sym::minnumf16
+        | sym::minnumf32
+        | sym::minnumf64
+        | sym::minnumf128
+        | sym::mul_with_overflow
+        | sym::needs_drop
+        | sym::offload
+        | sym::offset_of
+        | sym::overflow_checks
+        | sym::powf16
+        | sym::powf32
+        | sym::powf64
+        | sym::powf128
+        | sym::powif16
+        | sym::powif32
+        | sym::powif64
+        | sym::powif128
+        | sym::prefetch_read_data
+        | sym::prefetch_read_instruction
+        | sym::prefetch_write_data
+        | sym::prefetch_write_instruction
+        | sym::ptr_guaranteed_cmp
         | sym::ptr_mask
-        | sym::aggregate_raw_ptr
         | sym::ptr_metadata
-        | sym::ub_checks
-        | sym::contract_checks
-        | sym::contract_check_requires
-        | sym::contract_check_ensures
-        | sym::fadd_algebraic
-        | sym::fsub_algebraic
-        | sym::fmul_algebraic
-        | sym::fdiv_algebraic
-        | sym::frem_algebraic
+        | sym::rotate_left
+        | sym::rotate_right
         | sym::round_ties_even_f16
         | sym::round_ties_even_f32
         | sym::round_ties_even_f64
         | sym::round_ties_even_f128
-        | sym::autodiff
-        | sym::prefetch_read_data
-        | sym::prefetch_write_data
-        | sym::prefetch_read_instruction
-        | sym::prefetch_write_instruction
-        | sym::const_eval_select => hir::Safety::Safe,
+        | sym::roundf16
+        | sym::roundf32
+        | sym::roundf64
+        | sym::roundf128
+        | sym::rustc_peek
+        | sym::saturating_add
+        | sym::saturating_sub
+        | sym::select_unpredictable
+        | sym::sinf16
+        | sym::sinf32
+        | sym::sinf64
+        | sym::sinf128
+        | sym::size_of
+        | sym::sqrtf16
+        | sym::sqrtf32
+        | sym::sqrtf64
+        | sym::sqrtf128
+        | sym::sub_with_overflow
+        | sym::three_way_compare
+        | sym::truncf16
+        | sym::truncf32
+        | sym::truncf64
+        | sym::truncf128
+        | sym::type_id
+        | sym::type_id_eq
+        | sym::type_name
+        | sym::type_of
+        | sym::ub_checks
+        | sym::variant_count
+        | sym::vtable_for
+        | sym::wrapping_add
+        | sym::wrapping_mul
+        | sym::wrapping_sub
+        // tidy-alphabetical-end
+        => hir::Safety::Safe,
         _ => hir::Safety::Unsafe,
     };
 
@@ -211,6 +292,7 @@ pub(crate) fn check_intrinsic_type(
         sym::size_of_val | sym::align_of_val => {
             (1, 0, vec![Ty::new_imm_ptr(tcx, param(0))], tcx.types.usize)
         }
+        sym::offset_of => (1, 0, vec![tcx.types.u32, tcx.types.u32], tcx.types.usize),
         sym::rustc_peek => (1, 0, vec![param(0)], param(0)),
         sym::caller_location => (0, 0, vec![], tcx.caller_location_ty()),
         sym::assert_inhabited | sym::assert_zero_valid | sym::assert_mem_uninitialized_valid => {
@@ -227,13 +309,33 @@ pub(crate) fn check_intrinsic_type(
         sym::needs_drop => (1, 0, vec![], tcx.types.bool),
 
         sym::type_name => (1, 0, vec![], Ty::new_static_str(tcx)),
-        sym::type_id => {
-            (1, 0, vec![], tcx.type_of(tcx.lang_items().type_id().unwrap()).instantiate_identity())
-        }
+        sym::type_id => (
+            1,
+            0,
+            vec![],
+            tcx.type_of(tcx.lang_items().type_id().unwrap()).no_bound_vars().unwrap(),
+        ),
         sym::type_id_eq => {
-            let type_id = tcx.type_of(tcx.lang_items().type_id().unwrap()).instantiate_identity();
+            let type_id = tcx.type_of(tcx.lang_items().type_id().unwrap()).no_bound_vars().unwrap();
             (0, 0, vec![type_id, type_id], tcx.types.bool)
         }
+        sym::type_of => (
+            0,
+            0,
+            vec![tcx.type_of(tcx.lang_items().type_id().unwrap()).no_bound_vars().unwrap()],
+            tcx.type_of(tcx.lang_items().type_struct().unwrap()).no_bound_vars().unwrap(),
+        ),
+        sym::offload => (
+            3,
+            0,
+            vec![
+                param(0),
+                Ty::new_array_with_const_len(tcx, tcx.types.u32, Const::from_target_usize(tcx, 3)),
+                Ty::new_array_with_const_len(tcx, tcx.types.u32, Const::from_target_usize(tcx, 3)),
+                param(1),
+            ],
+            param(2),
+        ),
         sym::offset => (2, 0, vec![param(0), param(1)], param(0)),
         sym::arith_offset => (
             1,
@@ -449,6 +551,9 @@ pub(crate) fn check_intrinsic_type(
         }
         sym::unchecked_shl | sym::unchecked_shr => (2, 0, vec![param(0), param(1)], param(0)),
         sym::rotate_left | sym::rotate_right => (1, 0, vec![param(0), tcx.types.u32], param(0)),
+        sym::unchecked_funnel_shl | sym::unchecked_funnel_shr => {
+            (1, 0, vec![param(0), param(0), tcx.types.u32], param(0))
+        }
         sym::unchecked_add | sym::unchecked_sub | sym::unchecked_mul => {
             (1, 0, vec![param(0), param(0)], param(0))
         }
@@ -559,20 +664,34 @@ pub(crate) fn check_intrinsic_type(
             (0, 0, vec![Ty::new_imm_ptr(tcx, tcx.types.unit)], tcx.types.usize)
         }
 
+        sym::vtable_for => {
+            let dyn_metadata = tcx.require_lang_item(LangItem::DynMetadata, span);
+            let dyn_metadata_adt_ref = tcx.adt_def(dyn_metadata);
+            let dyn_metadata_args = tcx.mk_args(&[param(1).into()]);
+            let dyn_ty = Ty::new_adt(tcx, dyn_metadata_adt_ref, dyn_metadata_args);
+
+            let option_did = tcx.require_lang_item(LangItem::Option, span);
+            let option_adt_ref = tcx.adt_def(option_did);
+            let option_args = tcx.mk_args(&[dyn_ty.into()]);
+            let ret_ty = Ty::new_adt(tcx, option_adt_ref, option_args);
+
+            (2, 0, vec![], ret_ty)
+        }
+
         // This type check is not particularly useful, but the `where` bounds
         // on the definition in `core` do the heavy lifting for checking it.
         sym::aggregate_raw_ptr => (3, 0, vec![param(1), param(2)], param(0)),
         sym::ptr_metadata => (2, 0, vec![Ty::new_imm_ptr(tcx, param(0))], param(1)),
 
-        sym::ub_checks => (0, 0, Vec::new(), tcx.types.bool),
+        sym::ub_checks | sym::overflow_checks => (0, 0, Vec::new(), tcx.types.bool),
 
         sym::box_new => (1, 0, vec![param(0)], Ty::new_box(tcx, param(0))),
 
-        // contract_checks() -> bool
-        sym::contract_checks => (0, 0, Vec::new(), tcx.types.bool),
         // contract_check_requires::<C>(C) -> bool, where C: impl Fn() -> bool
         sym::contract_check_requires => (1, 0, vec![param(0)], tcx.types.unit),
-        sym::contract_check_ensures => (2, 0, vec![param(0), param(1)], param(1)),
+        sym::contract_check_ensures => {
+            (2, 0, vec![Ty::new_option(tcx, param(0)), param(1)], param(1))
+        }
 
         sym::simd_eq | sym::simd_ne | sym::simd_lt | sym::simd_le | sym::simd_gt | sym::simd_ge => {
             (2, 0, vec![param(0), param(0)], param(1))
@@ -616,8 +735,8 @@ pub(crate) fn check_intrinsic_type(
             (1, 0, vec![param(0), param(0), param(0)], param(0))
         }
         sym::simd_gather => (3, 0, vec![param(0), param(1), param(2)], param(0)),
-        sym::simd_masked_load => (3, 0, vec![param(0), param(1), param(2)], param(2)),
-        sym::simd_masked_store => (3, 0, vec![param(0), param(1), param(2)], tcx.types.unit),
+        sym::simd_masked_load => (3, 1, vec![param(0), param(1), param(2)], param(2)),
+        sym::simd_masked_store => (3, 1, vec![param(0), param(1), param(2)], tcx.types.unit),
         sym::simd_scatter => (3, 0, vec![param(0), param(1), param(2)], tcx.types.unit),
         sym::simd_insert | sym::simd_insert_dyn => {
             (2, 0, vec![param(0), tcx.types.u32, param(1)], param(0))

@@ -25,17 +25,21 @@ fn generic_in_place(_1: *mut Box<[T]>) -> () {
                         }
                     }
                     scope 18 (inlined <std::alloc::Global as Allocator>::deallocate) {
-                        let mut _9: *mut u8;
-                        scope 19 (inlined Layout::size) {
-                        }
-                        scope 20 (inlined NonNull::<u8>::as_ptr) {
-                        }
-                        scope 21 (inlined std::alloc::dealloc) {
-                            let mut _10: usize;
-                            scope 22 (inlined Layout::size) {
-                            }
-                            scope 23 (inlined Layout::align) {
-                                scope 24 (inlined std::ptr::Alignment::as_usize) {
+                        scope 19 (inlined std::alloc::Global::deallocate_impl) {
+                            scope 20 (inlined std::alloc::Global::deallocate_impl_runtime) {
+                                let mut _9: *mut u8;
+                                scope 21 (inlined Layout::size) {
+                                }
+                                scope 22 (inlined NonNull::<u8>::as_ptr) {
+                                }
+                                scope 23 (inlined std::alloc::dealloc) {
+                                    let mut _10: usize;
+                                    scope 24 (inlined Layout::size) {
+                                    }
+                                    scope 25 (inlined Layout::align) {
+                                        scope 26 (inlined std::ptr::Alignment::as_usize) {
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -73,7 +77,7 @@ fn generic_in_place(_1: *mut Box<[T]>) -> () {
     }
 
     bb1: {
-        _6 = AlignOf(T);
+        _6 = const <T as std::mem::SizedTypeProperties>::ALIGN;
         StorageLive(_7);
         _7 = copy _6 as std::ptr::Alignment (Transmute);
         _8 = move (_7.0: std::ptr::alignment::AlignmentEnum);

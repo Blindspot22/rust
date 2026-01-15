@@ -1,6 +1,5 @@
-use rustc_ast as ast;
 use rustc_ast::visit::{self, AssocCtxt, FnCtxt, FnKind, Visitor};
-use rustc_ast::{NodeId, PatKind, attr, token};
+use rustc_ast::{self as ast, AttrVec, NodeId, PatKind, attr, token};
 use rustc_feature::{AttributeGate, BUILTIN_ATTRIBUTE_MAP, BuiltinAttribute, Features};
 use rustc_session::Session;
 use rustc_session::parse::{feature_err, feature_warn};
@@ -161,7 +160,7 @@ impl<'a> PostExpansionVisitor<'a> {
 
 impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
     fn visit_attribute(&mut self, attr: &ast::Attribute) {
-        let attr_info = attr.ident().and_then(|ident| BUILTIN_ATTRIBUTE_MAP.get(&ident.name));
+        let attr_info = attr.name().and_then(|name| BUILTIN_ATTRIBUTE_MAP.get(&name));
         // Check feature gates for built-in attributes.
         if let Some(BuiltinAttribute {
             gate: AttributeGate::Gated { feature, message, check, notes, .. },
@@ -183,11 +182,12 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
                 gate_doc!(
                     "experimental" {
                         cfg => doc_cfg
-                        cfg_hide => doc_cfg_hide
+                        auto_cfg => doc_cfg
                         masked => doc_masked
                         notable_trait => doc_notable_trait
                     }
                     "meant for internal use only" {
+                        attribute => rustdoc_internals
                         keyword => rustdoc_internals
                         fake_variadic => rustdoc_internals
                         search_unbox => rustdoc_internals
@@ -301,17 +301,12 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
         visit::walk_ty(self, ty)
     }
 
-    fn visit_generics(&mut self, g: &'a ast::Generics) {
-        for predicate in &g.where_clause.predicates {
-            match &predicate.kind {
-                ast::WherePredicateKind::BoundPredicate(bound_pred) => {
-                    // A type bound (e.g., `for<'c> Foo: Send + Clone + 'c`).
-                    self.check_late_bound_lifetime_defs(&bound_pred.bound_generic_params);
-                }
-                _ => {}
-            }
+    fn visit_where_predicate_kind(&mut self, kind: &'a ast::WherePredicateKind) {
+        if let ast::WherePredicateKind::BoundPredicate(bound) = kind {
+            // A type bound (e.g., `for<'c> Foo: Send + Clone + 'c`).
+            self.check_late_bound_lifetime_defs(&bound.bound_generic_params);
         }
-        visit::walk_generics(self, g);
+        visit::walk_where_predicate_kind(self, kind);
     }
 
     fn visit_fn_ret_ty(&mut self, ret_ty: &'a ast::FnRetTy) {
@@ -339,8 +334,16 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
 
     fn visit_expr(&mut self, e: &'a ast::Expr) {
         match e.kind {
-            ast::ExprKind::TryBlock(_) => {
+            ast::ExprKind::TryBlock(_, None) => {
                 gate!(&self, try_blocks, e.span, "`try` expression is experimental");
+            }
+            ast::ExprKind::TryBlock(_, Some(_)) => {
+                gate!(
+                    &self,
+                    try_blocks_heterogeneous,
+                    e.span,
+                    "`try bikeshed` expression is experimental"
+                );
             }
             ast::ExprKind::Lit(token::Lit {
                 kind: token::LitKind::Float | token::LitKind::Integer,
@@ -391,7 +394,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
         visit::walk_poly_trait_ref(self, t);
     }
 
-    fn visit_fn(&mut self, fn_kind: FnKind<'a>, span: Span, _: NodeId) {
+    fn visit_fn(&mut self, fn_kind: FnKind<'a>, _: &AttrVec, span: Span, _: NodeId) {
         if let Some(_header) = fn_kind.header() {
             // Stability of const fn methods are covered in `visit_assoc_item` below.
         }
@@ -502,7 +505,6 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session, features: &Features) {
         half_open_range_patterns_in_slices,
         "half-open range patterns in slices are unstable"
     );
-    gate_all!(associated_const_equality, "associated const equality is incomplete");
     gate_all!(yeet_expr, "`do yeet` expression is experimental");
     gate_all!(const_closures, "const closures are experimental");
     gate_all!(builtin_syntax, "`builtin #` syntax is unstable");
@@ -514,6 +516,24 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session, features: &Features) {
     gate_all!(fn_delegation, "functions delegation is not yet fully implemented");
     gate_all!(postfix_match, "postfix match is experimental");
     gate_all!(mut_ref, "mutable by-reference bindings are experimental");
+    gate_all!(min_generic_const_args, "unbraced const blocks as const args are experimental");
+    // associated_const_equality is stabilized as part of min_generic_const_args
+    if let Some(spans) = spans.get(&sym::associated_const_equality) {
+        for span in spans {
+            if !visitor.features.min_generic_const_args()
+                && !span.allows_unstable(sym::min_generic_const_args)
+            {
+                #[allow(rustc::untranslatable_diagnostic)]
+                feature_err(
+                    &visitor.sess,
+                    sym::min_generic_const_args,
+                    *span,
+                    "associated const equality is incomplete",
+                )
+                .emit();
+            }
+        }
+    }
     gate_all!(global_registration, "global registration is experimental");
     gate_all!(return_type_notation, "return type notation is experimental");
     gate_all!(pin_ergonomics, "pinned reference syntax is experimental");
@@ -621,11 +641,7 @@ fn maybe_stage_features(sess: &Session, features: &Features, krate: &ast::Crate)
 }
 
 fn check_incompatible_features(sess: &Session, features: &Features) {
-    let enabled_lang_features =
-        features.enabled_lang_features().iter().map(|feat| (feat.gate_name, feat.attr_sp));
-    let enabled_lib_features =
-        features.enabled_lib_features().iter().map(|feat| (feat.gate_name, feat.attr_sp));
-    let enabled_features = enabled_lang_features.chain(enabled_lib_features);
+    let enabled_features = features.enabled_features_iter_stable_order();
 
     for (f1, f2) in rustc_feature::INCOMPATIBLE_FEATURES
         .iter()

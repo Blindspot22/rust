@@ -37,9 +37,10 @@ ast_passes_assoc_type_without_body =
     .suggestion = provide a definition for the type
 
 ast_passes_async_fn_in_const_trait_or_trait_impl =
-    async functions are not allowed in `const` {$in_impl ->
-        [true] trait impls
-        *[false] traits
+    async functions are not allowed in `const` {$context ->
+        [trait_impl] trait impls
+        [impl] impls
+        *[trait] traits
     }
     .label = associated functions of `const` cannot be declared `async`
 
@@ -57,14 +58,29 @@ ast_passes_auto_super_lifetime = auto traits cannot have super traits or lifetim
     .label = {ast_passes_auto_super_lifetime}
     .suggestion = remove the super traits or lifetime bounds
 
-ast_passes_bad_c_variadic = only foreign, `unsafe extern "C"`, or `unsafe extern "C-unwind"` functions may have a C-variadic arg
-
 ast_passes_body_in_extern = incorrect `{$kind}` inside `extern` block
     .cannot_have = cannot have a body
     .invalid = the invalid body
     .existing = `extern` blocks define existing foreign {$kind}s and {$kind}s inside of them cannot have a body
 
 ast_passes_bound_in_context = bounds on `type`s in {$ctx} have no effect
+
+ast_passes_c_variadic_bad_extern = `...` is not supported for `extern "{$abi}"` functions
+    .label = `extern "{$abi}"` because of this
+    .help = only `extern "C"` and `extern "C-unwind"` functions may have a C variable argument list
+
+ast_passes_c_variadic_bad_naked_extern = `...` is not supported for `extern "{$abi}"` naked functions
+    .label = `extern "{$abi}"` because of this
+    .help = C-variadic function must have a compatible calling convention
+
+ast_passes_c_variadic_must_be_unsafe =
+    functions with a C variable argument list must be unsafe
+    .suggestion = add the `unsafe` keyword to this definition
+
+ast_passes_c_variadic_no_extern = `...` is not supported for non-extern functions
+    .help = only `extern "C"` and `extern "C-unwind"` functions may have a C variable argument list
+
+ast_passes_c_variadic_not_supported = the `{$target}` target does not support c-variadic functions
 
 ast_passes_const_and_c_variadic = functions cannot be both `const` and C-variadic
     .const = `const` because of this
@@ -75,6 +91,9 @@ ast_passes_const_and_coroutine = functions cannot be both `const` and `{$corouti
     .coroutine = `{$coroutine_kind}` because of this
     .label = {""}
 
+ast_passes_const_auto_trait = auto traits cannot be const
+    .help = remove the `const` keyword
+
 ast_passes_const_bound_trait_object = const trait bounds are not allowed in trait object types
 
 ast_passes_const_without_body =
@@ -83,6 +102,10 @@ ast_passes_const_without_body =
 
 ast_passes_constraint_on_negative_bound =
     associated type constraints not allowed on negative bounds
+
+ast_passes_coroutine_and_c_variadic = functions cannot be both `{$coroutine_kind}` and C-variadic
+    .const = `{$coroutine_kind}` because of this
+    .variadic = C-variadic because of this
 
 ast_passes_equality_in_where = equality constraints are not yet supported in `where` clauses
     .label = not supported
@@ -187,6 +210,11 @@ ast_passes_generic_before_constraints = generic arguments must come before the f
 
 ast_passes_generic_default_trailing = generic parameters with a default must be trailing
 
+ast_passes_impl_fn_const =
+    redundant `const` fn marker in const impl
+    .parent_constness = this declares all associated functions implicitly const
+    .label = remove the `const`
+
 ast_passes_incompatible_features = `{$f1}` and `{$f2}` are incompatible, using them at the same time is not allowed
     .help = remove one of these features
 
@@ -201,6 +229,10 @@ ast_passes_match_arm_with_no_body =
     .suggestion = add a body after the pattern
 
 ast_passes_missing_unsafe_on_extern = extern blocks must be unsafe
+    .suggestion = needs `unsafe` before the extern keyword
+
+ast_passes_missing_unsafe_on_extern_lint = extern blocks should be unsafe
+    .suggestion = needs `unsafe` before the extern keyword
 
 ast_passes_module_nonascii = trying to load file for module `{$name}` with non-ascii identifier name
     .help = consider using the `#[path]` attribute to specify filesystem path
@@ -238,6 +270,8 @@ ast_passes_precise_capturing_duplicated = duplicate `use<...>` precise capturing
 
 ast_passes_precise_capturing_not_allowed_here = `use<...>` precise capturing syntax not allowed in {$loc}
 
+ast_passes_scalable_vector_not_tuple_struct = scalable vectors must be tuple structs
+
 ast_passes_static_without_body =
     free static item without body
     .suggestion = provide a definition for the static
@@ -273,7 +307,7 @@ ast_passes_trait_fn_const =
         *[false] {""}
     }
     .make_impl_const_sugg = ... and declare the impl to be const instead
-    .make_trait_const_sugg = ... and declare the trait to be a `#[const_trait]` instead
+    .make_trait_const_sugg = ... and declare the trait to be const instead
 
 ast_passes_trait_object_single_bound = only a single explicit lifetime bound is permitted
 

@@ -57,7 +57,9 @@ impl MiriEnv {
             .arg("--")
             .args(&["miri", "setup", "--print-sysroot"])
             .args(target_flag);
-        cmd.set_quiet(quiet);
+        if quiet {
+            cmd = cmd.arg("--quiet");
+        }
         let output = cmd.read()?;
         self.sh.set_var("MIRI_SYSROOT", &output);
         Ok(output.into())
@@ -112,8 +114,8 @@ impl Command {
             Command::Check { features, flags } => Self::check(features, flags),
             Command::Test { bless, target, coverage, features, flags } =>
                 Self::test(bless, target, coverage, features, flags),
-            Command::Run { dep, verbose, target, edition, features, flags } =>
-                Self::run(dep, verbose, target, edition, features, flags),
+            Command::Run { dep, quiet, target, edition, features, flags } =>
+                Self::run(dep, quiet, target, edition, features, flags),
             Command::Doc { features, flags } => Self::doc(features, flags),
             Command::Fmt { flags } => Self::fmt(flags),
             Command::Clippy { features, flags } => Self::clippy(features, flags),
@@ -130,15 +132,15 @@ impl Command {
         let new_commit = sh.read_file("rust-version")?.trim().to_owned();
         let current_commit = {
             let rustc_info = cmd!(sh, "rustc +miri --version -v").read();
-            if rustc_info.is_err() {
-                None
-            } else {
-                let metadata = rustc_version::version_meta_for(&rustc_info.unwrap())?;
+            if let Ok(rustc_info) = rustc_info {
+                let metadata = rustc_version::version_meta_for(&rustc_info)?;
                 Some(
                     metadata
                         .commit_hash
                         .ok_or_else(|| anyhow!("rustc metadata did not contain commit hash"))?,
                 )
+            } else {
+                None
             }
         };
         // Check if we already are at that commit.
@@ -389,7 +391,8 @@ impl Command {
         Ok(())
     }
 
-    fn check(features: Vec<String>, flags: Vec<String>) -> Result<()> {
+    fn check(mut features: Vec<String>, flags: Vec<String>) -> Result<()> {
+        features.push("check_only".into());
         let e = MiriEnv::new()?;
         e.check(".", &features, &flags)?;
         e.check("cargo-miri", &[], &flags)?;
@@ -403,7 +406,8 @@ impl Command {
         Ok(())
     }
 
-    fn clippy(features: Vec<String>, flags: Vec<String>) -> Result<()> {
+    fn clippy(mut features: Vec<String>, flags: Vec<String>) -> Result<()> {
+        features.push("check_only".into());
         let e = MiriEnv::new()?;
         e.clippy(".", &features, &flags)?;
         e.clippy("cargo-miri", &[], &flags)?;
@@ -458,7 +462,7 @@ impl Command {
 
     fn run(
         dep: bool,
-        verbose: bool,
+        quiet: bool,
         target: Option<String>,
         edition: Option<String>,
         features: Vec<String>,
@@ -468,7 +472,7 @@ impl Command {
 
         // Preparation: get a sysroot, and get the miri binary.
         let miri_sysroot =
-            e.build_miri_sysroot(/* quiet */ !verbose, target.as_deref(), &features)?;
+            e.build_miri_sysroot(/* quiet */ quiet, target.as_deref(), &features)?;
         let miri_bin = e
             .build_get_binary(".", &features)
             .context("failed to get filename of miri executable")?;
@@ -492,7 +496,7 @@ impl Command {
         // Compute flags.
         let miri_flags = e.sh.var("MIRIFLAGS").unwrap_or_default();
         let miri_flags = flagsplit(&miri_flags);
-        let quiet_flag = if verbose { None } else { Some("--quiet") };
+        let quiet_flag = if quiet { Some("--quiet") } else { None };
 
         // Run Miri.
         // The basic command that executes the Miri driver.
@@ -506,7 +510,7 @@ impl Command {
         } else {
             cmd!(e.sh, "{miri_bin}")
         };
-        cmd.set_quiet(!verbose);
+        cmd.set_quiet(quiet);
         // Add Miri flags
         let mut cmd = cmd.args(&miri_flags).args(&early_flags).args(&flags);
         // For `--dep` we also need to set the target in the env var.

@@ -230,24 +230,31 @@
 //!
 //! # Representation
 //!
-//! In some cases, [`Result<T, E>`] will gain the same size, alignment, and ABI
-//! guarantees as [`Option<U>`] has. One of either the `T` or `E` type must be a
-//! type that qualifies for the `Option` [representation guarantees][opt-rep],
-//! and the *other* type must meet all of the following conditions:
-//! * Is a zero-sized type with alignment 1 (a "1-ZST").
-//! * Has no fields.
-//! * Does not have the `#[non_exhaustive]` attribute.
+//! In some cases, [`Result<T, E>`] comes with size, alignment, and ABI
+//! guarantees. Specifically, one of either the `T` or `E` type must be a type
+//! that qualifies for the `Option` [representation guarantees][opt-rep] (let's
+//! call that type `I`), and the *other* type is a zero-sized type with
+//! alignment 1 (a "1-ZST").
+//!
+//! If that is the case, then `Result<T, E>` has the same size, alignment, and
+//! [function call ABI] as `I` (and therefore, as `Option<I>`). If `I` is `T`,
+//! it is therefore sound to transmute a value `t` of type `I` to type
+//! `Result<T, E>` (producing the value `Ok(t)`) and to transmute a value
+//! `Ok(t)` of type `Result<T, E>` to type `I` (producing the value `t`). If `I`
+//! is `E`, the same applies with `Ok` replaced by `Err`.
 //!
 //! For example, `NonZeroI32` qualifies for the `Option` representation
-//! guarantees, and `()` is a zero-sized type with alignment 1, no fields, and
-//! it isn't `non_exhaustive`. This means that both `Result<NonZeroI32, ()>` and
-//! `Result<(), NonZeroI32>` have the same size, alignment, and ABI guarantees
-//! as `Option<NonZeroI32>`. The only difference is the implied semantics:
+//! guarantees and `()` is a zero-sized type with alignment 1. This means that
+//! both `Result<NonZeroI32, ()>` and `Result<(), NonZeroI32>` have the same
+//! size, alignment, and ABI as `NonZeroI32` (and `Option<NonZeroI32>`). The
+//! only difference between these is in the implied semantics:
+//!
 //! * `Option<NonZeroI32>` is "a non-zero i32 might be present"
 //! * `Result<NonZeroI32, ()>` is "a non-zero i32 success result, if any"
 //! * `Result<(), NonZeroI32>` is "a non-zero i32 error result, if any"
 //!
 //! [opt-rep]: ../option/index.html#representation "Option Representation"
+//! [function call ABI]: ../primitive.fn.html#abi-compatibility
 //!
 //! # Method overview
 //!
@@ -542,7 +549,8 @@ use crate::{convert, fmt, hint};
 ///
 /// See the [module documentation](self) for details.
 #[doc(search_unbox)]
-#[derive(Copy, PartialEq, PartialOrd, Eq, Ord, Debug, Hash)]
+#[derive(Copy, Debug, Hash)]
+#[derive_const(PartialEq, PartialOrd, Eq, Ord)]
 #[must_use = "this `Result` may be an `Err` variant, which should be handled"]
 #[rustc_diagnostic_item = "Result"]
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -1034,11 +1042,12 @@ impl<T, E> Result<T, E> {
     /// ```
     #[inline]
     #[stable(feature = "inner_deref", since = "1.47.0")]
-    pub fn as_deref(&self) -> Result<&T::Target, &E>
+    #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+    pub const fn as_deref(&self) -> Result<&T::Target, &E>
     where
-        T: Deref,
+        T: [const] Deref,
     {
-        self.as_ref().map(|t| t.deref())
+        self.as_ref().map(Deref::deref)
     }
 
     /// Converts from `Result<T, E>` (or `&mut Result<T, E>`) to `Result<&mut <T as DerefMut>::Target, &mut E>`.
@@ -1061,11 +1070,12 @@ impl<T, E> Result<T, E> {
     /// ```
     #[inline]
     #[stable(feature = "inner_deref", since = "1.47.0")]
-    pub fn as_deref_mut(&mut self) -> Result<&mut T::Target, &mut E>
+    #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+    pub const fn as_deref_mut(&mut self) -> Result<&mut T::Target, &mut E>
     where
-        T: DerefMut,
+        T: [const] DerefMut,
     {
-        self.as_mut().map(|t| t.deref_mut())
+        self.as_mut().map(DerefMut::deref_mut)
     }
 
     /////////////////////////////////////////////////////////////////////////
@@ -1347,7 +1357,7 @@ impl<T, E> Result<T, E> {
     #[unstable(feature = "unwrap_infallible", reason = "newly added", issue = "61695")]
     #[inline]
     #[rustc_allow_const_fn_unstable(const_precise_live_drops)]
-    #[rustc_const_unstable(feature = "const_try", issue = "74935")]
+    #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
     pub const fn into_ok(self) -> T
     where
         E: [const] Into<!>,
@@ -1384,7 +1394,7 @@ impl<T, E> Result<T, E> {
     #[unstable(feature = "unwrap_infallible", reason = "newly added", issue = "61695")]
     #[inline]
     #[rustc_allow_const_fn_unstable(const_precise_live_drops)]
-    #[rustc_const_unstable(feature = "const_try", issue = "74935")]
+    #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
     pub const fn into_err(self) -> E
     where
         T: [const] Into<!>,
@@ -1636,11 +1646,16 @@ impl<T, E> Result<T, E> {
     #[inline]
     #[track_caller]
     #[stable(feature = "option_result_unwrap_unchecked", since = "1.58.0")]
-    pub unsafe fn unwrap_unchecked(self) -> T {
+    #[rustc_const_unstable(feature = "const_result_unwrap_unchecked", issue = "148714")]
+    pub const unsafe fn unwrap_unchecked(self) -> T {
         match self {
             Ok(t) => t,
-            // SAFETY: the safety contract must be upheld by the caller.
-            Err(_) => unsafe { hint::unreachable_unchecked() },
+            Err(e) => {
+                // FIXME(const-hack): to avoid E: const Destruct bound
+                super::mem::forget(e);
+                // SAFETY: the safety contract must be upheld by the caller.
+                unsafe { hint::unreachable_unchecked() }
+            }
         }
     }
 
@@ -1844,7 +1859,7 @@ impl<T, E> Result<Result<T, E>, E> {
 }
 
 // This is a separate function to reduce the code size of the methods
-#[cfg(not(feature = "panic_immediate_abort"))]
+#[cfg(not(panic = "immediate-abort"))]
 #[inline(never)]
 #[cold]
 #[track_caller]
@@ -1856,7 +1871,7 @@ fn unwrap_failed(msg: &str, error: &dyn fmt::Debug) -> ! {
 // that gets immediately thrown away, since vtables don't get cleaned up
 // by dead code elimination if a trait object is constructed even if it goes
 // unused
-#[cfg(feature = "panic_immediate_abort")]
+#[cfg(panic = "immediate-abort")]
 #[inline]
 #[cold]
 #[track_caller]

@@ -273,6 +273,7 @@ pub(crate) fn run(
     bin_crate: bool,
 ) {
     let inner = move || -> Result<(), String> {
+        let emit_dep_info = renderopts.dep_info().is_some();
         // Generates source files for examples
         renderopts.no_emit_shared = true;
         let (cx, _) = Context::init(krate, renderopts, cache, tcx, Default::default())
@@ -320,6 +321,10 @@ pub(crate) fn run(
         calls.encode(&mut encoder);
         encoder.finish().map_err(|(_path, e)| e.to_string())?;
 
+        if emit_dep_info {
+            rustc_interface::passes::write_dep_info(tcx);
+        }
+
         Ok(())
     };
 
@@ -333,14 +338,11 @@ pub(crate) fn run(
 pub(crate) fn load_call_locations(
     with_examples: Vec<String>,
     dcx: DiagCtxtHandle<'_>,
+    loaded_paths: &mut Vec<PathBuf>,
 ) -> AllCallLocations {
     let mut all_calls: AllCallLocations = FxIndexMap::default();
     for path in with_examples {
-        // FIXME: Figure out why this line is causing this feature to crash in specific contexts.
-        // Full issue backlog is available here: <https://github.com/rust-lang/rust/pull/144600>.
-        //
-        // Can be checked with `tests/run-make/rustdoc-scrape-examples-paths`.
-        // loaded_paths.push(path.clone().into());
+        loaded_paths.push(path.clone().into());
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(e) => dcx.fatal(format!("failed to load examples: {e}")),

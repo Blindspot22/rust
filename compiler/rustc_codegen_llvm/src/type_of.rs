@@ -7,10 +7,11 @@ use rustc_middle::bug;
 use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
 use rustc_middle::ty::print::{with_no_trimmed_paths, with_no_visible_paths};
 use rustc_middle::ty::{self, CoroutineArgsExt, Ty, TypeVisitableExt};
+use rustc_span::{DUMMY_SP, Span};
 use tracing::debug;
 
 use crate::common::*;
-use crate::type_::Type;
+use crate::llvm::Type;
 
 fn uncached_llvm_type<'a, 'tcx>(
     cx: &CodegenCx<'a, 'tcx>,
@@ -22,6 +23,15 @@ fn uncached_llvm_type<'a, 'tcx>(
         BackendRepr::SimdVector { element, count } => {
             let element = layout.scalar_llvm_type_at(cx, element);
             return cx.type_vector(element, count);
+        }
+        BackendRepr::ScalableVector { ref element, count } => {
+            let element = if element.is_bool() {
+                cx.type_i1()
+            } else {
+                layout.scalar_llvm_type_at(cx, *element)
+            };
+
+            return cx.type_scalable_vector(element, count);
         }
         BackendRepr::Memory { .. } | BackendRepr::ScalarPair(..) => {}
     }
@@ -149,7 +159,11 @@ impl<'a, 'tcx> CodegenCx<'a, 'tcx> {
     }
 
     pub(crate) fn size_and_align_of(&self, ty: Ty<'tcx>) -> (Size, Align) {
-        let layout = self.layout_of(ty);
+        self.spanned_size_and_align_of(ty, DUMMY_SP)
+    }
+
+    pub(crate) fn spanned_size_and_align_of(&self, ty: Ty<'tcx>, span: Span) -> (Size, Align) {
+        let layout = self.spanned_layout_of(ty, span);
         (layout.size, layout.align.abi)
     }
 }
@@ -171,7 +185,9 @@ pub(crate) trait LayoutLlvmExt<'tcx> {
 impl<'tcx> LayoutLlvmExt<'tcx> for TyAndLayout<'tcx> {
     fn is_llvm_immediate(&self) -> bool {
         match self.backend_repr {
-            BackendRepr::Scalar(_) | BackendRepr::SimdVector { .. } => true,
+            BackendRepr::Scalar(_)
+            | BackendRepr::SimdVector { .. }
+            | BackendRepr::ScalableVector { .. } => true,
             BackendRepr::ScalarPair(..) | BackendRepr::Memory { .. } => false,
         }
     }
@@ -181,6 +197,7 @@ impl<'tcx> LayoutLlvmExt<'tcx> for TyAndLayout<'tcx> {
             BackendRepr::ScalarPair(..) => true,
             BackendRepr::Scalar(_)
             | BackendRepr::SimdVector { .. }
+            | BackendRepr::ScalableVector { .. }
             | BackendRepr::Memory { .. } => false,
         }
     }
@@ -226,7 +243,7 @@ impl<'tcx> LayoutLlvmExt<'tcx> for TyAndLayout<'tcx> {
 
         // Make sure lifetimes are erased, to avoid generating distinct LLVM
         // types for Rust types that only differ in the choice of lifetimes.
-        let normal_ty = cx.tcx.erase_regions(self.ty);
+        let normal_ty = cx.tcx.erase_and_anonymize_regions(self.ty);
 
         let mut defer = None;
         let llty = if self.ty != normal_ty {

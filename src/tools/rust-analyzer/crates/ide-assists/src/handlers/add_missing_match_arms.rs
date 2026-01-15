@@ -1,15 +1,14 @@
 use std::iter::{self, Peekable};
 
 use either::Either;
-use hir::{Adt, AsAssocItem, Crate, HasAttrs, ImportPathConfig, ModuleDef, Semantics, sym};
+use hir::{Adt, AsAssocItem, Crate, FindPathConfig, HasAttrs, ModuleDef, Semantics};
 use ide_db::RootDatabase;
 use ide_db::assists::ExprFillDefaultMode;
 use ide_db::syntax_helpers::suggest_name;
 use ide_db::{famous_defs::FamousDefs, helpers::mod_path_to_ast};
 use itertools::Itertools;
 use syntax::ToSmolStr;
-use syntax::ast::edit::IndentLevel;
-use syntax::ast::edit_in_place::Indent;
+use syntax::ast::edit::{AstNodeEdit, IndentLevel};
 use syntax::ast::syntax_factory::SyntaxFactory;
 use syntax::ast::{self, AstNode, MatchArmList, MatchExpr, Pat, make};
 
@@ -68,20 +67,19 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
             }
             .map(move |pat| (pat, has_guard))
         })
-        .map(|(pat, has_guard)| {
+        .filter_map(|(pat, has_guard)| {
             has_catch_all_arm |= !has_guard && matches!(pat, Pat::WildcardPat(_));
-            pat
+            (!has_guard).then_some(pat)
         })
         // Exclude top level wildcards so that they are expanded by this assist, retains status quo in #8129.
         .filter(|pat| !matches!(pat, Pat::WildcardPat(_)))
         .collect();
 
-    let cfg = ctx.config.import_path_config();
-
     let make = SyntaxFactory::with_mappings();
 
     let scope = ctx.sema.scope(expr.syntax())?;
     let module = scope.module();
+    let cfg = ctx.config.find_path_config(ctx.sema.is_nightly(scope.krate()));
     let self_ty = if ctx.config.prefer_self_ty {
         scope
             .containing_function()
@@ -94,24 +92,25 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
         bool,
         bool,
     ) = if let Some(enum_def) = resolve_enum_def(&ctx.sema, &expr, self_ty.as_ref()) {
-        let is_non_exhaustive = enum_def.is_non_exhaustive(ctx.db(), module.krate());
+        let is_non_exhaustive = enum_def.is_non_exhaustive(ctx.db(), module.krate(ctx.db()));
 
         let variants = enum_def.variants(ctx.db());
 
-        let has_hidden_variants =
-            variants.iter().any(|variant| variant.should_be_hidden(ctx.db(), module.krate()));
+        let has_hidden_variants = variants
+            .iter()
+            .any(|variant| variant.should_be_hidden(ctx.db(), module.krate(ctx.db())));
 
         let missing_pats = variants
             .into_iter()
             .filter_map(|variant| {
                 Some((
                     build_pat(ctx, &make, module, variant, cfg)?,
-                    variant.should_be_hidden(ctx.db(), module.krate()),
+                    variant.should_be_hidden(ctx.db(), module.krate(ctx.db())),
                 ))
             })
             .filter(|(variant_pat, _)| is_variant_missing(&top_lvl_pats, variant_pat));
 
-        let option_enum = FamousDefs(&ctx.sema, module.krate()).core_option_Option();
+        let option_enum = FamousDefs(&ctx.sema, module.krate(ctx.db())).core_option_Option();
         let missing_pats: Box<dyn Iterator<Item = _>> = if matches!(enum_def, ExtendedEnum::Enum { enum_: e, .. } if Some(e) == option_enum)
         {
             // Match `Some` variant first.
@@ -122,8 +121,9 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
         };
         (missing_pats.peekable(), is_non_exhaustive, has_hidden_variants)
     } else if let Some(enum_defs) = resolve_tuple_of_enum_def(&ctx.sema, &expr, self_ty.as_ref()) {
-        let is_non_exhaustive =
-            enum_defs.iter().any(|enum_def| enum_def.is_non_exhaustive(ctx.db(), module.krate()));
+        let is_non_exhaustive = enum_defs
+            .iter()
+            .any(|enum_def| enum_def.is_non_exhaustive(ctx.db(), module.krate(ctx.db())));
 
         let mut n_arms = 1;
         let variants_of_enums: Vec<Vec<ExtendedVariant>> = enum_defs
@@ -147,7 +147,7 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
         let has_hidden_variants = variants_of_enums
             .iter()
             .flatten()
-            .any(|variant| variant.should_be_hidden(ctx.db(), module.krate()));
+            .any(|variant| variant.should_be_hidden(ctx.db(), module.krate(ctx.db())));
 
         let missing_pats = variants_of_enums
             .into_iter()
@@ -156,7 +156,7 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
             .map(|variants| {
                 let is_hidden = variants
                     .iter()
-                    .any(|variant| variant.should_be_hidden(ctx.db(), module.krate()));
+                    .any(|variant| variant.should_be_hidden(ctx.db(), module.krate(ctx.db())));
                 let patterns = variants
                     .into_iter()
                     .filter_map(|variant| build_pat(ctx, &make, module, variant, cfg));
@@ -172,15 +172,16 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
     } else if let Some((enum_def, len)) =
         resolve_array_of_enum_def(&ctx.sema, &expr, self_ty.as_ref())
     {
-        let is_non_exhaustive = enum_def.is_non_exhaustive(ctx.db(), module.krate());
+        let is_non_exhaustive = enum_def.is_non_exhaustive(ctx.db(), module.krate(ctx.db()));
         let variants = enum_def.variants(ctx.db());
 
         if len.pow(variants.len() as u32) > 256 {
             return None;
         }
 
-        let has_hidden_variants =
-            variants.iter().any(|variant| variant.should_be_hidden(ctx.db(), module.krate()));
+        let has_hidden_variants = variants
+            .iter()
+            .any(|variant| variant.should_be_hidden(ctx.db(), module.krate(ctx.db())));
 
         let variants_of_enums = vec![variants; len];
 
@@ -191,7 +192,7 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
             .map(|variants| {
                 let is_hidden = variants
                     .iter()
-                    .any(|variant| variant.should_be_hidden(ctx.db(), module.krate()));
+                    .any(|variant| variant.should_be_hidden(ctx.db(), module.krate(ctx.db())));
                 let patterns = variants
                     .into_iter()
                     .filter_map(|variant| build_pat(ctx, &make, module, variant, cfg));
@@ -262,6 +263,7 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
                         true
                     }
                 })
+                .map(|arm| arm.reset_indent().indent(IndentLevel(1)))
                 .collect();
 
             let first_new_arm_idx = arms.len();
@@ -301,7 +303,7 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
             };
 
             let mut editor = builder.make_editor(&old_place);
-            new_match_arm_list.indent(IndentLevel::from_node(&old_place));
+            let new_match_arm_list = new_match_arm_list.indent(IndentLevel::from_node(&old_place));
             editor.replace(old_place, new_match_arm_list.syntax());
 
             if let Some(cap) = ctx.config.snippet_cap {
@@ -402,7 +404,7 @@ impl ExtendedVariant {
     fn should_be_hidden(self, db: &RootDatabase, krate: Crate) -> bool {
         match self {
             ExtendedVariant::Variant { variant: var, .. } => {
-                var.attrs(db).has_doc_hidden() && var.module(db).krate() != krate
+                var.attrs(db).is_doc_hidden() && var.module(db).krate(db) != krate
             }
             _ => false,
         }
@@ -425,7 +427,7 @@ impl ExtendedEnum {
     fn is_non_exhaustive(&self, db: &RootDatabase, krate: Crate) -> bool {
         match self {
             ExtendedEnum::Enum { enum_: e, .. } => {
-                e.attrs(db).by_key(sym::non_exhaustive).exists() && e.module(db).krate() != krate
+                e.attrs(db).is_non_exhaustive() && e.module(db).krate(db) != krate
             }
             _ => false,
         }
@@ -498,12 +500,12 @@ fn build_pat(
     make: &SyntaxFactory,
     module: hir::Module,
     var: ExtendedVariant,
-    cfg: ImportPathConfig,
+    cfg: FindPathConfig,
 ) -> Option<ast::Pat> {
     let db = ctx.db();
     match var {
         ExtendedVariant::Variant { variant: var, use_self } => {
-            let edition = module.krate().edition(db);
+            let edition = module.krate(db).edition(db);
             let path = if use_self {
                 make::path_from_segments(
                     [
@@ -522,7 +524,7 @@ fn build_pat(
                 hir::StructKind::Tuple => {
                     let mut name_generator = suggest_name::NameGenerator::default();
                     let pats = fields.into_iter().map(|f| {
-                        let name = name_generator.for_type(&f.ty(db), db, edition);
+                        let name = name_generator.for_type(&f.ty(db).to_type(db), db, edition);
                         match name {
                             Some(name) => make::ext::simple_ident_pat(make.name(&name)).into(),
                             None => make.wildcard_pat().into(),
@@ -919,6 +921,39 @@ fn main() {
     }
 
     #[test]
+    fn partial_fill_option_with_indentation() {
+        check_assist(
+            add_missing_match_arms,
+            r#"
+//- minicore: option
+fn main() {
+    match None$0 {
+        None => {
+            foo(
+                "foo",
+                "bar",
+            );
+        }
+    }
+}
+"#,
+            r#"
+fn main() {
+    match None {
+        None => {
+            foo(
+                "foo",
+                "bar",
+            );
+        }
+        Some(${1:_}) => ${2:todo!()},$0
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
     fn partial_fill_or_pat() {
         check_assist(
             add_missing_match_arms,
@@ -966,7 +1001,8 @@ fn main() {
         A::Ds(_value) => { let x = 1; }
         A::Es(B::Xs) => (),
         A::As => ${1:todo!()},
-        A::Cs => ${2:todo!()},$0
+        A::Bs => ${2:todo!()},
+        A::Cs => ${3:todo!()},$0
     }
 }
 "#,

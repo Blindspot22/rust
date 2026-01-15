@@ -24,6 +24,7 @@ use std::sync::LazyLock;
 use regex::RegexSetBuilder;
 use rustc_hash::FxHashMap;
 
+use crate::diagnostics::{CheckId, TidyCtx};
 use crate::walk::{filter_dirs, walk};
 
 #[cfg(test)]
@@ -66,9 +67,9 @@ const ANNOTATIONS_TO_IGNORE: &[&str] = &[
     "//@ compile-flags",
     "// error-pattern",
     "//@ error-pattern",
-    "// gdb",
-    "// lldb",
-    "// cdb",
+    "//@ gdb",
+    "//@ lldb",
+    "//@ cdb",
     "//@ normalize-stderr",
 ];
 
@@ -338,7 +339,9 @@ fn is_unexplained_ignore(extension: &str, line: &str) -> bool {
     true
 }
 
-pub fn check(path: &Path, bad: &mut bool) {
+pub fn check(path: &Path, tidy_ctx: TidyCtx) {
+    let mut check = tidy_ctx.start_check(CheckId::new("style").path(path));
+
     fn skip(path: &Path, is_dir: bool) -> bool {
         if path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(".#")) {
             // vim or emacs temporary file
@@ -391,7 +394,7 @@ pub fn check(path: &Path, bad: &mut bool) {
             });
 
         if contents.is_empty() {
-            tidy_error!(bad, "{}: empty file", file.display());
+            check.error(format!("{}: empty file", file.display()));
         }
 
         let extension = file.extension().unwrap().to_string_lossy();
@@ -442,6 +445,7 @@ pub fn check(path: &Path, bad: &mut bool) {
         let mut comment_block: Option<(usize, usize)> = None;
         let is_test = file.components().any(|c| c.as_os_str() == "tests")
             || file.file_stem().unwrap() == "tests";
+        let is_codegen_test = is_test && file.components().any(|c| c.as_os_str() == "codegen-llvm");
         let is_this_file = file.ends_with(this_file) || this_file.ends_with(file);
         let is_test_for_this_file =
             is_test && file.parent().unwrap().ends_with(this_file.with_extension(""));
@@ -467,7 +471,7 @@ pub fn check(path: &Path, bad: &mut bool) {
             }
 
             let mut err = |msg: &str| {
-                tidy_error!(bad, "{}:{}: {}", file.display(), i + 1, msg);
+                check.error(format!("{}:{}: {msg}", file.display(), i + 1));
             };
 
             if trimmed.contains("dbg!")
@@ -483,6 +487,11 @@ pub fn check(path: &Path, bad: &mut bool) {
                     skip_dbg,
                     "`dbg!` macro is intended as a debugging tool. It should not be in version control."
                 )
+            }
+
+            if is_codegen_test && trimmed.contains("CHECK") && trimmed.ends_with(": br") {
+                err("`CHECK: br` and `CHECK-NOT: br` in codegen tests are fragile to false \
+                    positives in mangled symbols. Try using `br {{.*}}` instead.")
             }
 
             if !under_rustfmt
@@ -611,7 +620,7 @@ pub fn check(path: &Path, bad: &mut bool) {
                     && backtick_count % 2 == 1
                 {
                     let mut err = |msg: &str| {
-                        tidy_error!(bad, "{}:{start_line}: {msg}", file.display());
+                        check.error(format!("{}:{start_line}: {msg}", file.display()));
                     };
                     let block_len = (i + 1) - start_line;
                     if block_len == 1 {
@@ -632,12 +641,12 @@ pub fn check(path: &Path, bad: &mut bool) {
         }
         if leading_new_lines {
             let mut err = |_| {
-                tidy_error!(bad, "{}: leading newline", file.display());
+                check.error(format!("{}: leading newline", file.display()));
             };
             suppressible_tidy_err!(err, skip_leading_newlines, "missing leading newline");
         }
         let mut err = |msg: &str| {
-            tidy_error!(bad, "{}: {}", file.display(), msg);
+            check.error(format!("{}: {}", file.display(), msg));
         };
         match trailing_new_lines {
             0 => suppressible_tidy_err!(err, skip_trailing_newlines, "missing trailing newline"),
@@ -650,38 +659,36 @@ pub fn check(path: &Path, bad: &mut bool) {
         };
         if lines > LINES {
             let mut err = |_| {
-                tidy_error!(
-                    bad,
-                    "{}: too many lines ({}) (add `// \
+                check.error(format!(
+                    "{}: too many lines ({lines}) (add `// \
                      ignore-tidy-filelength` to the file to suppress this error)",
                     file.display(),
-                    lines
-                );
+                ));
             };
             suppressible_tidy_err!(err, skip_file_length, "");
         }
 
         if let Directive::Ignore(false) = skip_cr {
-            tidy_error!(bad, "{}: ignoring CR characters unnecessarily", file.display());
+            check.error(format!("{}: ignoring CR characters unnecessarily", file.display()));
         }
         if let Directive::Ignore(false) = skip_tab {
-            tidy_error!(bad, "{}: ignoring tab characters unnecessarily", file.display());
+            check.error(format!("{}: ignoring tab characters unnecessarily", file.display()));
         }
         if let Directive::Ignore(false) = skip_end_whitespace {
-            tidy_error!(bad, "{}: ignoring trailing whitespace unnecessarily", file.display());
+            check.error(format!("{}: ignoring trailing whitespace unnecessarily", file.display()));
         }
         if let Directive::Ignore(false) = skip_trailing_newlines {
-            tidy_error!(bad, "{}: ignoring trailing newlines unnecessarily", file.display());
+            check.error(format!("{}: ignoring trailing newlines unnecessarily", file.display()));
         }
         if let Directive::Ignore(false) = skip_leading_newlines {
-            tidy_error!(bad, "{}: ignoring leading newlines unnecessarily", file.display());
+            check.error(format!("{}: ignoring leading newlines unnecessarily", file.display()));
         }
         if let Directive::Ignore(false) = skip_copyright {
-            tidy_error!(bad, "{}: ignoring copyright unnecessarily", file.display());
+            check.error(format!("{}: ignoring copyright unnecessarily", file.display()));
         }
         // We deliberately do not warn about these being unnecessary,
         // that would just lead to annoying churn.
         let _unused = skip_line_length;
         let _unused = skip_file_length;
-    })
+    });
 }

@@ -1,7 +1,6 @@
 pub(crate) mod tags;
 
 mod highlights;
-mod injector;
 
 mod escape;
 mod format;
@@ -16,7 +15,7 @@ use std::ops::ControlFlow;
 
 use either::Either;
 use hir::{DefWithBody, EditionedFileId, InFile, InRealFile, MacroKind, Name, Semantics};
-use ide_db::{FxHashMap, FxHashSet, Ranker, RootDatabase, SymbolKind};
+use ide_db::{FxHashMap, FxHashSet, MiniCore, Ranker, RootDatabase, SymbolKind};
 use syntax::{
     AstNode, AstToken, NodeOrToken,
     SyntaxKind::*,
@@ -35,6 +34,7 @@ use crate::{
 };
 
 pub(crate) use html::highlight_as_html;
+pub(crate) use html::highlight_as_html_with_config;
 
 #[derive(Debug, Clone, Copy)]
 pub struct HlRange {
@@ -43,10 +43,12 @@ pub struct HlRange {
     pub binding_hash: Option<u64>,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct HighlightConfig {
+#[derive(Copy, Clone, Debug)]
+pub struct HighlightConfig<'a> {
     /// Whether to highlight strings
     pub strings: bool,
+    /// Whether to highlight comments
+    pub comments: bool,
     /// Whether to highlight punctuation
     pub punctuation: bool,
     /// Whether to specialize punctuation highlights
@@ -61,6 +63,7 @@ pub struct HighlightConfig {
     pub macro_bang: bool,
     /// Whether to highlight unresolved things be their syntax
     pub syntactic_name_ref_highlighting: bool,
+    pub minicore: MiniCore<'a>,
 }
 
 // Feature: Semantic Syntax Highlighting
@@ -111,9 +114,9 @@ pub struct HighlightConfig {
 // |-----------|--------------------------------|
 // |operator| Emitted for general operators.|
 // |arithmetic| Emitted for the arithmetic operators `+`, `-`, `*`, `/`, `+=`, `-=`, `*=`, `/=`.|
-// |bitwise| Emitted for the bitwise operators `|`, `&`, `!`, `^`, `|=`, `&=`, `^=`.|
+// |bitwise| Emitted for the bitwise operators `\|`, `&`, `!`, `^`, `\|=`, `&=`, `^=`.|
 // |comparison| Emitted for the comparison oerators `>`, `<`, `==`, `>=`, `<=`, `!=`.|
-// |logical| Emitted for the logical operatos `||`, `&&`, `!`.|
+// |logical| Emitted for the logical operators `\|\|`, `&&`, `!`.|
 //
 // - For punctuation:
 //
@@ -169,34 +172,32 @@ pub struct HighlightConfig {
 // |constant| Emitted for const.|
 // |consuming| Emitted for locals that are being consumed when use in a function call.|
 // |controlFlow| Emitted for control-flow related tokens, this includes th `?` operator.|
-// |crateRoot| Emitted for crate names, like `serde` and `crate.|
+// |crateRoot| Emitted for crate names, like `serde` and `crate`.|
 // |declaration| Emitted for names of definitions, like `foo` in `fn foo(){}`.|
-// |defaultLibrary| Emitted for items from built-in crates (std, core, allc, test and proc_macro).|
+// |defaultLibrary| Emitted for items from built-in crates (std, core, alloc, test and proc_macro).|
 // |documentation| Emitted for documentation comment.|
 // |injected| Emitted for doc-string injected highlighting like rust source blocks in documentation.|
 // |intraDocLink| Emitted for intra doc links in doc-string.|
-// |library| Emitted for items that are defined outside of the current crae.|
+// |library| Emitted for items that are defined outside of the current crate.|
 // |macro|  Emitted for tokens inside macro call.|
 // |mutable| Emitted for mutable locals and statics as well as functions taking `&mut self`.|
-// |public| Emitted for items that are from the current crate and are `pub.|
-// |reference| Emitted for locals behind a reference and functions taking self` by reference.|
-// |static| Emitted for "static" functions, also known as functions that d not take a `self` param, as well as statics and consts.|
+// |public| Emitted for items that are from the current crate and are `pub`.|
+// |reference| Emitted for locals behind a reference and functions taking `self` by reference.|
+// |static| Emitted for "static" functions, also known as functions that do not take a `self` param, as well as statics and consts.|
 // |trait| Emitted for associated trait item.|
-// |unsafe| Emitted for unsafe operations, like unsafe function calls, as ell as the `unsafe` token.|
+// |unsafe| Emitted for unsafe operations, like unsafe function calls, as well as the `unsafe` token.|
 //
 // ![Semantic Syntax Highlighting](https://user-images.githubusercontent.com/48062697/113164457-06cfb980-9239-11eb-819b-0f93e646acf8.png)
 // ![Semantic Syntax Highlighting](https://user-images.githubusercontent.com/48062697/113187625-f7f50100-9250-11eb-825e-91c58f236071.png)
 pub(crate) fn highlight(
     db: &RootDatabase,
-    config: HighlightConfig,
+    config: &HighlightConfig<'_>,
     file_id: FileId,
     range_to_highlight: Option<TextRange>,
 ) -> Vec<HlRange> {
     let _p = tracing::info_span!("highlight").entered();
     let sema = Semantics::new(db);
-    let file_id = sema
-        .attach_first_edition(file_id)
-        .unwrap_or_else(|| EditionedFileId::current_edition(db, file_id));
+    let file_id = sema.attach_first_edition(file_id);
 
     // Determine the root based on the given range.
     let (root, range_to_highlight) = {
@@ -223,7 +224,7 @@ pub(crate) fn highlight(
 fn traverse(
     hl: &mut Highlights,
     sema: &Semantics<'_, RootDatabase>,
-    config: HighlightConfig,
+    config: &HighlightConfig<'_>,
     InRealFile { file_id, value: root }: InRealFile<&SyntaxNode>,
     krate: Option<hir::Crate>,
     range_to_highlight: TextRange,
@@ -486,7 +487,7 @@ fn traverse(
 fn string_injections(
     hl: &mut Highlights,
     sema: &Semantics<'_, RootDatabase>,
-    config: HighlightConfig,
+    config: &HighlightConfig<'_>,
     file_id: EditionedFileId,
     krate: Option<hir::Crate>,
     token: SyntaxToken,
@@ -583,9 +584,10 @@ fn descend_token(
     })
 }
 
-fn filter_by_config(highlight: &mut Highlight, config: HighlightConfig) -> bool {
+fn filter_by_config(highlight: &mut Highlight, config: &HighlightConfig<'_>) -> bool {
     match &mut highlight.tag {
         HlTag::StringLiteral if !config.strings => return false,
+        HlTag::Comment if !config.comments => return false,
         // If punctuation is disabled, make the macro bang part of the macro call again.
         tag @ HlTag::Punctuation(HlPunct::MacroBang) => {
             if !config.macro_bang {

@@ -13,9 +13,11 @@ pub(crate) mod format_string;
 pub(crate) mod item_list;
 pub(crate) mod keyword;
 pub(crate) mod lifetime;
+pub(crate) mod macro_def;
 pub(crate) mod mod_;
 pub(crate) mod pattern;
 pub(crate) mod postfix;
+pub(crate) mod ra_fixture;
 pub(crate) mod record;
 pub(crate) mod snippet;
 pub(crate) mod r#type;
@@ -74,6 +76,10 @@ impl Completions {
         self.buf.push(item)
     }
 
+    fn add_many(&mut self, items: impl IntoIterator<Item = CompletionItem>) {
+        self.buf.extend(items)
+    }
+
     fn add_opt(&mut self, item: Option<CompletionItem>) {
         if let Some(item) = item {
             self.buf.push(item)
@@ -104,6 +110,13 @@ impl Completions {
         if ctx.depth_from_crate_root > 0 {
             self.add_keyword(ctx, "super");
         }
+    }
+
+    pub(crate) fn add_type_keywords(&mut self, ctx: &CompletionContext<'_>) {
+        self.add_keyword_snippet(ctx, "fn", "fn($1)");
+        self.add_keyword_snippet(ctx, "dyn", "dyn $0");
+        self.add_keyword_snippet(ctx, "impl", "impl $0");
+        self.add_keyword_snippet(ctx, "for", "for<$1>");
     }
 
     pub(crate) fn add_super_keyword(
@@ -178,7 +191,7 @@ impl Completions {
         path_ctx: &PathCompletionCtx<'_>,
     ) {
         ctx.process_all_names(&mut |name, res, doc_aliases| match res {
-            ScopeDef::ModuleDef(hir::ModuleDef::Module(m)) if m.is_crate_root() => {
+            ScopeDef::ModuleDef(hir::ModuleDef::Module(m)) if m.is_crate_root(ctx.db) => {
                 self.add_module(ctx, path_ctx, m, name, doc_aliases);
             }
             _ => (),
@@ -630,7 +643,7 @@ fn enum_variants_with_paths(
     acc: &mut Completions,
     ctx: &CompletionContext<'_>,
     enum_: hir::Enum,
-    impl_: &Option<ast::Impl>,
+    impl_: Option<&ast::Impl>,
     cb: impl Fn(&mut Completions, &CompletionContext<'_>, hir::Variant, hir::ModPath),
 ) {
     let mut process_variant = |variant: Variant| {
@@ -644,7 +657,7 @@ fn enum_variants_with_paths(
 
     let variants = enum_.variants(ctx.db);
 
-    if let Some(impl_) = impl_.as_ref().and_then(|impl_| ctx.sema.to_def(impl_))
+    if let Some(impl_) = impl_.and_then(|impl_| ctx.sema.to_def(impl_))
         && impl_.self_ty(ctx.db).as_adt() == Some(hir::Adt::Enum(enum_))
     {
         variants.iter().for_each(|variant| process_variant(*variant));
@@ -654,7 +667,7 @@ fn enum_variants_with_paths(
         if let Some(path) = ctx.module.find_path(
             ctx.db,
             hir::ModuleDef::from(variant),
-            ctx.config.import_path_config(ctx.is_nightly),
+            ctx.config.find_path_config(ctx.is_nightly),
         ) {
             // Variants with trivial paths are already added by the existing completion logic,
             // so we should avoid adding these twice
@@ -691,6 +704,9 @@ pub(super) fn complete_name(
         NameKind::RecordField => {
             field::complete_field_list_record_variant(acc, ctx);
         }
+        NameKind::TypeParam => {
+            acc.add_keyword_snippet(ctx, "const", "const $1: $0");
+        }
         NameKind::ConstParam
         | NameKind::Enum
         | NameKind::MacroDef
@@ -700,7 +716,6 @@ pub(super) fn complete_name(
         | NameKind::Static
         | NameKind::Struct
         | NameKind::Trait
-        | NameKind::TypeParam
         | NameKind::Union
         | NameKind::Variant => (),
     }

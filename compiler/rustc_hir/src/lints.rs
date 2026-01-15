@@ -1,8 +1,10 @@
 use rustc_data_structures::fingerprint::Fingerprint;
+pub use rustc_lint_defs::AttributeLintKind;
+use rustc_lint_defs::LintId;
 use rustc_macros::HashStable_Generic;
 use rustc_span::Span;
 
-use crate::{AttrPath, HirId, Target};
+use crate::HirId;
 
 #[derive(Debug)]
 pub struct DelayedLints {
@@ -17,22 +19,15 @@ pub struct DelayedLints {
 /// and then there's a gap where no lints can be emitted until HIR is done.
 /// The variants in this enum represent lints that are temporarily stashed during
 /// AST lowering to be emitted once HIR is built.
-#[derive(Clone, Debug, HashStable_Generic)]
+#[derive(Debug, HashStable_Generic)]
 pub enum DelayedLint {
     AttributeParsing(AttributeLint<HirId>),
 }
 
-#[derive(Clone, Debug, HashStable_Generic)]
+#[derive(Debug, HashStable_Generic)]
 pub struct AttributeLint<Id> {
+    pub lint_id: LintId,
     pub id: Id,
     pub span: Span,
     pub kind: AttributeLintKind,
-}
-
-#[derive(Clone, Debug, HashStable_Generic)]
-pub enum AttributeLintKind {
-    UnusedDuplicate { this: Span, other: Span, warning: bool },
-    IllFormedAttributeInput { suggestions: Vec<String> },
-    EmptyAttribute { first_span: Span },
-    InvalidTarget { name: AttrPath, target: Target, applied: Vec<String>, only: &'static str },
 }

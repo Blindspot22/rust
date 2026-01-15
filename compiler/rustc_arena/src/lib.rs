@@ -12,18 +12,12 @@
 #![allow(internal_features)]
 #![cfg_attr(test, feature(test))]
 #![deny(unsafe_op_in_unsafe_fn)]
-#![doc(
-    html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/",
-    test(no_crate_inject, attr(deny(warnings)))
-)]
-#![doc(rust_logo)]
+#![doc(test(no_crate_inject, attr(deny(warnings), allow(internal_features))))]
 #![feature(core_intrinsics)]
 #![feature(decl_macro)]
 #![feature(dropck_eyepatch)]
-#![feature(maybe_uninit_slice)]
 #![feature(never_type)]
 #![feature(rustc_attrs)]
-#![feature(rustdoc_internals)]
 #![feature(unwrap_infallible)]
 // tidy-alphabetical-end
 
@@ -624,7 +618,7 @@ impl DroplessArena {
 /// - Types that are `!Copy` and `Drop`: these must be specified in the
 ///   arguments. The `TypedArena` will be used for them.
 ///
-#[rustc_macro_transparency = "semitransparent"]
+#[rustc_macro_transparency = "semiopaque"]
 pub macro declare_arena([$($a:tt $name:ident: $ty:ty,)*]) {
     #[derive(Default)]
     pub struct Arena<'tcx> {

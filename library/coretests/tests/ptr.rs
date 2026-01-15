@@ -490,6 +490,14 @@ fn is_aligned() {
 }
 
 #[test]
+#[should_panic = "is_aligned_to: align is not a power-of-two"]
+fn invalid_is_aligned() {
+    let data = 42;
+    let ptr: *const i32 = &data;
+    assert!(ptr.is_aligned_to(3));
+}
+
+#[test]
 fn offset_from() {
     let mut a = [0; 5];
     let ptr1: *mut i32 = &mut a[1];
@@ -557,6 +565,7 @@ fn ptr_metadata() {
 
 #[test]
 fn ptr_metadata_bounds() {
+    #[allow(unknown_lints, function_casts_as_integer)]
     fn metadata_eq_method_address<T: ?Sized>() -> usize {
         // The `Metadata` associated type has an `Ord` bound, so this is valid:
         <<T as Pointee>::Metadata as PartialEq>::eq as usize

@@ -478,7 +478,6 @@ pub enum StatementKind {
     Assign(Place, Rvalue),
     FakeRead(FakeReadCause, Place),
     SetDiscriminant { place: Place, variant_index: VariantIdx },
-    Deinit(Place),
     StorageLive(Local),
     StorageDead(Local),
     Retag(RetagKind, Place),
@@ -588,9 +587,6 @@ pub enum Rvalue {
     /// nature of this operation?
     ThreadLocalRef(crate::CrateItem),
 
-    /// Computes a value as described by the operation.
-    NullaryOp(NullOp, Ty),
-
     /// Exactly like `BinaryOp`, but less operands.
     ///
     /// Also does two's-complement arithmetic. Negation requires a signed integer or a float;
@@ -642,11 +638,6 @@ impl Rvalue {
                     .discriminant_ty()
                     .ok_or_else(|| error!("Expected a `RigidTy` but found: {place_ty:?}"))
             }
-            Rvalue::NullaryOp(NullOp::SizeOf | NullOp::AlignOf | NullOp::OffsetOf(..), _) => {
-                Ok(Ty::usize_ty())
-            }
-            Rvalue::NullaryOp(NullOp::ContractChecks, _)
-            | Rvalue::NullaryOp(NullOp::UbChecks, _) => Ok(Ty::bool_ty()),
             Rvalue::Aggregate(ak, ops) => match *ak {
                 AggregateKind::Array(ty) => Ty::try_new_array(ty, ops.len() as u64),
                 AggregateKind::Tuple => Ok(Ty::new_tuple(
@@ -682,6 +673,7 @@ pub enum Operand {
     Copy(Place),
     Move(Place),
     Constant(ConstOperand),
+    RuntimeChecks(RuntimeChecks),
 }
 
 #[derive(Clone, Eq, PartialEq, Hash, Serialize)]
@@ -702,6 +694,16 @@ pub struct ConstOperand {
     pub span: Span,
     pub user_ty: Option<UserTypeAnnotationIndex>,
     pub const_: MirConst,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
+pub enum RuntimeChecks {
+    /// cfg!(ub_checks), but at codegen time
+    UbChecks,
+    /// cfg!(contract_checks), but at codegen time
+    ContractChecks,
+    /// cfg!(overflow_checks), but at codegen time
+    OverflowChecks,
 }
 
 /// Debug information pertaining to a user variable.
@@ -836,14 +838,6 @@ pub enum ProjectionElem {
     /// Like an explicit cast from an opaque type to a concrete type, but without
     /// requiring an intermediate variable.
     OpaqueCast(Ty),
-
-    /// A `Subtype(T)` projection is applied to any `StatementKind::Assign` where
-    /// type of lvalue doesn't match the type of rvalue, the primary goal is making subtyping
-    /// explicit during optimizations and codegen.
-    ///
-    /// This projection doesn't impact the runtime behavior of the program except for potentially changing
-    /// some type metadata of the interpreter or codegen backend.
-    Subtype(Ty),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -991,7 +985,7 @@ pub enum Safety {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize)]
 pub enum PointerCoercion {
     /// Go from a fn-item type to a fn-pointer type.
-    ReifyFnPointer,
+    ReifyFnPointer(Safety),
 
     /// Go from a safe fn pointer to an unsafe fn pointer.
     UnsafeFnPointer,
@@ -1028,20 +1022,7 @@ pub enum CastKind {
     PtrToPtr,
     FnPtrToPtr,
     Transmute,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize)]
-pub enum NullOp {
-    /// Returns the size of a value of that type.
-    SizeOf,
-    /// Returns the minimum alignment of a type.
-    AlignOf,
-    /// Returns the offset of a field.
-    OffsetOf(Vec<(VariantIdx, FieldIdx)>),
-    /// cfg!(ub_checks), but at codegen time
-    UbChecks,
-    /// cfg!(contract_checks), but at codegen time
-    ContractChecks,
+    Subtype,
 }
 
 impl Operand {
@@ -1055,6 +1036,7 @@ impl Operand {
         match self {
             Operand::Copy(place) | Operand::Move(place) => place.ty(locals),
             Operand::Constant(c) => Ok(c.ty()),
+            Operand::RuntimeChecks(_) => Ok(Ty::bool_ty()),
         }
     }
 }
@@ -1089,7 +1071,7 @@ impl ProjectionElem {
                 Self::subslice_ty(ty, *from, *to, *from_end)
             }
             ProjectionElem::Downcast(_) => Ok(ty),
-            ProjectionElem::OpaqueCast(ty) | ProjectionElem::Subtype(ty) => Ok(*ty),
+            ProjectionElem::OpaqueCast(ty) => Ok(*ty),
         }
     }
 

@@ -251,7 +251,7 @@ impl<'mir, 'tcx> Checker<'mir, 'tcx> {
                 let mut transient = DenseBitSet::new_filled(ccx.body.local_decls.len());
                 // Make sure to only visit reachable blocks, the dataflow engine can ICE otherwise.
                 for (bb, data) in traversal::reachable(&ccx.body) {
-                    if matches!(data.terminator().kind, TerminatorKind::Return) {
+                    if data.terminator().kind == TerminatorKind::Return {
                         let location = ccx.body.terminator_loc(bb);
                         maybe_storage_live.seek_after_primary_effect(location);
                         // If a local may be live here, it is definitely not transient.
@@ -415,7 +415,7 @@ impl<'mir, 'tcx> Checker<'mir, 'tcx> {
             )
         }));
 
-        let errors = ocx.select_all_or_error();
+        let errors = ocx.evaluate_obligations_error_on_ambiguity();
         if errors.is_empty() {
             Some(ConstConditionsHold::Yes)
         } else {
@@ -573,8 +573,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
             Rvalue::Use(_)
             | Rvalue::CopyForDeref(..)
             | Rvalue::Repeat(..)
-            | Rvalue::Discriminant(..)
-            | Rvalue::Len(_) => {}
+            | Rvalue::Discriminant(..) => {}
 
             Rvalue::Aggregate(kind, ..) => {
                 if let AggregateKind::Coroutine(def_id, ..) = kind.as_ref()
@@ -628,7 +627,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                     | PointerCoercion::ArrayToPointer
                     | PointerCoercion::UnsafeFnPointer
                     | PointerCoercion::ClosureFnPointer(_)
-                    | PointerCoercion::ReifyFnPointer,
+                    | PointerCoercion::ReifyFnPointer(_),
                     _,
                 ),
                 _,
@@ -646,14 +645,6 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
 
             Rvalue::Cast(_, _, _) => {}
 
-            Rvalue::NullaryOp(
-                NullOp::SizeOf
-                | NullOp::AlignOf
-                | NullOp::OffsetOf(_)
-                | NullOp::UbChecks
-                | NullOp::ContractChecks,
-                _,
-            ) => {}
             Rvalue::ShallowInitBox(_, _) => {}
 
             Rvalue::UnaryOp(op, operand) => {
@@ -733,7 +724,6 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
         match statement.kind {
             StatementKind::Assign(..)
             | StatementKind::SetDiscriminant { .. }
-            | StatementKind::Deinit(..)
             | StatementKind::FakeRead(..)
             | StatementKind::StorageLive(_)
             | StatementKind::StorageDead(_)
@@ -843,12 +833,13 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
 
                 // const-eval of `panic_display` assumes the argument is `&&str`
                 if tcx.is_lang_item(callee, LangItem::PanicDisplay) {
-                    match args[0].node.ty(&self.ccx.body.local_decls, tcx).kind() {
-                        ty::Ref(_, ty, _) if matches!(ty.kind(), ty::Ref(_, ty, _) if ty.is_str()) =>
-                            {}
-                        _ => {
-                            self.check_op(ops::PanicNonStr);
-                        }
+                    if let ty::Ref(_, ty, _) =
+                        args[0].node.ty(&self.ccx.body.local_decls, tcx).kind()
+                        && let ty::Ref(_, ty, _) = ty.kind()
+                        && ty.is_str()
+                    {
+                    } else {
+                        self.check_op(ops::PanicNonStr);
                     }
                     // Allow this call, skip all the checks below.
                     return;
@@ -895,6 +886,15 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                             feature,
                             ..
                         }) => {
+                            // We only honor `span.allows_unstable` aka `#[allow_internal_unstable]`
+                            // if the callee is safe to expose, to avoid bypassing recursive stability.
+                            // This is not ideal since it means the user sees an error, not the macro
+                            // author, but that's also the case if one forgets to set
+                            // `#[allow_internal_unstable]` in the first place.
+                            if self.span.allows_unstable(feature) && is_const_stable {
+                                return;
+                            }
+
                             self.check_op(ops::IntrinsicUnstable {
                                 name: intrinsic.name,
                                 feature,

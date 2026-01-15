@@ -26,8 +26,6 @@ Discussion happens in this Zulip stream:
 
 <https://rust-lang.zulipchat.com/#narrow/stream/185405-t-compiler.2Frust-analyzer>
 
-<!-- toc -->
-
 # Issue Labels
 
 * [good-first-issue](https://github.com/rust-lang/rust-analyzer/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22)
@@ -276,7 +274,7 @@ There are two sets of people with extra permissions:
   Feel free to request a review or assign any PR to a reviewer with the relevant expertise to bring the work to their attention.
   Don't feel pressured to review assigned PRs though.
   If you don't feel like reviewing for whatever reason, someone else will pick the review up (but please speak up if you don't feel like it)!
-* The [rust-lang](https://github.com/rust-lang) team [t-rust-analyzer-contributors]([https://github.com/orgs/rust-analyzer/teams/triage](https://github.com/rust-lang/team/blob/master/teams/rust-analyzer-contributors.toml)).
+* The [rust-lang](https://github.com/rust-lang) team [t-rust-analyzer-contributors](https://github.com/rust-lang/team/blob/master/teams/rust-analyzer-contributors.toml).
   This team has general triaging permissions allowing to label, close and re-open issues.
 
 ## Synchronizing subtree changes

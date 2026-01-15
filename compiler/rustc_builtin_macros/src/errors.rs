@@ -3,8 +3,28 @@ use rustc_errors::{
     Diag, DiagCtxtHandle, Diagnostic, EmissionGuarantee, Level, MultiSpan, SingleLabelManySpans,
     Subdiagnostic,
 };
-use rustc_macros::{Diagnostic, Subdiagnostic};
+use rustc_macros::{Diagnostic, LintDiagnostic, Subdiagnostic};
 use rustc_span::{Ident, Span, Symbol};
+
+#[derive(LintDiagnostic)]
+#[diag(builtin_macros_avoid_intel_syntax)]
+pub(crate) struct AvoidIntelSyntax;
+
+#[derive(LintDiagnostic)]
+#[diag(builtin_macros_avoid_att_syntax)]
+pub(crate) struct AvoidAttSyntax;
+
+#[derive(LintDiagnostic)]
+#[diag(builtin_macros_incomplete_include)]
+pub(crate) struct IncompleteInclude;
+
+#[derive(LintDiagnostic)]
+#[diag(builtin_macros_unnameable_test_items)]
+pub(crate) struct UnnameableTestItems;
+
+#[derive(LintDiagnostic)]
+#[diag(builtin_macros_duplicate_macro_attribute)]
+pub(crate) struct DuplicateMacroAttribute;
 
 #[derive(Diagnostic)]
 #[diag(builtin_macros_requires_cfg_pattern)]
@@ -191,17 +211,6 @@ mod autodiff {
     #[derive(Diagnostic)]
     #[diag(builtin_macros_autodiff)]
     pub(crate) struct AutoDiffInvalidApplication {
-        #[primary_span]
-        pub(crate) span: Span,
-    }
-}
-
-pub(crate) use ad_fallback::*;
-mod ad_fallback {
-    use super::*;
-    #[derive(Diagnostic)]
-    #[diag(builtin_macros_autodiff_not_build)]
-    pub(crate) struct AutoDiffSupportNotBuild {
         #[primary_span]
         pub(crate) span: Span,
     }
@@ -515,6 +524,14 @@ pub(crate) enum EnvNotDefined<'a> {
         var_expr: &'a rustc_ast::Expr,
     },
     #[diag(builtin_macros_env_not_defined)]
+    #[help(builtin_macros_cargo_typo)]
+    CargoEnvVarTypo {
+        #[primary_span]
+        span: Span,
+        var: Symbol,
+        suggested_var: Symbol,
+    },
+    #[diag(builtin_macros_env_not_defined)]
     #[help(builtin_macros_custom)]
     CustomEnvVar {
         #[primary_span]
@@ -625,6 +642,15 @@ pub(crate) enum InvalidFormatStringSuggestion {
         #[primary_span]
         span: Span,
         replacement: String,
+    },
+    #[suggestion(
+        builtin_macros_format_add_missing_colon,
+        code = ":?",
+        applicability = "machine-applicable"
+    )]
+    AddMissingColon {
+        #[primary_span]
+        span: Span,
     },
 }
 
@@ -932,7 +958,7 @@ pub(crate) struct AttributeOnlyUsableWithCrateType<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag(builtin_macros_source_uitls_expected_item)]
+#[diag(builtin_macros_source_utils_expected_item)]
 pub(crate) struct ExpectedItem<'a> {
     #[primary_span]
     pub span: Span,
@@ -981,4 +1007,62 @@ pub(crate) struct CfgSelectUnreachable {
 
     #[label]
     pub wildcard_span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(builtin_macros_eii_declaration_expected_macro)]
+pub(crate) struct EiiExternTargetExpectedMacro {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(builtin_macros_eii_declaration_expected_list)]
+pub(crate) struct EiiExternTargetExpectedList {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(builtin_macros_eii_declaration_expected_unsafe)]
+pub(crate) struct EiiExternTargetExpectedUnsafe {
+    #[primary_span]
+    #[note]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(builtin_macros_eii_shared_macro_expected_function)]
+pub(crate) struct EiiSharedMacroExpectedFunction {
+    #[primary_span]
+    pub span: Span,
+    pub name: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(builtin_macros_eii_shared_macro_in_statement_position)]
+pub(crate) struct EiiSharedMacroInStatementPosition {
+    #[primary_span]
+    pub span: Span,
+    pub name: String,
+    #[label]
+    pub item_span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(builtin_macros_eii_only_once)]
+pub(crate) struct EiiOnlyOnce {
+    #[primary_span]
+    pub span: Span,
+    #[note]
+    pub first_span: Span,
+    pub name: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(builtin_macros_eii_shared_macro_expected_max_one_argument)]
+pub(crate) struct EiiMacroExpectedMaxOneArgument {
+    #[primary_span]
+    pub span: Span,
+    pub name: String,
 }

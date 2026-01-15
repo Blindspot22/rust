@@ -13,10 +13,10 @@ use rustc_hir::LangItem;
 use rustc_hir::def::{self, CtorKind, DefKind, Namespace};
 use rustc_hir::def_id::{DefIdMap, DefIdSet, LOCAL_CRATE, ModDefId};
 use rustc_hir::definitions::{DefKey, DefPathDataName};
+use rustc_hir::limit::Limit;
 use rustc_macros::{Lift, extension};
-use rustc_session::Limit;
 use rustc_session::cstore::{ExternCrate, ExternCrateSource};
-use rustc_span::{FileNameDisplayPreference, Ident, Symbol, kw, sym};
+use rustc_span::{Ident, RemapPathScopeComponents, Symbol, kw, sym};
 use rustc_type_ir::{Upcast as _, elaborate};
 use smallvec::SmallVec;
 
@@ -31,6 +31,7 @@ use crate::ty::{
 
 thread_local! {
     static FORCE_IMPL_FILENAME_LINE: Cell<bool> = const { Cell::new(false) };
+    static SHOULD_PREFIX_WITH_CRATE_NAME: Cell<bool> = const { Cell::new(false) };
     static SHOULD_PREFIX_WITH_CRATE: Cell<bool> = const { Cell::new(false) };
     static NO_TRIMMED_PATH: Cell<bool> = const { Cell::new(false) };
     static FORCE_TRIMMED_PATH: Cell<bool> = const { Cell::new(false) };
@@ -98,7 +99,18 @@ define_helper!(
     /// cycle errors, this can result in extra or suboptimal error output,
     /// so this variable disables that check.
     fn with_forced_impl_filename_line(ForcedImplGuard, FORCE_IMPL_FILENAME_LINE);
+    /// Adds the crate name prefix to paths where appropriate.
+    /// Unlike `with_crate_prefix`, this unconditionally uses `tcx.crate_name` instead of sometimes
+    /// using `crate::` for local items.
+    ///
+    /// Overrides `with_crate_prefix`.
+
+    // This function is used by `rustc_public` and downstream rustc-driver in
+    // Ferrocene. Please check with them before removing it.
+    fn with_resolve_crate_name(CrateNamePrefixGuard, SHOULD_PREFIX_WITH_CRATE_NAME);
     /// Adds the `crate::` prefix to paths where appropriate.
+    ///
+    /// Ignored if `with_resolve_crate_name` is active.
     fn with_crate_prefix(CratePrefixGuard, SHOULD_PREFIX_WITH_CRATE);
     /// Prevent path trimming if it is turned on. Path trimming affects `Display` impl
     /// of various rustc types, for example `std::vec::Vec` would be trimmed to `Vec`,
@@ -784,14 +796,12 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
                 },
             },
             ty::Adt(def, args) => self.print_def_path(def.did(), args)?,
-            ty::Dynamic(data, r, repr) => {
+            ty::Dynamic(data, r) => {
                 let print_r = self.should_print_optional_region(r);
                 if print_r {
                     write!(self, "(")?;
                 }
-                match repr {
-                    ty::Dyn => write!(self, "dyn ")?,
-                }
+                write!(self, "dyn ")?;
                 data.print(self)?;
                 if print_r {
                     write!(self, " + ")?;
@@ -880,7 +890,7 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
                             "@{}",
                             // This may end up in stderr diagnostics but it may also be emitted
                             // into MIR. Hence we use the remapped path if available
-                            self.tcx().sess.source_map().span_to_embeddable_string(span)
+                            self.tcx().sess.source_map().span_to_diagnostic_string(span)
                         )?;
                     } else {
                         write!(self, "@")?;
@@ -911,7 +921,7 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
                             "@{}",
                             // This may end up in stderr diagnostics but it may also be emitted
                             // into MIR. Hence we use the remapped path if available
-                            self.tcx().sess.source_map().span_to_embeddable_string(span)
+                            self.tcx().sess.source_map().span_to_diagnostic_string(span)
                         )?;
                     } else {
                         write!(self, "@")?;
@@ -937,10 +947,13 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
                                 self.print_def_path(did.to_def_id(), args)?;
                             } else {
                                 let span = self.tcx().def_span(did);
-                                let preference = if with_forced_trimmed_paths() {
-                                    FileNameDisplayPreference::Short
+                                let loc = if with_forced_trimmed_paths() {
+                                    self.tcx().sess.source_map().span_to_short_string(
+                                        span,
+                                        RemapPathScopeComponents::DIAGNOSTICS,
+                                    )
                                 } else {
-                                    FileNameDisplayPreference::Remapped
+                                    self.tcx().sess.source_map().span_to_diagnostic_string(span)
                                 };
                                 write!(
                                     self,
@@ -948,7 +961,7 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
                                     // This may end up in stderr diagnostics but it may also be
                                     // emitted into MIR. Hence we use the remapped path if
                                     // available
-                                    self.tcx().sess.source_map().span_to_string(span, preference)
+                                    loc
                                 )?;
                             }
                         } else {
@@ -994,18 +1007,17 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
                             self.print_def_path(did.to_def_id(), args)?;
                         } else {
                             let span = self.tcx().def_span(did);
-                            let preference = if with_forced_trimmed_paths() {
-                                FileNameDisplayPreference::Short
+                            // This may end up in stderr diagnostics but it may also be emitted
+                            // into MIR. Hence we use the remapped path if available
+                            let loc = if with_forced_trimmed_paths() {
+                                self.tcx().sess.source_map().span_to_short_string(
+                                    span,
+                                    RemapPathScopeComponents::DIAGNOSTICS,
+                                )
                             } else {
-                                FileNameDisplayPreference::Remapped
+                                self.tcx().sess.source_map().span_to_diagnostic_string(span)
                             };
-                            write!(
-                                self,
-                                "@{}",
-                                // This may end up in stderr diagnostics but it may also be emitted
-                                // into MIR. Hence we use the remapped path if available
-                                self.tcx().sess.source_map().span_to_string(span, preference)
-                            )?;
+                            write!(self, "@{loc}")?;
                         }
                     } else {
                         write!(self, "@")?;
@@ -1436,8 +1448,8 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
                                 // anonymized regions, but the super projections can still
                                 // contain named regions. So we erase and anonymize everything
                                 // here to compare the types modulo regions below.
-                                let proj = p.tcx().erase_regions(proj);
-                                let super_proj = p.tcx().erase_regions(super_proj);
+                                let proj = p.tcx().erase_and_anonymize_regions(proj);
+                                let super_proj = p.tcx().erase_and_anonymize_regions(super_proj);
 
                                 proj == super_proj
                             });
@@ -1907,66 +1919,65 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
                 self.pretty_print_byte_str(bytes)?;
                 return Ok(());
             }
-            // Aggregates, printed as array/tuple/struct/variant construction syntax.
-            (ty::ValTreeKind::Branch(_), ty::Array(..) | ty::Tuple(..) | ty::Adt(..)) => {
-                let contents = self.tcx().destructure_const(ty::Const::new_value(
-                    self.tcx(),
-                    cv.valtree,
-                    cv.ty,
-                ));
-                let fields = contents.fields.iter().copied();
+            (ty::ValTreeKind::Branch(fields), ty::Array(..) | ty::Tuple(..)) => {
+                let fields_iter = fields.iter().copied();
+
                 match *cv.ty.kind() {
                     ty::Array(..) => {
                         write!(self, "[")?;
-                        self.comma_sep(fields)?;
+                        self.comma_sep(fields_iter)?;
                         write!(self, "]")?;
                     }
                     ty::Tuple(..) => {
                         write!(self, "(")?;
-                        self.comma_sep(fields)?;
-                        if contents.fields.len() == 1 {
+                        self.comma_sep(fields_iter)?;
+                        if fields.len() == 1 {
                             write!(self, ",")?;
                         }
                         write!(self, ")")?;
                     }
-                    ty::Adt(def, _) if def.variants().is_empty() => {
-                        self.typed_value(
-                            |this| {
-                                write!(this, "unreachable()")?;
-                                Ok(())
-                            },
-                            |this| this.print_type(cv.ty),
-                            ": ",
-                        )?;
-                    }
-                    ty::Adt(def, args) => {
-                        let variant_idx =
-                            contents.variant.expect("destructed const of adt without variant idx");
-                        let variant_def = &def.variant(variant_idx);
-                        self.pretty_print_value_path(variant_def.def_id, args)?;
-                        match variant_def.ctor_kind() {
-                            Some(CtorKind::Const) => {}
-                            Some(CtorKind::Fn) => {
-                                write!(self, "(")?;
-                                self.comma_sep(fields)?;
-                                write!(self, ")")?;
-                            }
-                            None => {
-                                write!(self, " {{ ")?;
-                                let mut first = true;
-                                for (field_def, field) in iter::zip(&variant_def.fields, fields) {
-                                    if !first {
-                                        write!(self, ", ")?;
-                                    }
-                                    write!(self, "{}: ", field_def.name)?;
-                                    field.print(self)?;
-                                    first = false;
+                    _ => unreachable!(),
+                }
+                return Ok(());
+            }
+            (ty::ValTreeKind::Branch(_), ty::Adt(def, args)) => {
+                let contents = cv.destructure_adt_const();
+                let fields = contents.fields.iter().copied();
+
+                if def.variants().is_empty() {
+                    self.typed_value(
+                        |this| {
+                            write!(this, "unreachable()")?;
+                            Ok(())
+                        },
+                        |this| this.print_type(cv.ty),
+                        ": ",
+                    )?;
+                } else {
+                    let variant_idx = contents.variant;
+                    let variant_def = &def.variant(variant_idx);
+                    self.pretty_print_value_path(variant_def.def_id, args)?;
+                    match variant_def.ctor_kind() {
+                        Some(CtorKind::Const) => {}
+                        Some(CtorKind::Fn) => {
+                            write!(self, "(")?;
+                            self.comma_sep(fields)?;
+                            write!(self, ")")?;
+                        }
+                        None => {
+                            write!(self, " {{ ")?;
+                            let mut first = true;
+                            for (field_def, field) in iter::zip(&variant_def.fields, fields) {
+                                if !first {
+                                    write!(self, ", ")?;
                                 }
-                                write!(self, " }}")?;
+                                write!(self, "{}: ", field_def.name)?;
+                                field.print(self)?;
+                                first = false;
                             }
+                            write!(self, " }}")?;
                         }
                     }
-                    _ => unreachable!(),
                 }
                 return Ok(());
             }
@@ -2146,6 +2157,7 @@ fn guess_def_namespace(tcx: TyCtxt<'_>, def_id: DefId) -> Namespace {
 
         DefPathData::ValueNs(..)
         | DefPathData::AnonConst
+        | DefPathData::LateAnonConst
         | DefPathData::Closure
         | DefPathData::Ctor => Namespace::ValueNS,
 
@@ -2247,7 +2259,7 @@ impl<'tcx> Printer<'tcx> for FmtPrinter<'_, 'tcx> {
                     "<impl at {}>",
                     // This may end up in stderr diagnostics but it may also be emitted
                     // into MIR. Hence we use the remapped path if available
-                    self.tcx.sess.source_map().span_to_embeddable_string(span)
+                    self.tcx.sess.source_map().span_to_diagnostic_string(span)
                 )?;
                 self.empty_path = false;
 
@@ -2315,7 +2327,7 @@ impl<'tcx> Printer<'tcx> for FmtPrinter<'_, 'tcx> {
 
     fn print_crate_name(&mut self, cnum: CrateNum) -> Result<(), PrintError> {
         self.empty_path = true;
-        if cnum == LOCAL_CRATE {
+        if cnum == LOCAL_CRATE && !with_resolve_crate_name() {
             if self.tcx.sess.at_least_rust_2018() {
                 // We add the `crate::` keyword on Rust 2018, only when desired.
                 if with_crate_prefix() {
@@ -2666,7 +2678,7 @@ impl<'a, 'tcx> ty::TypeFolder<TyCtxt<'tcx>> for RegionFolder<'a, 'tcx> {
     fn fold_region(&mut self, r: ty::Region<'tcx>) -> ty::Region<'tcx> {
         let name = &mut self.name;
         let region = match r.kind() {
-            ty::ReBound(db, br) if db >= self.current_index => {
+            ty::ReBound(ty::BoundVarIndexKind::Bound(db), br) if db >= self.current_index => {
                 *self.region_map.entry(br).or_insert_with(|| name(Some(db), self.current_index, br))
             }
             ty::RePlaceholder(ty::PlaceholderRegion {
@@ -2689,7 +2701,7 @@ impl<'a, 'tcx> ty::TypeFolder<TyCtxt<'tcx>> for RegionFolder<'a, 'tcx> {
             }
             _ => return r,
         };
-        if let ty::ReBound(debruijn1, br) = region.kind() {
+        if let ty::ReBound(ty::BoundVarIndexKind::Bound(debruijn1), br) = region.kind() {
             assert_eq!(debruijn1, ty::INNERMOST);
             ty::Region::new_bound(self.tcx, self.current_index, br)
         } else {
@@ -3179,8 +3191,7 @@ define_print! {
                 write!(p, "` can be evaluated")?;
             }
             ty::ClauseKind::UnstableFeature(symbol) => {
-                write!(p, "unstable feature: ")?;
-                write!(p, "`{symbol}`")?;
+                write!(p, "feature({symbol}) is enabled")?;
             }
         }
     }
@@ -3264,6 +3275,16 @@ define_print! {
         p.reset_type_limit();
         self.term.print(p)?;
     }
+
+    ty::PlaceholderType<'tcx> {
+        match self.bound.kind {
+            ty::BoundTyKind::Anon => write!(p, "{self:?}")?,
+            ty::BoundTyKind::Param(def_id) => match p.should_print_verbose() {
+                true => write!(p, "{self:?}")?,
+                false => write!(p, "{}", p.tcx().item_name(def_id))?,
+            },
+        }
+    }
 }
 
 define_print_and_forward_display! {
@@ -3328,16 +3349,6 @@ define_print_and_forward_display! {
         write!(p, "{}", self.name)?;
     }
 
-    ty::PlaceholderType {
-        match self.bound.kind {
-            ty::BoundTyKind::Anon => write!(p, "{self:?}")?,
-            ty::BoundTyKind::Param(def_id) => match p.should_print_verbose() {
-                true => write!(p, "{self:?}")?,
-                false => write!(p, "{}", p.tcx().item_name(def_id))?,
-            },
-        }
-    }
-
     ty::ParamConst {
         write!(p, "{}", self.name)?;
     }
@@ -3369,7 +3380,7 @@ define_print_and_forward_display! {
 fn for_each_def(tcx: TyCtxt<'_>, mut collect_fn: impl for<'b> FnMut(&'b Ident, Namespace, DefId)) {
     // Iterate all (non-anonymous) local crate items no matter where they are defined.
     for id in tcx.hir_free_items() {
-        if matches!(tcx.def_kind(id.owner_id), DefKind::Use) {
+        if tcx.def_kind(id.owner_id) == DefKind::Use {
             continue;
         }
 

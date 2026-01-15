@@ -57,12 +57,14 @@ pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
     where
         V: TypeFoldable<Self::Interner>;
 
-    fn instantiate_canonical_var_with_infer(
+    fn instantiate_canonical_var(
         &self,
         kind: ty::CanonicalVarKind<Self::Interner>,
         span: <Self::Interner as Interner>::Span,
+        var_values: &[<Self::Interner as Interner>::GenericArg],
         universe_map: impl Fn(ty::UniverseIndex) -> ty::UniverseIndex,
     ) -> <Self::Interner as Interner>::GenericArg;
+
     fn add_item_bounds_for_hidden_type(
         &self,
         def_id: <Self::Interner as Interner>::DefId,
@@ -76,7 +78,7 @@ pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
         &self,
         goal_trait_ref: ty::TraitRef<Self::Interner>,
         trait_assoc_def_id: <Self::Interner as Interner>::DefId,
-        impl_def_id: <Self::Interner as Interner>::DefId,
+        impl_def_id: <Self::Interner as Interner>::ImplId,
     ) -> Result<
         Option<<Self::Interner as Interner>::DefId>,
         <Self::Interner as Interner>::ErrorGuaranteed,
@@ -84,8 +86,8 @@ pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
 
     fn is_transmutable(
         &self,
-        dst: <Self::Interner as Interner>::Ty,
         src: <Self::Interner as Interner>::Ty,
+        dst: <Self::Interner as Interner>::Ty,
         assume: <Self::Interner as Interner>::Const,
     ) -> Result<Certainty, NoSolution>;
 }

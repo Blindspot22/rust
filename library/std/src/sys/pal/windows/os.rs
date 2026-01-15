@@ -8,73 +8,12 @@ mod tests;
 use super::api;
 #[cfg(not(target_vendor = "uwp"))]
 use super::api::WinError;
-use crate::error::Error as StdError;
 use crate::ffi::{OsStr, OsString};
 use crate::os::windows::ffi::EncodeWide;
 use crate::os::windows::prelude::*;
 use crate::path::{self, PathBuf};
 use crate::sys::pal::{c, cvt};
 use crate::{fmt, io, ptr};
-
-pub fn errno() -> i32 {
-    api::get_last_error().code as i32
-}
-
-/// Gets a detailed string description for the given error number.
-pub fn error_string(mut errnum: i32) -> String {
-    let mut buf = [0 as c::WCHAR; 2048];
-
-    unsafe {
-        let mut module = ptr::null_mut();
-        let mut flags = 0;
-
-        // NTSTATUS errors may be encoded as HRESULT, which may returned from
-        // GetLastError. For more information about Windows error codes, see
-        // `[MS-ERREF]`: https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-erref/0642cb2f-2075-4469-918c-4441e69c548a
-        if (errnum & c::FACILITY_NT_BIT as i32) != 0 {
-            // format according to https://support.microsoft.com/en-us/help/259693
-            const NTDLL_DLL: &[u16] = &[
-                'N' as _, 'T' as _, 'D' as _, 'L' as _, 'L' as _, '.' as _, 'D' as _, 'L' as _,
-                'L' as _, 0,
-            ];
-            module = c::GetModuleHandleW(NTDLL_DLL.as_ptr());
-
-            if !module.is_null() {
-                errnum ^= c::FACILITY_NT_BIT as i32;
-                flags = c::FORMAT_MESSAGE_FROM_HMODULE;
-            }
-        }
-
-        let res = c::FormatMessageW(
-            flags | c::FORMAT_MESSAGE_FROM_SYSTEM | c::FORMAT_MESSAGE_IGNORE_INSERTS,
-            module,
-            errnum as u32,
-            0,
-            buf.as_mut_ptr(),
-            buf.len() as u32,
-            ptr::null(),
-        ) as usize;
-        if res == 0 {
-            // Sometimes FormatMessageW can fail e.g., system doesn't like 0 as langId,
-            let fm_err = errno();
-            return format!("OS Error {errnum} (FormatMessageW() returned error {fm_err})");
-        }
-
-        match String::from_utf16(&buf[..res]) {
-            Ok(mut msg) => {
-                // Trim trailing CRLF inserted by FormatMessageW
-                let len = msg.trim_end().len();
-                msg.truncate(len);
-                msg
-            }
-            Err(..) => format!(
-                "OS Error {} (FormatMessageW() returned \
-                 invalid UTF-16)",
-                errnum
-            ),
-        }
-    }
-}
 
 pub struct SplitPaths<'a> {
     data: EncodeWide<'a>,
@@ -162,12 +101,7 @@ impl fmt::Display for JoinPathsError {
     }
 }
 
-impl StdError for JoinPathsError {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        "failed to join paths"
-    }
-}
+impl crate::error::Error for JoinPathsError {}
 
 pub fn current_exe() -> io::Result<PathBuf> {
     super::fill_utf16_buf(

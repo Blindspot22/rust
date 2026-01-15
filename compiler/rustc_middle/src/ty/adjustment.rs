@@ -9,8 +9,9 @@ use crate::ty::{Ty, TyCtxt};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, TyEncodable, TyDecodable, Hash, HashStable)]
 pub enum PointerCoercion {
-    /// Go from a fn-item type to a fn-pointer type.
-    ReifyFnPointer,
+    /// Go from a fn-item type to a fn pointer or an unsafe fn pointer.
+    /// It cannot convert an unsafe fn-item to a safe fn pointer.
+    ReifyFnPointer(hir::Safety),
 
     /// Go from a safe fn pointer to an unsafe fn pointer.
     UnsafeFnPointer,
@@ -232,4 +233,7 @@ pub enum PatAdjust {
     /// An implicit call to `Deref(Mut)::deref(_mut)` before matching, such as when matching the
     /// pattern `[..]` against a scrutinee of type `Vec<T>`.
     OverloadedDeref,
+    /// An implicit dereference before matching a `&pin` reference (under feature `pin_ergonomics`),
+    /// which will be lowered as a builtin deref of the private field `__pointer` in `Pin`
+    PinDeref,
 }

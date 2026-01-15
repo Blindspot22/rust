@@ -2,9 +2,10 @@ use std::iter;
 
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_errors::ErrorGuaranteed;
-use rustc_hir as hir;
+use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
+use rustc_hir::{self as hir, find_attr};
 use rustc_macros::{Decodable, Encodable, HashStable};
 use tracing::debug;
 
@@ -239,6 +240,12 @@ pub(super) fn trait_impls_of_provider(tcx: TyCtxt<'_>, trait_id: DefId) -> Trait
 
 /// Query provider for `incoherent_impls`.
 pub(super) fn incoherent_impls_provider(tcx: TyCtxt<'_>, simp: SimplifiedType) -> &[DefId] {
+    if let Some(def_id) = simp.def()
+        && !find_attr!(tcx.get_all_attrs(def_id), AttributeKind::RustcHasIncoherentInherentImpls)
+    {
+        return &[];
+    }
+
     let mut impls = Vec::new();
     for cnum in iter::once(LOCAL_CRATE).chain(tcx.crates(()).iter().copied()) {
         for &impl_def_id in tcx.crate_incoherent_impls((cnum, simp)) {
@@ -264,9 +271,7 @@ pub(super) fn traits_provider(tcx: TyCtxt<'_>, _: LocalCrate) -> &[DefId] {
 pub(super) fn trait_impls_in_crate_provider(tcx: TyCtxt<'_>, _: LocalCrate) -> &[DefId] {
     let mut trait_impls = Vec::new();
     for id in tcx.hir_free_items() {
-        if matches!(tcx.def_kind(id.owner_id), DefKind::Impl { .. })
-            && tcx.impl_trait_ref(id.owner_id).is_some()
-        {
+        if tcx.def_kind(id.owner_id) == (DefKind::Impl { of_trait: true }) {
             trait_impls.push(id.owner_id.to_def_id())
         }
     }

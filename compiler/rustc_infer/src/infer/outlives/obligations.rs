@@ -170,6 +170,10 @@ impl<'tcx> InferCtxt<'tcx> {
         std::mem::take(&mut self.inner.borrow_mut().region_obligations)
     }
 
+    pub fn clone_registered_region_obligations(&self) -> Vec<TypeOutlivesConstraint<'tcx>> {
+        self.inner.borrow().region_obligations.clone()
+    }
+
     pub fn register_region_assumption(&self, assumption: ty::ArgOutlivesPredicate<'tcx>) {
         let mut inner = self.inner.borrow_mut();
         inner.undo_log.push(UndoLog::PushRegionAssumption);
@@ -390,7 +394,7 @@ where
         &mut self,
         origin: infer::SubregionOrigin<'tcx>,
         region: ty::Region<'tcx>,
-        placeholder_ty: ty::PlaceholderType,
+        placeholder_ty: ty::PlaceholderType<'tcx>,
     ) {
         let verify_bound = self
             .verify_bound

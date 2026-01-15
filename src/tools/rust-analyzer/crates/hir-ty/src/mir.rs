@@ -2,18 +2,7 @@
 
 use std::{collections::hash_map::Entry, fmt::Display, iter};
 
-use crate::{
-    CallableDefId, ClosureId, Const, ConstScalar, InferenceResult, Interner, MemoryMap,
-    Substitution, TraitEnvironment, Ty, TyExt, TyKind,
-    consteval::usize_const,
-    db::HirDatabase,
-    display::{DisplayTarget, HirDisplay},
-    infer::{PointerCast, normalize},
-    lang_items::is_box,
-    mapping::ToChalk,
-};
 use base_db::Crate;
-use chalk_ir::Mutability;
 use either::Either;
 use hir_def::{
     DefWithBodyId, FieldId, StaticId, TupleFieldId, UnionId, VariantId,
@@ -21,6 +10,25 @@ use hir_def::{
     hir::{BindingAnnotation, BindingId, Expr, ExprId, Ordering, PatId},
 };
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
+use rustc_ast_ir::Mutability;
+use rustc_hash::FxHashMap;
+use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, Ty as _};
+use smallvec::{SmallVec, smallvec};
+use stdx::{impl_from, never};
+
+use crate::{
+    CallableDefId, InferenceResult, MemoryMap,
+    consteval::usize_const,
+    db::{HirDatabase, InternedClosureId},
+    display::{DisplayTarget, HirDisplay},
+    infer::PointerCast,
+    next_solver::{
+        Const, DbInterner, ErrorGuaranteed, GenericArgs, ParamEnv, StoredConst, StoredGenericArgs,
+        StoredTy, Ty, TyKind,
+        infer::{InferCtxt, traits::ObligationCause},
+        obligation_ctxt::ObligationCtxt,
+    },
+};
 
 mod borrowck;
 mod eval;
@@ -34,17 +42,13 @@ pub use eval::{
 };
 pub use lower::{MirLowerError, lower_to_mir, mir_body_for_closure_query, mir_body_query};
 pub use monomorphization::{
-    monomorphize_mir_body_bad, monomorphized_mir_body_for_closure_query,
-    monomorphized_mir_body_query,
+    monomorphized_mir_body_for_closure_query, monomorphized_mir_body_query,
 };
-use rustc_hash::FxHashMap;
-use smallvec::{SmallVec, smallvec};
-use stdx::{impl_from, never};
 
 pub(crate) use lower::mir_body_cycle_result;
 pub(crate) use monomorphization::monomorphized_mir_body_cycle_result;
 
-use super::consteval::{intern_const_scalar, try_const_usize};
+use super::consteval::try_const_usize;
 
 pub type BasicBlockId = Idx<BasicBlock>;
 pub type LocalId = Idx<Local>;
@@ -55,7 +59,7 @@ fn return_slot() -> LocalId {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Local {
-    pub ty: Ty,
+    pub ty: StoredTy,
 }
 
 /// An operand in MIR represents a "value" in Rust, the definition of which is undecided and part of
@@ -100,45 +104,45 @@ pub enum OperandKind {
     /// [UCG#188]: https://github.com/rust-lang/unsafe-code-guidelines/issues/188
     Move(Place),
     /// Constants are already semantically values, and remain unchanged.
-    Constant(Const),
+    Constant { konst: StoredConst, ty: StoredTy },
     /// NON STANDARD: This kind of operand returns an immutable reference to that static memory. Rustc
     /// handles it with the `Constant` variant somehow.
     Static(StaticId),
 }
 
-impl Operand {
-    fn from_concrete_const(data: Box<[u8]>, memory_map: MemoryMap, ty: Ty) -> Self {
+impl<'db> Operand {
+    fn from_concrete_const(data: Box<[u8]>, memory_map: MemoryMap<'db>, ty: Ty<'db>) -> Self {
+        let interner = DbInterner::conjure();
         Operand {
-            kind: OperandKind::Constant(intern_const_scalar(
-                ConstScalar::Bytes(data, memory_map),
-                ty,
-            )),
+            kind: OperandKind::Constant {
+                konst: Const::new_valtree(interner, ty, data, memory_map).store(),
+                ty: ty.store(),
+            },
             span: None,
         }
     }
 
-    fn from_bytes(data: Box<[u8]>, ty: Ty) -> Self {
+    fn from_bytes(data: Box<[u8]>, ty: Ty<'db>) -> Self {
         Operand::from_concrete_const(data, MemoryMap::default(), ty)
     }
 
-    fn const_zst(ty: Ty) -> Operand {
+    fn const_zst(ty: Ty<'db>) -> Operand {
         Self::from_bytes(Box::default(), ty)
     }
 
     fn from_fn(
-        db: &dyn HirDatabase,
+        db: &'db dyn HirDatabase,
         func_id: hir_def::FunctionId,
-        generic_args: Substitution,
+        generic_args: GenericArgs<'db>,
     ) -> Operand {
-        let ty =
-            chalk_ir::TyKind::FnDef(CallableDefId::FunctionId(func_id).to_chalk(db), generic_args)
-                .intern(Interner);
+        let interner = DbInterner::new_no_crate(db);
+        let ty = Ty::new_fn_def(interner, CallableDefId::FunctionId(func_id).into(), generic_args);
         Operand::from_bytes(Box::default(), ty)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ProjectionElem<V, T> {
+pub enum ProjectionElem<V: PartialEq> {
     Deref,
     Field(Either<FieldId, TupleFieldId>),
     // FIXME: get rid of this, and use FieldId for tuples and closures
@@ -147,87 +151,84 @@ pub enum ProjectionElem<V, T> {
     ConstantIndex { offset: u64, from_end: bool },
     Subslice { from: u64, to: u64 },
     //Downcast(Option<Symbol>, VariantIdx),
-    OpaqueCast(T),
+    OpaqueCast(StoredTy),
 }
 
-impl<V, T> ProjectionElem<V, T> {
-    pub fn projected_ty(
+impl<V: PartialEq> ProjectionElem<V> {
+    pub fn projected_ty<'db>(
         &self,
-        mut base: Ty,
-        db: &dyn HirDatabase,
-        closure_field: impl FnOnce(ClosureId, &Substitution, usize) -> Ty,
+        infcx: &InferCtxt<'db>,
+        env: ParamEnv<'db>,
+        mut base: Ty<'db>,
+        closure_field: impl FnOnce(InternedClosureId, GenericArgs<'db>, usize) -> Ty<'db>,
         krate: Crate,
-    ) -> Ty {
+    ) -> Ty<'db> {
+        let interner = infcx.interner;
+        let db = interner.db;
+
         // we only bail on mir building when there are type mismatches
         // but error types may pop up resulting in us still attempting to build the mir
         // so just propagate the error type
-        if base.is_unknown() {
-            return TyKind::Error.intern(Interner);
+        if base.is_ty_error() {
+            return Ty::new_error(interner, ErrorGuaranteed);
         }
 
-        if matches!(base.kind(Interner), TyKind::Alias(_) | TyKind::AssociatedType(..)) {
-            base = normalize(
-                db,
-                // FIXME: we should get this from caller
-                TraitEnvironment::empty(krate),
-                base,
-            );
+        if matches!(base.kind(), TyKind::Alias(..)) {
+            let mut ocx = ObligationCtxt::new(infcx);
+            match ocx.structurally_normalize_ty(&ObligationCause::dummy(), env, base) {
+                Ok(it) => base = it,
+                Err(_) => return Ty::new_error(interner, ErrorGuaranteed),
+            }
         }
+
         match self {
-            ProjectionElem::Deref => match &base.kind(Interner) {
-                TyKind::Raw(_, inner) | TyKind::Ref(_, _, inner) => inner.clone(),
-                TyKind::Adt(adt, subst) if is_box(db, adt.0) => {
-                    subst.at(Interner, 0).assert_ty_ref(Interner).clone()
-                }
+            ProjectionElem::Deref => match base.kind() {
+                TyKind::RawPtr(inner, _) | TyKind::Ref(_, inner, _) => inner,
+                TyKind::Adt(adt_def, subst) if adt_def.is_box() => subst.type_at(0),
                 _ => {
                     never!(
                         "Overloaded deref on type {} is not a projection",
                         base.display(db, DisplayTarget::from_crate(db, krate))
                     );
-                    TyKind::Error.intern(Interner)
+                    Ty::new_error(interner, ErrorGuaranteed)
                 }
             },
-            ProjectionElem::Field(Either::Left(f)) => match base.kind(Interner) {
+            ProjectionElem::Field(Either::Left(f)) => match base.kind() {
                 TyKind::Adt(_, subst) => {
-                    db.field_types(f.parent)[f.local_id].clone().substitute(Interner, subst)
+                    db.field_types(f.parent)[f.local_id].get().instantiate(interner, subst)
                 }
                 ty => {
                     never!("Only adt has field, found {:?}", ty);
-                    TyKind::Error.intern(Interner)
+                    Ty::new_error(interner, ErrorGuaranteed)
                 }
             },
-            ProjectionElem::Field(Either::Right(f)) => match &base.kind(Interner) {
-                TyKind::Tuple(_, subst) => subst
-                    .as_slice(Interner)
-                    .get(f.index as usize)
-                    .map(|x| x.assert_ty_ref(Interner))
-                    .cloned()
-                    .unwrap_or_else(|| {
+            ProjectionElem::Field(Either::Right(f)) => match base.kind() {
+                TyKind::Tuple(subst) => {
+                    subst.as_slice().get(f.index as usize).copied().unwrap_or_else(|| {
                         never!("Out of bound tuple field");
-                        TyKind::Error.intern(Interner)
-                    }),
+                        Ty::new_error(interner, ErrorGuaranteed)
+                    })
+                }
                 ty => {
                     never!("Only tuple has tuple field: {:?}", ty);
-                    TyKind::Error.intern(Interner)
+                    Ty::new_error(interner, ErrorGuaranteed)
                 }
             },
-            ProjectionElem::ClosureField(f) => match &base.kind(Interner) {
-                TyKind::Closure(id, subst) => closure_field(*id, subst, *f),
+            ProjectionElem::ClosureField(f) => match base.kind() {
+                TyKind::Closure(id, subst) => closure_field(id.0, subst, *f),
                 _ => {
                     never!("Only closure has closure field");
-                    TyKind::Error.intern(Interner)
+                    Ty::new_error(interner, ErrorGuaranteed)
                 }
             },
-            ProjectionElem::ConstantIndex { .. } | ProjectionElem::Index(_) => {
-                match &base.kind(Interner) {
-                    TyKind::Array(inner, _) | TyKind::Slice(inner) => inner.clone(),
-                    _ => {
-                        never!("Overloaded index is not a projection");
-                        TyKind::Error.intern(Interner)
-                    }
+            ProjectionElem::ConstantIndex { .. } | ProjectionElem::Index(_) => match base.kind() {
+                TyKind::Array(inner, _) | TyKind::Slice(inner) => inner,
+                _ => {
+                    never!("Overloaded index is not a projection");
+                    Ty::new_error(interner, ErrorGuaranteed)
                 }
-            }
-            &ProjectionElem::Subslice { from, to } => match &base.kind(Interner) {
+            },
+            &ProjectionElem::Subslice { from, to } => match base.kind() {
                 TyKind::Array(inner, c) => {
                     let next_c = usize_const(
                         db,
@@ -237,23 +238,23 @@ impl<V, T> ProjectionElem<V, T> {
                         },
                         krate,
                     );
-                    TyKind::Array(inner.clone(), next_c).intern(Interner)
+                    Ty::new_array_with_const_len(interner, inner, next_c)
                 }
-                TyKind::Slice(_) => base.clone(),
+                TyKind::Slice(_) => base,
                 _ => {
                     never!("Subslice projection should only happen on slice and array");
-                    TyKind::Error.intern(Interner)
+                    Ty::new_error(interner, ErrorGuaranteed)
                 }
             },
             ProjectionElem::OpaqueCast(_) => {
                 never!("We don't emit these yet");
-                TyKind::Error.intern(Interner)
+                Ty::new_error(interner, ErrorGuaranteed)
             }
         }
     }
 }
 
-type PlaceElem = ProjectionElem<LocalId, Ty>;
+type PlaceElem = ProjectionElem<LocalId>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProjectionId(u32);
@@ -352,12 +353,12 @@ impl From<LocalId> for Place {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum AggregateKind {
     /// The type is of the element
-    Array(Ty),
+    Array(StoredTy),
     /// The type is of the tuple
-    Tuple(Ty),
-    Adt(VariantId, Substitution),
+    Tuple(StoredTy),
+    Adt(VariantId, StoredGenericArgs),
     Union(UnionId, FieldId),
-    Closure(Ty),
+    Closure(StoredTy),
     //Coroutine(LocalDefId, SubstsRef, Movability),
 }
 
@@ -709,10 +710,10 @@ impl BorrowKind {
         }
     }
 
-    fn from_chalk(m: Mutability) -> Self {
+    fn from_rustc(m: rustc_ast_ir::Mutability) -> Self {
         match m {
-            Mutability::Not => BorrowKind::Shared,
-            Mutability::Mut => BorrowKind::Mut { kind: MutBorrowKind::Default },
+            rustc_ast_ir::Mutability::Not => BorrowKind::Shared,
+            rustc_ast_ir::Mutability::Mut => BorrowKind::Mut { kind: MutBorrowKind::Default },
         }
     }
 }
@@ -878,7 +879,7 @@ pub enum Rvalue {
     /// Creates an array where each element is the value of the operand.
     ///
     /// Corresponds to source code like `[x; 32]`.
-    Repeat(Operand, Const),
+    Repeat(Operand, StoredConst),
 
     /// Creates a reference of the indicated kind to the place.
     ///
@@ -926,7 +927,7 @@ pub enum Rvalue {
     ///
     /// **FIXME**: Document exactly which `CastKind`s allow which types of casts. Figure out why
     /// `ArrayToPointer` and `MutToConstPointer` are special.
-    Cast(CastKind, Operand, Ty),
+    Cast(CastKind, Operand, StoredTy),
 
     // FIXME link to `pointer::offset` when it hits stable.
     /// * `Offset` has the same semantics as `pointer::offset`, except that the second
@@ -972,15 +973,13 @@ pub enum Rvalue {
     UnaryOp(UnOp, Operand),
 
     /// Computes the discriminant of the place, returning it as an integer of type
-    /// [`discriminant_ty`]. Returns zero for types without discriminant.
+    /// `discriminant_ty`. Returns zero for types without discriminant.
     ///
     /// The validity requirements for the underlying value are undecided for this rvalue, see
     /// [#91095]. Note too that the value of the discriminant is not the same thing as the
-    /// variant index; use [`discriminant_for_variant`] to convert.
+    /// variant index; use `discriminant_for_variant` to convert.
     ///
-    /// [`discriminant_ty`]: crate::ty::Ty::discriminant_ty
     /// [#91095]: https://github.com/rust-lang/rust/issues/91095
-    /// [`discriminant_for_variant`]: crate::ty::Ty::discriminant_for_variant
     Discriminant(Place),
 
     /// Creates an aggregate value, like a tuple or struct.
@@ -998,10 +997,10 @@ pub enum Rvalue {
     /// This is different from a normal transmute because dataflow analysis will treat the box as
     /// initialized but its content as uninitialized. Like other pointer casts, this in general
     /// affects alias analysis.
-    ShallowInitBox(Operand, Ty),
+    ShallowInitBox(Operand, StoredTy),
 
     /// NON STANDARD: allocates memory with the type's layout, and shallow init the box with the resulting pointer.
-    ShallowInitBoxWithAlloc(Ty),
+    ShallowInitBoxWithAlloc(StoredTy),
 
     /// A CopyForDeref is equivalent to a read from a place at the
     /// codegen level, but is treated specially by drop elaboration. When such a read happens, it
@@ -1075,7 +1074,7 @@ pub struct MirBody {
     pub param_locals: Vec<LocalId>,
     /// This field stores the closures directly owned by this body. It is used
     /// in traversing every mir body.
-    pub closures: Vec<ClosureId>,
+    pub closures: Vec<InternedClosureId>,
 }
 
 impl MirBody {
@@ -1093,7 +1092,7 @@ impl MirBody {
                 OperandKind::Copy(p) | OperandKind::Move(p) => {
                     f(p, store);
                 }
-                OperandKind::Constant(_) | OperandKind::Static(_) => (),
+                OperandKind::Constant { .. } | OperandKind::Static(_) => (),
             }
         }
         for (_, block) in self.basic_blocks.iter_mut() {

@@ -5,9 +5,10 @@
 #![stable(feature = "rust1", since = "1.0.0")]
 
 use crate::fs::{self, Metadata, OpenOptions};
+use crate::io::BorrowedCursor;
 use crate::path::Path;
 use crate::sealed::Sealed;
-use crate::sys_common::{AsInner, AsInnerMut, IntoInner};
+use crate::sys::{AsInner, AsInnerMut, IntoInner};
 use crate::time::SystemTime;
 use crate::{io, sys};
 
@@ -49,6 +50,44 @@ pub trait FileExt {
     #[stable(feature = "file_offset", since = "1.15.0")]
     fn seek_read(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;
 
+    /// Seeks to a given position and reads some bytes into the buffer.
+    ///
+    /// This is equivalent to the [`seek_read`](FileExt::seek_read) method, except that it is passed
+    /// a [`BorrowedCursor`] rather than `&mut [u8]` to allow use with uninitialized buffers. The
+    /// new data will be appended to any existing contents of `buf`.
+    ///
+    /// Reading beyond the end of the file will always succeed without reading any bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// #![feature(core_io_borrowed_buf)]
+    /// #![feature(read_buf_at)]
+    ///
+    /// use std::io;
+    /// use std::io::BorrowedBuf;
+    /// use std::fs::File;
+    /// use std::mem::MaybeUninit;
+    /// use std::os::windows::prelude::*;
+    ///
+    /// fn main() -> io::Result<()> {
+    ///     let mut file = File::open("pi.txt")?;
+    ///
+    ///     // Read some bytes starting from offset 2
+    ///     let mut buf: [MaybeUninit<u8>; 10] = [MaybeUninit::uninit(); 10];
+    ///     let mut buf = BorrowedBuf::from(buf.as_mut_slice());
+    ///     file.seek_read_buf(buf.unfilled(), 2)?;
+    ///
+    ///     assert!(buf.filled().starts_with(b"1"));
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    #[unstable(feature = "read_buf_at", issue = "140771")]
+    fn seek_read_buf(&self, buf: BorrowedCursor<'_>, offset: u64) -> io::Result<()> {
+        io::default_read_buf(|b| self.seek_read(b, offset), buf)
+    }
+
     /// Seeks to a given position and writes a number of bytes.
     ///
     /// Returns the number of bytes written.
@@ -87,6 +126,10 @@ pub trait FileExt {
 impl FileExt for fs::File {
     fn seek_read(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         self.as_inner().read_at(buf, offset)
+    }
+
+    fn seek_read_buf(&self, buf: BorrowedCursor<'_>, offset: u64) -> io::Result<()> {
+        self.as_inner().read_buf_at(buf, offset)
     }
 
     fn seek_write(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
@@ -262,6 +305,18 @@ pub trait OpenOptionsExt {
     ///     https://docs.microsoft.com/en-us/windows/win32/api/winnt/ne-winnt-security_impersonation_level
     #[stable(feature = "open_options_ext", since = "1.10.0")]
     fn security_qos_flags(&mut self, flags: u32) -> &mut Self;
+
+    /// If set to `true`, prevent the "last access time" of the file from being changed.
+    ///
+    /// Default to `false`.
+    #[unstable(feature = "windows_freeze_file_times", issue = "149715")]
+    fn freeze_last_access_time(&mut self, freeze: bool) -> &mut Self;
+
+    /// If set to `true`, prevent the "last write time" of the file from being changed.
+    ///
+    /// Default to `false`.
+    #[unstable(feature = "windows_freeze_file_times", issue = "149715")]
+    fn freeze_last_write_time(&mut self, freeze: bool) -> &mut Self;
 }
 
 #[stable(feature = "open_options_ext", since = "1.10.0")]
@@ -288,6 +343,16 @@ impl OpenOptionsExt for OpenOptions {
 
     fn security_qos_flags(&mut self, flags: u32) -> &mut OpenOptions {
         self.as_inner_mut().security_qos_flags(flags);
+        self
+    }
+
+    fn freeze_last_access_time(&mut self, freeze: bool) -> &mut Self {
+        self.as_inner_mut().freeze_last_access_time(freeze);
+        self
+    }
+
+    fn freeze_last_write_time(&mut self, freeze: bool) -> &mut Self {
+        self.as_inner_mut().freeze_last_write_time(freeze);
         self
     }
 }

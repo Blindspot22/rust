@@ -58,6 +58,40 @@ fn reassemble_ptr_fragments_in_static() {
     };
 }
 
+const _PARTIAL_OVERWRITE: () = {
+    // The result in `p` is not a valid pointer, but we never use it again so that's fine.
+    let mut p = &42;
+    unsafe {
+        let ptr: *mut _ = &mut p;
+        *(ptr as *mut u8) = 123;
+    }
+};
+
+#[allow(dead_code)]
+#[cfg(not(target_arch = "s390x"))] // u128 is less aligned on s390x, removing the padding
+fn fragment_in_dst_padding_gets_overwritten() {
+    #[repr(C)]
+    struct Pair {
+        x: u128,
+        // at offset 16
+        y: u64,
+    }
+
+    const C: MaybeUninit<Pair> = unsafe {
+        let mut m = MaybeUninit::<Pair>::uninit();
+        // Store pointer half-way into trailing padding.
+        m.as_mut_ptr().byte_add(20).cast::<&i32>().write_unaligned(&0);
+        // Overwrite `m`.
+        let val = Pair { x: 0, y: 0 };
+        *m.as_mut_ptr() = val;
+        // If the assignment of `val` above only copied the field and left the rest of `m`
+        // unchanged, there would be pointer fragments left in the padding which would be carried
+        // all the way to the final value, causing compilation failure.
+        // We prevent this by having the copy of `val` overwrite the entire destination.
+        m
+    };
+}
+
 fn main() {
     assert_eq!(unsafe { MEMCPY_RET.assume_init().read() }, 42);
 }

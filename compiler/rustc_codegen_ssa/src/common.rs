@@ -1,12 +1,13 @@
 #![allow(non_camel_case_types)]
 
 use rustc_hir::LangItem;
+use rustc_hir::attrs::PeImportNameType;
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{self, Instance, TyCtxt};
 use rustc_middle::{bug, mir, span_bug};
-use rustc_session::cstore::{DllCallingConvention, DllImport, PeImportNameType};
+use rustc_session::cstore::{DllCallingConvention, DllImport};
 use rustc_span::Span;
-use rustc_target::spec::Target;
+use rustc_target::spec::{Abi, Env, Os, Target};
 
 use crate::traits::*;
 
@@ -170,7 +171,7 @@ pub fn asm_const_to_str<'tcx>(
 }
 
 pub fn is_mingw_gnu_toolchain(target: &Target) -> bool {
-    target.vendor == "pc" && target.os == "windows" && target.env == "gnu" && target.abi.is_empty()
+    target.os == Os::Windows && target.env == Env::Gnu && target.abi == Abi::Unspecified
 }
 
 pub fn i686_decorated_name(

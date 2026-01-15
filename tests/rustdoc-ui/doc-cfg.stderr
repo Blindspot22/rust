@@ -1,46 +1,44 @@
-error: `cfg` predicate is not specified
-  --> $DIR/doc-cfg.rs:3:7
+error[E0805]: malformed `doc` attribute input
+  --> $DIR/doc-cfg.rs:3:1
    |
 LL | #[doc(cfg(), cfg(foo, bar))]
-   |       ^^^^^ help: expected syntax is: `cfg(/* predicate */)`
+   | ^^^^^^^^^--^^^^^^^^^^^^^^^^^
+   |          |
+   |          expected a single argument here
 
-error: multiple `cfg` predicates are specified
-  --> $DIR/doc-cfg.rs:3:23
+error[E0805]: malformed `doc` attribute input
+  --> $DIR/doc-cfg.rs:3:1
    |
 LL | #[doc(cfg(), cfg(foo, bar))]
-   |                       ^^^
+   | ^^^^^^^^^^^^^^^^----------^^
+   |                 |
+   |                 expected a single argument here
 
-error: `cfg` predicate is not specified
-  --> $DIR/doc-cfg.rs:9:7
+error[E0805]: malformed `doc` attribute input
+  --> $DIR/doc-cfg.rs:6:1
    |
 LL | #[doc(cfg())]
-   |       ^^^^^ help: expected syntax is: `cfg(/* predicate */)`
+   | ^^^^^^^^^--^^
+   |          |
+   |          expected a single argument here
 
-error: multiple `cfg` predicates are specified
-  --> $DIR/doc-cfg.rs:10:16
+error[E0805]: malformed `doc` attribute input
+  --> $DIR/doc-cfg.rs:7:1
    |
 LL | #[doc(cfg(foo, bar))]
-   |                ^^^
+   | ^^^^^^^^^----------^^
+   |          |
+   |          expected a single argument here
 
-warning: unexpected `cfg` condition name: `foo`
-  --> $DIR/doc-cfg.rs:6:11
+error[E0539]: malformed `doc` attribute input
+  --> $DIR/doc-cfg.rs:8:1
    |
-LL | #[doc(cfg(foo), cfg(bar))]
-   |           ^^^
-   |
-   = help: expected names are: `FALSE` and `test` and 31 more
-   = help: to expect this configuration use `--check-cfg=cfg(foo)`
-   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg.html> for more information about checking conditional configuration
-   = note: `#[warn(unexpected_cfgs)]` on by default
+LL | #[doc(auto_cfg(hide(foo::bar)))]
+   | ^^^^^^^^^^^^^^^^^^^^--------^^^^
+   |                     |
+   |                     expected a valid identifier here
 
-warning: unexpected `cfg` condition name: `bar`
-  --> $DIR/doc-cfg.rs:6:21
-   |
-LL | #[doc(cfg(foo), cfg(bar))]
-   |                     ^^^
-   |
-   = help: to expect this configuration use `--check-cfg=cfg(bar)`
-   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg.html> for more information about checking conditional configuration
+error: aborting due to 5 previous errors
 
-error: aborting due to 4 previous errors; 2 warnings emitted
-
+Some errors have detailed explanations: E0539, E0805.
+For more information about an error, try `rustc --explain E0539`.

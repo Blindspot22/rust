@@ -130,12 +130,14 @@ pub enum RuntimePhase {
     /// * [`TerminatorKind::Yield`]
     /// * [`TerminatorKind::CoroutineDrop`]
     /// * [`Rvalue::Aggregate`] for any `AggregateKind` except `Array`
+    /// * [`Rvalue::CopyForDeref`]
     /// * [`PlaceElem::OpaqueCast`]
+    /// * [`LocalInfo::DerefTemp`](super::LocalInfo::DerefTemp)
     ///
     /// And the following variants are allowed:
     /// * [`StatementKind::Retag`]
     /// * [`StatementKind::SetDiscriminant`]
-    /// * [`StatementKind::Deinit`]
+    /// * [`PlaceElem::ConstantIndex`] / [`PlaceElem::Subslice`] after [`PlaceElem::Subslice`]
     ///
     /// Furthermore, `Copy` operands are allowed for non-`Copy` types.
     Initial = 0,
@@ -327,9 +329,11 @@ pub enum StatementKind<'tcx> {
     /// interesting for optimizations? Do we want to allow such optimizations?
     ///
     /// **Needs clarification**: We currently require that the LHS place not overlap with any place
-    /// read as part of computation of the RHS for some rvalues (generally those not producing
-    /// primitives). This requirement is under discussion in [#68364]. As a part of this discussion,
-    /// it is also unclear in what order the components are evaluated.
+    /// read as part of computation of the RHS for some rvalues. This requirement is under
+    /// discussion in [#68364]. Specifically, overlap is permitted only for assignments of a type
+    /// with `BackendRepr::Scalar | BackendRepr::ScalarPair` where all the scalar fields are
+    /// [`Scalar::Initialized`][rustc_abi::Scalar::Initialized]. As a part of this discussion, it is
+    /// also unclear in what order the components are evaluated.
     ///
     /// [#68364]: https://github.com/rust-lang/rust/issues/68364
     ///
@@ -359,11 +363,6 @@ pub enum StatementKind<'tcx> {
     /// entire place; instead, it writes to the minimum set of bytes as required by the layout for
     /// the type.
     SetDiscriminant { place: Box<Place<'tcx>>, variant_index: VariantIdx },
-
-    /// Deinitializes the place.
-    ///
-    /// This writes `uninit` bytes to the entire place.
-    Deinit(Box<Place<'tcx>>),
 
     /// `StorageLive` and `StorageDead` statements mark the live range of a local.
     ///
@@ -1248,6 +1247,9 @@ pub enum ProjectionElem<V, T> {
     ///
     /// If `from_end` is true `slice[from..slice.len() - to]`.
     /// Otherwise `array[from..to]`.
+    ///
+    /// This projection cannot have `ConstantIndex` or additional `Subslice` projections after it
+    /// before runtime MIR.
     Subslice {
         from: u64,
         to: u64,
@@ -1273,18 +1275,6 @@ pub enum ProjectionElem<V, T> {
     /// A transmute from an unsafe binder to the type that it wraps. This is a projection
     /// of a place, so it doesn't necessarily constitute a move out of the binder.
     UnwrapUnsafeBinder(T),
-
-    /// A `Subtype(T)` projection is applied to any `StatementKind::Assign` where
-    /// type of lvalue doesn't match the type of rvalue, the primary goal is making subtyping
-    /// explicit during optimizations and codegen.
-    ///
-    /// This projection doesn't impact the runtime behavior of the program except for potentially changing
-    /// some type metadata of the interpreter or codegen backend.
-    ///
-    /// This goal is achieved with mir_transform pass `Subtyper`, which runs right after
-    /// borrowchecker, as we only care about subtyping that can affect trait selection and
-    /// `TypeId`.
-    Subtype(T),
 }
 
 /// Alias for projections as they appear in places, where the base is a place
@@ -1337,6 +1327,10 @@ pub enum Operand<'tcx> {
 
     /// Constants are already semantically values, and remain unchanged.
     Constant(Box<ConstOperand<'tcx>>),
+
+    /// Query the compilation session of the current crate for a particular flag. This is not quite
+    /// a const since its value can differ across crates within a single crate graph.
+    RuntimeChecks(RuntimeChecks),
 }
 
 #[derive(Clone, Copy, PartialEq, TyEncodable, TyDecodable, Hash, HashStable)]
@@ -1405,16 +1399,6 @@ pub enum Rvalue<'tcx> {
     /// model.
     RawPtr(RawPtrKind, Place<'tcx>),
 
-    /// Yields the length of the place, as a `usize`.
-    ///
-    /// If the type of the place is an array, this is the array length. For slices (`[T]`, not
-    /// `&[T]`) this accesses the place's metadata to determine the length. This rvalue is
-    /// ill-formed for places of other types.
-    ///
-    /// This cannot be a `UnOp(PtrMetadata, _)` because that expects a value, and we only
-    /// have a place, and `UnOp(PtrMetadata, RawPtr(place))` is not a thing.
-    Len(Place<'tcx>),
-
     /// Performs essentially all of the casts that can be performed via `as`.
     ///
     /// This allows for casts from/to a variety of types.
@@ -1437,9 +1421,6 @@ pub enum Rvalue<'tcx> {
     /// * The remaining operations accept signed integers, unsigned integers, or floats with
     ///   matching types and return a value of that type.
     BinaryOp(BinOp, Box<(Operand<'tcx>, Operand<'tcx>)>),
-
-    /// Computes a value as described by the operation.
-    NullaryOp(NullOp<'tcx>, Ty<'tcx>),
 
     /// Exactly like `BinaryOp`, but less operands.
     ///
@@ -1480,11 +1461,13 @@ pub enum Rvalue<'tcx> {
     /// A CopyForDeref is equivalent to a read from a place at the
     /// codegen level, but is treated specially by drop elaboration. When such a read happens, it
     /// is guaranteed (via nature of the mir_opt `Derefer` in rustc_mir_transform/src/deref_separator)
-    /// that the only use of the returned value is a deref operation, immediately
-    /// followed by one or more projections. Drop elaboration treats this rvalue as if the
+    /// that the returned value is written into a `DerefTemp` local and that its only use is a deref operation,
+    /// immediately followed by one or more projections. Drop elaboration treats this rvalue as if the
     /// read never happened and just projects further. This allows simplifying various MIR
     /// optimizations and codegen backends that previously had to handle deref operations anywhere
     /// in a place.
+    ///
+    /// Disallowed in runtime MIR and is replaced by normal copies.
     CopyForDeref(Place<'tcx>),
 
     /// Wraps a value in an unsafe binder.
@@ -1521,6 +1504,18 @@ pub enum CastKind {
     /// MIR is well-formed if the input and output types have different sizes,
     /// but running a transmute between differently-sized types is UB.
     Transmute,
+
+    /// A `Subtype` cast is applied to any `StatementKind::Assign` where
+    /// type of lvalue doesn't match the type of rvalue, the primary goal is making subtyping
+    /// explicit during optimizations and codegen.
+    ///
+    /// This cast doesn't impact the runtime behavior of the program except for potentially changing
+    /// some type metadata of the interpreter or codegen backend.
+    ///
+    /// This goal is achieved with mir_transform pass `Subtyper`, which runs right after
+    /// borrowchecker, as we only care about subtyping that can affect trait selection and
+    /// `TypeId`.
+    Subtype,
 }
 
 /// Represents how a [`CastKind::PointerCoercion`] was constructed.
@@ -1568,19 +1563,26 @@ pub enum AggregateKind<'tcx> {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, TyEncodable, TyDecodable, Hash, HashStable)]
-pub enum NullOp<'tcx> {
-    /// Returns the size of a value of that type
-    SizeOf,
-    /// Returns the minimum alignment of a type
-    AlignOf,
-    /// Returns the offset of a field
-    OffsetOf(&'tcx List<(VariantIdx, FieldIdx)>),
+pub enum RuntimeChecks {
     /// Returns whether we should perform some UB-checking at runtime.
     /// See the `ub_checks` intrinsic docs for details.
     UbChecks,
     /// Returns whether we should perform contract-checking at runtime.
     /// See the `contract_checks` intrinsic docs for details.
     ContractChecks,
+    /// Returns whether we should perform some overflow-checking at runtime.
+    /// See the `overflow_checks` intrinsic docs for details.
+    OverflowChecks,
+}
+
+impl RuntimeChecks {
+    pub fn value(self, sess: &rustc_session::Session) -> bool {
+        match self {
+            Self::UbChecks => sess.ub_checks(),
+            Self::ContractChecks => sess.contract_checks(),
+            Self::OverflowChecks => sess.overflow_checks(),
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]

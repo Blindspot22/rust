@@ -219,8 +219,7 @@ degree documented below):
 - We have unofficial support (not maintained by the Miri team itself) for some further operating systems.
   - `solaris` / `illumos`: maintained by @devnexen. Supports the entire test suite.
   - `freebsd`: maintained by @YohDeadfall and @LorrensP-2158466. Supports the entire test suite.
-  - `android`: **maintainer wanted**. Support very incomplete, but a basic "hello world" works.
-  - `wasi`: **maintainer wanted**. Support very incomplete, not even standard output works, but an empty `main` function works.
+  - `android`: **maintainer wanted**. Supports the entire test suite.
 - For targets on other operating systems, Miri might fail before even reaching the `main` function.
 
 However, even for targets that we do support, the degree of support for accessing platform APIs
@@ -245,6 +244,21 @@ races where two tests race on a shared resource, but `cargo miri nextest run` wi
 such races.
 
 Note: `cargo-nextest` does not support doctests, see https://github.com/nextest-rs/nextest/issues/16
+
+### Directly invoking the `miri` driver
+
+The recommended way to invoke Miri is via `cargo miri`. Directly invoking the underlying `miri`
+driver is not supported, which is why that binary is not even installed into the PATH. However, if
+you need to run Miri on many small tests and want to invoke it directly like you would invoke
+`rustc`, that is still possible with a bit of extra effort:
+
+```sh
+# one-time setup
+cargo +nightly miri setup
+SYSROOT=$(cargo +nightly miri setup --print-sysroot)
+# per file
+~/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/miri --sysroot "$SYSROOT" file.rs
+```
 
 ### Common Problems
 
@@ -277,6 +291,9 @@ Try running `cargo miri clean`.
 Miri adds its own set of `-Z` flags, which are usually set via the `MIRIFLAGS`
 environment variable. We first document the most relevant and most commonly used flags:
 
+* `-Zmiri-backtrace=<0|1|full>` configures how Miri prints backtraces: `1` is the default,
+  where backtraces are printed in pruned form; `full` prints backtraces without pruning, and `0`
+  disables backtraces entirely.
 * `-Zmiri-deterministic-concurrency` makes Miri's concurrency-related behavior fully deterministic.
   Strictly speaking, Miri is always fully deterministic when isolation is enabled (the default
   mode), but this determinism is achieved by using an RNG with a fixed seed. Seemingly harmless
@@ -319,8 +336,14 @@ environment variable. We first document the most relevant and most commonly used
   Can be used without a value; in that case the range defaults to `0..64`.
 * `-Zmiri-many-seeds-keep-going` tells Miri to really try all the seeds in the given range, even if
   a failing seed has already been found. This is useful to determine which fraction of seeds fails.
+* `-Zmiri-max-extra-rounding-error` tells Miri to always apply the maximum error to float operations
+  that do not have a guaranteed precision. The sign of the error is still non-deterministic.
 * `-Zmiri-no-extra-rounding-error` stops Miri from adding extra rounding errors to float operations
   that do not have a guaranteed precision.
+* `-Zmiri-no-short-fd-operations` stops Miri from artificially forcing `read`/`write` operations
+  to only process a part of their buffer. Note that whenever Miri uses host operations to
+  implement `read`/`write` (e.g. for file-backed file descriptors), the host system can still
+  introduce short reads/writes.
 * `-Zmiri-num-cpus` states the number of available CPUs to be reported by miri. By default, the
   number of available CPUs is `1`. Note that this flag does not affect how miri handles threads in
   any way.
@@ -352,6 +375,12 @@ environment variable. We first document the most relevant and most commonly used
   ensure alignment.  (The standard library `align_to` method works fine in both modes; under
   symbolic alignment it only fills the middle slice when the allocation guarantees sufficient
   alignment.)
+* `-Zmiri-user-relevant-crates=<crate>,<crate>,...` extends the list of crates that Miri considers
+  "user-relevant". This affects the rendering of backtraces (for user-relevant crates, Miri shows
+  not just the function name but the actual code) and it affects the spans collected for data races
+  and aliasing violations (where Miri will show the span of the topmost non-`#[track_caller]` frame
+  in a user-relevant crate). When using `cargo miri`, the crates in the local workspace are always
+  considered user-relevant.
 
 The remaining flags are for advanced use only, and more likely to change or be removed.
 Some of these are **unsound**, which means they can lead
@@ -435,11 +464,6 @@ to Miri failing to detect cases of undefined behavior in a program.
   errors and warnings.
 * `-Zmiri-recursive-validation` is a *highly experimental* flag that makes validity checking
   recurse below references.
-* `-Zmiri-retag-fields[=<all|none|scalar>]` controls when Stacked Borrows retagging recurses into
-  fields. `all` means it always recurses (the default, and equivalent to `-Zmiri-retag-fields`
-  without an explicit value), `none` means it never recurses, `scalar` means it only recurses for
-  types where we would also emit `noalias` annotations in the generated LLVM IR (types passed as
-  individual scalars or pairs of scalars). Setting this to `none` is **unsound**.
 * `-Zmiri-preemption-rate` configures the probability that at the end of a basic block, the active
   thread will be preempted. The default is `0.01` (i.e., 1%). Setting this to `0` disables
   preemption. Note that even without preemption, the schedule is still non-deterministic:
@@ -453,7 +477,8 @@ to Miri failing to detect cases of undefined behavior in a program.
 * `-Zmiri-track-alloc-id=<id1>,<id2>,...` shows a backtrace when the given allocations are
   being allocated or freed.  This helps in debugging memory leaks and
   use after free bugs. Specifying this argument multiple times does not overwrite the previous
-  values, instead it appends its values to the list. Listing an id multiple times has no effect.
+  values, instead it appends its values to the list. Listing an ID multiple times has no effect.
+  You can also add IDs at runtime using `miri_track_alloc`.
 * `-Zmiri-track-pointer-tag=<tag1>,<tag2>,...` shows a backtrace when a given pointer tag
   is created and when (if ever) it is popped from a borrow stack (which is where the tag becomes invalid
   and any future use of it will error).  This helps you in finding out why UB is
@@ -471,8 +496,6 @@ to Miri failing to detect cases of undefined behavior in a program.
   of Rust will be stricter than Tree Borrows. In other words, if you use Tree Borrows,
   even if your code is accepted today, it might be declared UB in the future.
   This is much less likely with Stacked Borrows.
-  Using Tree Borrows currently implies `-Zmiri-strict-provenance` because integer-to-pointer
-  casts are not supported in this mode, but that may change in the future.
 * `-Zmiri-tree-borrows-no-precise-interior-mut` makes Tree Borrows
   track interior mutable data on the level of references instead of on the
   byte-level as is done by default.  Therefore, with this flag, Tree
@@ -600,6 +623,8 @@ Definite bugs found:
 * [A bug in the new `RwLock::downgrade` implementation](https://rust-lang.zulipchat.com/#narrow/channel/269128-miri/topic/Miri.20error.20library.20test) (caught by Miri before it landed in the Rust repo)
 * [Mockall reading uninitialized memory when mocking `std::io::Read::read`, even if all expectations are satisfied](https://github.com/asomers/mockall/issues/647) (caught by Miri running Tokio's test suite)
 * [`ReentrantLock` not correctly dealing with reuse of addresses for TLS storage of different threads](https://github.com/rust-lang/rust/pull/141248)
+* [Rare Deadlock in the thread (un)parking example code](https://github.com/rust-lang/rust/issues/145816)
+* [`winit` registering a global constructor with the wrong ABI on Windows](https://github.com/rust-windowing/winit/issues/4435)
 
 Violations of [Stacked Borrows] found that are likely bugs (but Stacked Borrows is currently just an experiment):
 
@@ -626,6 +651,11 @@ Violations of [Stacked Borrows] found that are likely bugs (but Stacked Borrows 
 * [Stacked Borrows: An Aliasing Model for Rust](https://plv.mpi-sws.org/rustbelt/stacked-borrows/)
 * [Using Lightweight Formal Methods to Validate a Key-Value Storage Node in Amazon S3](https://www.amazon.science/publications/using-lightweight-formal-methods-to-validate-a-key-value-storage-node-in-amazon-s3)
 * [SyRust: Automatic Testing of Rust Libraries with Semantic-Aware Program Synthesis](https://dl.acm.org/doi/10.1145/3453483.3454084)
+* [Crabtree: Rust API Test Synthesis Guided by Coverage and Type](https://dl.acm.org/doi/10.1145/3689733)
+* [Rustlantis: Randomized Differential Testing of the Rust Compiler](https://dl.acm.org/doi/10.1145/3689780)
+* [A Study of Undefined Behavior Across Foreign Function Boundaries in Rust Libraries](https://arxiv.org/abs/2404.11671)
+* [Tree Borrows](https://plf.inf.ethz.ch/research/pldi25-tree-borrows.html)
+* [Miri: Practical Undefined Behavior Detection for Rust](https://plf.inf.ethz.ch/research/popl26-miri.html) **(this paper describes Miri itself)**
 
 ## License
 

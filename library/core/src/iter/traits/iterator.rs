@@ -4,6 +4,7 @@ use super::super::{
     Product, Rev, Scan, Skip, SkipWhile, StepBy, Sum, Take, TakeWhile, TrustedRandomAccessNoCoerce,
     Zip, try_process,
 };
+use super::TrustedLen;
 use crate::array;
 use crate::cmp::{self, Ordering};
 use crate::num::NonZero;
@@ -234,6 +235,10 @@ pub trait Iterator {
     /// This method will evaluate the iterator until it returns [`None`]. While
     /// doing so, it keeps track of the current element. After [`None`] is
     /// returned, `last()` will then return the last element it saw.
+    ///
+    /// # Panics
+    ///
+    /// This function might panic if the iterator is infinite.
     ///
     /// # Examples
     ///
@@ -1901,9 +1906,12 @@ pub trait Iterator {
 
     /// Transforms an iterator into a collection.
     ///
-    /// `collect()` can take anything iterable, and turn it into a relevant
-    /// collection. This is one of the more powerful methods in the standard
-    /// library, used in a variety of contexts.
+    /// `collect()` takes ownership of an iterator and produces whichever
+    /// collection type you request. The iterator itself carries no knowledge of
+    /// the eventual container; the target collection is chosen entirely by the
+    /// type you ask `collect()` to return. This makes `collect()` one of the
+    /// more powerful methods in the standard library, and it shows up in a wide
+    /// variety of contexts.
     ///
     /// The most basic pattern in which `collect()` is used is to turn one
     /// collection into another. You take a collection, call [`iter`] on it,
@@ -2857,6 +2865,17 @@ pub trait Iterator {
     /// assert_eq!(a.into_iter().find(|&x| x == 5), None);
     /// ```
     ///
+    /// Iterating over references:
+    ///
+    /// ```
+    /// let a = [1, 2, 3];
+    ///
+    /// // `iter()` yields references i.e. `&i32` and `find()` takes a
+    /// // reference to each element.
+    /// assert_eq!(a.iter().find(|&&x| x == 2), Some(&2));
+    /// assert_eq!(a.iter().find(|&&x| x == 5), None);
+    /// ```
+    ///
     /// Stopping at the first `true`:
     ///
     /// ```
@@ -3522,7 +3541,7 @@ pub trait Iterator {
     /// assert_eq!(iter.next(), Some(['l', 'o']));
     /// assert_eq!(iter.next(), Some(['r', 'e']));
     /// assert_eq!(iter.next(), None);
-    /// assert_eq!(iter.into_remainder().unwrap().as_slice(), &['m']);
+    /// assert_eq!(iter.into_remainder().as_slice(), &['m']);
     /// ```
     ///
     /// ```
@@ -3816,10 +3835,7 @@ pub trait Iterator {
             }
         }
 
-        match iter_compare(self, other.into_iter(), compare(eq)) {
-            ControlFlow::Continue(ord) => ord == Ordering::Equal,
-            ControlFlow::Break(()) => false,
-        }
+        SpecIterEq::spec_iter_eq(self, other.into_iter(), compare(eq))
     }
 
     /// Determines if the elements of this [`Iterator`] are not equal to those of
@@ -4038,6 +4054,42 @@ pub trait Iterator {
     }
 }
 
+trait SpecIterEq<B: Iterator>: Iterator {
+    fn spec_iter_eq<F>(self, b: B, f: F) -> bool
+    where
+        F: FnMut(Self::Item, <B as Iterator>::Item) -> ControlFlow<()>;
+}
+
+impl<A: Iterator, B: Iterator> SpecIterEq<B> for A {
+    #[inline]
+    default fn spec_iter_eq<F>(self, b: B, f: F) -> bool
+    where
+        F: FnMut(Self::Item, <B as Iterator>::Item) -> ControlFlow<()>,
+    {
+        iter_eq(self, b, f)
+    }
+}
+
+impl<A: Iterator + TrustedLen, B: Iterator + TrustedLen> SpecIterEq<B> for A {
+    #[inline]
+    fn spec_iter_eq<F>(self, b: B, f: F) -> bool
+    where
+        F: FnMut(Self::Item, <B as Iterator>::Item) -> ControlFlow<()>,
+    {
+        // we *can't* short-circuit if:
+        match (self.size_hint(), b.size_hint()) {
+            // ... both iterators have the same length
+            ((_, Some(a)), (_, Some(b))) if a == b => {}
+            // ... or both of them are longer than `usize::MAX` (i.e. have an unknown length).
+            ((_, None), (_, None)) => {}
+            // otherwise, we can ascertain that they are unequal without actually comparing items
+            _ => return false,
+        }
+
+        iter_eq(self, b, f)
+    }
+}
+
 /// Compares two iterators element-wise using the given function.
 ///
 /// If `ControlFlow::Continue(())` is returned from the function, the comparison moves on to the next
@@ -4076,6 +4128,16 @@ where
         }),
         ControlFlow::Break(x) => x,
     }
+}
+
+#[inline]
+fn iter_eq<A, B, F>(a: A, b: B, f: F) -> bool
+where
+    A: Iterator,
+    B: Iterator,
+    F: FnMut(A::Item, B::Item) -> ControlFlow<()>,
+{
+    iter_compare(a, b, f).continue_value().is_some_and(|ord| ord == Ordering::Equal)
 }
 
 /// Implements `Iterator` for mutable references to iterators, such as those produced by [`Iterator::by_ref`].

@@ -1,4 +1,4 @@
-//@ compile-flags: -Copt-level=3 --target wasm32-unknown-emscripten
+//@ compile-flags: -Copt-level=3 --target wasm32-unknown-emscripten -Z emscripten-wasm-eh=false
 //@ needs-llvm-components: webassembly
 
 // Emscripten has its own unique implementation of catch_unwind (in `codegen_emcc_try`),
@@ -25,7 +25,7 @@ trait Copy {}
 impl<T> Copy for *mut T {}
 
 #[rustc_intrinsic]
-fn size_of<T>() -> usize {
+const fn size_of<T>() -> usize {
     loop {}
 }
 
@@ -40,7 +40,7 @@ unsafe fn catch_unwind(
 #[no_mangle]
 pub fn ptr_size() -> usize {
     // CHECK: ret [[PTR_SIZE:.*]]
-    size_of::<*mut u8>()
+    const { size_of::<*mut u8>() }
 }
 
 // CHECK-LABEL: @test_catch_unwind

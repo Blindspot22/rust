@@ -1,9 +1,8 @@
 use rustc_hir as hir;
 use rustc_hir::{Expr, Stmt};
 use rustc_middle::ty::{Mutability, TyKind};
-use rustc_session::lint::FutureIncompatibilityReason;
+use rustc_session::lint::fcw;
 use rustc_session::{declare_lint, declare_lint_pass};
-use rustc_span::edition::Edition;
 use rustc_span::{BytePos, Span};
 
 use crate::lints::{MutRefSugg, RefOfMutStatic};
@@ -53,8 +52,7 @@ declare_lint! {
     Warn,
     "creating a shared reference to mutable static",
     @future_incompatible = FutureIncompatibleInfo {
-        reason: FutureIncompatibilityReason::EditionError(Edition::Edition2024),
-        reference: "<https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>",
+        reason: fcw!(EditionError 2024 "static-mut-references"),
         explain_reason: false,
     };
     @edition Edition2024 => Deny;
@@ -108,7 +106,7 @@ impl<'tcx> LateLintPass<'tcx> for StaticMutRefs {
     fn check_stmt(&mut self, cx: &LateContext<'tcx>, stmt: &Stmt<'_>) {
         if let hir::StmtKind::Let(loc) = stmt.kind
             && let hir::PatKind::Binding(ba, _, _, _) = loc.pat.kind
-            && let hir::ByRef::Yes(m) = ba.0
+            && let hir::ByRef::Yes(_, m) = ba.0
             && let Some(init) = loc.init
             && let Some(err_span) = path_is_static_mut(init, init.span)
         {

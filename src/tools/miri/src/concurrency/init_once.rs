@@ -57,6 +57,10 @@ impl InitOnceRef {
     pub fn begin(&self) {
         self.0.borrow_mut().begin();
     }
+
+    pub fn queue_is_empty(&self) -> bool {
+        self.0.borrow().waiters.is_empty()
+    }
 }
 
 impl VisitProvenance for InitOnceRef {
@@ -96,10 +100,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         init_once.status = InitOnceStatus::Complete;
 
         // Each complete happens-before the end of the wait
-        if let Some(data_race) = this.machine.data_race.as_vclocks_ref() {
-            data_race
-                .release_clock(&this.machine.threads, |clock| init_once.clock.clone_from(clock));
-        }
+        this.release_clock(|clock| init_once.clock.clone_from(clock))?;
 
         // Wake up everyone.
         // need to take the queue to avoid having `this` be borrowed multiple times
@@ -125,10 +126,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         init_once.status = InitOnceStatus::Uninitialized;
 
         // Each complete happens-before the end of the wait
-        if let Some(data_race) = this.machine.data_race.as_vclocks_ref() {
-            data_race
-                .release_clock(&this.machine.threads, |clock| init_once.clock.clone_from(clock));
-        }
+        this.release_clock(|clock| init_once.clock.clone_from(clock))?;
 
         // Wake up one waiting thread, so they can go ahead and try to init this.
         if let Some(waiter) = init_once.waiters.pop_front() {
@@ -142,7 +140,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     /// Synchronize with the previous completion of an InitOnce.
     /// Must only be called after checking that it is complete.
     #[inline]
-    fn init_once_observe_completed(&mut self, init_once_ref: &InitOnceRef) {
+    fn init_once_observe_completed(&mut self, init_once_ref: &InitOnceRef) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
         let init_once = init_once_ref.0.borrow();
 
@@ -152,6 +150,6 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             "observing the completion of incomplete init once"
         );
 
-        this.acquire_clock(&init_once.clock);
+        this.acquire_clock(&init_once.clock)
     }
 }

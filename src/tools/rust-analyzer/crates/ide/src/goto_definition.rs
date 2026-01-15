@@ -1,5 +1,6 @@
 use std::{iter, mem::discriminant};
 
+use crate::Analysis;
 use crate::{
     FilePosition, NavigationTarget, RangeInfo, TryToNav, UpmappingResult,
     doc_links::token_as_doc_comment,
@@ -8,22 +9,25 @@ use crate::{
 use hir::{
     AsAssocItem, AssocItem, CallableKind, FileRange, HasCrate, InFile, ModuleDef, Semantics, sym,
 };
+use ide_db::{MiniCore, ra_fixture::UpmapFromRaFixture};
 use ide_db::{
     RootDatabase, SymbolKind,
     base_db::{AnchoredPath, SourceDatabase},
     defs::{Definition, IdentClass},
     famous_defs::FamousDefs,
     helpers::pick_best_token,
+    syntax_helpers::node_ext::find_loops,
 };
 use itertools::Itertools;
-use span::{Edition, FileId};
+use span::FileId;
 use syntax::{
-    AstNode, AstToken,
-    SyntaxKind::*,
-    SyntaxNode, SyntaxToken, T, TextRange,
-    ast::{self, HasLoopBody},
-    match_ast,
+    AstNode, AstToken, SyntaxKind::*, SyntaxNode, SyntaxToken, T, TextRange, ast, match_ast,
 };
+
+#[derive(Debug)]
+pub struct GotoDefinitionConfig<'a> {
+    pub minicore: MiniCore<'a>,
+}
 
 // Feature: Go to Definition
 //
@@ -39,11 +43,11 @@ use syntax::{
 pub(crate) fn goto_definition(
     db: &RootDatabase,
     FilePosition { file_id, offset }: FilePosition,
+    config: &GotoDefinitionConfig<'_>,
 ) -> Option<RangeInfo<Vec<NavigationTarget>>> {
     let sema = &Semantics::new(db);
     let file = sema.parse_guess_edition(file_id).syntax().clone();
-    let edition =
-        sema.attach_first_edition(file_id).map(|it| it.edition(db)).unwrap_or(Edition::CURRENT);
+    let edition = sema.attach_first_edition(file_id).edition(db);
     let original_token = pick_best_token(file.token_at_offset(offset), |kind| match kind {
         IDENT
         | INT_NUMBER
@@ -62,7 +66,7 @@ pub(crate) fn goto_definition(
     })?;
     if let Some(doc_comment) = token_as_doc_comment(&original_token) {
         return doc_comment.get_definition_with_descend_at(sema, offset, |def, _, link_range| {
-            let nav = def.try_to_nav(db)?;
+            let nav = def.try_to_nav(sema)?;
             Some(RangeInfo::new(link_range, nav.collect()))
         });
     }
@@ -73,7 +77,7 @@ pub(crate) fn goto_definition(
         return Some(RangeInfo::new(
             range,
             match resolution {
-                Some(res) => def_to_nav(db, Definition::from(res)),
+                Some(res) => def_to_nav(sema, Definition::from(res)),
                 None => vec![],
             },
         ));
@@ -83,52 +87,64 @@ pub(crate) fn goto_definition(
         return Some(RangeInfo::new(original_token.text_range(), navs));
     }
 
-    if let Some(navs) = find_definition_for_known_blanket_dual_impls(sema, &original_token) {
-        return Some(RangeInfo::new(original_token.text_range(), navs));
-    }
+    let tokens = sema.descend_into_macros_no_opaque(original_token.clone(), false);
+    let mut navs = Vec::new();
+    for token in tokens {
+        if let Some(n) = find_definition_for_known_blanket_dual_impls(sema, &token.value) {
+            navs.extend(n);
+            continue;
+        }
 
-    let navs = sema
-        .descend_into_macros_no_opaque(original_token.clone(), false)
-        .into_iter()
-        .filter_map(|token| {
-            let parent = token.value.parent()?;
+        if let Some(token) = ast::String::cast(token.value.clone())
+            && let Some(original_token) = ast::String::cast(original_token.clone())
+            && let Some((analysis, fixture_analysis)) =
+                Analysis::from_ra_fixture(sema, original_token, &token, config.minicore)
+            && let Some((virtual_file_id, file_offset)) = fixture_analysis.map_offset_down(offset)
+        {
+            return hir::attach_db_allow_change(&analysis.db, || {
+                goto_definition(
+                    &analysis.db,
+                    FilePosition { file_id: virtual_file_id, offset: file_offset },
+                    config,
+                )
+            })
+            .and_then(|navs| {
+                navs.upmap_from_ra_fixture(&fixture_analysis, virtual_file_id, file_id).ok()
+            });
+        }
 
-            let token_file_id = token.file_id;
-            if let Some(token) = ast::String::cast(token.value.clone())
-                && let Some(x) =
-                    try_lookup_include_path(sema, InFile::new(token_file_id, token), file_id)
-            {
-                return Some(vec![x]);
-            }
+        let parent = token.value.parent()?;
 
-            if ast::TokenTree::can_cast(parent.kind())
-                && let Some(x) = try_lookup_macro_def_in_macro_use(sema, token.value)
-            {
-                return Some(vec![x]);
-            }
+        let token_file_id = token.file_id;
+        if let Some(token) = ast::String::cast(token.value.clone())
+            && let Some(x) =
+                try_lookup_include_path(sema, InFile::new(token_file_id, token), file_id)
+        {
+            navs.push(x);
+            continue;
+        }
 
-            Some(
-                IdentClass::classify_node(sema, &parent)?
-                    .definitions()
+        if ast::TokenTree::can_cast(parent.kind())
+            && let Some(x) = try_lookup_macro_def_in_macro_use(sema, token.value)
+        {
+            navs.push(x);
+            continue;
+        }
+
+        let Some(ident_class) = IdentClass::classify_node(sema, &parent) else { continue };
+        navs.extend(ident_class.definitions().into_iter().flat_map(|(def, _)| {
+            if let Definition::ExternCrateDecl(crate_def) = def {
+                return crate_def
+                    .resolved_crate(db)
+                    .map(|it| it.root_module(db).to_nav(db))
                     .into_iter()
-                    .flat_map(|(def, _)| {
-                        if let Definition::ExternCrateDecl(crate_def) = def {
-                            return crate_def
-                                .resolved_crate(db)
-                                .map(|it| it.root_module().to_nav(sema.db))
-                                .into_iter()
-                                .flatten()
-                                .collect();
-                        }
-                        try_filter_trait_item_definition(sema, &def)
-                            .unwrap_or_else(|| def_to_nav(sema.db, def))
-                    })
-                    .collect(),
-            )
-        })
-        .flatten()
-        .unique()
-        .collect::<Vec<NavigationTarget>>();
+                    .flatten()
+                    .collect();
+            }
+            try_filter_trait_item_definition(sema, &def).unwrap_or_else(|| def_to_nav(sema, def))
+        }));
+    }
+    let navs = navs.into_iter().unique().collect();
 
     Some(RangeInfo::new(original_token.text_range(), navs))
 }
@@ -160,7 +176,7 @@ fn find_definition_for_known_blanket_dual_impls(
                     t_f,
                     [return_type.type_arguments().next()?],
                 )
-                .map(|f| def_to_nav(sema.db, f.into()));
+                .map(|f| def_to_nav(sema, f.into()));
         }
         hir::AssocItemContainer::Impl(_) => return None,
     };
@@ -201,7 +217,7 @@ fn find_definition_for_known_blanket_dual_impls(
     // succeed
     let _t = f.as_assoc_item(sema.db)?.implemented_trait(sema.db)?;
     let def = Definition::from(f);
-    Some(def_to_nav(sema.db, def))
+    Some(def_to_nav(sema, def))
 }
 
 fn try_lookup_include_path(
@@ -225,7 +241,7 @@ fn try_lookup_include_path(
     Some(NavigationTarget {
         file_id,
         full_range: TextRange::new(0.into(), size),
-        name: path.into(),
+        name: hir::Symbol::intern(&path),
         alias: None,
         focus_range: None,
         kind: None,
@@ -243,10 +259,10 @@ fn try_lookup_macro_def_in_macro_use(
     let extern_crate = sema.to_def(&extern_crate)?;
     let krate = extern_crate.resolved_crate(sema.db)?;
 
-    for mod_def in krate.root_module().declarations(sema.db) {
+    for mod_def in krate.root_module(sema.db).declarations(sema.db) {
         if let ModuleDef::Macro(mac) = mod_def
             && mac.name(sema.db).as_str() == token.text()
-            && let Some(nav) = mac.try_to_nav(sema.db)
+            && let Some(nav) = mac.try_to_nav(sema)
         {
             return Some(nav.call_site);
         }
@@ -278,7 +294,7 @@ fn try_filter_trait_item_definition(
                 .items(db)
                 .iter()
                 .filter(|itm| discriminant(*itm) == discriminant_value)
-                .find_map(|itm| (itm.name(db)? == name).then(|| itm.try_to_nav(db)).flatten())
+                .find_map(|itm| (itm.name(db)? == name).then(|| itm.try_to_nav(sema)).flatten())
                 .map(|it| it.collect())
         }
     }
@@ -347,7 +363,7 @@ fn nav_for_exit_points(
             match_ast! {
                 match node {
                     ast::Fn(fn_) => {
-                        let mut nav = sema.to_def(&fn_)?.try_to_nav(db)?;
+                        let mut nav = sema.to_def(&fn_)?.try_to_nav(sema)?;
                         // For async token, we navigate to itself, which triggers
                         // VSCode to find the references
                         let focus_token = if matches!(token_kind, T![async]) {
@@ -491,51 +507,6 @@ fn nav_for_branch_exit_points(
     Some(navs)
 }
 
-pub(crate) fn find_loops(
-    sema: &Semantics<'_, RootDatabase>,
-    token: &SyntaxToken,
-) -> Option<Vec<ast::Expr>> {
-    let parent = token.parent()?;
-    let lbl = match_ast! {
-        match parent {
-            ast::BreakExpr(break_) => break_.lifetime(),
-            ast::ContinueExpr(continue_) => continue_.lifetime(),
-            _ => None,
-        }
-    };
-    let label_matches =
-        |it: Option<ast::Label>| match (lbl.as_ref(), it.and_then(|it| it.lifetime())) {
-            (Some(lbl), Some(it)) => lbl.text() == it.text(),
-            (None, _) => true,
-            (Some(_), None) => false,
-        };
-
-    let find_ancestors = |token: SyntaxToken| {
-        for anc in sema.token_ancestors_with_macros(token).filter_map(ast::Expr::cast) {
-            let node = match &anc {
-                ast::Expr::LoopExpr(loop_) if label_matches(loop_.label()) => anc,
-                ast::Expr::WhileExpr(while_) if label_matches(while_.label()) => anc,
-                ast::Expr::ForExpr(for_) if label_matches(for_.label()) => anc,
-                ast::Expr::BlockExpr(blk)
-                    if blk.label().is_some() && label_matches(blk.label()) =>
-                {
-                    anc
-                }
-                _ => continue,
-            };
-
-            return Some(node);
-        }
-        None
-    };
-
-    sema.descend_into_macros(token.clone())
-        .into_iter()
-        .filter_map(find_ancestors)
-        .collect_vec()
-        .into()
-}
-
 fn nav_for_break_points(
     sema: &Semantics<'_, RootDatabase>,
     token: &SyntaxToken,
@@ -543,7 +514,6 @@ fn nav_for_break_points(
     let db = sema.db;
 
     let navs = find_loops(sema, token)?
-        .into_iter()
         .filter_map(|expr| {
             let file_id = sema.hir_file_for(expr.syntax());
             let expr_in_file = InFile::new(file_id, expr.clone());
@@ -564,8 +534,8 @@ fn nav_for_break_points(
     Some(navs)
 }
 
-fn def_to_nav(db: &RootDatabase, def: Definition) -> Vec<NavigationTarget> {
-    def.try_to_nav(db).map(|it| it.collect()).unwrap_or_default()
+fn def_to_nav(sema: &Semantics<'_, RootDatabase>, def: Definition) -> Vec<NavigationTarget> {
+    def.try_to_nav(sema).map(|it| it.collect()).unwrap_or_default()
 }
 
 fn expr_to_nav(
@@ -578,21 +548,33 @@ fn expr_to_nav(
     let value_range = value.syntax().text_range();
     let navs = navigation_target::orig_range_with_focus_r(db, file_id, value_range, focus_range);
     navs.map(|(hir::FileRangeWrapper { file_id, range }, focus_range)| {
-        NavigationTarget::from_syntax(file_id, "<expr>".into(), focus_range, range, kind)
+        NavigationTarget::from_syntax(
+            file_id,
+            hir::Symbol::intern("<expr>"),
+            focus_range,
+            range,
+            kind,
+        )
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::fixture;
-    use ide_db::FileRange;
+    use crate::{GotoDefinitionConfig, fixture};
+    use ide_db::{FileRange, MiniCore};
     use itertools::Itertools;
-    use syntax::SmolStr;
+
+    const TEST_CONFIG: GotoDefinitionConfig<'_> =
+        GotoDefinitionConfig { minicore: MiniCore::default() };
 
     #[track_caller]
     fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
         let (analysis, position, expected) = fixture::annotations(ra_fixture);
-        let navs = analysis.goto_definition(position).unwrap().expect("no definition found").info;
+        let navs = analysis
+            .goto_definition(position, &TEST_CONFIG)
+            .unwrap()
+            .expect("no definition found")
+            .info;
 
         let cmp = |&FileRange { file_id, range }: &_| (file_id, range.start());
         let navs = navs
@@ -611,19 +593,27 @@ mod tests {
 
     fn check_unresolved(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
         let (analysis, position) = fixture::position(ra_fixture);
-        let navs = analysis.goto_definition(position).unwrap().expect("no definition found").info;
+        let navs = analysis
+            .goto_definition(position, &TEST_CONFIG)
+            .unwrap()
+            .expect("no definition found")
+            .info;
 
         assert!(navs.is_empty(), "didn't expect this to resolve anywhere: {navs:?}")
     }
 
     fn check_name(expected_name: &str, #[rust_analyzer::rust_fixture] ra_fixture: &str) {
         let (analysis, position, _) = fixture::annotations(ra_fixture);
-        let navs = analysis.goto_definition(position).unwrap().expect("no definition found").info;
+        let navs = analysis
+            .goto_definition(position, &TEST_CONFIG)
+            .unwrap()
+            .expect("no definition found")
+            .info;
         assert!(navs.len() < 2, "expected single navigation target but encountered {}", navs.len());
         let Some(target) = navs.into_iter().next() else {
             panic!("expected single navigation target but encountered none");
         };
-        assert_eq!(target.name, SmolStr::new_inline(expected_name));
+        assert_eq!(target.name, hir::Symbol::intern(expected_name));
     }
 
     #[test]
@@ -3284,6 +3274,32 @@ fn f() {
     }
 
     #[test]
+    fn into_call_to_from_definition_within_macro() {
+        check(
+            r#"
+//- proc_macros: identity
+//- minicore: from
+struct A;
+
+struct B;
+
+impl From<A> for B {
+    fn from(value: A) -> Self {
+     //^^^^
+        B
+    }
+}
+
+#[proc_macros::identity]
+fn f() {
+    let a = A;
+    let b: B = a.into$0();
+}
+        "#,
+        );
+    }
+
+    #[test]
     fn into_call_to_from_definition_with_trait_bounds() {
         check(
             r#"
@@ -3920,5 +3936,102 @@ fn main() {
 }
 "#,
         );
+    }
+
+    #[test]
+    fn goto_builtin_type() {
+        check(
+            r#"
+//- /main.rs crate:main deps:std
+const _: &str$0 = ""; }
+
+//- /libstd.rs crate:std
+mod prim_str {}
+//  ^^^^^^^^
+"#,
+        );
+    }
+
+    #[test]
+    fn ra_fixture() {
+        check(
+            r##"
+fn fixture(#[rust_analyzer::rust_fixture] ra_fixture: &str) {}
+
+fn foo() {
+    fixture(r#"
+fn foo() {}
+// ^^^
+fn bar() {
+    f$0oo();
+}
+    "#)
+}
+        "##,
+        );
+    }
+
+    #[test]
+    fn regression_20038() {
+        check(
+            r#"
+//- minicore: clone, fn
+struct Map<Fut, F>(Fut, F);
+
+struct InspectFn<F>(F);
+
+trait FnOnce1<A> {
+    type Output;
+}
+
+trait Future1 {
+    type Output;
+}
+
+trait FusedFuture1: Future1 {
+    fn is_terminated(&self) -> bool;
+     //^^^^^^^^^^^^^
+}
+
+impl<T, A, R> FnOnce1<A> for T
+where
+    T: FnOnce(A) -> R,
+{
+    type Output = R;
+}
+
+impl<F, A> FnOnce1<A> for InspectFn<F>
+where
+    F: for<'a> FnOnce1<&'a A, Output = ()>,
+{
+    type Output = A;
+}
+
+impl<Fut, F, T> Future1 for Map<Fut, F>
+where
+    Fut: Future1,
+    F: FnOnce1<Fut::Output, Output = T>,
+{
+    type Output = T;
+}
+
+impl<Fut, F, T> FusedFuture1 for Map<Fut, F>
+where
+    Fut: Future1,
+    F: FnOnce1<Fut::Output, Output = T>,
+{
+    fn is_terminated(&self) -> bool {
+        false
+    }
+}
+
+fn overflows<Fut, F>(inner: &Map<Fut, InspectFn<F>>)
+where
+    Map<Fut, InspectFn<F>>: FusedFuture1
+{
+    let _x = inner.is_terminated$0();
+}
+"#,
+        )
     }
 }

@@ -99,7 +99,7 @@ fn resolve_block<'tcx>(
         for (i, statement) in blk.stmts.iter().enumerate() {
             match statement.kind {
                 hir::StmtKind::Let(LetStmt { els: Some(els), .. }) => {
-                    // Let-else has a special lexical structure for variables.
+                    // let-else has a special lexical structure for variables.
                     // First we take a checkpoint of the current scope context here.
                     let mut prev_cx = visitor.cx;
 
@@ -467,8 +467,12 @@ fn resolve_local<'tcx>(
     // A, but the inner rvalues `a()` and `b()` have an extended lifetime
     // due to rule C.
 
-    if let_kind == LetKind::Super {
-        if let Some(scope) = visitor.extended_super_lets.remove(&pat.unwrap().hir_id.local_id) {
+    let extend_initializer = match let_kind {
+        LetKind::Regular => true,
+        LetKind::Super
+            if let Some(scope) =
+                visitor.extended_super_lets.remove(&pat.unwrap().hir_id.local_id) =>
+        {
             // This expression was lifetime-extended by a parent let binding. E.g.
             //
             //     let a = {
@@ -481,7 +485,10 @@ fn resolve_local<'tcx>(
             // Processing of `let a` will have already decided to extend the lifetime of this
             // `super let` to its own var_scope. We use that scope.
             visitor.cx.var_parent = scope;
-        } else {
+            // Extend temporaries to live in the same scope as the parent `let`'s bindings.
+            true
+        }
+        LetKind::Super => {
             // This `super let` is not subject to lifetime extension from a parent let binding. E.g.
             //
             //     identity({ super let x = temp(); &x }).method();
@@ -490,27 +497,29 @@ fn resolve_local<'tcx>(
             //
             // Iterate up to the enclosing destruction scope to find the same scope that will also
             // be used for the result of the block itself.
-            while let Some(s) = visitor.cx.var_parent {
-                let parent = visitor.scope_tree.parent_map.get(&s).cloned();
-                if let Some(Scope { data: ScopeData::Destruction, .. }) = parent {
-                    break;
-                }
-                visitor.cx.var_parent = parent;
+            if let Some(inner_scope) = visitor.cx.var_parent {
+                visitor.cx.var_parent =
+                    Some(visitor.scope_tree.default_temporary_scope(inner_scope).0)
             }
+            // Don't lifetime-extend child `super let`s or block tail expressions' temporaries in
+            // the initializer when this `super let` is not itself extended by a parent `let`
+            // (#145784). Block tail expressions are temporary drop scopes in Editions 2024 and
+            // later, their temps shouldn't outlive the block in e.g. `f(pin!({ &temp() }))`.
+            false
         }
-    }
+    };
 
-    if let Some(expr) = init {
+    if let Some(expr) = init
+        && extend_initializer
+    {
         record_rvalue_scope_if_borrow_expr(visitor, expr, visitor.cx.var_parent);
 
         if let Some(pat) = pat {
             if is_binding_pat(pat) {
-                visitor.scope_tree.record_rvalue_candidate(
-                    expr.hir_id,
-                    RvalueCandidate {
-                        target: expr.hir_id.local_id,
-                        lifetime: visitor.cx.var_parent,
-                    },
+                record_subexpr_extended_temp_scopes(
+                    &mut visitor.scope_tree,
+                    expr,
+                    visitor.cx.var_parent,
                 );
             }
         }
@@ -564,7 +573,7 @@ fn resolve_local<'tcx>(
         // & expression, and its lifetime would be extended to the end of the block (due
         // to a different rule, not the below code).
         match pat.kind {
-            PatKind::Binding(hir::BindingMode(hir::ByRef::Yes(_), _), ..) => true,
+            PatKind::Binding(hir::BindingMode(hir::ByRef::Yes(..), _), ..) => true,
 
             PatKind::Struct(_, field_pats, _) => field_pats.iter().any(|fp| is_binding_pat(fp.pat)),
 
@@ -582,7 +591,7 @@ fn resolve_local<'tcx>(
                 is_binding_pat(subpat)
             }
 
-            PatKind::Ref(_, _)
+            PatKind::Ref(_, _, _)
             | PatKind::Binding(hir::BindingMode(hir::ByRef::No, _), ..)
             | PatKind::Missing
             | PatKind::Wild
@@ -593,7 +602,7 @@ fn resolve_local<'tcx>(
         }
     }
 
-    /// If `expr` matches the `E&` grammar, then records an extended rvalue scope as appropriate:
+    /// If `expr` matches the `E&` grammar, then records an extended temporary scope as appropriate:
     ///
     /// ```text
     ///     E& = & ET
@@ -616,10 +625,7 @@ fn resolve_local<'tcx>(
         match expr.kind {
             hir::ExprKind::AddrOf(_, _, subexpr) => {
                 record_rvalue_scope_if_borrow_expr(visitor, subexpr, blk_id);
-                visitor.scope_tree.record_rvalue_candidate(
-                    subexpr.hir_id,
-                    RvalueCandidate { target: subexpr.hir_id.local_id, lifetime: blk_id },
-                );
+                record_subexpr_extended_temp_scopes(&mut visitor.scope_tree, subexpr, blk_id);
             }
             hir::ExprKind::Struct(_, fields, _) => {
                 for field in fields {
@@ -673,6 +679,47 @@ fn resolve_local<'tcx>(
             }
             _ => {}
         }
+    }
+}
+
+/// Applied to an expression `expr` if `expr` -- or something owned or partially owned by
+/// `expr` -- is going to be indirectly referenced by a variable in a let statement. In that
+/// case, the "temporary lifetime" of `expr` is extended to be the block enclosing the `let`
+/// statement.
+///
+/// More formally, if `expr` matches the grammar `ET`, record the temporary scope of the matching
+/// `<rvalue>` as `lifetime`:
+///
+/// ```text
+///     ET = *ET
+///        | ET[...]
+///        | ET.f
+///        | (ET)
+///        | <rvalue>
+/// ```
+///
+/// Note: ET is intended to match "rvalues or places based on rvalues".
+fn record_subexpr_extended_temp_scopes(
+    scope_tree: &mut ScopeTree,
+    expr: &hir::Expr<'_>,
+    lifetime: Option<Scope>,
+) {
+    // Note: give all the expressions matching `ET` with the
+    // extended temporary lifetime, not just the innermost rvalue,
+    // because in MIR building if we must compile e.g., `*rvalue()`
+    // into a temporary, we request the temporary scope of the
+    // outer expression.
+
+    scope_tree.record_extended_temp_scope(expr.hir_id.local_id, lifetime);
+
+    match expr.kind {
+        hir::ExprKind::AddrOf(_, _, subexpr)
+        | hir::ExprKind::Unary(hir::UnOp::Deref, subexpr)
+        | hir::ExprKind::Field(subexpr, _)
+        | hir::ExprKind::Index(subexpr, _, _) => {
+            record_subexpr_extended_temp_scopes(scope_tree, subexpr, lifetime);
+        }
+        _ => {}
     }
 }
 
@@ -742,10 +789,10 @@ impl<'tcx> Visitor<'tcx> for ScopeResolutionVisitor<'tcx> {
                 // The body of the every fn is a root scope.
                 resolve_expr(this, body.value, true);
             } else {
-                // Only functions have an outer terminating (drop) scope, while
-                // temporaries in constant initializers may be 'static, but only
-                // according to rvalue lifetime semantics, using the same
-                // syntactical rules used for let initializers.
+                // All bodies have an outer temporary drop scope, but temporaries
+                // and `super let` bindings in constant initializers may be extended
+                // to have 'static lifetimes, using the same syntactical rules used
+                // for `let` initializers.
                 //
                 // e.g., in `let x = &f();`, the temporary holding the result from
                 // the `f()` call lives for the entirety of the surrounding block.

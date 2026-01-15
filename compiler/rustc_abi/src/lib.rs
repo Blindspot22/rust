@@ -1,9 +1,7 @@
 // tidy-alphabetical-start
 #![cfg_attr(feature = "nightly", allow(internal_features))]
-#![cfg_attr(feature = "nightly", doc(rust_logo))]
 #![cfg_attr(feature = "nightly", feature(assert_matches))]
 #![cfg_attr(feature = "nightly", feature(rustc_attrs))]
-#![cfg_attr(feature = "nightly", feature(rustdoc_internals))]
 #![cfg_attr(feature = "nightly", feature(step_trait))]
 // tidy-alphabetical-end
 
@@ -63,6 +61,8 @@ mod tests;
 
 pub use callconv::{Heterogeneous, HomogeneousAggregate, Reg, RegKind};
 pub use canon_abi::{ArmCall, CanonAbi, InterruptKind, X86Call};
+#[cfg(feature = "nightly")]
+pub use extern_abi::CVariadicStatus;
 pub use extern_abi::{ExternAbi, all_names};
 #[cfg(feature = "nightly")]
 pub use layout::{FIRST_VARIANT, FieldIdx, Layout, TyAbiInterface, TyAndLayout, VariantIdx};
@@ -86,16 +86,21 @@ bitflags! {
         const IS_C               = 1 << 0;
         const IS_SIMD            = 1 << 1;
         const IS_TRANSPARENT     = 1 << 2;
-        // Internal only for now. If true, don't reorder fields.
-        // On its own it does not prevent ABI optimizations.
+        /// Internal only for now. If true, don't reorder fields.
+        /// On its own it does not prevent ABI optimizations.
         const IS_LINEAR          = 1 << 3;
-        // If true, the type's crate has opted into layout randomization.
-        // Other flags can still inhibit reordering and thus randomization.
-        // The seed stored in `ReprOptions.field_shuffle_seed`.
+        /// If true, the type's crate has opted into layout randomization.
+        /// Other flags can still inhibit reordering and thus randomization.
+        /// The seed stored in `ReprOptions.field_shuffle_seed`.
         const RANDOMIZE_LAYOUT   = 1 << 4;
-        // Any of these flags being set prevent field reordering optimisation.
-        const FIELD_ORDER_UNOPTIMIZABLE   = ReprFlags::IS_C.bits()
+        /// If true, the type is always passed indirectly by non-Rustic ABIs.
+        /// See [`TyAndLayout::pass_indirectly_in_non_rustic_abis`] for details.
+        const PASS_INDIRECTLY_IN_NON_RUSTIC_ABIS = 1 << 5;
+        const IS_SCALABLE        = 1 << 6;
+         // Any of these flags being set prevent field reordering optimisation.
+        const FIELD_ORDER_UNOPTIMIZABLE = ReprFlags::IS_C.bits()
                                  | ReprFlags::IS_SIMD.bits()
+                                 | ReprFlags::IS_SCALABLE.bits()
                                  | ReprFlags::IS_LINEAR.bits();
         const ABI_UNOPTIMIZABLE = ReprFlags::IS_C.bits() | ReprFlags::IS_SIMD.bits();
     }
@@ -132,6 +137,19 @@ impl IntegerType {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    feature = "nightly",
+    derive(Encodable_NoContext, Decodable_NoContext, HashStable_Generic)
+)]
+pub enum ScalableElt {
+    /// `N` in `rustc_scalable_vector(N)` - the element count of the scalable vector
+    ElementCount(u16),
+    /// `rustc_scalable_vector` w/out `N`, used for tuple types of scalable vectors that only
+    /// contain other scalable vectors
+    Container,
+}
+
 /// Represents the repr options provided by the user.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
 #[cfg_attr(
@@ -143,6 +161,8 @@ pub struct ReprOptions {
     pub align: Option<Align>,
     pub pack: Option<Align>,
     pub flags: ReprFlags,
+    /// `#[rustc_scalable_vector]`
+    pub scalable: Option<ScalableElt>,
     /// The seed to be used for randomizing a type's layout
     ///
     /// Note: This could technically be a `u128` which would
@@ -157,6 +177,11 @@ impl ReprOptions {
     #[inline]
     pub fn simd(&self) -> bool {
         self.flags.contains(ReprFlags::IS_SIMD)
+    }
+
+    #[inline]
+    pub fn scalable(&self) -> bool {
+        self.flags.contains(ReprFlags::IS_SCALABLE)
     }
 
     #[inline]
@@ -181,6 +206,11 @@ impl ReprOptions {
 
     /// Returns the discriminant type, given these `repr` options.
     /// This must only be called on enums!
+    ///
+    /// This is the "typeck type" of the discriminant, which is effectively the maximum size:
+    /// discriminant values will be wrapped to fit (with a lint). Layout can later decide to use a
+    /// smaller type for the tag that stores the discriminant at runtime and that will work just
+    /// fine, it just induces casts when getting/setting the discriminant.
     pub fn discr_type(&self) -> IntegerType {
         self.int.unwrap_or(IntegerType::Pointer(true))
     }
@@ -227,7 +257,7 @@ pub struct PointerSpec {
     /// The size of the bitwise representation of the pointer.
     pointer_size: Size,
     /// The alignment of pointers for this address space
-    pointer_align: AbiAlign,
+    pointer_align: Align,
     /// The size of the value a pointer can be offset by in this address space.
     pointer_offset: Size,
     /// Pointers into this address space contain extra metadata
@@ -240,20 +270,20 @@ pub struct PointerSpec {
 #[derive(Debug, PartialEq, Eq)]
 pub struct TargetDataLayout {
     pub endian: Endian,
-    pub i1_align: AbiAlign,
-    pub i8_align: AbiAlign,
-    pub i16_align: AbiAlign,
-    pub i32_align: AbiAlign,
-    pub i64_align: AbiAlign,
-    pub i128_align: AbiAlign,
-    pub f16_align: AbiAlign,
-    pub f32_align: AbiAlign,
-    pub f64_align: AbiAlign,
-    pub f128_align: AbiAlign,
-    pub aggregate_align: AbiAlign,
+    pub i1_align: Align,
+    pub i8_align: Align,
+    pub i16_align: Align,
+    pub i32_align: Align,
+    pub i64_align: Align,
+    pub i128_align: Align,
+    pub f16_align: Align,
+    pub f32_align: Align,
+    pub f64_align: Align,
+    pub f128_align: Align,
+    pub aggregate_align: Align,
 
     /// Alignments for vector types.
-    pub vector_align: Vec<(Size, AbiAlign)>,
+    pub vector_align: Vec<(Size, Align)>,
 
     pub default_address_space: AddressSpace,
     pub default_address_space_pointer_spec: PointerSpec,
@@ -280,25 +310,25 @@ impl Default for TargetDataLayout {
         let align = |bits| Align::from_bits(bits).unwrap();
         TargetDataLayout {
             endian: Endian::Big,
-            i1_align: AbiAlign::new(align(8)),
-            i8_align: AbiAlign::new(align(8)),
-            i16_align: AbiAlign::new(align(16)),
-            i32_align: AbiAlign::new(align(32)),
-            i64_align: AbiAlign::new(align(32)),
-            i128_align: AbiAlign::new(align(32)),
-            f16_align: AbiAlign::new(align(16)),
-            f32_align: AbiAlign::new(align(32)),
-            f64_align: AbiAlign::new(align(64)),
-            f128_align: AbiAlign::new(align(128)),
-            aggregate_align: AbiAlign { abi: align(8) },
+            i1_align: align(8),
+            i8_align: align(8),
+            i16_align: align(16),
+            i32_align: align(32),
+            i64_align: align(32),
+            i128_align: align(32),
+            f16_align: align(16),
+            f32_align: align(32),
+            f64_align: align(64),
+            f128_align: align(128),
+            aggregate_align: align(8),
             vector_align: vec![
-                (Size::from_bits(64), AbiAlign::new(align(64))),
-                (Size::from_bits(128), AbiAlign::new(align(128))),
+                (Size::from_bits(64), align(64)),
+                (Size::from_bits(128), align(128)),
             ],
             default_address_space: AddressSpace::ZERO,
             default_address_space_pointer_spec: PointerSpec {
                 pointer_size: Size::from_bits(64),
-                pointer_align: AbiAlign::new(align(64)),
+                pointer_align: align(64),
                 pointer_offset: Size::from_bits(64),
                 _is_fat: false,
             },
@@ -315,7 +345,7 @@ pub enum TargetDataLayoutErrors<'a> {
     MissingAlignment { cause: &'a str },
     InvalidAlignment { cause: &'a str, err: AlignFromBytesError },
     InconsistentTargetArchitecture { dl: &'a str, target: &'a str },
-    InconsistentTargetPointerWidth { pointer_size: u64, target: u32 },
+    InconsistentTargetPointerWidth { pointer_size: u64, target: u16 },
     InvalidBitsSize { err: String },
     UnknownPointerSpecification { err: String },
 }
@@ -358,7 +388,7 @@ impl TargetDataLayout {
                     .map_err(|err| TargetDataLayoutErrors::InvalidAlignment { cause, err })
             };
             let abi = parse_bits(s, "alignment", cause)?;
-            Ok(AbiAlign::new(align_from_bits(abi)?))
+            Ok(align_from_bits(abi)?)
         };
 
         // Parse an alignment sequence, possibly in the form `<align>[:<preferred_alignment>]`,
@@ -594,7 +624,7 @@ impl TargetDataLayout {
 
     /// psABI-mandated alignment for a vector type, if any
     #[inline]
-    fn cabi_vector_align(&self, vec_size: Size) -> Option<AbiAlign> {
+    fn cabi_vector_align(&self, vec_size: Size) -> Option<Align> {
         self.vector_align
             .iter()
             .find(|(size, _align)| *size == vec_size)
@@ -603,10 +633,9 @@ impl TargetDataLayout {
 
     /// an alignment resembling the one LLVM would pick for a vector
     #[inline]
-    pub fn llvmlike_vector_align(&self, vec_size: Size) -> AbiAlign {
-        self.cabi_vector_align(vec_size).unwrap_or(AbiAlign::new(
-            Align::from_bytes(vec_size.bytes().next_power_of_two()).unwrap(),
-        ))
+    pub fn llvmlike_vector_align(&self, vec_size: Size) -> Align {
+        self.cabi_vector_align(vec_size)
+            .unwrap_or(Align::from_bytes(vec_size.bytes().next_power_of_two()).unwrap())
     }
 
     /// Get the pointer size in the default data address space.
@@ -652,21 +681,19 @@ impl TargetDataLayout {
     /// Get the pointer alignment in the default data address space.
     #[inline]
     pub fn pointer_align(&self) -> AbiAlign {
-        self.default_address_space_pointer_spec.pointer_align
+        AbiAlign::new(self.default_address_space_pointer_spec.pointer_align)
     }
 
     /// Get the pointer alignment in a specific address space.
     #[inline]
     pub fn pointer_align_in(&self, c: AddressSpace) -> AbiAlign {
-        if c == self.default_address_space {
-            return self.default_address_space_pointer_spec.pointer_align;
-        }
-
-        if let Some(e) = self.address_space_info.iter().find(|(a, _)| a == &c) {
+        AbiAlign::new(if c == self.default_address_space {
+            self.default_address_space_pointer_spec.pointer_align
+        } else if let Some(e) = self.address_space_info.iter().find(|(a, _)| a == &c) {
             e.1.pointer_align
         } else {
             panic!("Use of unknown address space {c:?}");
-        }
+        })
     }
 }
 
@@ -1183,13 +1210,13 @@ impl Integer {
         use Integer::*;
         let dl = cx.data_layout();
 
-        match self {
+        AbiAlign::new(match self {
             I8 => dl.i8_align,
             I16 => dl.i16_align,
             I32 => dl.i32_align,
             I64 => dl.i64_align,
             I128 => dl.i128_align,
-        }
+        })
     }
 
     /// Returns the largest signed value that can be represented by this Integer.
@@ -1309,12 +1336,12 @@ impl Float {
         use Float::*;
         let dl = cx.data_layout();
 
-        match self {
+        AbiAlign::new(match self {
             F16 => dl.f16_align,
             F32 => dl.f32_align,
             F64 => dl.f64_align,
             F128 => dl.f128_align,
-        }
+        })
     }
 }
 
@@ -1609,19 +1636,14 @@ pub enum FieldsShape<FieldIdx: Idx> {
         // FIXME(eddyb) use small vector optimization for the common case.
         offsets: IndexVec<FieldIdx, Size>,
 
-        /// Maps source order field indices to memory order indices,
+        /// Maps memory order field indices to source order indices,
         /// depending on how the fields were reordered (if at all).
         /// This is a permutation, with both the source order and the
         /// memory order using the same (0..n) index ranges.
         ///
-        /// Note that during computation of `memory_index`, sometimes
-        /// it is easier to operate on the inverse mapping (that is,
-        /// from memory order to source order), and that is usually
-        /// named `inverse_memory_index`.
-        ///
         // FIXME(eddyb) build a better abstraction for permutations, if possible.
         // FIXME(camlorn) also consider small vector optimization here.
-        memory_index: IndexVec<FieldIdx, u32>,
+        in_memory_order: IndexVec<u32, FieldIdx>,
     },
 }
 
@@ -1655,51 +1677,17 @@ impl<FieldIdx: Idx> FieldsShape<FieldIdx> {
         }
     }
 
-    #[inline]
-    pub fn memory_index(&self, i: usize) -> usize {
-        match *self {
-            FieldsShape::Primitive => {
-                unreachable!("FieldsShape::memory_index: `Primitive`s have no fields")
-            }
-            FieldsShape::Union(_) | FieldsShape::Array { .. } => i,
-            FieldsShape::Arbitrary { ref memory_index, .. } => {
-                memory_index[FieldIdx::new(i)].try_into().unwrap()
-            }
-        }
-    }
-
     /// Gets source indices of the fields by increasing offsets.
     #[inline]
     pub fn index_by_increasing_offset(&self) -> impl ExactSizeIterator<Item = usize> {
-        let mut inverse_small = [0u8; 64];
-        let mut inverse_big = IndexVec::new();
-        let use_small = self.count() <= inverse_small.len();
-
-        // We have to write this logic twice in order to keep the array small.
-        if let FieldsShape::Arbitrary { ref memory_index, .. } = *self {
-            if use_small {
-                for (field_idx, &mem_idx) in memory_index.iter_enumerated() {
-                    inverse_small[mem_idx as usize] = field_idx.index() as u8;
-                }
-            } else {
-                inverse_big = memory_index.invert_bijective_mapping();
-            }
-        }
-
         // Primitives don't really have fields in the way that structs do,
         // but having this return an empty iterator for them is unhelpful
         // since that makes them look kinda like ZSTs, which they're not.
         let pseudofield_count = if let FieldsShape::Primitive = self { 1 } else { self.count() };
 
-        (0..pseudofield_count).map(move |i| match *self {
+        (0..pseudofield_count).map(move |i| match self {
             FieldsShape::Primitive | FieldsShape::Union(_) | FieldsShape::Array { .. } => i,
-            FieldsShape::Arbitrary { .. } => {
-                if use_small {
-                    inverse_small[i] as usize
-                } else {
-                    inverse_big[i as u32].index()
-                }
-            }
+            FieldsShape::Arbitrary { in_memory_order, .. } => in_memory_order[i as u32].index(),
         })
     }
 }
@@ -1731,6 +1719,10 @@ impl AddressSpace {
 pub enum BackendRepr {
     Scalar(Scalar),
     ScalarPair(Scalar, Scalar),
+    ScalableVector {
+        element: Scalar,
+        count: u64,
+    },
     SimdVector {
         element: Scalar,
         count: u64,
@@ -1749,6 +1741,12 @@ impl BackendRepr {
         match *self {
             BackendRepr::Scalar(_)
             | BackendRepr::ScalarPair(..)
+            // FIXME(rustc_scalable_vector): Scalable vectors are `Sized` while the
+            // `sized_hierarchy` feature is not yet fully implemented. After `sized_hierarchy` is
+            // fully implemented, scalable vectors will remain `Sized`, they just won't be
+            // `const Sized` - whether `is_unsized` continues to return `false` at that point will
+            // need to be revisited and will depend on what `is_unsized` is used for.
+            | BackendRepr::ScalableVector { .. }
             | BackendRepr::SimdVector { .. } => false,
             BackendRepr::Memory { sized } => !sized,
         }
@@ -1789,7 +1787,9 @@ impl BackendRepr {
             BackendRepr::Scalar(s) => Some(s.align(cx).abi),
             BackendRepr::ScalarPair(s1, s2) => Some(s1.align(cx).max(s2.align(cx)).abi),
             // The align of a Vector can vary in surprising ways
-            BackendRepr::SimdVector { .. } | BackendRepr::Memory { .. } => None,
+            BackendRepr::SimdVector { .. }
+            | BackendRepr::Memory { .. }
+            | BackendRepr::ScalableVector { .. } => None,
         }
     }
 
@@ -1811,7 +1811,9 @@ impl BackendRepr {
                 Some(size)
             }
             // The size of a Vector can vary in surprising ways
-            BackendRepr::SimdVector { .. } | BackendRepr::Memory { .. } => None,
+            BackendRepr::SimdVector { .. }
+            | BackendRepr::Memory { .. }
+            | BackendRepr::ScalableVector { .. } => None,
         }
     }
 
@@ -1826,6 +1828,9 @@ impl BackendRepr {
                 BackendRepr::SimdVector { element: element.to_union(), count }
             }
             BackendRepr::Memory { .. } => BackendRepr::Memory { sized: true },
+            BackendRepr::ScalableVector { element, count } => {
+                BackendRepr::ScalableVector { element: element.to_union(), count }
+            }
         }
     }
 
@@ -2066,7 +2071,9 @@ impl<FieldIdx: Idx, VariantIdx: Idx> LayoutData<FieldIdx, VariantIdx> {
     /// Returns `true` if this is an aggregate type (including a ScalarPair!)
     pub fn is_aggregate(&self) -> bool {
         match self.backend_repr {
-            BackendRepr::Scalar(_) | BackendRepr::SimdVector { .. } => false,
+            BackendRepr::Scalar(_)
+            | BackendRepr::SimdVector { .. }
+            | BackendRepr::ScalableVector { .. } => false,
             BackendRepr::ScalarPair(..) | BackendRepr::Memory { .. } => true,
         }
     }
@@ -2157,7 +2164,20 @@ impl<FieldIdx: Idx, VariantIdx: Idx> LayoutData<FieldIdx, VariantIdx> {
 
     /// Returns `true` if the type is sized and a 1-ZST (meaning it has size 0 and alignment 1).
     pub fn is_1zst(&self) -> bool {
-        self.is_sized() && self.size.bytes() == 0 && self.align.abi.bytes() == 1
+        self.is_sized() && self.size.bytes() == 0 && self.align.bytes() == 1
+    }
+
+    /// Returns `true` if the size of the type is only known at runtime.
+    pub fn is_runtime_sized(&self) -> bool {
+        matches!(self.backend_repr, BackendRepr::ScalableVector { .. })
+    }
+
+    /// Returns the elements count of a scalable vector.
+    pub fn scalable_vector_element_count(&self) -> Option<u64> {
+        match self.backend_repr {
+            BackendRepr::ScalableVector { count, .. } => Some(count),
+            _ => None,
+        }
     }
 
     /// Returns `true` if the type is a ZST and not unsized.
@@ -2168,6 +2188,7 @@ impl<FieldIdx: Idx, VariantIdx: Idx> LayoutData<FieldIdx, VariantIdx> {
         match self.backend_repr {
             BackendRepr::Scalar(_)
             | BackendRepr::ScalarPair(..)
+            | BackendRepr::ScalableVector { .. }
             | BackendRepr::SimdVector { .. } => false,
             BackendRepr::Memory { sized } => sized && self.size.bytes() == 0,
         }

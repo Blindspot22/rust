@@ -14,6 +14,7 @@ pub use self::variance::{
     PhantomInvariant, PhantomInvariantLifetime, Variance, variance,
 };
 use crate::cell::UnsafeCell;
+use crate::clone::TrivialClone;
 use crate::cmp;
 use crate::fmt::Debug;
 use crate::hash::{Hash, Hasher};
@@ -162,7 +163,7 @@ pub trait Sized: MetaSized {
 }
 
 /// Types with a size that can be determined from pointer metadata.
-#[unstable(feature = "sized_hierarchy", issue = "none")]
+#[unstable(feature = "sized_hierarchy", issue = "144404")]
 #[lang = "meta_sized"]
 #[diagnostic::on_unimplemented(
     message = "the size for values of type `{Self}` cannot be known",
@@ -180,7 +181,7 @@ pub trait MetaSized: PointeeSized {
 }
 
 /// Types that may or may not have a size.
-#[unstable(feature = "sized_hierarchy", issue = "none")]
+#[unstable(feature = "sized_hierarchy", issue = "144404")]
 #[lang = "pointee_sized"]
 #[diagnostic::on_unimplemented(
     message = "values of type `{Self}` may or may not have a size",
@@ -454,12 +455,8 @@ marker_impls! {
 /// [impls]: #implementors
 #[stable(feature = "rust1", since = "1.0.0")]
 #[lang = "copy"]
-// FIXME(matthewjasper) This allows copying a type that doesn't implement
-// `Copy` because of unsatisfied lifetime bounds (copying `A<'_>` when only
-// `A<'static>: Copy` and `A<'_>: Clone`).
-// We have this attribute here for now only because there are quite a few
-// existing specializations on `Copy` that already exist in the standard
-// library, and there's no way to safely have this behavior right now.
+// This is unsound, but required by `hashbrown`
+// FIXME(joboet): change `hashbrown` to use `TrivialClone`
 #[rustc_unsafe_specialization_marker]
 #[rustc_diagnostic_item = "Copy"]
 pub trait Copy: Clone {
@@ -469,7 +466,7 @@ pub trait Copy: Clone {
 /// Derive macro generating an impl of the trait `Copy`.
 #[rustc_builtin_macro]
 #[stable(feature = "builtin_macro_prelude", since = "1.38.0")]
-#[allow_internal_unstable(core_intrinsics, derive_clone_copy)]
+#[allow_internal_unstable(core_intrinsics, derive_clone_copy_internals)]
 pub macro Copy($item:item) {
     /* compiler built-in */
 }
@@ -861,6 +858,10 @@ impl<T: PointeeSized> Clone for PhantomData<T> {
     }
 }
 
+#[doc(hidden)]
+#[unstable(feature = "trivial_clone", issue = "none")]
+unsafe impl<T: PointeeSized> TrivialClone for PhantomData<T> {}
+
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_const_unstable(feature = "const_default", issue = "143894")]
 impl<T: PointeeSized> const Default for PhantomData<T> {
@@ -1049,7 +1050,7 @@ marker_impls! {
 
 /// A marker for types that can be dropped.
 ///
-/// This should be used for `~const` bounds,
+/// This should be used for `[const]` bounds,
 /// as non-const bounds will always hold for every type.
 #[unstable(feature = "const_destruct", issue = "133214")]
 #[rustc_const_unstable(feature = "const_destruct", issue = "133214")]
@@ -1057,8 +1058,7 @@ marker_impls! {
 #[rustc_on_unimplemented(message = "can't drop `{Self}`", append_const_msg)]
 #[rustc_deny_explicit_impl]
 #[rustc_do_not_implement_via_object]
-#[const_trait]
-pub trait Destruct {}
+pub const trait Destruct: PointeeSized {}
 
 /// A marker for tuple types.
 ///
@@ -1084,30 +1084,13 @@ pub trait Tuple {}
 // We name this differently than the derive macro so that the `adt_const_params` can
 // be used independently of `unsized_const_params` without requiring a full path
 // to the derive macro every time it is used. This should be renamed on stabilization.
-pub trait ConstParamTy_: UnsizedConstParamTy + StructuralPartialEq + Eq {}
+pub trait ConstParamTy_: StructuralPartialEq + Eq {}
 
 /// Derive macro generating an impl of the trait `ConstParamTy`.
 #[rustc_builtin_macro]
 #[allow_internal_unstable(unsized_const_params)]
 #[unstable(feature = "adt_const_params", issue = "95174")]
 pub macro ConstParamTy($item:item) {
-    /* compiler built-in */
-}
-
-#[lang = "unsized_const_param_ty"]
-#[unstable(feature = "unsized_const_params", issue = "95174")]
-#[diagnostic::on_unimplemented(message = "`{Self}` can't be used as a const parameter type")]
-/// A marker for types which can be used as types of `const` generic parameters.
-///
-/// Equivalent to [`ConstParamTy_`] except that this is used by
-/// the `unsized_const_params` to allow for fake unstable impls.
-pub trait UnsizedConstParamTy: StructuralPartialEq + Eq {}
-
-/// Derive macro generating an impl of the trait `ConstParamTy`.
-#[rustc_builtin_macro]
-#[allow_internal_unstable(unsized_const_params)]
-#[unstable(feature = "unsized_const_params", issue = "95174")]
-pub macro UnsizedConstParamTy($item:item) {
     /* compiler built-in */
 }
 
@@ -1125,17 +1108,11 @@ marker_impls! {
 
 marker_impls! {
     #[unstable(feature = "unsized_const_params", issue = "95174")]
-    UnsizedConstParamTy for
-        usize, u8, u16, u32, u64, u128,
-        isize, i8, i16, i32, i64, i128,
-        bool,
-        char,
-        (),
-        {T: UnsizedConstParamTy, const N: usize} [T; N],
-
+    #[unstable_feature_bound(unsized_const_params)]
+    ConstParamTy_ for
         str,
-        {T: UnsizedConstParamTy} [T],
-        {T: UnsizedConstParamTy + ?Sized} &T,
+        {T: ConstParamTy_} [T],
+        {T: ConstParamTy_ + ?Sized} &T,
 }
 
 /// A common trait implemented by all function pointers.
@@ -1364,12 +1341,4 @@ pub macro CoercePointee($item:item) {
 #[doc(hidden)]
 pub trait CoercePointeeValidated {
     /* compiler built-in */
-}
-
-/// Allows value to be reborrowed as exclusive, creating a copy of the value
-/// that disables the source for reads and writes for the lifetime of the copy.
-#[lang = "reborrow"]
-#[unstable(feature = "reborrow", issue = "145612")]
-pub trait Reborrow {
-    // Empty.
 }

@@ -1,6 +1,7 @@
 //! Main evaluator loop and setting up the initial stack frame.
 
 use std::ffi::{OsStr, OsString};
+use std::num::NonZeroI32;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -14,6 +15,7 @@ use rustc_hir::def_id::DefId;
 use rustc_middle::ty::layout::{HasTyCtxt, HasTypingEnv, LayoutCx};
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_session::config::EntryFnType;
+use rustc_target::spec::Os;
 
 use crate::concurrency::GenmcCtx;
 use crate::concurrency::thread::TlsAllocAction;
@@ -31,65 +33,6 @@ pub enum MiriEntryFnType {
 /// But we must only do that a finite number of times, or a background thread running `loop {}`
 /// will hang the program.
 const MAIN_THREAD_YIELDS_AT_SHUTDOWN: u32 = 256;
-
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub enum AlignmentCheck {
-    /// Do not check alignment.
-    None,
-    /// Check alignment "symbolically", i.e., using only the requested alignment for an allocation and not its real base address.
-    Symbolic,
-    /// Check alignment on the actual physical integer address.
-    Int,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub enum RejectOpWith {
-    /// Isolated op is rejected with an abort of the machine.
-    Abort,
-
-    /// If not Abort, miri returns an error for an isolated op.
-    /// Following options determine if user should be warned about such error.
-    /// Do not print warning about rejected isolated op.
-    NoWarning,
-
-    /// Print a warning about rejected isolated op, with backtrace.
-    Warning,
-
-    /// Print a warning about rejected isolated op, without backtrace.
-    WarningWithoutBacktrace,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub enum IsolatedOp {
-    /// Reject an op requiring communication with the host. By
-    /// default, miri rejects the op with an abort. If not, it returns
-    /// an error code, and prints a warning about it. Warning levels
-    /// are controlled by `RejectOpWith` enum.
-    Reject(RejectOpWith),
-
-    /// Execute op requiring communication with the host, i.e. disable isolation.
-    Allow,
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum BacktraceStyle {
-    /// Prints a terser backtrace which ideally only contains relevant information.
-    Short,
-    /// Prints a backtrace with all possible information.
-    Full,
-    /// Prints only the frame that the error occurs in.
-    Off,
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum ValidationMode {
-    /// Do not perform any kind of validation.
-    No,
-    /// Validate the interior of the value, but not things behind references.
-    Shallow,
-    /// Fully recursively validate references.
-    Deep,
-}
 
 /// Configuration needed to spawn a Miri instance.
 #[derive(Clone)]
@@ -146,8 +89,6 @@ pub struct MiriConfig {
     pub preemption_rate: f64,
     /// Report the current instruction being executed every N basic blocks.
     pub report_progress: Option<u32>,
-    /// Whether Stacked Borrows and Tree Borrows retagging should recurse into fields of datatypes.
-    pub retag_fields: RetagFields,
     /// The location of the shared object files to load when calling external functions
     pub native_lib: Vec<PathBuf>,
     /// Whether to enable the new native lib tracing system.
@@ -171,7 +112,11 @@ pub struct MiriConfig {
     /// Whether floating-point operations can behave non-deterministically.
     pub float_nondet: bool,
     /// Whether floating-point operations can have a non-deterministic rounding error.
-    pub float_rounding_error: bool,
+    pub float_rounding_error: FloatRoundingErrorMode,
+    /// Whether Miri artifically introduces short reads/writes on file descriptors.
+    pub short_fd_operations: bool,
+    /// A list of crates that are considered user-relevant.
+    pub user_relevant_crates: Vec<String>,
 }
 
 impl Default for MiriConfig {
@@ -201,7 +146,6 @@ impl Default for MiriConfig {
             mute_stdout_stderr: false,
             preemption_rate: 0.01, // 1%
             report_progress: None,
-            retag_fields: RetagFields::Yes,
             native_lib: vec![],
             native_lib_enable_tracing: false,
             gc_interval: 10_000,
@@ -213,7 +157,9 @@ impl Default for MiriConfig {
             fixed_scheduling: false,
             force_intrinsic_fallback: false,
             float_nondet: true,
-            float_rounding_error: true,
+            float_rounding_error: FloatRoundingErrorMode::Random,
+            short_fd_operations: true,
+            user_relevant_crates: vec![],
         }
     }
 }
@@ -303,8 +249,21 @@ impl<'tcx> MainThreadState<'tcx> {
                 // to be like a global `static`, so that all memory reached by it is considered to "not leak".
                 this.terminate_active_thread(TlsAllocAction::Leak)?;
 
-                // Stop interpreter loop.
-                throw_machine_stop!(TerminationInfo::Exit { code: exit_code, leak_check: true });
+                // In GenMC mode, we do not immediately stop execution on main thread exit.
+                if let Some(genmc_ctx) = this.machine.data_race.as_genmc_ref() {
+                    // If there's no error, execution will continue (on another thread).
+                    genmc_ctx.handle_exit(
+                        ThreadId::MAIN_THREAD,
+                        exit_code,
+                        crate::concurrency::ExitType::MainThreadFinish,
+                    )?;
+                } else {
+                    // Stop interpreter loop.
+                    throw_machine_stop!(TerminationInfo::Exit {
+                        code: exit_code,
+                        leak_check: true
+                    });
+                }
             }
         }
         interp_ok(Poll::Pending)
@@ -381,7 +340,7 @@ pub fn create_ecx<'tcx>(
             ecx.machine.argv = Some(argv_place.ptr());
         }
         // Store command line as UTF-16 for Windows `GetCommandLineW`.
-        if tcx.sess.target.os == "windows" {
+        if tcx.sess.target.os == Os::Windows {
             // Construct a command string with all the arguments.
             let cmd_utf16: Vec<u16> = args_to_utf16_command_string(config.args.iter());
 
@@ -501,13 +460,9 @@ pub fn eval_entry<'tcx>(
     entry_type: MiriEntryFnType,
     config: &MiriConfig,
     genmc_ctx: Option<Rc<GenmcCtx>>,
-) -> Option<i32> {
+) -> Result<(), NonZeroI32> {
     // Copy setting before we move `config`.
     let ignore_leaks = config.ignore_leaks;
-
-    if let Some(genmc_ctx) = &genmc_ctx {
-        genmc_ctx.handle_execution_start();
-    }
 
     let mut ecx = match create_ecx(tcx, entry_id, entry_type, config, genmc_ctx).report_err() {
         Ok(v) => v,
@@ -525,44 +480,50 @@ pub fn eval_entry<'tcx>(
         ecx.handle_ice();
         panic::resume_unwind(panic_payload)
     });
-    // `Ok` can never happen; the interpreter loop always exits with an "error"
-    // (but that "error" might be just "regular program termination").
-    let Err(err) = res.report_err();
+    // Obtain the result of the execution. This is always an `Err`, but that doesn't necessarily
+    // indicate an error.
+    let Err(res) = res.report_err();
 
-    // Show diagnostic, if any.
-    let (return_code, leak_check) = report_error(&ecx, err)?;
+    // Error reporting: if we survive all checks, we return the exit code the program gave us.
+    'miri_error: {
+        // Show diagnostic, if any.
+        let Some((return_code, leak_check)) = report_result(&ecx, res) else {
+            break 'miri_error;
+        };
 
-    // We inform GenMC that the execution is complete.
-    if let Some(genmc_ctx) = ecx.machine.data_race.as_genmc_ref()
-        && let Err(error) = genmc_ctx.handle_execution_end(&ecx)
-    {
-        // FIXME(GenMC): Improve error reporting.
-        tcx.dcx().err(format!("GenMC returned an error: \"{error}\""));
-        return None;
+        // If we get here there was no fatal error -- yet.
+        // Possibly check for memory leaks.
+        if leak_check && !ignore_leaks {
+            // Check for thread leaks.
+            if !ecx.have_all_terminated() {
+                tcx.dcx()
+                    .err("the main thread terminated without waiting for all remaining threads");
+                tcx.dcx().note("set `MIRIFLAGS=-Zmiri-ignore-leaks` to disable this check");
+                break 'miri_error;
+            }
+            // Check for memory leaks.
+            info!("Additional static roots: {:?}", ecx.machine.static_roots);
+            let leaks = ecx.take_leaked_allocations(|ecx| &ecx.machine.static_roots);
+            if !leaks.is_empty() {
+                report_leaks(&ecx, leaks);
+                tcx.dcx().note("set `MIRIFLAGS=-Zmiri-ignore-leaks` to disable this check");
+                // Ignore the provided return code - let the reported error
+                // determine the return code.
+                break 'miri_error;
+            }
+        }
+
+        // The interpreter has not reported an error.
+        // (There could still be errors in the session if there are other interpreters.)
+        return match NonZeroI32::new(return_code) {
+            None => Ok(()),
+            Some(return_code) => Err(return_code),
+        };
     }
 
-    // If we get here there was no fatal error.
-
-    // Possibly check for memory leaks.
-    if leak_check && !ignore_leaks {
-        // Check for thread leaks.
-        if !ecx.have_all_terminated() {
-            tcx.dcx().err("the main thread terminated without waiting for all remaining threads");
-            tcx.dcx().note("set `MIRIFLAGS=-Zmiri-ignore-leaks` to disable this check");
-            return None;
-        }
-        // Check for memory leaks.
-        info!("Additional static roots: {:?}", ecx.machine.static_roots);
-        let leaks = ecx.take_leaked_allocations(|ecx| &ecx.machine.static_roots);
-        if !leaks.is_empty() {
-            report_leaks(&ecx, leaks);
-            tcx.dcx().note("set `MIRIFLAGS=-Zmiri-ignore-leaks` to disable this check");
-            // Ignore the provided return code - let the reported error
-            // determine the return code.
-            return None;
-        }
-    }
-    Some(return_code)
+    // The interpreter reported an error.
+    assert!(tcx.dcx().has_errors().is_some());
+    Err(NonZeroI32::new(rustc_driver::EXIT_FAILURE).unwrap())
 }
 
 /// Turns an array of arguments into a Windows command line string.
@@ -582,9 +543,7 @@ where
 {
     // Parse argv[0]. Slashes aren't escaped. Literal double quotes are not allowed.
     let mut cmd = {
-        let arg0 = if let Some(arg0) = args.next() {
-            arg0
-        } else {
+        let Some(arg0) = args.next() else {
             return vec![0];
         };
         let arg0 = arg0.as_ref();

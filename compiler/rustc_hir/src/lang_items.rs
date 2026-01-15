@@ -10,7 +10,7 @@
 use rustc_ast::attr::AttributeExt;
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
-use rustc_macros::{Decodable, Encodable, HashStable_Generic};
+use rustc_macros::{BlobDecodable, Encodable, HashStable_Generic};
 use rustc_span::{Span, Symbol, kw, sym};
 
 use crate::def_id::DefId;
@@ -75,7 +75,7 @@ macro_rules! language_item_table {
         $( $(#[$attr:meta])* $variant:ident, $module:ident :: $name:ident, $method:ident, $target:expr, $generics:expr; )*
     ) => {
         /// A representation of all the valid lang items in Rust.
-        #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Encodable, Decodable)]
+        #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Encodable, BlobDecodable)]
         pub enum LangItem {
             $(
                 #[doc = concat!("The `", stringify!($name), "` lang item.")]
@@ -168,12 +168,16 @@ language_item_table! {
     MetaSized,               sym::meta_sized,          meta_sized_trait,           Target::Trait,          GenericRequirement::Exact(0);
     PointeeSized,            sym::pointee_sized,       pointee_sized_trait,        Target::Trait,          GenericRequirement::Exact(0);
     Unsize,                  sym::unsize,              unsize_trait,               Target::Trait,          GenericRequirement::Minimum(1);
+    AlignOf,                 sym::mem_align_const,     align_const,                Target::AssocConst,     GenericRequirement::Exact(0);
+    SizeOf,                  sym::mem_size_const,      size_const,                 Target::AssocConst,     GenericRequirement::Exact(0);
+    OffsetOf,                sym::offset_of,           offset_of,                  Target::Fn,             GenericRequirement::Exact(1);
     /// Trait injected by `#[derive(PartialEq)]`, (i.e. "Partial EQ").
     StructuralPeq,           sym::structural_peq,      structural_peq_trait,       Target::Trait,          GenericRequirement::None;
     Copy,                    sym::copy,                copy_trait,                 Target::Trait,          GenericRequirement::Exact(0);
     Clone,                   sym::clone,               clone_trait,                Target::Trait,          GenericRequirement::None;
     CloneFn,                 sym::clone_fn,            clone_fn,                   Target::Method(MethodKind::Trait { body: false }), GenericRequirement::None;
     UseCloned,               sym::use_cloned,          use_cloned_trait,           Target::Trait,          GenericRequirement::None;
+    TrivialClone,            sym::trivial_clone,       trivial_clone_trait,        Target::Trait,          GenericRequirement::None;
     Sync,                    sym::sync,                sync_trait,                 Target::Trait,          GenericRequirement::Exact(0);
     DiscriminantKind,        sym::discriminant_kind,   discriminant_kind_trait,    Target::Trait,          GenericRequirement::None;
     /// The associated item of the `DiscriminantKind` trait.
@@ -274,6 +278,7 @@ language_item_table! {
     PartialOrd,              sym::partial_ord,         partial_ord_trait,          Target::Trait,          GenericRequirement::Exact(1);
     CVoid,                   sym::c_void,              c_void,                     Target::Enum,           GenericRequirement::None;
 
+    Type,                    sym::type_info,           type_struct,                Target::Struct,         GenericRequirement::None;
     TypeId,                  sym::type_id,             type_id,                    Target::Struct,         GenericRequirement::None;
 
     // A number of panic-related lang items. The `panic` item corresponds to divide-by-zero and
@@ -326,9 +331,6 @@ language_item_table! {
     // Lang items needed for `format_args!()`.
     FormatArgument,          sym::format_argument,     format_argument,            Target::Struct,         GenericRequirement::None;
     FormatArguments,         sym::format_arguments,    format_arguments,           Target::Struct,         GenericRequirement::None;
-    FormatCount,             sym::format_count,        format_count,               Target::Enum,           GenericRequirement::None;
-    FormatPlaceholder,       sym::format_placeholder,  format_placeholder,         Target::Struct,         GenericRequirement::None;
-    FormatUnsafeArg,         sym::format_unsafe_arg,   format_unsafe_arg,          Target::Struct,         GenericRequirement::None;
 
     ExchangeMalloc,          sym::exchange_malloc,     exchange_malloc_fn,         Target::Fn,             GenericRequirement::None;
     DropInPlace,             sym::drop_in_place,       drop_in_place_fn,           Target::Fn,             GenericRequirement::Minimum(1);
@@ -342,6 +344,10 @@ language_item_table! {
 
     EhPersonality,           sym::eh_personality,      eh_personality,             Target::Fn,             GenericRequirement::None;
     EhCatchTypeinfo,         sym::eh_catch_typeinfo,   eh_catch_typeinfo,          Target::Static,         GenericRequirement::None;
+
+    // Profiling markers for move/copy operations (used by -Z annotate-moves)
+    CompilerMove,            sym::compiler_move,       compiler_move_fn,           Target::Fn,             GenericRequirement::Exact(2);
+    CompilerCopy,            sym::compiler_copy,       compiler_copy_fn,           Target::Fn,             GenericRequirement::Exact(2);
 
     OwnedBox,                sym::owned_box,           owned_box,                  Target::Struct,         GenericRequirement::Minimum(1);
     GlobalAlloc,             sym::global_alloc_ty,     global_alloc_ty,            Target::Struct,         GenericRequirement::None;
@@ -366,11 +372,11 @@ language_item_table! {
     TryTraitFromOutput,      sym::from_output,         from_output_fn,             Target::Method(MethodKind::Trait { body: false }), GenericRequirement::None;
     TryTraitBranch,          sym::branch,              branch_fn,                  Target::Method(MethodKind::Trait { body: false }), GenericRequirement::None;
     TryTraitFromYeet,        sym::from_yeet,           from_yeet_fn,               Target::Fn,             GenericRequirement::None;
+    ResidualIntoTryType,     sym::into_try_type,       into_try_type_fn,           Target::Fn,             GenericRequirement::None;
 
     CoercePointeeValidated, sym::coerce_pointee_validated, coerce_pointee_validated_trait, Target::Trait,     GenericRequirement::Exact(0);
 
     ConstParamTy,            sym::const_param_ty,      const_param_ty_trait,       Target::Trait,          GenericRequirement::Exact(0);
-    UnsizedConstParamTy,     sym::unsized_const_param_ty, unsized_const_param_ty_trait, Target::Trait, GenericRequirement::Exact(0);
 
     Poll,                    sym::Poll,                poll,                       Target::Enum,           GenericRequirement::None;
     PollReady,               sym::Ready,               poll_ready_variant,         Target::Variant,        GenericRequirement::None;
@@ -422,6 +428,7 @@ language_item_table! {
     RangeFromCopy,           sym::RangeFromCopy,       range_from_copy_struct,     Target::Struct,         GenericRequirement::None;
     RangeCopy,               sym::RangeCopy,           range_copy_struct,          Target::Struct,         GenericRequirement::None;
     RangeInclusiveCopy,      sym::RangeInclusiveCopy,  range_inclusive_copy_struct, Target::Struct,         GenericRequirement::None;
+    RangeToInclusiveCopy,    sym::RangeToInclusiveCopy,     range_to_inclusive_copy_struct, Target::Struct, GenericRequirement::None;
 
     String,                  sym::String,              string,                     Target::Struct,         GenericRequirement::None;
     CStr,                    sym::CStr,                c_str,                      Target::Struct,         GenericRequirement::None;
@@ -440,6 +447,7 @@ language_item_table! {
 
     // Reborrowing related lang-items
     Reborrow,                sym::reborrow,            reborrow,                   Target::Trait,          GenericRequirement::Exact(0);
+    CoerceShared,            sym::coerce_shared,       coerce_shared,              Target::Trait,          GenericRequirement::Exact(0);
 }
 
 /// The requirement imposed on the generics of a lang item

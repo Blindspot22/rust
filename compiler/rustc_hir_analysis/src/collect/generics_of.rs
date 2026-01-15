@@ -77,20 +77,6 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
         // stable enough and does not need a feature gate anymore.
         Node::AnonConst(_) => {
             let parent_did = tcx.parent(def_id.to_def_id());
-
-            // We don't do this unconditionally because the `DefId` parent of an anon const
-            // might be an implicitly created closure during `async fn` desugaring. This would
-            // have the wrong generics.
-            //
-            // i.e. `async fn foo<'a>() { let a = [(); { 1 + 2 }]; bar().await() }`
-            // would implicitly have a closure in its body that would be the parent of
-            // the `{ 1 + 2 }` anon const. This closure's generics is simply a witness
-            // instead of `['a]`.
-            let parent_did = if let DefKind::AnonConst = tcx.def_kind(parent_did) {
-                parent_did
-            } else {
-                tcx.hir_get_parent_item(hir_id).to_def_id()
-            };
             debug!(?parent_did);
 
             let mut in_param_ty = false;
@@ -305,7 +291,7 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
 
                 ty::GenericParamDefKind::Type { has_default: default.is_some(), synthetic }
             }
-            GenericParamKind::Const { ty: _, default, synthetic } => {
+            GenericParamKind::Const { ty: _, default } => {
                 if default.is_some() {
                     match param_default_policy.expect("no policy for generic param default") {
                         ParamDefaultPolicy::Allowed => {}
@@ -316,7 +302,7 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
                     }
                 }
 
-                ty::GenericParamDefKind::Const { has_default: default.is_some(), synthetic }
+                ty::GenericParamDefKind::Const { has_default: default.is_some() }
             }
         };
         Some(ty::GenericParamDef {
@@ -523,7 +509,7 @@ impl<'v> Visitor<'v> for AnonConstInParamTyDetector {
     type Result = ControlFlow<()>;
 
     fn visit_generic_param(&mut self, p: &'v hir::GenericParam<'v>) -> Self::Result {
-        if let GenericParamKind::Const { ty, default: _, synthetic: _ } = p.kind {
+        if let GenericParamKind::Const { ty, default: _ } = p.kind {
             let prev = self.in_param_ty;
             self.in_param_ty = true;
             let res = self.visit_ty_unambig(ty);

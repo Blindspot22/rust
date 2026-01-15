@@ -17,7 +17,7 @@ use tracing::{info, instrument, trace};
 
 use super::{
     FnArg, FnVal, ImmTy, Immediate, InterpCx, InterpResult, Machine, MemPlaceMeta, PlaceTy,
-    Projectable, Scalar, interp_ok, throw_ub, throw_unsup_format,
+    Projectable, interp_ok, throw_ub, throw_unsup_format,
 };
 use crate::interpret::EnteredTraceSpan;
 use crate::{enter_trace_span, util};
@@ -96,11 +96,6 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             SetDiscriminant { place, variant_index } => {
                 let dest = self.eval_place(**place)?;
                 self.write_discriminant(*variant_index, &dest)?;
-            }
-
-            Deinit(place) => {
-                let dest = self.eval_place(**place)?;
-                self.write_uninit(&dest)?;
             }
 
             // Mark locals as alive
@@ -188,10 +183,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 self.copy_op(&op, &dest)?;
             }
 
-            CopyForDeref(place) => {
-                let op = self.eval_place_to_op(place, Some(dest.layout))?;
-                self.copy_op(&op, &dest)?;
-            }
+            CopyForDeref(_) => bug!("`CopyForDeref` in runtime MIR"),
 
             BinaryOp(bin_op, box (ref left, ref right)) => {
                 let layout = util::binop_left_homogeneous(bin_op).then_some(dest.layout);
@@ -211,24 +203,12 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 self.write_immediate(*result, &dest)?;
             }
 
-            NullaryOp(null_op, ty) => {
-                let ty = self.instantiate_from_current_frame_and_normalize_erasing_regions(ty)?;
-                let val = self.nullary_op(null_op, ty)?;
-                self.write_immediate(*val, &dest)?;
-            }
-
             Aggregate(box ref kind, ref operands) => {
                 self.write_aggregate(kind, operands, &dest)?;
             }
 
             Repeat(ref operand, _) => {
                 self.write_repeat(operand, &dest)?;
-            }
-
-            Len(place) => {
-                let src = self.eval_place(place)?;
-                let len = src.len(self)?;
-                self.write_scalar(Scalar::from_target_usize(len, self), &dest)?;
             }
 
             Ref(_, borrow_kind, place) => {
@@ -310,7 +290,6 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         operands: &IndexSlice<FieldIdx, mir::Operand<'tcx>>,
         dest: &PlaceTy<'tcx, M::Provenance>,
     ) -> InterpResult<'tcx> {
-        self.write_uninit(dest)?; // make sure all the padding ends up as uninit
         let (variant_index, variant_dest, active_field_index) = match *kind {
             mir::AggregateKind::Adt(_, variant_index, _, _, active_field_index) => {
                 let variant_dest = self.project_downcast(dest, variant_index)?;
@@ -346,9 +325,20 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             let field_index = active_field_index.unwrap_or(field_index);
             let field_dest = self.project_field(&variant_dest, field_index)?;
             let op = self.eval_operand(operand, Some(field_dest.layout))?;
-            self.copy_op(&op, &field_dest)?;
+            // We validate manually below so we don't have to do it here.
+            self.copy_op_no_validate(&op, &field_dest, /*allow_transmute*/ false)?;
         }
-        self.write_discriminant(variant_index, dest)
+        self.write_discriminant(variant_index, dest)?;
+        // Validate that the entire thing is valid, and reset padding that might be in between the
+        // fields.
+        if M::enforce_validity(self, dest.layout()) {
+            self.validate_operand(
+                dest,
+                M::enforce_validity_recursively(self, dest.layout()),
+                /*reset_provenance_and_padding*/ true,
+            )?;
+        }
+        interp_ok(())
     }
 
     /// Repeats `operand` into the destination. `dest` must have array type, and that type
@@ -397,7 +387,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         move_definitely_disjoint: bool,
     ) -> InterpResult<'tcx, FnArg<'tcx, M::Provenance>> {
         interp_ok(match op {
-            mir::Operand::Copy(_) | mir::Operand::Constant(_) => {
+            mir::Operand::Copy(_) | mir::Operand::Constant(_) | mir::Operand::RuntimeChecks(_) => {
                 // Make a regular copy.
                 let op = self.eval_operand(op, None)?;
                 FnArg::Copy(op)
@@ -566,8 +556,11 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                     if fn_abi.can_unwind { unwind } else { mir::UnwindAction::Unreachable },
                 )?;
                 // Sanity-check that `eval_fn_call` either pushed a new frame or
-                // did a jump to another block.
-                if self.frame_idx() == old_stack && self.frame().loc == old_loc {
+                // did a jump to another block. We disable the sanity check for functions that
+                // can't return, since Miri sometimes does have to keep the location the same
+                // for those (which is fine since execution will continue on a different thread).
+                if target.is_some() && self.frame_idx() == old_stack && self.frame().loc == old_loc
+                {
                     span_bug!(terminator.source_info.span, "evaluating this call made no progress");
                 }
             }

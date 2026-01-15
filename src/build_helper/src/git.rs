@@ -143,14 +143,24 @@ pub fn check_path_modifications(
 
 /// Returns true if any of the passed `paths` have changed since the `base` commit.
 pub fn has_changed_since(git_dir: &Path, base: &str, paths: &[&str]) -> bool {
-    let mut git = Command::new("git");
-    git.current_dir(git_dir);
+    run_git_diff_index(Some(git_dir), |cmd| {
+        cmd.args(["--quiet", base, "--"]).args(paths);
 
-    git.args(["diff-index", "--quiet", base, "--"]).args(paths);
+        // Exit code 0 => no changes
+        // Exit code 1 => some changes were detected
+        !cmd.status().expect("cannot run git diff-index").success()
+    })
+}
 
-    // Exit code 0 => no changes
-    // Exit code 1 => some changes were detected
-    !git.status().expect("cannot run git diff-index").success()
+// Temporary e-mail used by new bors for merge commits for a few days, until it learned how to reuse
+// the original homu e-mail
+// FIXME: remove in Q2 2026
+const TEMPORARY_BORS_EMAIL: &str = "122020455+rust-bors[bot]@users.noreply.github.com";
+
+/// Escape characters from the git user e-mail, so that git commands do not interpret it as regex
+/// special characters.
+fn escape_email_git_regex(text: &str) -> String {
+    text.replace("[", "\\[").replace("]", "\\]").replace(".", "\\.")
 }
 
 /// Returns the latest upstream commit that modified `target_paths`, or `None` if no such commit
@@ -183,8 +193,13 @@ fn get_latest_upstream_commit_that_modified_files(
         "-n1",
         &upstream,
         "--author",
-        git_config.git_merge_commit_email,
+        &escape_email_git_regex(git_config.git_merge_commit_email),
     ]);
+
+    // Also search for temporary bors account
+    if git_config.git_merge_commit_email != TEMPORARY_BORS_EMAIL {
+        git.args(["--author", &escape_email_git_regex(TEMPORARY_BORS_EMAIL)]);
+    }
 
     if !target_paths.is_empty() {
         git.arg("--").args(target_paths);
@@ -230,10 +245,15 @@ pub fn get_closest_upstream_commit(
     git.args([
         "rev-list",
         "--author-date-order",
-        &format!("--author={}", config.git_merge_commit_email),
+        &format!("--author={}", &escape_email_git_regex(config.git_merge_commit_email),),
         "-n1",
         base,
     ]);
+
+    // Also search for temporary bors account
+    if config.git_merge_commit_email != TEMPORARY_BORS_EMAIL {
+        git.args(["--author", &escape_email_git_regex(TEMPORARY_BORS_EMAIL)]);
+    }
 
     let output = output_result(&mut git)?.trim().to_owned();
     if output.is_empty() { Ok(None) } else { Ok(Some(output)) }
@@ -267,29 +287,47 @@ pub fn get_git_modified_files(
         return Err("No upstream commit was found".to_string());
     };
 
-    let mut git = Command::new("git");
-    if let Some(git_dir) = git_dir {
-        git.current_dir(git_dir);
-    }
-    let files = output_result(git.args(["diff-index", "--name-status", merge_base.trim()]))?
-        .lines()
-        .filter_map(|f| {
-            let (status, name) = f.trim().split_once(char::is_whitespace).unwrap();
-            if status == "D" {
-                None
-            } else if Path::new(name).extension().map_or(extensions.is_empty(), |ext| {
-                // If there is no extension, we allow the path if `extensions` is empty
-                // If there is an extension, we allow it if `extension` is empty or it contains the
-                // extension.
-                extensions.is_empty() || extensions.contains(&ext.to_str().unwrap())
-            }) {
-                Some(name.to_owned())
-            } else {
-                None
-            }
-        })
-        .collect();
+    let files = run_git_diff_index(git_dir, |cmd| {
+        output_result(cmd.args(["--name-status", merge_base.trim()]))
+    })?
+    .lines()
+    .filter_map(|f| {
+        let (status, name) = f.trim().split_once(char::is_whitespace).unwrap();
+        if status == "D" {
+            None
+        } else if Path::new(name).extension().map_or(extensions.is_empty(), |ext| {
+            // If there is no extension, we allow the path if `extensions` is empty
+            // If there is an extension, we allow it if `extension` is empty or it contains the
+            // extension.
+            extensions.is_empty() || extensions.contains(&ext.to_str().unwrap())
+        }) {
+            Some(name.to_owned())
+        } else {
+            None
+        }
+    })
+    .collect();
     Ok(files)
+}
+
+/// diff-index can return outdated information, because it does not update the git index.
+/// This function uses `update-index` to update the index first, and then provides `func` with a
+/// command prepared to run `git diff-index`.
+fn run_git_diff_index<F, T>(git_dir: Option<&Path>, func: F) -> T
+where
+    F: FnOnce(&mut Command) -> T,
+{
+    let git = || {
+        let mut git = Command::new("git");
+        if let Some(git_dir) = git_dir {
+            git.current_dir(git_dir);
+        }
+        git
+    };
+
+    // We ignore the exit code, as it errors out when some files are modified.
+    let _ = output_result(git().args(["update-index", "--refresh", "-q"]));
+    func(git().arg("diff-index"))
 }
 
 /// Returns the files that haven't been added to git yet.

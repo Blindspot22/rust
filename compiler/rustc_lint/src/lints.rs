@@ -15,9 +15,8 @@ use rustc_macros::{LintDiagnostic, Subdiagnostic};
 use rustc_middle::ty::inhabitedness::InhabitedPredicate;
 use rustc_middle::ty::{Clause, PolyExistentialTraitRef, Ty, TyCtxt};
 use rustc_session::Session;
-use rustc_session::lint::AmbiguityErrorDiag;
 use rustc_span::edition::Edition;
-use rustc_span::{Ident, MacroRulesNormalizedIdent, Span, Symbol, sym};
+use rustc_span::{Ident, Span, Symbol, sym};
 
 use crate::builtin::{InitError, ShorthandAssocTyCollector, TypeAliasBounds};
 use crate::errors::{OverruledAttributeSub, RequestedLevel};
@@ -229,8 +228,8 @@ pub(crate) struct BuiltinNoMangleGeneric {
 #[derive(LintDiagnostic)]
 #[diag(lint_builtin_const_no_mangle)]
 pub(crate) struct BuiltinConstNoMangle {
-    #[suggestion(code = "pub static", applicability = "machine-applicable")]
-    pub suggestion: Span,
+    #[suggestion(code = "pub static ", applicability = "machine-applicable")]
+    pub suggestion: Option<Span>,
 }
 
 #[derive(LintDiagnostic)]
@@ -784,6 +783,39 @@ pub(crate) enum InvalidFromUtf8Diag {
     },
 }
 
+// interior_mutable_consts.rs
+#[derive(LintDiagnostic)]
+#[diag(lint_const_item_interior_mutations)]
+#[note(lint_temporary)]
+#[note(lint_never_original)]
+#[help]
+pub(crate) struct ConstItemInteriorMutationsDiag<'tcx> {
+    pub method_name: Ident,
+    pub const_name: Ident,
+    pub const_ty: Ty<'tcx>,
+    #[label]
+    pub receiver_span: Span,
+    #[subdiagnostic]
+    pub sugg_static: Option<ConstItemInteriorMutationsSuggestionStatic>,
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum ConstItemInteriorMutationsSuggestionStatic {
+    #[suggestion(
+        lint_suggestion_static,
+        code = "{before}static ",
+        style = "verbose",
+        applicability = "maybe-incorrect"
+    )]
+    Spanful {
+        #[primary_span]
+        const_: Span,
+        before: &'static str,
+    },
+    #[help(lint_suggestion_static)]
+    Spanless,
+}
+
 // reference_casting.rs
 #[derive(LintDiagnostic)]
 pub(crate) enum InvalidReferenceCastingDiag<'tcx> {
@@ -924,6 +956,13 @@ pub(crate) struct UntranslatableDiag;
 #[diag(lint_bad_opt_access)]
 pub(crate) struct BadOptAccessDiag<'a> {
     pub msg: &'a str,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(lint_implicit_sysroot_crate_import)]
+#[help]
+pub(crate) struct ImplicitSysrootCrateImportDiag<'a> {
+    pub name: &'a str,
 }
 
 // let_underscore.rs
@@ -1099,10 +1138,10 @@ pub(crate) struct IgnoredUnlessCrateSpecified<'a> {
 // dangling.rs
 #[derive(LintDiagnostic)]
 #[diag(lint_dangling_pointers_from_temporaries)]
-#[note]
 #[help(lint_help_bind)]
-#[help(lint_help_returned)]
-#[help(lint_help_visit)]
+#[note(lint_note_safe)]
+#[note(lint_note_return)]
+#[note(lint_note_more_info)]
 // FIXME: put #[primary_span] on `ptr_span` once it does not cause conflicts
 pub(crate) struct DanglingPointersFromTemporaries<'tcx> {
     pub callee: Ident,
@@ -1115,7 +1154,8 @@ pub(crate) struct DanglingPointersFromTemporaries<'tcx> {
 
 #[derive(LintDiagnostic)]
 #[diag(lint_dangling_pointers_from_locals)]
-#[note]
+#[note(lint_note_safe)]
+#[note(lint_note_more_info)]
 pub(crate) struct DanglingPointersFromLocals<'tcx> {
     pub ret_ty: Ty<'tcx>,
     #[label(lint_ret_ty)]
@@ -1554,7 +1594,7 @@ impl<'a> LintDiagnostic<'a, ()> for DropGlue<'_> {
 #[help(lint_help_exposed_provenance)]
 pub(crate) struct IntegerToPtrTransmutes<'tcx> {
     #[subdiagnostic]
-    pub suggestion: IntegerToPtrTransmutesSuggestion<'tcx>,
+    pub suggestion: Option<IntegerToPtrTransmutesSuggestion<'tcx>>,
 }
 
 #[derive(Subdiagnostic)]
@@ -1970,6 +2010,19 @@ impl<'a> LintDiagnostic<'a, ()> for ImproperCTypes<'_> {
 }
 
 #[derive(LintDiagnostic)]
+#[diag(lint_improper_gpu_kernel_arg)]
+#[help]
+pub(crate) struct ImproperGpuKernelArg<'a> {
+    pub ty: Ty<'a>,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(lint_missing_gpu_kernel_export_name)]
+#[help]
+#[note]
+pub(crate) struct MissingGpuKernelExportName;
+
+#[derive(LintDiagnostic)]
 #[diag(lint_variant_size_differences)]
 pub(crate) struct VariantSizeDifferencesDiag {
     pub largest: u64,
@@ -2362,6 +2415,17 @@ pub(crate) mod unexpected_cfg_name {
             #[subdiagnostic]
             expected_names: Option<ExpectedNames>,
         },
+        #[suggestion(
+            lint_unexpected_cfg_boolean,
+            applicability = "machine-applicable",
+            style = "verbose",
+            code = "{literal}"
+        )]
+        BooleanLiteral {
+            #[primary_span]
+            span: Span,
+            literal: bool,
+        },
     }
 
     #[derive(Subdiagnostic)]
@@ -2536,100 +2600,6 @@ pub(crate) mod unexpected_cfg_value {
 }
 
 #[derive(LintDiagnostic)]
-#[diag(lint_macro_use_deprecated)]
-#[help]
-pub(crate) struct MacroUseDeprecated;
-
-#[derive(LintDiagnostic)]
-#[diag(lint_unused_macro_use)]
-pub(crate) struct UnusedMacroUse;
-
-#[derive(LintDiagnostic)]
-#[diag(lint_private_extern_crate_reexport, code = E0365)]
-pub(crate) struct PrivateExternCrateReexport {
-    pub ident: Ident,
-    #[suggestion(code = "pub ", style = "verbose", applicability = "maybe-incorrect")]
-    pub sugg: Span,
-}
-
-#[derive(LintDiagnostic)]
-#[diag(lint_unused_label)]
-pub(crate) struct UnusedLabel;
-
-#[derive(LintDiagnostic)]
-#[diag(lint_macro_is_private)]
-pub(crate) struct MacroIsPrivate {
-    pub ident: Ident,
-}
-
-#[derive(LintDiagnostic)]
-#[diag(lint_unused_macro_definition)]
-pub(crate) struct UnusedMacroDefinition {
-    pub name: Symbol,
-}
-
-#[derive(LintDiagnostic)]
-#[diag(lint_macro_rule_never_used)]
-pub(crate) struct MacroRuleNeverUsed {
-    pub n: usize,
-    pub name: Symbol,
-}
-
-pub(crate) struct UnstableFeature {
-    pub msg: DiagMessage,
-}
-
-impl<'a> LintDiagnostic<'a, ()> for UnstableFeature {
-    fn decorate_lint<'b>(self, diag: &'b mut Diag<'a, ()>) {
-        diag.primary_message(self.msg);
-    }
-}
-
-#[derive(LintDiagnostic)]
-#[diag(lint_avoid_intel_syntax)]
-pub(crate) struct AvoidIntelSyntax;
-
-#[derive(LintDiagnostic)]
-#[diag(lint_avoid_att_syntax)]
-pub(crate) struct AvoidAttSyntax;
-
-#[derive(LintDiagnostic)]
-#[diag(lint_incomplete_include)]
-pub(crate) struct IncompleteInclude;
-
-#[derive(LintDiagnostic)]
-#[diag(lint_unnameable_test_items)]
-pub(crate) struct UnnameableTestItems;
-
-#[derive(LintDiagnostic)]
-#[diag(lint_duplicate_macro_attribute)]
-pub(crate) struct DuplicateMacroAttribute;
-
-#[derive(LintDiagnostic)]
-#[diag(lint_cfg_attr_no_attributes)]
-pub(crate) struct CfgAttrNoAttributes;
-
-#[derive(LintDiagnostic)]
-#[diag(lint_metavariable_still_repeating)]
-pub(crate) struct MetaVariableStillRepeating {
-    pub name: MacroRulesNormalizedIdent,
-}
-
-#[derive(LintDiagnostic)]
-#[diag(lint_metavariable_wrong_operator)]
-pub(crate) struct MetaVariableWrongOperator;
-
-#[derive(LintDiagnostic)]
-#[diag(lint_duplicate_matcher_binding)]
-pub(crate) struct DuplicateMatcherBinding;
-
-#[derive(LintDiagnostic)]
-#[diag(lint_unknown_macro_variable)]
-pub(crate) struct UnknownMacroVariable {
-    pub name: MacroRulesNormalizedIdent,
-}
-
-#[derive(LintDiagnostic)]
 #[diag(lint_unused_crate_dependency)]
 #[help]
 pub(crate) struct UnusedCrateDependency {
@@ -2646,26 +2616,6 @@ pub(crate) struct IllFormedAttributeInput {
     #[note]
     pub has_docs: bool,
     pub docs: &'static str,
-}
-
-#[derive(LintDiagnostic)]
-#[diag(lint_unknown_diagnostic_attribute)]
-pub(crate) struct UnknownDiagnosticAttribute {
-    #[subdiagnostic]
-    pub typo: Option<UnknownDiagnosticAttributeTypoSugg>,
-}
-
-#[derive(Subdiagnostic)]
-#[suggestion(
-    lint_unknown_diagnostic_attribute_typo_sugg,
-    style = "verbose",
-    code = "{typo_name}",
-    applicability = "machine-applicable"
-)]
-pub(crate) struct UnknownDiagnosticAttributeTypoSugg {
-    #[primary_span]
-    pub span: Span,
-    pub typo_name: Symbol,
 }
 
 #[derive(LintDiagnostic)]
@@ -2715,41 +2665,10 @@ pub(crate) struct AbsPathWithModuleSugg {
 }
 
 #[derive(LintDiagnostic)]
-#[diag(lint_proc_macro_derive_resolution_fallback)]
-pub(crate) struct ProcMacroDeriveResolutionFallback {
-    #[label]
-    pub span: Span,
-    pub ns_descr: &'static str,
-    pub ident: Ident,
-}
-
-#[derive(LintDiagnostic)]
-#[diag(lint_macro_expanded_macro_exports_accessed_by_absolute_paths)]
-pub(crate) struct MacroExpandedMacroExportsAccessedByAbsolutePaths {
-    #[note]
-    pub definition: Span,
-}
-
-#[derive(LintDiagnostic)]
 #[diag(lint_hidden_lifetime_parameters)]
 pub(crate) struct ElidedLifetimesInPaths {
     #[subdiagnostic]
     pub subdiag: ElidedLifetimeInPathSubdiag,
-}
-
-#[derive(LintDiagnostic)]
-#[diag(lint_invalid_crate_type_value)]
-pub(crate) struct UnknownCrateTypes {
-    #[subdiagnostic]
-    pub sugg: Option<UnknownCrateTypesSub>,
-}
-
-#[derive(Subdiagnostic)]
-#[suggestion(lint_suggestion, code = r#""{candidate}""#, applicability = "maybe-incorrect")]
-pub(crate) struct UnknownCrateTypesSub {
-    #[primary_span]
-    pub span: Span,
-    pub candidate: Symbol,
 }
 
 #[derive(LintDiagnostic)]
@@ -2810,14 +2729,6 @@ pub(crate) enum RedundantImportSub {
 }
 
 #[derive(LintDiagnostic)]
-#[diag(lint_unused_doc_comment)]
-#[help]
-pub(crate) struct UnusedDocComment {
-    #[label]
-    pub span: Span,
-}
-
-#[derive(LintDiagnostic)]
 pub(crate) enum PatternsInFnsWithoutBody {
     #[diag(lint_pattern_in_foreign)]
     Foreign {
@@ -2841,21 +2752,6 @@ pub(crate) struct PatternsInFnsWithoutBodySub {
 }
 
 #[derive(LintDiagnostic)]
-#[diag(lint_legacy_derive_helpers)]
-pub(crate) struct LegacyDeriveHelpers {
-    #[label]
-    pub span: Span,
-}
-
-#[derive(LintDiagnostic)]
-#[diag(lint_or_patterns_back_compat)]
-pub(crate) struct OrPatternsBackCompat {
-    #[suggestion(code = "{suggestion}", applicability = "machine-applicable")]
-    pub span: Span,
-    pub suggestion: String,
-}
-
-#[derive(LintDiagnostic)]
 #[diag(lint_reserved_prefix)]
 pub(crate) struct ReservedPrefix {
     #[label]
@@ -2873,27 +2769,6 @@ pub(crate) struct RawPrefix {
     pub label: Span,
     #[suggestion(code = " ", applicability = "machine-applicable")]
     pub suggestion: Span,
-}
-
-#[derive(LintDiagnostic)]
-#[diag(lint_unused_builtin_attribute)]
-pub(crate) struct UnusedBuiltinAttribute {
-    #[note]
-    pub invoc_span: Span,
-    pub attr_name: Symbol,
-    pub macro_name: String,
-    #[suggestion(code = "", applicability = "machine-applicable", style = "tool-only")]
-    pub attr_span: Span,
-}
-
-#[derive(LintDiagnostic)]
-#[diag(lint_trailing_semi_macro)]
-pub(crate) struct TrailingMacro {
-    #[note(lint_note1)]
-    #[note(lint_note2)]
-    pub is_trailing: bool,
-
-    pub name: Ident,
 }
 
 #[derive(LintDiagnostic)]
@@ -2936,13 +2811,6 @@ pub(crate) enum DeprecatedWhereClauseLocationSugg {
         #[primary_span]
         span: Span,
     },
-}
-
-#[derive(LintDiagnostic)]
-#[diag(lint_missing_unsafe_on_extern)]
-pub(crate) struct MissingUnsafeOnExtern {
-    #[suggestion(code = "unsafe ", applicability = "machine-applicable")]
-    pub suggestion: Span,
 }
 
 #[derive(LintDiagnostic)]
@@ -2993,44 +2861,6 @@ pub(crate) struct NamedArgumentUsedPositionally {
 }
 
 #[derive(LintDiagnostic)]
-#[diag(lint_byte_slice_in_packed_struct_with_derive)]
-#[help]
-pub(crate) struct ByteSliceInPackedStructWithDerive {
-    // FIXME: make this translatable
-    pub ty: String,
-}
-
-#[derive(LintDiagnostic)]
-#[diag(lint_unused_extern_crate)]
-pub(crate) struct UnusedExternCrate {
-    #[label]
-    pub span: Span,
-    #[suggestion(code = "", applicability = "machine-applicable", style = "verbose")]
-    pub removal_span: Span,
-}
-
-#[derive(LintDiagnostic)]
-#[diag(lint_extern_crate_not_idiomatic)]
-pub(crate) struct ExternCrateNotIdiomatic {
-    #[suggestion(style = "verbose", code = "{code}", applicability = "machine-applicable")]
-    pub span: Span,
-
-    pub code: &'static str,
-}
-
-// FIXME: make this translatable
-pub(crate) struct AmbiguousGlobImports {
-    pub ambiguity: AmbiguityErrorDiag,
-}
-
-impl<'a, G: EmissionGuarantee> LintDiagnostic<'a, G> for AmbiguousGlobImports {
-    fn decorate_lint<'b>(self, diag: &'b mut Diag<'a, G>) {
-        diag.primary_message(self.ambiguity.msg.clone());
-        rustc_errors::report_ambiguity_error(diag, self.ambiguity);
-    }
-}
-
-#[derive(LintDiagnostic)]
 #[diag(lint_ambiguous_glob_reexport)]
 pub(crate) struct AmbiguousGlobReexports {
     #[label(lint_label_first_reexport)]
@@ -3057,14 +2887,6 @@ pub(crate) struct HiddenGlobReexports {
 }
 
 #[derive(LintDiagnostic)]
-#[diag(lint_reexport_private_dependency)]
-pub(crate) struct ReexportPrivateDependency {
-    pub name: String,
-    pub kind: String,
-    pub krate: Symbol,
-}
-
-#[derive(LintDiagnostic)]
 #[diag(lint_unnecessary_qualification)]
 pub(crate) struct UnusedQualifications {
     #[suggestion(style = "verbose", code = "", applicability = "machine-applicable")]
@@ -3081,49 +2903,6 @@ pub(crate) struct AssociatedConstElidedLifetime {
     pub elided: bool,
     #[note]
     pub lifetimes_in_scope: MultiSpan,
-}
-
-#[derive(LintDiagnostic)]
-#[diag(lint_redundant_import_visibility)]
-pub(crate) struct RedundantImportVisibility {
-    #[note]
-    pub span: Span,
-    #[help]
-    pub help: (),
-
-    pub import_vis: String,
-    pub max_vis: String,
-}
-
-#[derive(LintDiagnostic)]
-#[diag(lint_unsafe_attr_outside_unsafe)]
-pub(crate) struct UnsafeAttrOutsideUnsafe {
-    #[label]
-    pub span: Span,
-    #[subdiagnostic]
-    pub suggestion: UnsafeAttrOutsideUnsafeSuggestion,
-}
-
-#[derive(Subdiagnostic)]
-#[multipart_suggestion(
-    lint_unsafe_attr_outside_unsafe_suggestion,
-    applicability = "machine-applicable"
-)]
-pub(crate) struct UnsafeAttrOutsideUnsafeSuggestion {
-    #[suggestion_part(code = "unsafe(")]
-    pub left: Span,
-    #[suggestion_part(code = ")")]
-    pub right: Span,
-}
-
-#[derive(LintDiagnostic)]
-#[diag(lint_out_of_scope_macro_calls)]
-#[help]
-pub(crate) struct OutOfScopeMacroCalls {
-    #[label]
-    pub span: Span,
-    pub path: String,
-    pub location: String,
 }
 
 #[derive(LintDiagnostic)]
@@ -3174,6 +2953,26 @@ pub(crate) struct ReservedString {
 pub(crate) struct ReservedMultihash {
     #[suggestion(code = " ", applicability = "machine-applicable")]
     pub suggestion: Span,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(lint_function_casts_as_integer)]
+pub(crate) struct FunctionCastsAsIntegerDiag<'tcx> {
+    #[subdiagnostic]
+    pub(crate) sugg: FunctionCastsAsIntegerSugg<'tcx>,
+}
+
+#[derive(Subdiagnostic)]
+#[suggestion(
+    lint_cast_as_fn,
+    code = " as *const ()",
+    applicability = "machine-applicable",
+    style = "verbose"
+)]
+pub(crate) struct FunctionCastsAsIntegerSugg<'tcx> {
+    #[primary_span]
+    pub suggestion: Span,
+    pub cast_to_ty: Ty<'tcx>,
 }
 
 #[derive(Debug)]
@@ -3352,3 +3151,169 @@ impl Subdiagnostic for MismatchedLifetimeSyntaxesSuggestion {
         }
     }
 }
+
+#[derive(LintDiagnostic)]
+#[diag(lint_empty_attribute)]
+#[note]
+pub(crate) struct EmptyAttributeList {
+    #[suggestion(code = "", applicability = "machine-applicable")]
+    pub attr_span: Span,
+    pub attr_path: String,
+    pub valid_without_list: bool,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(lint_invalid_target)]
+#[warning]
+#[help]
+pub(crate) struct InvalidTargetLint {
+    pub name: String,
+    pub target: &'static str,
+    pub applied: DiagArgValue,
+    pub only: &'static str,
+    #[suggestion(code = "", applicability = "machine-applicable", style = "tool-only")]
+    pub attr_span: Span,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(lint_invalid_style)]
+pub(crate) struct InvalidAttrStyle {
+    pub name: String,
+    pub is_used_as_inner: bool,
+    #[note]
+    pub target_span: Option<Span>,
+    pub target: &'static str,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(lint_unused_duplicate)]
+pub(crate) struct UnusedDuplicate {
+    #[suggestion(code = "", applicability = "machine-applicable")]
+    pub this: Span,
+    #[note]
+    pub other: Span,
+    #[warning]
+    pub warning: bool,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(lint_unsafe_attr_outside_unsafe)]
+pub(crate) struct UnsafeAttrOutsideUnsafeLint {
+    #[label]
+    pub span: Span,
+    #[subdiagnostic]
+    pub suggestion: Option<UnsafeAttrOutsideUnsafeSuggestion>,
+}
+
+#[derive(Subdiagnostic)]
+#[multipart_suggestion(
+    lint_unsafe_attr_outside_unsafe_suggestion,
+    applicability = "machine-applicable"
+)]
+pub(crate) struct UnsafeAttrOutsideUnsafeSuggestion {
+    #[suggestion_part(code = "unsafe(")]
+    pub left: Span,
+    #[suggestion_part(code = ")")]
+    pub right: Span,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(lint_unused_visibilities)]
+#[note]
+pub(crate) struct UnusedVisibility {
+    #[suggestion(style = "short", code = "", applicability = "machine-applicable")]
+    pub span: Span,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(lint_doc_alias_duplicated)]
+pub(crate) struct DocAliasDuplicated {
+    #[label]
+    pub first_defn: Span,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(lint_doc_auto_cfg_expects_hide_or_show)]
+pub(crate) struct DocAutoCfgExpectsHideOrShow;
+
+#[derive(LintDiagnostic)]
+#[diag(lint_doc_auto_cfg_hide_show_unexpected_item)]
+pub(crate) struct DocAutoCfgHideShowUnexpectedItem {
+    pub attr_name: Symbol,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(lint_doc_auto_cfg_hide_show_expects_list)]
+pub(crate) struct DocAutoCfgHideShowExpectsList {
+    pub attr_name: Symbol,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(lint_doc_invalid)]
+pub(crate) struct DocInvalid;
+
+#[derive(LintDiagnostic)]
+#[diag(lint_doc_unknown_include)]
+pub(crate) struct DocUnknownInclude {
+    pub inner: &'static str,
+    pub value: Symbol,
+    #[suggestion(code = "#{inner}[doc = include_str!(\"{value}\")]")]
+    pub sugg: (Span, Applicability),
+}
+
+#[derive(LintDiagnostic)]
+#[diag(lint_doc_unknown_spotlight)]
+#[note]
+#[note(lint_no_op_note)]
+pub(crate) struct DocUnknownSpotlight {
+    #[suggestion(style = "short", applicability = "machine-applicable", code = "notable_trait")]
+    pub sugg_span: Span,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(lint_doc_unknown_passes)]
+#[note]
+#[note(lint_no_op_note)]
+pub(crate) struct DocUnknownPasses {
+    pub name: Symbol,
+    #[label]
+    pub note_span: Span,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(lint_doc_unknown_plugins)]
+#[note]
+#[note(lint_no_op_note)]
+pub(crate) struct DocUnknownPlugins {
+    #[label]
+    pub label_span: Span,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(lint_doc_unknown_any)]
+pub(crate) struct DocUnknownAny {
+    pub name: Symbol,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(lint_doc_auto_cfg_wrong_literal)]
+pub(crate) struct DocAutoCfgWrongLiteral;
+
+#[derive(LintDiagnostic)]
+#[diag(lint_doc_test_takes_list)]
+pub(crate) struct DocTestTakesList;
+
+#[derive(LintDiagnostic)]
+#[diag(lint_doc_test_unknown)]
+pub(crate) struct DocTestUnknown {
+    pub name: Symbol,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(lint_doc_test_literal)]
+pub(crate) struct DocTestLiteral;
+
+#[derive(LintDiagnostic)]
+#[diag(lint_attr_crate_level)]
+#[note]
+pub(crate) struct AttrCrateLevelOnly;

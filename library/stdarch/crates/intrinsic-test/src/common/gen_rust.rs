@@ -1,23 +1,31 @@
 use itertools::Itertools;
 use std::process::Command;
 
+use super::compare::INTRINSIC_DELIMITER;
 use super::indentation::Indentation;
-use super::intrinsic::{IntrinsicDefinition, format_f16_return_value};
 use super::intrinsic_helpers::IntrinsicTypeDefinition;
+use crate::common::argument::ArgumentList;
+use crate::common::intrinsic::Intrinsic;
 
 // The number of times each intrinsic will be called.
-const PASSES: u32 = 20;
+pub(crate) const PASSES: u32 = 20;
+
+macro_rules! concatln {
+    ($($lines:expr),* $(,)?) => {
+        concat!($( $lines, "\n" ),*)
+    };
+}
 
 fn write_cargo_toml_header(w: &mut impl std::io::Write, name: &str) -> std::io::Result<()> {
     writeln!(
         w,
-        concat!(
-            "[package]\n",
-            "name = \"{name}\"\n",
-            "version = \"{version}\"\n",
-            "authors = [{authors}]\n",
-            "license = \"{license}\"\n",
-            "edition = \"2018\"\n",
+        concatln!(
+            "[package]",
+            "name = \"{name}\"",
+            "version = \"{version}\"",
+            "authors = [{authors}]",
+            "license = \"{license}\"",
+            "edition = \"2018\"",
         ),
         name = name,
         version = env!("CARGO_PKG_VERSION"),
@@ -35,6 +43,7 @@ pub fn write_bin_cargo_toml(
     write_cargo_toml_header(w, "intrinsic-test-programs")?;
 
     writeln!(w, "[dependencies]")?;
+    writeln!(w, "core_arch = {{ path = \"../crates/core_arch\" }}")?;
 
     for i in 0..module_count {
         writeln!(w, "mod_{i} = {{ path = \"mod_{i}/\" }}")?;
@@ -77,18 +86,12 @@ pub fn write_main_rs<'a>(
 
     writeln!(w, "fn main() {{")?;
 
-    writeln!(w, "    match std::env::args().nth(1).unwrap().as_str() {{")?;
-
     for binary in intrinsics {
-        writeln!(w, "        \"{binary}\" => run_{binary}(),")?;
+        writeln!(w, "    println!(\"{INTRINSIC_DELIMITER}\");")?;
+        writeln!(w, "    println!(\"{binary}\");")?;
+        writeln!(w, "    run_{binary}();\n")?;
     }
 
-    writeln!(
-        w,
-        "        other => panic!(\"unknown intrinsic `{{}}`\", other),"
-    )?;
-
-    writeln!(w, "    }}")?;
     writeln!(w, "}}")?;
 
     Ok(())
@@ -96,11 +99,10 @@ pub fn write_main_rs<'a>(
 
 pub fn write_lib_rs<T: IntrinsicTypeDefinition>(
     w: &mut impl std::io::Write,
-    architecture: &str,
     notice: &str,
     cfg: &str,
     definitions: &str,
-    intrinsics: &[impl IntrinsicDefinition<T>],
+    intrinsics: &[Intrinsic<T>],
 ) -> std::io::Result<()> {
     write!(w, "{notice}")?;
 
@@ -115,9 +117,21 @@ pub fn write_lib_rs<T: IntrinsicTypeDefinition>(
 
     writeln!(w, "{cfg}")?;
 
-    writeln!(w, "use core_arch::arch::{architecture}::*;")?;
-
     writeln!(w, "{definitions}")?;
+
+    let mut seen = std::collections::HashSet::new();
+
+    for intrinsic in intrinsics {
+        for arg in &intrinsic.arguments.args {
+            if !arg.has_constraint() && arg.ty.is_rust_vals_array_const() {
+                let name = arg.rust_vals_array_name().to_string();
+
+                if seen.insert(name) {
+                    ArgumentList::gen_arg_rust(arg, w, Indentation::default(), PASSES)?;
+                }
+            }
+        }
+    }
 
     for intrinsic in intrinsics {
         crate::common::gen_rust::create_rust_test_module(w, intrinsic)?;
@@ -126,7 +140,12 @@ pub fn write_lib_rs<T: IntrinsicTypeDefinition>(
     Ok(())
 }
 
-pub fn compile_rust_programs(toolchain: Option<&str>, target: &str, linker: Option<&str>) -> bool {
+pub fn compile_rust_programs(
+    toolchain: Option<&str>,
+    target: &str,
+    profile: &str,
+    linker: Option<&str>,
+) -> bool {
     /* If there has been a linker explicitly set from the command line then
      * we want to set it via setting it in the RUSTFLAGS*/
 
@@ -147,7 +166,7 @@ pub fn compile_rust_programs(toolchain: Option<&str>, target: &str, linker: Opti
     if toolchain.is_some_and(|val| !val.is_empty()) {
         cargo_command.arg(toolchain.unwrap());
     }
-    cargo_command.args(["build", "--target", target, "--release"]);
+    cargo_command.args(["build", "--target", target, "--profile", profile]);
 
     let mut rust_flags = "-Cdebuginfo=0".to_string();
     if let Some(linker) = linker {
@@ -189,16 +208,16 @@ pub fn compile_rust_programs(toolchain: Option<&str>, target: &str, linker: Opti
 
 pub fn generate_rust_test_loop<T: IntrinsicTypeDefinition>(
     w: &mut impl std::io::Write,
-    intrinsic: &dyn IntrinsicDefinition<T>,
+    intrinsic: &Intrinsic<T>,
     indentation: Indentation,
-    specializations: &[Vec<u8>],
+    specializations: &[Vec<i32>],
     passes: u32,
 ) -> std::io::Result<()> {
-    let intrinsic_name = intrinsic.name();
+    let intrinsic_name = &intrinsic.name;
 
     // Each function (and each specialization) has its own type. Erase that type with a cast.
     let mut coerce = String::from("unsafe fn(");
-    for _ in intrinsic.arguments().iter().filter(|a| !a.has_constraint()) {
+    for _ in intrinsic.arguments.iter().filter(|a| !a.has_constraint()) {
         coerce += "_, ";
     }
     coerce += ") -> _";
@@ -233,30 +252,30 @@ pub fn generate_rust_test_loop<T: IntrinsicTypeDefinition>(
         }
     }
 
-    let return_value = format_f16_return_value(intrinsic);
-    let indentation2 = indentation.nested();
-    let indentation3 = indentation2.nested();
-    writeln!(
+    write!(
         w,
-        "\
-            for (id, f) in specializations {{\n\
-                for i in 0..{passes} {{\n\
-                    unsafe {{\n\
-                        {loaded_args}\
-                        let __return_value = f({args});\n\
-                        println!(\"Result {{id}}-{{}}: {{:?}}\", i + 1, {return_value});\n\
-                    }}\n\
-                }}\n\
-            }}",
-        loaded_args = intrinsic.arguments().load_values_rust(indentation3),
-        args = intrinsic.arguments().as_call_param_rust(),
+        concatln!(
+            "    for (id, f) in specializations {{",
+            "        for i in 0..{passes} {{",
+            "            unsafe {{",
+            "{loaded_args}",
+            "                let __return_value = f({args});",
+            "                println!(\"Result {{id}}-{{}}: {{:?}}\", i + 1, {return_value});",
+            "            }}",
+            "        }}",
+            "    }}",
+        ),
+        loaded_args = intrinsic.arguments.load_values_rust(indentation.nest_by(4)),
+        args = intrinsic.arguments.as_call_param_rust(),
+        return_value = intrinsic.results.print_result_rust(),
+        passes = passes,
     )
 }
 
 /// Generate the specializations (unique sequences of const-generic arguments) for this intrinsic.
-fn generate_rust_specializations<'a>(
+fn generate_rust_specializations(
     constraints: &mut impl Iterator<Item = impl Iterator<Item = i64>>,
-) -> Vec<Vec<u8>> {
+) -> Vec<Vec<i32>> {
     let mut specializations = vec![vec![]];
 
     for constraint in constraints {
@@ -264,7 +283,7 @@ fn generate_rust_specializations<'a>(
             .flat_map(|right| {
                 specializations.iter().map(move |left| {
                     let mut left = left.clone();
-                    left.push(u8::try_from(right).unwrap());
+                    left.push(i32::try_from(right).unwrap());
                     left
                 })
             })
@@ -277,15 +296,15 @@ fn generate_rust_specializations<'a>(
 // Top-level function to create complete test program
 pub fn create_rust_test_module<T: IntrinsicTypeDefinition>(
     w: &mut impl std::io::Write,
-    intrinsic: &dyn IntrinsicDefinition<T>,
+    intrinsic: &Intrinsic<T>,
 ) -> std::io::Result<()> {
-    trace!("generating `{}`", intrinsic.name());
+    trace!("generating `{}`", intrinsic.name);
     let indentation = Indentation::default();
 
-    writeln!(w, "pub fn run_{}() {{", intrinsic.name())?;
+    writeln!(w, "pub fn run_{}() {{", intrinsic.name)?;
 
     // Define the arrays of arguments.
-    let arguments = intrinsic.arguments();
+    let arguments = &intrinsic.arguments;
     arguments.gen_arglists_rust(w, indentation.nested(), PASSES)?;
 
     // Define any const generics as `const` items, then generate the actual test loop.

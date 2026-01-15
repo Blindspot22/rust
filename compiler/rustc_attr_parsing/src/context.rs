@@ -6,11 +6,12 @@ use std::sync::LazyLock;
 use private::Sealed;
 use rustc_ast::{AttrStyle, MetaItemLit, NodeId};
 use rustc_errors::{Diag, Diagnostic, Level};
-use rustc_feature::AttributeTemplate;
+use rustc_feature::{AttrSuggestionStyle, AttributeTemplate};
 use rustc_hir::attrs::AttributeKind;
 use rustc_hir::lints::{AttributeLint, AttributeLintKind};
 use rustc_hir::{AttrPath, HirId};
 use rustc_session::Session;
+use rustc_session::lint::{Lint, LintId};
 use rustc_span::{ErrorGuaranteed, Span, Symbol};
 
 use crate::AttributeParser;
@@ -18,39 +19,62 @@ use crate::attributes::allow_unstable::{
     AllowConstFnUnstableParser, AllowInternalUnstableParser, UnstableFeatureBoundParser,
 };
 use crate::attributes::body::CoroutineParser;
+use crate::attributes::cfi_encoding::CfiEncodingParser;
 use crate::attributes::codegen_attrs::{
-    ColdParser, CoverageParser, ExportNameParser, ForceTargetFeatureParser, NakedParser,
-    NoMangleParser, OptimizeParser, SanitizeParser, TargetFeatureParser, TrackCallerParser,
-    UsedParser,
+    ColdParser, CoverageParser, EiiForeignItemParser, ExportNameParser, ForceTargetFeatureParser,
+    NakedParser, NoMangleParser, ObjcClassParser, ObjcSelectorParser, OptimizeParser,
+    RustcPassIndirectlyInNonRusticAbisParser, SanitizeParser, TargetFeatureParser,
+    ThreadLocalParser, TrackCallerParser, UsedParser,
 };
 use crate::attributes::confusables::ConfusablesParser;
-use crate::attributes::crate_level::CrateNameParser;
+use crate::attributes::crate_level::{
+    CrateNameParser, MoveSizeLimitParser, NoCoreParser, NoStdParser, PatternComplexityLimitParser,
+    RecursionLimitParser, RustcCoherenceIsCoreParser, TypeLengthLimitParser,
+    WindowsSubsystemParser,
+};
+use crate::attributes::debugger::DebuggerViualizerParser;
 use crate::attributes::deprecation::DeprecationParser;
+use crate::attributes::doc::DocParser;
 use crate::attributes::dummy::DummyParser;
 use crate::attributes::inline::{InlineParser, RustcForceInlineParser};
+use crate::attributes::instruction_set::InstructionSetParser;
 use crate::attributes::link_attrs::{
     ExportStableParser, FfiConstParser, FfiPureParser, LinkNameParser, LinkOrdinalParser,
-    LinkSectionParser, LinkageParser, StdInternalSymbolParser,
+    LinkParser, LinkSectionParser, LinkageParser, StdInternalSymbolParser,
 };
 use crate::attributes::lint_helpers::{
     AsPtrParser, AutomaticallyDerivedParser, PassByValueParser, PubTransparentParser,
+    RustcShouldNotBeCalledOnConstItems,
 };
 use crate::attributes::loop_match::{ConstContinueParser, LoopMatchParser};
 use crate::attributes::macro_attrs::{
-    AllowInternalUnsafeParser, MacroEscapeParser, MacroUseParser,
+    AllowInternalUnsafeParser, CollapseDebugInfoParser, MacroEscapeParser, MacroExportParser,
+    MacroUseParser,
 };
+use crate::attributes::must_not_suspend::MustNotSuspendParser;
 use crate::attributes::must_use::MustUseParser;
 use crate::attributes::no_implicit_prelude::NoImplicitPreludeParser;
+use crate::attributes::no_link::NoLinkParser;
 use crate::attributes::non_exhaustive::NonExhaustiveParser;
 use crate::attributes::path::PathParser as PathAttributeParser;
+use crate::attributes::pin_v2::PinV2Parser;
 use crate::attributes::proc_macro_attrs::{
     ProcMacroAttributeParser, ProcMacroDeriveParser, ProcMacroParser, RustcBuiltinMacroParser,
 };
 use crate::attributes::prototype::CustomMirParser;
-use crate::attributes::repr::{AlignParser, ReprParser};
+use crate::attributes::repr::{AlignParser, AlignStaticParser, ReprParser};
+use crate::attributes::rustc_dump::{
+    RustcDumpDefParents, RustcDumpItemBounds, RustcDumpPredicates, RustcDumpUserArgs,
+    RustcDumpVtable,
+};
 use crate::attributes::rustc_internal::{
-    RustcLayoutScalarValidRangeEnd, RustcLayoutScalarValidRangeStart,
-    RustcObjectLifetimeDefaultParser,
+    RustcHasIncoherentInherentImplsParser, RustcLayoutScalarValidRangeEndParser,
+    RustcLayoutScalarValidRangeStartParser, RustcLegacyConstGenericsParser,
+    RustcLintDiagnosticsParser, RustcLintOptDenyFieldAccessParser, RustcLintOptTyParser,
+    RustcLintQueryInstabilityParser, RustcLintUntrackedQueryInformationParser, RustcMainParser,
+    RustcMustImplementOneOfParser, RustcNeverReturnsNullPointerParser,
+    RustcNoImplicitAutorefsParser, RustcObjectLifetimeDefaultParser, RustcScalableVectorParser,
+    RustcSimdMonomorphizeLaneLimitParser,
 };
 use crate::attributes::semantics::MayDangleParser;
 use crate::attributes::stability::{
@@ -58,17 +82,18 @@ use crate::attributes::stability::{
 };
 use crate::attributes::test_attrs::{IgnoreParser, ShouldPanicParser};
 use crate::attributes::traits::{
-    AllowIncoherentImplParser, CoherenceIsCoreParser, CoinductiveParser, ConstTraitParser,
-    DenyExplicitImplParser, DoNotImplementViaObjectParser, FundamentalParser, MarkerParser,
-    ParenSugarParser, PointeeParser, SkipDuringMethodDispatchParser, SpecializationTraitParser,
-    TypeConstParser, UnsafeSpecializationMarkerParser,
+    AllowIncoherentImplParser, CoinductiveParser, DenyExplicitImplParser,
+    DoNotImplementViaObjectParser, FundamentalParser, MarkerParser, ParenSugarParser,
+    PointeeParser, SkipDuringMethodDispatchParser, SpecializationTraitParser, TypeConstParser,
+    UnsafeSpecializationMarkerParser,
 };
 use crate::attributes::transparency::TransparencyParser;
 use crate::attributes::{AttributeParser as _, Combine, Single, WithoutArgs};
-use crate::parser::{ArgParser, PathParser};
-use crate::session_diagnostics::{AttributeParseError, AttributeParseErrorReason, UnknownMetaItem};
+use crate::parser::{ArgParser, RefPathParser};
+use crate::session_diagnostics::{
+    AttributeParseError, AttributeParseErrorReason, ParsedDescription,
+};
 use crate::target_checking::AllowedTargets;
-
 type GroupType<S> = LazyLock<GroupTypeInner<S>>;
 
 pub(super) struct GroupTypeInner<S: Stage> {
@@ -83,7 +108,7 @@ pub(super) struct GroupTypeInnerAccept<S: Stage> {
 }
 
 type AcceptFn<S> =
-    Box<dyn for<'sess, 'a> Fn(&mut AcceptContext<'_, 'sess, S>, &ArgParser<'a>) + Send + Sync>;
+    Box<dyn for<'sess, 'a> Fn(&mut AcceptContext<'_, 'sess, S>, &ArgParser) + Send + Sync>;
 type FinalizeFn<S> =
     Box<dyn Send + Sync + Fn(&mut FinalizeContext<'_, '_, S>) -> Option<AttributeKind>>;
 
@@ -147,9 +172,11 @@ attribute_parsers!(
     pub(crate) static ATTRIBUTE_PARSERS = [
         // tidy-alphabetical-start
         AlignParser,
+        AlignStaticParser,
         BodyStabilityParser,
         ConfusablesParser,
         ConstStabilityParser,
+        DocParser,
         MacroUseParser,
         NakedParser,
         StabilityParser,
@@ -159,13 +186,17 @@ attribute_parsers!(
         // tidy-alphabetical-start
         Combine<AllowConstFnUnstableParser>,
         Combine<AllowInternalUnstableParser>,
+        Combine<DebuggerViualizerParser>,
         Combine<ForceTargetFeatureParser>,
+        Combine<LinkParser>,
         Combine<ReprParser>,
         Combine<TargetFeatureParser>,
         Combine<UnstableFeatureBoundParser>,
         // tidy-alphabetical-end
 
         // tidy-alphabetical-start
+        Single<CfiEncodingParser>,
+        Single<CollapseDebugInfoParser>,
         Single<CoverageParser>,
         Single<CrateNameParser>,
         Single<CustomMirParser>,
@@ -174,36 +205,50 @@ attribute_parsers!(
         Single<ExportNameParser>,
         Single<IgnoreParser>,
         Single<InlineParser>,
+        Single<InstructionSetParser>,
         Single<LinkNameParser>,
         Single<LinkOrdinalParser>,
         Single<LinkSectionParser>,
         Single<LinkageParser>,
+        Single<MacroExportParser>,
+        Single<MoveSizeLimitParser>,
+        Single<MustNotSuspendParser>,
         Single<MustUseParser>,
+        Single<ObjcClassParser>,
+        Single<ObjcSelectorParser>,
         Single<OptimizeParser>,
         Single<PathAttributeParser>,
+        Single<PatternComplexityLimitParser>,
         Single<ProcMacroDeriveParser>,
+        Single<RecursionLimitParser>,
         Single<RustcBuiltinMacroParser>,
         Single<RustcForceInlineParser>,
-        Single<RustcLayoutScalarValidRangeEnd>,
-        Single<RustcLayoutScalarValidRangeStart>,
+        Single<RustcLayoutScalarValidRangeEndParser>,
+        Single<RustcLayoutScalarValidRangeStartParser>,
+        Single<RustcLegacyConstGenericsParser>,
+        Single<RustcLintOptDenyFieldAccessParser>,
+        Single<RustcMustImplementOneOfParser>,
         Single<RustcObjectLifetimeDefaultParser>,
+        Single<RustcScalableVectorParser>,
+        Single<RustcSimdMonomorphizeLaneLimitParser>,
         Single<SanitizeParser>,
         Single<ShouldPanicParser>,
         Single<SkipDuringMethodDispatchParser>,
         Single<TransparencyParser>,
+        Single<TypeLengthLimitParser>,
+        Single<WindowsSubsystemParser>,
         Single<WithoutArgs<AllowIncoherentImplParser>>,
         Single<WithoutArgs<AllowInternalUnsafeParser>>,
         Single<WithoutArgs<AsPtrParser>>,
         Single<WithoutArgs<AutomaticallyDerivedParser>>,
-        Single<WithoutArgs<CoherenceIsCoreParser>>,
         Single<WithoutArgs<CoinductiveParser>>,
         Single<WithoutArgs<ColdParser>>,
         Single<WithoutArgs<ConstContinueParser>>,
         Single<WithoutArgs<ConstStabilityIndirectParser>>,
-        Single<WithoutArgs<ConstTraitParser>>,
         Single<WithoutArgs<CoroutineParser>>,
         Single<WithoutArgs<DenyExplicitImplParser>>,
         Single<WithoutArgs<DoNotImplementViaObjectParser>>,
+        Single<WithoutArgs<EiiForeignItemParser>>,
         Single<WithoutArgs<ExportStableParser>>,
         Single<WithoutArgs<FfiConstParser>>,
         Single<WithoutArgs<FfiPureParser>>,
@@ -212,17 +257,38 @@ attribute_parsers!(
         Single<WithoutArgs<MacroEscapeParser>>,
         Single<WithoutArgs<MarkerParser>>,
         Single<WithoutArgs<MayDangleParser>>,
+        Single<WithoutArgs<NoCoreParser>>,
         Single<WithoutArgs<NoImplicitPreludeParser>>,
+        Single<WithoutArgs<NoLinkParser>>,
         Single<WithoutArgs<NoMangleParser>>,
+        Single<WithoutArgs<NoStdParser>>,
         Single<WithoutArgs<NonExhaustiveParser>>,
         Single<WithoutArgs<ParenSugarParser>>,
         Single<WithoutArgs<PassByValueParser>>,
+        Single<WithoutArgs<PinV2Parser>>,
         Single<WithoutArgs<PointeeParser>>,
         Single<WithoutArgs<ProcMacroAttributeParser>>,
         Single<WithoutArgs<ProcMacroParser>>,
         Single<WithoutArgs<PubTransparentParser>>,
+        Single<WithoutArgs<RustcCoherenceIsCoreParser>>,
+        Single<WithoutArgs<RustcDumpDefParents>>,
+        Single<WithoutArgs<RustcDumpItemBounds>>,
+        Single<WithoutArgs<RustcDumpPredicates>>,
+        Single<WithoutArgs<RustcDumpUserArgs>>,
+        Single<WithoutArgs<RustcDumpVtable>>,
+        Single<WithoutArgs<RustcHasIncoherentInherentImplsParser>>,
+        Single<WithoutArgs<RustcLintDiagnosticsParser>>,
+        Single<WithoutArgs<RustcLintOptTyParser>>,
+        Single<WithoutArgs<RustcLintQueryInstabilityParser>>,
+        Single<WithoutArgs<RustcLintUntrackedQueryInformationParser>>,
+        Single<WithoutArgs<RustcMainParser>>,
+        Single<WithoutArgs<RustcNeverReturnsNullPointerParser>>,
+        Single<WithoutArgs<RustcNoImplicitAutorefsParser>>,
+        Single<WithoutArgs<RustcPassIndirectlyInNonRusticAbisParser>>,
+        Single<WithoutArgs<RustcShouldNotBeCalledOnConstItems>>,
         Single<WithoutArgs<SpecializationTraitParser>>,
         Single<WithoutArgs<StdInternalSymbolParser>>,
+        Single<WithoutArgs<ThreadLocalParser>>,
         Single<WithoutArgs<TrackCallerParser>>,
         Single<WithoutArgs<TypeConstParser>>,
         Single<WithoutArgs<UnsafeSpecializationMarkerParser>>,
@@ -309,11 +375,23 @@ pub struct Late;
 /// Gives [`AttributeParser`]s enough information to create errors, for example.
 pub struct AcceptContext<'f, 'sess, S: Stage> {
     pub(crate) shared: SharedContext<'f, 'sess, S>,
-    /// The span of the attribute currently being parsed
+
+    /// The outer span of the attribute currently being parsed
+    /// #[attribute(...)]
+    /// ^^^^^^^^^^^^^^^^^ outer span
+    /// For attributes in `cfg_attr`, the outer span and inner spans are equal.
     pub(crate) attr_span: Span,
+    /// The inner span of the attribute currently being parsed
+    /// #[attribute(...)]
+    ///   ^^^^^^^^^^^^^^  inner span
+    pub(crate) inner_span: Span,
 
     /// Whether it is an inner or outer attribute
     pub(crate) attr_style: AttrStyle,
+
+    /// A description of the thing we are parsing using this attribute parser
+    /// We are not only using these parsers for attributes, but also for macros such as the `cfg!()` macro.
+    pub(crate) parsed_description: ParsedDescription,
 
     /// The expected structure of the attribute.
     ///
@@ -332,16 +410,20 @@ impl<'f, 'sess: 'f, S: Stage> SharedContext<'f, 'sess, S> {
     /// Emit a lint. This method is somewhat special, since lints emitted during attribute parsing
     /// must be delayed until after HIR is built. This method will take care of the details of
     /// that.
-    pub(crate) fn emit_lint(&mut self, lint: AttributeLintKind, span: Span) {
-        if matches!(self.stage.should_emit(), ShouldEmit::Nothing) {
+    pub(crate) fn emit_lint(&mut self, lint: &'static Lint, kind: AttributeLintKind, span: Span) {
+        if !matches!(
+            self.stage.should_emit(),
+            ShouldEmit::ErrorsAndLints | ShouldEmit::EarlyFatal { also_emit_lints: true }
+        ) {
             return;
         }
         let id = self.target_id;
-        (self.emit_lint)(AttributeLint { id, span, kind: lint });
+        (self.emit_lint)(AttributeLint { lint_id: LintId::of(lint), id, span, kind });
     }
 
     pub(crate) fn warn_unused_duplicate(&mut self, used_span: Span, unused_span: Span) {
         self.emit_lint(
+            rustc_session::lint::builtin::UNUSED_ATTRIBUTES,
             AttributeLintKind::UnusedDuplicate {
                 this: unused_span,
                 other: used_span,
@@ -357,6 +439,7 @@ impl<'f, 'sess: 'f, S: Stage> SharedContext<'f, 'sess, S> {
         unused_span: Span,
     ) {
         self.emit_lint(
+            rustc_session::lint::builtin::UNUSED_ATTRIBUTES,
             AttributeLintKind::UnusedDuplicate {
                 this: unused_span,
                 other: used_span,
@@ -368,13 +451,20 @@ impl<'f, 'sess: 'f, S: Stage> SharedContext<'f, 'sess, S> {
 }
 
 impl<'f, 'sess: 'f, S: Stage> AcceptContext<'f, 'sess, S> {
-    pub(crate) fn unknown_key(
+    fn emit_parse_error(
         &self,
         span: Span,
-        found: String,
-        options: &'static [&'static str],
+        reason: AttributeParseErrorReason<'_>,
     ) -> ErrorGuaranteed {
-        self.emit_err(UnknownMetaItem { span, item: found, expected: options })
+        self.emit_err(AttributeParseError {
+            span,
+            attr_span: self.attr_span,
+            template: self.template.clone(),
+            path: self.attr_path.clone(),
+            description: self.parsed_description,
+            reason,
+            suggestions: self.suggestions(),
+        })
     }
 
     /// error that a string literal was expected.
@@ -386,123 +476,84 @@ impl<'f, 'sess: 'f, S: Stage> AcceptContext<'f, 'sess, S> {
         span: Span,
         actual_literal: Option<&MetaItemLit>,
     ) -> ErrorGuaranteed {
-        self.emit_err(AttributeParseError {
+        self.emit_parse_error(
             span,
-            attr_span: self.attr_span,
-            template: self.template.clone(),
-            attribute: self.attr_path.clone(),
-            reason: AttributeParseErrorReason::ExpectedStringLiteral {
+            AttributeParseErrorReason::ExpectedStringLiteral {
                 byte_string: actual_literal.and_then(|i| {
                     i.kind.is_bytestr().then(|| self.sess().source_map().start_point(i.span))
                 }),
             },
-            attr_style: self.attr_style,
-        })
+        )
     }
 
     pub(crate) fn expected_integer_literal(&self, span: Span) -> ErrorGuaranteed {
-        self.emit_err(AttributeParseError {
-            span,
-            attr_span: self.attr_span,
-            template: self.template.clone(),
-            attribute: self.attr_path.clone(),
-            reason: AttributeParseErrorReason::ExpectedIntegerLiteral,
-            attr_style: self.attr_style,
-        })
+        self.emit_parse_error(span, AttributeParseErrorReason::ExpectedIntegerLiteral)
     }
 
-    pub(crate) fn expected_list(&self, span: Span) -> ErrorGuaranteed {
-        self.emit_err(AttributeParseError {
-            span,
-            attr_span: self.attr_span,
-            template: self.template.clone(),
-            attribute: self.attr_path.clone(),
-            reason: AttributeParseErrorReason::ExpectedList,
-            attr_style: self.attr_style,
-        })
+    pub(crate) fn expected_list(&self, span: Span, args: &ArgParser) -> ErrorGuaranteed {
+        let span = match args {
+            ArgParser::NoArgs => span,
+            ArgParser::List(list) => list.span,
+            ArgParser::NameValue(nv) => nv.args_span(),
+        };
+        self.emit_parse_error(span, AttributeParseErrorReason::ExpectedList)
     }
 
-    pub(crate) fn expected_no_args(&self, args_span: Span) -> ErrorGuaranteed {
-        self.emit_err(AttributeParseError {
-            span: args_span,
-            attr_span: self.attr_span,
-            template: self.template.clone(),
-            attribute: self.attr_path.clone(),
-            reason: AttributeParseErrorReason::ExpectedNoArgs,
-            attr_style: self.attr_style,
-        })
+    pub(crate) fn expected_list_with_num_args_or_more(
+        &self,
+        args: usize,
+        span: Span,
+    ) -> ErrorGuaranteed {
+        self.emit_parse_error(
+            span,
+            AttributeParseErrorReason::ExpectedListWithNumArgsOrMore { args },
+        )
+    }
+
+    pub(crate) fn expected_list_or_no_args(&self, span: Span) -> ErrorGuaranteed {
+        self.emit_parse_error(span, AttributeParseErrorReason::ExpectedListOrNoArgs)
+    }
+
+    pub(crate) fn expected_nv_or_no_args(&self, span: Span) -> ErrorGuaranteed {
+        self.emit_parse_error(span, AttributeParseErrorReason::ExpectedNameValueOrNoArgs)
+    }
+
+    pub(crate) fn expected_non_empty_string_literal(&self, span: Span) -> ErrorGuaranteed {
+        self.emit_parse_error(span, AttributeParseErrorReason::ExpectedNonEmptyStringLiteral)
+    }
+
+    pub(crate) fn expected_no_args(&self, span: Span) -> ErrorGuaranteed {
+        self.emit_parse_error(span, AttributeParseErrorReason::ExpectedNoArgs)
     }
 
     /// emit an error that a `name` was expected here
     pub(crate) fn expected_identifier(&self, span: Span) -> ErrorGuaranteed {
-        self.emit_err(AttributeParseError {
-            span,
-            attr_span: self.attr_span,
-            template: self.template.clone(),
-            attribute: self.attr_path.clone(),
-            reason: AttributeParseErrorReason::ExpectedIdentifier,
-            attr_style: self.attr_style,
-        })
+        self.emit_parse_error(span, AttributeParseErrorReason::ExpectedIdentifier)
     }
 
     /// emit an error that a `name = value` pair was expected at this span. The symbol can be given for
     /// a nicer error message talking about the specific name that was found lacking a value.
     pub(crate) fn expected_name_value(&self, span: Span, name: Option<Symbol>) -> ErrorGuaranteed {
-        self.emit_err(AttributeParseError {
-            span,
-            attr_span: self.attr_span,
-            template: self.template.clone(),
-            attribute: self.attr_path.clone(),
-            reason: AttributeParseErrorReason::ExpectedNameValue(name),
-            attr_style: self.attr_style,
-        })
+        self.emit_parse_error(span, AttributeParseErrorReason::ExpectedNameValue(name))
     }
 
     /// emit an error that a `name = value` pair was found where that name was already seen.
     pub(crate) fn duplicate_key(&self, span: Span, key: Symbol) -> ErrorGuaranteed {
-        self.emit_err(AttributeParseError {
-            span,
-            attr_span: self.attr_span,
-            template: self.template.clone(),
-            attribute: self.attr_path.clone(),
-            reason: AttributeParseErrorReason::DuplicateKey(key),
-            attr_style: self.attr_style,
-        })
+        self.emit_parse_error(span, AttributeParseErrorReason::DuplicateKey(key))
     }
 
     /// an error that should be emitted when a [`MetaItemOrLitParser`](crate::parser::MetaItemOrLitParser)
     /// was expected *not* to be a literal, but instead a meta item.
     pub(crate) fn unexpected_literal(&self, span: Span) -> ErrorGuaranteed {
-        self.emit_err(AttributeParseError {
-            span,
-            attr_span: self.attr_span,
-            template: self.template.clone(),
-            attribute: self.attr_path.clone(),
-            reason: AttributeParseErrorReason::UnexpectedLiteral,
-            attr_style: self.attr_style,
-        })
+        self.emit_parse_error(span, AttributeParseErrorReason::UnexpectedLiteral)
     }
 
     pub(crate) fn expected_single_argument(&self, span: Span) -> ErrorGuaranteed {
-        self.emit_err(AttributeParseError {
-            span,
-            attr_span: self.attr_span,
-            template: self.template.clone(),
-            attribute: self.attr_path.clone(),
-            reason: AttributeParseErrorReason::ExpectedSingleArgument,
-            attr_style: self.attr_style,
-        })
+        self.emit_parse_error(span, AttributeParseErrorReason::ExpectedSingleArgument)
     }
 
     pub(crate) fn expected_at_least_one_argument(&self, span: Span) -> ErrorGuaranteed {
-        self.emit_err(AttributeParseError {
-            span,
-            attr_span: self.attr_span,
-            template: self.template.clone(),
-            attribute: self.attr_path.clone(),
-            reason: AttributeParseErrorReason::ExpectedAtLeastOneArgument,
-            attr_style: self.attr_style,
-        })
+        self.emit_parse_error(span, AttributeParseErrorReason::ExpectedAtLeastOneArgument)
     }
 
     /// produces an error along the lines of `expected one of [foo, meow]`
@@ -511,18 +562,14 @@ impl<'f, 'sess: 'f, S: Stage> AcceptContext<'f, 'sess, S> {
         span: Span,
         possibilities: &[Symbol],
     ) -> ErrorGuaranteed {
-        self.emit_err(AttributeParseError {
+        self.emit_parse_error(
             span,
-            attr_span: self.attr_span,
-            template: self.template.clone(),
-            attribute: self.attr_path.clone(),
-            reason: AttributeParseErrorReason::ExpectedSpecificArgument {
+            AttributeParseErrorReason::ExpectedSpecificArgument {
                 possibilities,
                 strings: false,
                 list: false,
             },
-            attr_style: self.attr_style,
-        })
+        )
     }
 
     /// produces an error along the lines of `expected one of [foo, meow] as an argument`.
@@ -532,18 +579,14 @@ impl<'f, 'sess: 'f, S: Stage> AcceptContext<'f, 'sess, S> {
         span: Span,
         possibilities: &[Symbol],
     ) -> ErrorGuaranteed {
-        self.emit_err(AttributeParseError {
+        self.emit_parse_error(
             span,
-            attr_span: self.attr_span,
-            template: self.template.clone(),
-            attribute: self.attr_path.clone(),
-            reason: AttributeParseErrorReason::ExpectedSpecificArgument {
+            AttributeParseErrorReason::ExpectedSpecificArgument {
                 possibilities,
                 strings: false,
                 list: true,
             },
-            attr_style: self.attr_style,
-        })
+        )
     }
 
     /// produces an error along the lines of `expected one of ["foo", "meow"]`
@@ -552,22 +595,47 @@ impl<'f, 'sess: 'f, S: Stage> AcceptContext<'f, 'sess, S> {
         span: Span,
         possibilities: &[Symbol],
     ) -> ErrorGuaranteed {
-        self.emit_err(AttributeParseError {
+        self.emit_parse_error(
             span,
-            attr_span: self.attr_span,
-            template: self.template.clone(),
-            attribute: self.attr_path.clone(),
-            reason: AttributeParseErrorReason::ExpectedSpecificArgument {
+            AttributeParseErrorReason::ExpectedSpecificArgument {
                 possibilities,
                 strings: true,
                 list: false,
             },
-            attr_style: self.attr_style,
-        })
+        )
     }
 
     pub(crate) fn warn_empty_attribute(&mut self, span: Span) {
-        self.emit_lint(AttributeLintKind::EmptyAttribute { first_span: span }, span);
+        let attr_path = self.attr_path.clone().to_string();
+        let valid_without_list = self.template.word;
+        self.emit_lint(
+            rustc_session::lint::builtin::UNUSED_ATTRIBUTES,
+            AttributeLintKind::EmptyAttribute { first_span: span, attr_path, valid_without_list },
+            span,
+        );
+    }
+
+    pub(crate) fn warn_ill_formed_attribute_input(&mut self, lint: &'static Lint) {
+        let suggestions = self.suggestions();
+        let span = self.attr_span;
+        self.emit_lint(
+            lint,
+            AttributeLintKind::IllFormedAttributeInput { suggestions, docs: None },
+            span,
+        );
+    }
+
+    pub(crate) fn suggestions(&self) -> Vec<String> {
+        let style = match self.parsed_description {
+            // If the outer and inner spans are equal, we are parsing an embedded attribute
+            ParsedDescription::Attribute if self.attr_span == self.inner_span => {
+                AttrSuggestionStyle::EmbeddedAttribute
+            }
+            ParsedDescription::Attribute => AttrSuggestionStyle::Attribute(self.attr_style),
+            ParsedDescription::Macro => AttrSuggestionStyle::Macro,
+        };
+
+        self.template.suggestions(style, &self.attr_path)
     }
 }
 
@@ -597,6 +665,7 @@ pub struct SharedContext<'p, 'sess, S: Stage> {
     pub(crate) target_span: Span,
     /// The id ([`NodeId`] if `S` is `Early`, [`HirId`] if `S` is `Late`) of the syntactical component this attribute was applied to
     pub(crate) target_id: S::Id,
+    pub(crate) target: Option<rustc_hir::Target>,
 
     pub(crate) emit_lint: &'p mut dyn FnMut(AttributeLint<S::Id>),
 }
@@ -614,7 +683,7 @@ pub(crate) struct FinalizeContext<'p, 'sess, S: Stage> {
     ///
     /// Usually, you should use normal attribute parsing logic instead,
     /// especially when making a *denylist* of other attributes.
-    pub(crate) all_attrs: &'p [PathParser<'p>],
+    pub(crate) all_attrs: &'p [RefPathParser<'p>],
 }
 
 impl<'p, 'sess: 'p, S: Stage> Deref for FinalizeContext<'p, 'sess, S> {
@@ -657,20 +726,20 @@ pub enum ShouldEmit {
     ///
     /// Only relevant when early parsing, in late parsing equivalent to `ErrorsAndLints`.
     /// Late parsing is never fatal, and instead tries to emit as many diagnostics as possible.
-    EarlyFatal,
+    EarlyFatal { also_emit_lints: bool },
     /// The operation will emit errors and lints.
     /// This is usually what you need.
     ErrorsAndLints,
     /// The operation will emit *not* errors and lints.
-    /// Use this if you are *sure* that this operation will be called at a different time with `ShouldEmit::Emit`.
+    /// Use this if you are *sure* that this operation will be called at a different time with `ShouldEmit::ErrorsAndLints`.
     Nothing,
 }
 
 impl ShouldEmit {
     pub(crate) fn emit_err(&self, diag: Diag<'_>) -> ErrorGuaranteed {
         match self {
-            ShouldEmit::EarlyFatal if diag.level() == Level::DelayedBug => diag.emit(),
-            ShouldEmit::EarlyFatal => diag.upgrade_to_fatal().emit(),
+            ShouldEmit::EarlyFatal { .. } if diag.level() == Level::DelayedBug => diag.emit(),
+            ShouldEmit::EarlyFatal { .. } => diag.upgrade_to_fatal().emit(),
             ShouldEmit::ErrorsAndLints => diag.emit(),
             ShouldEmit::Nothing => diag.delay_as_bug(),
         }

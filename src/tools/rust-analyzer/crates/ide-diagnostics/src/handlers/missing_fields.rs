@@ -1,6 +1,6 @@
 use either::Either;
 use hir::{
-    AssocItem, HirDisplay, ImportPathConfig, InFile, Type,
+    AssocItem, FindPathConfig, HirDisplay, InFile, Type,
     db::{ExpandDatabase, HirDatabase},
     sym,
 };
@@ -132,7 +132,7 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::MissingFields) -> Option<Vec<Ass
                         let type_path = current_module?.find_path(
                             ctx.sema.db,
                             item_for_path_search(ctx.sema.db, item_in_ns)?,
-                            ImportPathConfig {
+                            FindPathConfig {
                                 prefer_no_std: ctx.config.prefer_no_std,
                                 prefer_prelude: ctx.config.prefer_prelude,
                                 prefer_absolute: ctx.config.prefer_absolute,
@@ -221,12 +221,12 @@ fn get_default_constructor(
     let krate = ctx
         .sema
         .file_to_module_def(d.file.original_file(ctx.sema.db).file_id(ctx.sema.db))?
-        .krate();
-    let module = krate.root_module();
+        .krate(ctx.sema.db);
+    let module = krate.root_module(ctx.sema.db);
 
     // Look for a ::new() associated function
     let has_new_func = ty
-        .iterate_assoc_items(ctx.sema.db, krate, |assoc_item| {
+        .iterate_assoc_items(ctx.sema.db, |assoc_item| {
             if let AssocItem::Function(func) = assoc_item
                 && func.name(ctx.sema.db) == sym::new
                 && func.assoc_fn_params(ctx.sema.db).is_empty()

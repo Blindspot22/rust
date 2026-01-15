@@ -6,7 +6,8 @@
     clippy::redundant_locals,
     clippy::manual_midpoint,
     clippy::manual_unwrap_or_default,
-    clippy::manual_unwrap_or
+    clippy::manual_unwrap_or,
+    clippy::unnecessary_option_map_or_else
 )]
 
 fn bad1(string: Option<&str>) -> (bool, &str) {
@@ -150,6 +151,22 @@ fn complex_subpat() -> DummyEnum {
     let x = Some(DummyEnum::One(1));
     let _ = if let Some(_one @ DummyEnum::One(..)) = x { 1 } else { 2 };
     DummyEnum::Two
+}
+
+// #10335
+pub fn test_result_err_ignored_1(r: Result<&[u8], &[u8]>) -> Vec<u8> {
+    match r {
+        //~^ option_if_let_else
+        Ok(s) => s.to_owned(),
+        Err(_) => Vec::new(),
+    }
+}
+
+// #10335
+pub fn test_result_err_ignored_2(r: Result<&[u8], &[u8]>) -> Vec<u8> {
+    if let Ok(s) = r { s.to_owned() }
+    //~^ option_if_let_else
+    else { Vec::new() }
 }
 
 fn main() {

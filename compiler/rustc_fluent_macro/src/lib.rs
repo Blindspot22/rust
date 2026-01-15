@@ -1,11 +1,8 @@
 // tidy-alphabetical-start
-#![allow(internal_features)]
 #![allow(rustc::default_hash_types)]
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![doc(rust_logo)]
+#![cfg_attr(bootstrap, feature(track_path))]
+#![cfg_attr(not(bootstrap), feature(proc_macro_tracked_path))]
 #![feature(proc_macro_diagnostic)]
-#![feature(rustdoc_internals)]
-#![feature(track_path)]
 // tidy-alphabetical-end
 
 use proc_macro::TokenStream;
