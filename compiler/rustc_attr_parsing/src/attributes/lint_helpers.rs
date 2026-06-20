@@ -1,9 +1,10 @@
+use rustc_feature::AttributeStability;
+
 use super::prelude::*;
 
-pub(crate) struct AsPtrParser;
-impl<S: Stage> NoArgsAttributeParser<S> for AsPtrParser {
+pub(crate) struct RustcAsPtrParser;
+impl NoArgsAttributeParser for RustcAsPtrParser {
     const PATH: &[Symbol] = &[sym::rustc_as_ptr];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
         Allow(Target::Fn),
         Allow(Target::Method(MethodKind::Inherent)),
@@ -11,52 +12,54 @@ impl<S: Stage> NoArgsAttributeParser<S> for AsPtrParser {
         Allow(Target::Method(MethodKind::Trait { body: true })),
         Allow(Target::Method(MethodKind::TraitImpl)),
     ]);
-    const CREATE: fn(Span) -> AttributeKind = AttributeKind::AsPtr;
+    const STABILITY: AttributeStability = unstable!(rustc_attrs);
+    const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::RustcAsPtr;
 }
 
-pub(crate) struct PubTransparentParser;
-impl<S: Stage> NoArgsAttributeParser<S> for PubTransparentParser {
+pub(crate) struct RustcPubTransparentParser;
+impl NoArgsAttributeParser for RustcPubTransparentParser {
     const PATH: &[Symbol] = &[sym::rustc_pub_transparent];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
         Allow(Target::Struct),
         Allow(Target::Enum),
         Allow(Target::Union),
     ]);
-    const CREATE: fn(Span) -> AttributeKind = AttributeKind::PubTransparent;
+    const STABILITY: AttributeStability = unstable!(rustc_attrs);
+    const CREATE: fn(Span) -> AttributeKind = AttributeKind::RustcPubTransparent;
 }
 
-pub(crate) struct PassByValueParser;
-impl<S: Stage> NoArgsAttributeParser<S> for PassByValueParser {
+pub(crate) struct RustcPassByValueParser;
+impl NoArgsAttributeParser for RustcPassByValueParser {
     const PATH: &[Symbol] = &[sym::rustc_pass_by_value];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
         Allow(Target::Struct),
         Allow(Target::Enum),
         Allow(Target::TyAlias),
     ]);
-    const CREATE: fn(Span) -> AttributeKind = AttributeKind::PassByValue;
+    const STABILITY: AttributeStability = unstable!(rustc_attrs);
+    const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::RustcPassByValue;
 }
 
-pub(crate) struct RustcShouldNotBeCalledOnConstItems;
-impl<S: Stage> NoArgsAttributeParser<S> for RustcShouldNotBeCalledOnConstItems {
+pub(crate) struct RustcShouldNotBeCalledOnConstItemsParser;
+impl NoArgsAttributeParser for RustcShouldNotBeCalledOnConstItemsParser {
     const PATH: &[Symbol] = &[sym::rustc_should_not_be_called_on_const_items];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
         Allow(Target::Method(MethodKind::Inherent)),
         Allow(Target::Method(MethodKind::TraitImpl)),
     ]);
-    const CREATE: fn(Span) -> AttributeKind = AttributeKind::RustcShouldNotBeCalledOnConstItems;
+    const STABILITY: AttributeStability = unstable!(rustc_attrs);
+    const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::RustcShouldNotBeCalledOnConstItems;
 }
 
 pub(crate) struct AutomaticallyDerivedParser;
-impl<S: Stage> NoArgsAttributeParser<S> for AutomaticallyDerivedParser {
+impl NoArgsAttributeParser for AutomaticallyDerivedParser {
     const PATH: &[Symbol] = &[sym::automatically_derived];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Warn;
+    const ON_DUPLICATE: OnDuplicate = OnDuplicate::Warn;
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowListWarnRest(&[
         Allow(Target::Impl { of_trait: true }),
         Error(Target::Crate),
         Error(Target::WherePredicate),
     ]);
-    const CREATE: fn(Span) -> AttributeKind = AttributeKind::AutomaticallyDerived;
+    const STABILITY: AttributeStability = AttributeStability::Stable;
+    const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::AutomaticallyDerived;
 }

@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use rustc_abi::{Align, Size};
 use rustc_data_structures::fx::{FxBuildHasher, FxHashSet};
-use rustc_errors::{Diag, DiagMessage, Level};
+use rustc_errors::{Diag, Level};
 use rustc_span::{DUMMY_SP, Span, SpanData, Symbol};
 
 use crate::borrow_tracker::stacked_borrows::diagnostics::TagHistory;
@@ -18,7 +18,7 @@ pub enum TerminationInfo {
         leak_check: bool,
     },
     Abort(String),
-    /// Miri was interrupted by a Ctrl+C from the user
+    /// Miri was interrupted by a Ctrl+C from the user.
     Interrupted,
     UnsupportedInIsolation(String),
     StackedBorrowsUb {
@@ -32,6 +32,8 @@ pub enum TerminationInfo {
         history: tree_diagnostics::HistoryData,
     },
     Int2PtrWithStrictProvenance,
+    /// GenMC determined that the execution should stop.
+    GenmcSkip,
     /// All threads are blocked.
     GlobalDeadlock,
     /// Some thread discovered a deadlock condition (e.g. in a mutex with reentrancy checking).
@@ -81,6 +83,7 @@ impl fmt::Display for TerminationInfo {
             TreeBorrowsUb { title, .. } => write!(f, "{title}"),
             GlobalDeadlock => write!(f, "the evaluated program deadlocked"),
             LocalDeadlock => write!(f, "a thread deadlocked"),
+            GenmcSkip => write!(f, "GenMC wants to skip this execution"),
             MultipleSymbolDefinitions { link_name, .. } =>
                 write!(f, "multiple definitions of symbol `{link_name}`"),
             SymbolShimClashing { link_name, .. } =>
@@ -107,13 +110,14 @@ impl fmt::Debug for TerminationInfo {
 }
 
 impl MachineStopType for TerminationInfo {
-    fn diagnostic_message(&self) -> DiagMessage {
-        self.to_string().into()
-    }
-    fn add_args(
-        self: Box<Self>,
-        _: &mut dyn FnMut(std::borrow::Cow<'static, str>, rustc_errors::DiagArgValue),
-    ) {
+    fn with_validation_path(&mut self, path: String) {
+        use TerminationInfo::*;
+        match self {
+            StackedBorrowsUb { help, .. } => {
+                help.push(format!("while retagging field {path}"));
+            }
+            _ => {}
+        }
     }
 }
 
@@ -148,6 +152,11 @@ pub enum NonHaltingDiagnostic {
         upgraded_success_ordering: AtomicRwOrd,
         failure_ordering: AtomicReadOrd,
         effective_failure_ordering: AtomicReadOrd,
+    },
+    FileInProcOpened,
+    ConnectingSocketGetsockname,
+    SocketAddressResolution {
+        error: std::io::Error,
     },
 }
 
@@ -248,6 +257,10 @@ pub fn report_result<'tcx>(
                 Some("unsupported operation"),
             StackedBorrowsUb { .. } | TreeBorrowsUb { .. } | DataRace { .. } =>
                 Some("Undefined Behavior"),
+            GenmcSkip => {
+                assert!(ecx.machine.data_race.as_genmc_ref().is_some());
+                return Some((0, false));
+            }
             LocalDeadlock => {
                 labels.push(format!("thread got stuck here"));
                 None
@@ -257,7 +270,7 @@ pub fn report_result<'tcx>(
                 // The "active" thread might actually be terminated, so we ignore it.
                 let mut any_pruned = false;
                 for (thread, stack) in ecx.machine.threads.all_blocked_stacks() {
-                    let stacktrace = Frame::generate_stacktrace_from_stack(stack);
+                    let stacktrace = Frame::generate_stacktrace_from_stack(stack, *ecx.tcx);
                     let (stacktrace, was_pruned) = prune_stacktrace(stacktrace, &ecx.machine);
                     any_pruned |= was_pruned;
                     report_msg(
@@ -353,16 +366,14 @@ pub fn report_result<'tcx>(
         (title, helps)
     } else {
         let title = match res.kind() {
-            UndefinedBehavior(ValidationError(validation_err))
-                if matches!(
-                    validation_err.kind,
-                    ValidationErrorKind::PointerAsInt { .. } | ValidationErrorKind::PartialPointer
-                ) =>
-            {
+            UndefinedBehavior(UndefinedBehaviorInfo::ValidationError {
+                ptr_bytes_warning: true,
+                ..
+            }) => {
                 ecx.handle_ice(); // print interpreter backtrace (this is outside the eval `catch_unwind`)
                 bug!(
                     "This validation error should be impossible in Miri: {}",
-                    format_interp_error(ecx.tcx.dcx(), res)
+                    format_interp_error(res)
                 );
             }
             UndefinedBehavior(_) => "Undefined Behavior",
@@ -379,10 +390,7 @@ pub fn report_result<'tcx>(
             ) => "post-monomorphization error",
             _ => {
                 ecx.handle_ice(); // print interpreter backtrace (this is outside the eval `catch_unwind`)
-                bug!(
-                    "This error should be impossible in Miri: {}",
-                    format_interp_error(ecx.tcx.dcx(), res)
-                );
+                bug!("This error should be impossible in Miri: {}", format_interp_error(res));
             }
         };
         #[rustfmt::skip]
@@ -410,10 +418,10 @@ pub fn report_result<'tcx>(
                 match info {
                     PointerUseAfterFree(alloc_id, _) | PointerOutOfBounds { alloc_id, .. } => {
                         if let Some(span) = ecx.machine.allocated_span(*alloc_id) {
-                            helps.push(note_span!(span, "{:?} was allocated here:", alloc_id));
+                            helps.push(note_span!(span, "{alloc_id} was allocated here:"));
                         }
                         if let Some(span) = ecx.machine.deallocated_span(*alloc_id) {
-                            helps.push(note_span!(span, "{:?} was deallocated here:", alloc_id));
+                            helps.push(note_span!(span, "{alloc_id} was deallocated here:"));
                         }
                     }
                     AbiMismatchArgument { .. } | AbiMismatchReturn { .. } => {
@@ -446,7 +454,7 @@ pub fn report_result<'tcx>(
         UndefinedBehavior(InvalidUninitBytes(Some((alloc_id, access)))) => {
             writeln!(
                 extra,
-                "Uninitialized memory occurred at {alloc_id:?}{range:?}, in this allocation:",
+                "Uninitialized memory occurred at {alloc_id}{range}, in this allocation:",
                 range = access.bad,
             )
             .unwrap();
@@ -459,7 +467,7 @@ pub fn report_result<'tcx>(
     if let Some(title) = title {
         write!(primary_msg, "{title}: ").unwrap();
     }
-    write!(primary_msg, "{}", format_interp_error(ecx.tcx.dcx(), res)).unwrap();
+    write!(primary_msg, "{}", format_interp_error(res)).unwrap();
 
     if labels.is_empty() {
         labels.push(format!(
@@ -493,7 +501,7 @@ pub fn report_result<'tcx>(
     for (i, frame) in ecx.active_thread_stack().iter().enumerate() {
         trace!("-------------------");
         trace!("Frame {}", i);
-        trace!("    return: {:?}", frame.return_place);
+        trace!("    return: {:?}", frame.return_place());
         for (i, local) in frame.locals.iter().enumerate() {
             trace!("    local {}: {:?}", i, local);
         }
@@ -509,7 +517,7 @@ pub fn report_leaks<'tcx>(
     let mut any_pruned = false;
     for (id, kind, alloc) in leaks {
         let mut title = format!(
-            "memory leaked: {id:?} ({}, size: {:?}, align: {:?})",
+            "memory leaked: {id:?} ({}, size: {}, align: {})",
             kind,
             alloc.size().bytes(),
             alloc.align.bytes()
@@ -633,7 +641,8 @@ impl<'tcx> MiriMachine<'tcx> {
     pub fn emit_diagnostic(&self, e: NonHaltingDiagnostic) {
         use NonHaltingDiagnostic::*;
 
-        let stacktrace = Frame::generate_stacktrace_from_stack(self.threads.active_thread_stack());
+        let stacktrace =
+            Frame::generate_stacktrace_from_stack(self.threads.active_thread_stack(), self.tcx);
         let (stacktrace, _was_pruned) = prune_stacktrace(stacktrace, self);
 
         let (label, diag_level) = match &e {
@@ -654,6 +663,11 @@ impl<'tcx> MiriMachine<'tcx> {
             | ProgressReport { .. }
             | WeakMemoryOutdatedLoad { .. } =>
                 ("tracking was triggered here".to_string(), DiagLevel::Note),
+            FileInProcOpened => ("open a file in `/proc`".to_string(), DiagLevel::Warning),
+            ConnectingSocketGetsockname =>
+                ("Called `getsockname` on connecting socket".to_string(), DiagLevel::Warning),
+            SocketAddressResolution { .. } =>
+                ("error during address resolution".to_string(), DiagLevel::Warning),
         };
 
         let title = match &e {
@@ -662,17 +676,17 @@ impl<'tcx> MiriMachine<'tcx> {
                 format!("created {tag:?} with {perm} derived from unknown tag"),
             CreatedPointerTag(tag, Some(perm), Some((alloc_id, range, orig_tag))) =>
                 format!(
-                    "created tag {tag:?} with {perm} at {alloc_id:?}{range:?} derived from {orig_tag:?}"
+                    "created tag {tag:?} with {perm} at {alloc_id}{range} derived from {orig_tag:?}"
                 ),
             PoppedPointerTag(item, cause) => format!("popped tracked tag for item {item:?}{cause}"),
             TrackingAlloc(id, size, align) =>
                 format!(
-                    "now tracking allocation {id:?} of {size} bytes (alignment {align} bytes)",
+                    "now tracking allocation {id} of {size} bytes (alignment {align} bytes)",
                     size = size.bytes(),
                     align = align.bytes(),
                 ),
             AccessedAlloc(id, range, access_kind) =>
-                format!("{access_kind} at {id:?}[{}..{}]", range.start.bytes(), range.end().bytes()),
+                format!("{access_kind} at {id}{range}"),
             FreedAlloc(id) => format!("freed allocation {id:?}"),
             RejectedIsolatedOp(op) => format!("{op} was made to return an error due to isolation"),
             ProgressReport { .. } =>
@@ -701,12 +715,28 @@ impl<'tcx> MiriMachine<'tcx> {
                 };
                 format!("GenMC currently does not model the failure ordering for `compare_exchange`. {was_upgraded_msg}. Miri with GenMC might miss bugs related to this memory access.")
             }
+            FileInProcOpened => format!("files in `/proc` can bypass the Abstract Machine and might not work properly in Miri"),
+            ConnectingSocketGetsockname => format!("connecting sockets return unspecified socket addresses on Windows hosts"),
+            SocketAddressResolution { error } => format!("address resolution failed: {error}"),
         };
 
         let notes = match &e {
             ProgressReport { block_count } => {
                 vec![note!("so far, {block_count} basic blocks have been executed")]
             }
+            ConnectingSocketGetsockname =>
+                vec![
+                    note!(
+                        "Windows hosts do not provide `local_addr` information while the socket is still connecting, which might break the assumptions of code compiled for Unix targets"
+                    ),
+                    note!(
+                        "an unspecified socket address (e.g. `0.0.0.0:0`) will be returned instead"
+                    ),
+                ],
+            SocketAddressResolution { .. } =>
+                vec![note!(
+                    "Miri cannot return proper error information from this call; only a generic error code is being returned"
+                )],
             _ => vec![],
         };
 

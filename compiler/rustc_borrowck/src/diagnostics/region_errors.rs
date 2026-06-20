@@ -1,7 +1,7 @@
 //! Error reporting machinery for lifetime errors.
 
 use rustc_data_structures::fx::FxIndexSet;
-use rustc_errors::{Applicability, Diag, ErrorGuaranteed, MultiSpan};
+use rustc_errors::{Applicability, Diag, ErrorGuaranteed, MultiSpan, msg};
 use rustc_hir as hir;
 use rustc_hir::GenericBound::Trait;
 use rustc_hir::QPath::Resolved;
@@ -27,16 +27,15 @@ use rustc_trait_selection::infer::InferCtxtExt;
 use rustc_trait_selection::traits::{Obligation, ObligationCtxt};
 use tracing::{debug, instrument, trace};
 
-use super::{OutlivesSuggestionBuilder, RegionName, RegionNameSource};
+use super::{LIMITATION_NOTE, OutlivesSuggestionBuilder, RegionName, RegionNameSource};
 use crate::nll::ConstraintDescription;
-use crate::region_infer::values::RegionElement;
 use crate::region_infer::{BlameConstraint, TypeTest};
 use crate::session_diagnostics::{
     FnMutError, FnMutReturnTypeErr, GenericDoesNotLiveLongEnough, LifetimeOutliveErr,
     LifetimeReturnCategoryErr, RequireStaticErr, VarHereDenote,
 };
 use crate::universal_regions::DefiningTy;
-use crate::{MirBorrowckCtxt, borrowck_errors, fluent_generated as fluent};
+use crate::{MirBorrowckCtxt, borrowck_errors};
 
 impl<'tcx> ConstraintDescription for ConstraintCategory<'tcx> {
     fn description(&self) -> &'static str {
@@ -57,7 +56,8 @@ impl<'tcx> ConstraintDescription for ConstraintCategory<'tcx> {
             ConstraintCategory::OpaqueType => "opaque type ",
             ConstraintCategory::ClosureUpvar(_) => "closure capture ",
             ConstraintCategory::Usage => "this usage ",
-            ConstraintCategory::Predicate(_)
+            ConstraintCategory::SolverRegionConstraint(_)
+            | ConstraintCategory::Predicate(_)
             | ConstraintCategory::Boring
             | ConstraintCategory::BoringNoLocation
             | ConstraintCategory::Internal
@@ -104,15 +104,9 @@ pub(crate) enum RegionErrorKind<'tcx> {
     /// A generic bound failure for a type test (`T: 'a`).
     TypeTestError { type_test: TypeTest<'tcx> },
 
-    /// Higher-ranked subtyping error.
-    BoundUniversalRegionError {
-        /// The placeholder free region.
-        longer_fr: RegionVid,
-        /// The region element that erroneously must be outlived by `longer_fr`.
-        error_element: RegionElement<'tcx>,
-        /// The placeholder region.
-        placeholder: ty::PlaceholderRegion<'tcx>,
-    },
+    /// 'p outlives 'r, which does not hold. 'p is always a placeholder
+    /// and 'r is some other region.
+    PlaceholderOutlivesIllegalRegion { longer_fr: RegionVid, illegally_outlived_r: RegionVid },
 
     /// Any other lifetime error.
     RegionError {
@@ -196,7 +190,6 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
     // For generic associated types (GATs) which implied 'static requirement
     // from higher-ranked trait bounds (HRTB). Try to locate span of the trait
     // and the span which bounded to the trait for adding 'static lifetime suggestion
-    #[allow(rustc::diagnostic_outside_of_impl)]
     fn suggest_static_lifetime_for_gat_from_hrtb(
         &self,
         diag: &mut Diag<'_>,
@@ -266,7 +259,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
             let Trait(PolyTraitRef { trait_ref, span: trait_span, .. }) = bound else {
                 return;
             };
-            diag.span_note(*trait_span, fluent::borrowck_limitations_implies_static);
+            diag.span_note(*trait_span, LIMITATION_NOTE);
             let Some(generics_fn) = tcx.hir_get_generics(self.body.source.def_id().expect_local())
             else {
                 return;
@@ -298,8 +291,8 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         });
         if suggestions.len() > 0 {
             suggestions.dedup();
-            diag.multipart_suggestion_verbose(
-                fluent::borrowck_restrict_to_static,
+            diag.multipart_suggestion(
+                msg!("consider restricting the type parameter to the `'static` lifetime"),
                 suggestions,
                 Applicability::MaybeIncorrect,
             );
@@ -361,28 +354,11 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
                     }
                 }
 
-                RegionErrorKind::BoundUniversalRegionError {
+                RegionErrorKind::PlaceholderOutlivesIllegalRegion {
                     longer_fr,
-                    placeholder,
-                    error_element,
+                    illegally_outlived_r,
                 } => {
-                    let error_vid = self.regioncx.region_from_element(longer_fr, &error_element);
-
-                    // Find the code to blame for the fact that `longer_fr` outlives `error_fr`.
-                    let cause = self
-                        .regioncx
-                        .best_blame_constraint(
-                            longer_fr,
-                            NllRegionVariableOrigin::Placeholder(placeholder),
-                            error_vid,
-                        )
-                        .0
-                        .cause;
-
-                    let universe = placeholder.universe;
-                    let universe_info = self.regioncx.universe_info(universe);
-
-                    universe_info.report_erroneous_element(self, placeholder, error_element, cause);
+                    self.report_erroneous_rvid_reaches_placeholder(longer_fr, illegally_outlived_r)
                 }
 
                 RegionErrorKind::RegionError { fr_origin, longer_fr, shorter_fr, is_reported } => {
@@ -413,6 +389,43 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         outlives_suggestion.add_suggestion(self);
     }
 
+    /// Report that `longer_fr: error_vid`, which doesn't hold,
+    /// where `longer_fr` is a placeholder.
+    fn report_erroneous_rvid_reaches_placeholder(
+        &mut self,
+        longer_fr: RegionVid,
+        error_vid: RegionVid,
+    ) {
+        use NllRegionVariableOrigin::*;
+
+        let origin_longer = self.regioncx.definitions[longer_fr].origin;
+
+        let Placeholder(placeholder) = origin_longer else {
+            bug!("Expected {longer_fr:?} to come from placeholder!");
+        };
+
+        // FIXME: Is throwing away the existential region really the best here?
+        let error_region = match self.regioncx.definitions[error_vid].origin {
+            FreeRegion | Existential { .. } => None,
+            Placeholder(other_placeholder) => Some(other_placeholder),
+        };
+
+        // Find the code to blame for the fact that `longer_fr` outlives `error_fr`.
+        let cause =
+            self.regioncx.best_blame_constraint(longer_fr, origin_longer, error_vid).0.cause;
+
+        // FIXME these methods should have better names, and also probably not be this generic.
+        // FIXME note that we *throw away* the error element here! We probably want to
+        // thread it through the computation further down and use it, but there currently isn't
+        // anything there to receive it.
+        self.regioncx.universe_info(placeholder.universe).report_erroneous_element(
+            self,
+            placeholder,
+            error_region,
+            cause,
+        );
+    }
+
     /// Report an error because the universal region `fr` was required to outlive
     /// `outlived_fr` but it is not known to do so. For example:
     ///
@@ -421,9 +434,6 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
     /// ```
     ///
     /// Here we would be invoked with `fr = 'a` and `outlived_fr = 'b`.
-    // FIXME: make this translatable
-    #[allow(rustc::diagnostic_outside_of_impl)]
-    #[allow(rustc::untranslatable_diagnostic)]
     pub(crate) fn report_region_error(
         &mut self,
         fr: RegionVid,
@@ -463,6 +473,14 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         let errci = ErrorConstraintInfo { fr, outlived_fr, category, span: cause.span };
 
         let mut diag = match (category, fr_is_local, outlived_fr_is_local) {
+            (ConstraintCategory::SolverRegionConstraint(span), _, _) => {
+                let mut d = self.dcx().struct_span_err(
+                    span,
+                    "unsatisfied lifetime constraint from -Zassumptions-on-binders :3",
+                );
+                d.note("meoow :c");
+                d
+            }
             (ConstraintCategory::Return(kind), true, false) if self.is_closure_fn_mut(fr) => {
                 self.report_fnmut_error(&errci, kind)
             }
@@ -523,7 +541,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
                     ty::FnDef(def_id, _) => {
                         let name = self.infcx.tcx.item_name(*def_id);
                         let identity_args = GenericArgs::identity_for_item(self.infcx.tcx, *def_id);
-                        let desc = format!("a function pointer to `{name}`");
+                        let desc = format!("the function item type defined by `{name}`");
                         let note = format!(
                             "the function `{name}` is invariant over the parameter `{}`",
                             identity_args[param_index as usize]
@@ -577,7 +595,6 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
     ///            executing...
     ///    = note: ...therefore, returned references to captured variables will escape the closure
     /// ```
-    #[allow(rustc::diagnostic_outside_of_impl)] // FIXME
     fn report_fnmut_error(
         &self,
         errci: &ErrorConstraintInfo<'tcx>,
@@ -586,8 +603,8 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         let ErrorConstraintInfo { outlived_fr, span, .. } = errci;
 
         let mut output_ty = self.regioncx.universal_regions().unnormalized_output_ty;
-        if let ty::Alias(ty::Opaque, ty::AliasTy { def_id, .. }) = *output_ty.kind() {
-            output_ty = self.infcx.tcx.type_of(def_id).instantiate_identity()
+        if let ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id }, .. }) = *output_ty.kind() {
+            output_ty = self.infcx.tcx.type_of(def_id).instantiate_identity().skip_norm_wip()
         };
 
         debug!("report_fnmut_error: output_ty={:?}", output_ty);
@@ -678,6 +695,8 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
             || (*category == ConstraintCategory::Assignment
                 && self.regioncx.universal_regions().defining_ty.is_fn_def())
             || self.regioncx.universal_regions().defining_ty.is_const()
+            || (fr_name_and_span.is_none()
+                && self.regioncx.universal_regions().defining_ty.is_fn_def())
         {
             return self.report_general_error(errci);
         }
@@ -686,18 +705,12 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
             borrowck_errors::borrowed_data_escapes_closure(self.infcx.tcx, *span, escapes_from);
 
         if let Some((Some(outlived_fr_name), outlived_fr_span)) = outlived_fr_name_and_span {
-            // FIXME: make this translatable
-            #[allow(rustc::diagnostic_outside_of_impl)]
-            #[allow(rustc::untranslatable_diagnostic)]
             diag.span_label(
                 outlived_fr_span,
                 format!("`{outlived_fr_name}` declared here, outside of the {escapes_from} body",),
             );
         }
 
-        // FIXME: make this translatable
-        #[allow(rustc::diagnostic_outside_of_impl)]
-        #[allow(rustc::untranslatable_diagnostic)]
         if let Some((Some(fr_name), fr_span)) = fr_name_and_span {
             diag.span_label(
                 fr_span,
@@ -732,9 +745,6 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
                 let outlived_fr_region_name = self.give_region_a_name(errci.outlived_fr).unwrap();
                 outlived_fr_region_name.highlight_region_name(&mut diag);
 
-                // FIXME: make this translatable
-                #[allow(rustc::diagnostic_outside_of_impl)]
-                #[allow(rustc::untranslatable_diagnostic)]
                 diag.span_label(
                     *span,
                     format!(
@@ -766,7 +776,6 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
     ///    |     ^^^^^^^^^^^^^^ function was supposed to return data with lifetime `'a` but it
     ///    |                    is returning data with lifetime `'b`
     /// ```
-    #[allow(rustc::diagnostic_outside_of_impl)] // FIXME
     fn report_general_error(&self, errci: &ErrorConstraintInfo<'tcx>) -> Diag<'infcx> {
         let ErrorConstraintInfo { fr, outlived_fr, span, category, .. } = errci;
 
@@ -824,8 +833,6 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
     /// LL |     fn iter_values_anon(&self) -> impl Iterator<Item=u32> + 'a {
     ///    |                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
     /// ```
-    #[allow(rustc::diagnostic_outside_of_impl)]
-    #[allow(rustc::untranslatable_diagnostic)] // FIXME: make this translatable
     fn add_static_impl_trait_suggestion(
         &self,
         diag: &mut Diag<'_>,
@@ -889,6 +896,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
             for alias_ty in alias_tys {
                 if alias_ty.span.desugaring_kind().is_some() {
                     // Skip `async` desugaring `impl Future`.
+                    continue;
                 }
                 if let TyKind::TraitObject(_, lt) = alias_ty.kind {
                     if lt.kind == hir::LifetimeKind::ImplicitObjectLifetimeDefault {
@@ -905,7 +913,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
                 spans_suggs.push((alias_span.shrink_to_hi(), "<'a>".to_string()));
             }
 
-            diag.multipart_suggestion_verbose(
+            diag.multipart_suggestion(
                 format!(
                     "to declare that the trait object {captures}, you can add a lifetime parameter `'a` in the type alias"
                 ),
@@ -929,11 +937,11 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         let tcx = self.infcx.tcx;
 
         let ConstraintCategory::CallArgument(Some(func_ty)) = category else { return };
-        let ty::FnDef(fn_did, args) = func_ty.kind() else { return };
+        let ty::FnDef(fn_did, args) = *func_ty.kind() else { return };
         debug!(?fn_did, ?args);
 
         // Only suggest this on function calls, not closures
-        let ty = tcx.type_of(fn_did).instantiate_identity();
+        let ty = tcx.type_of(fn_did).instantiate_identity().skip_norm_wip();
         debug!("ty: {:?}, ty.kind: {:?}", ty, ty.kind());
         if let ty::Closure(_, _) = ty.kind() {
             return;
@@ -941,7 +949,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         let Ok(Some(instance)) = ty::Instance::try_resolve(
             tcx,
             self.infcx.typing_env(self.infcx.param_env),
-            *fn_did,
+            fn_did,
             self.infcx.resolve_vars_if_possible(args),
         ) else {
             return;
@@ -966,7 +974,6 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         self.suggest_constrain_dyn_trait_in_impl(diag, &visitor.0, ident, self_ty);
     }
 
-    #[allow(rustc::diagnostic_outside_of_impl)]
     #[instrument(skip(self, err), level = "debug")]
     fn suggest_constrain_dyn_trait_in_impl(
         &self,
@@ -984,12 +991,18 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
             debug!("trait spans found: {:?}", traits);
             for span in &traits {
                 let mut multi_span: MultiSpan = vec![*span].into();
-                multi_span.push_span_label(*span, fluent::borrowck_implicit_static);
-                multi_span.push_span_label(ident.span, fluent::borrowck_implicit_static_introduced);
+                multi_span.push_span_label(
+                    *span,
+                    msg!("this has an implicit `'static` lifetime requirement"),
+                );
+                multi_span.push_span_label(
+                    ident.span,
+                    msg!("calling this method introduces the `impl`'s `'static` requirement"),
+                );
                 err.subdiagnostic(RequireStaticErr::UsedImpl { multi_span });
                 err.span_suggestion_verbose(
                     span.shrink_to_hi(),
-                    fluent::borrowck_implicit_static_relax,
+                    msg!("consider relaxing the implicit `'static` requirement"),
                     " + '_",
                     Applicability::MaybeIncorrect,
                 );
@@ -1032,7 +1045,6 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         );
     }
 
-    #[allow(rustc::diagnostic_outside_of_impl)]
     /// When encountering a lifetime error caused by the return type of a closure, check the
     /// corresponding trait bound and see if dereferencing the closure return value would satisfy
     /// them. If so, we produce a structured suggestion.
@@ -1049,7 +1061,8 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         else {
             return;
         };
-        let ty::Closure(_, args) = *tcx.type_of(closure_def_id).instantiate_identity().kind()
+        let ty::Closure(_, args) =
+            *tcx.type_of(closure_def_id).instantiate_identity().skip_norm_wip().kind()
         else {
             return;
         };
@@ -1080,14 +1093,14 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         }
 
         // Build a new closure where the return type is an owned value, instead of a ref.
+        // The new closure is safe, but otherwise has the same ABI, splat, and c-variadic.
+        let fn_sig_kind = liberated_sig.fn_sig_kind.set_safety(hir::Safety::Safe);
         let closure_sig_as_fn_ptr_ty = Ty::new_fn_ptr(
             tcx,
             ty::Binder::dummy(tcx.mk_fn_sig(
                 liberated_sig.inputs().iter().copied(),
                 peeled_ty,
-                liberated_sig.c_variadic,
-                hir::Safety::Safe,
-                rustc_abi::ExternAbi::Rust,
+                fn_sig_kind,
             )),
         );
         let closure_ty = Ty::new_closure(
@@ -1147,20 +1160,25 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         let ocx = ObligationCtxt::new(&self.infcx);
         ocx.register_obligations(preds.iter().map(|(pred, span)| {
             trace!(?pred);
-            Obligation::misc(tcx, span, self.mir_def_id(), self.infcx.param_env, pred)
+            Obligation::misc(
+                tcx,
+                span,
+                self.mir_def_id(),
+                self.infcx.param_env,
+                pred.skip_norm_wip(),
+            )
         }));
 
         if ocx.evaluate_obligations_error_on_ambiguity().is_empty() && count > 0 {
             diag.span_suggestion_verbose(
                 tcx.hir_body(*body).value.peel_blocks().span.shrink_to_lo(),
-                fluent::borrowck_dereference_suggestion,
+                msg!("dereference the return value"),
                 "*".repeat(count),
                 Applicability::MachineApplicable,
             );
         }
     }
 
-    #[allow(rustc::diagnostic_outside_of_impl)]
     fn suggest_move_on_borrowing_closure(&self, diag: &mut Diag<'_>) {
         let body = self.infcx.tcx.hir_body_owned_by(self.mir_def_id());
         let expr = &body.value.peel_blocks();
@@ -1198,7 +1216,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         if let Some(closure_span) = closure_span {
             diag.span_suggestion_verbose(
                 closure_span,
-                fluent::borrowck_move_closure_suggestion,
+                msg!("consider adding 'move' keyword before the nested closure"),
                 "move ",
                 Applicability::MaybeIncorrect,
             );

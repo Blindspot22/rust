@@ -7,18 +7,18 @@
 //! * Traits that represent operators; e.g., `Add`, `Sub`, `Index`.
 //! * Functions called by the compiler itself.
 
-use rustc_ast::attr::AttributeExt;
 use rustc_data_structures::fx::FxIndexMap;
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
-use rustc_macros::{BlobDecodable, Encodable, HashStable_Generic};
-use rustc_span::{Span, Symbol, kw, sym};
+use rustc_data_structures::stable_hash::{StableHash, StableHashCtxt, StableHasher};
+use rustc_macros::{BlobDecodable, Encodable, PrintAttribute, StableHash};
+use rustc_span::{Symbol, kw, sym};
 
+use crate::attrs::PrintAttribute;
 use crate::def_id::DefId;
 use crate::{MethodKind, Target};
 
 /// All of the lang items, defined or not.
 /// Defined lang items can come from the current crate or its dependencies.
-#[derive(HashStable_Generic, Debug)]
+#[derive(StableHash, Debug)]
 pub struct LanguageItems {
     /// Mappings from lang items to their possibly found [`DefId`]s.
     /// The index corresponds to the order in [`LangItem`].
@@ -75,7 +75,7 @@ macro_rules! language_item_table {
         $( $(#[$attr:meta])* $variant:ident, $module:ident :: $name:ident, $method:ident, $target:expr, $generics:expr; )*
     ) => {
         /// A representation of all the valid lang items in Rust.
-        #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Encodable, BlobDecodable)]
+        #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Encodable, BlobDecodable, PrintAttribute)]
         pub enum LangItem {
             $(
                 #[doc = concat!("The `", stringify!($name), "` lang item.")]
@@ -144,22 +144,10 @@ macro_rules! language_item_table {
     }
 }
 
-impl<CTX> HashStable<CTX> for LangItem {
-    fn hash_stable(&self, _: &mut CTX, hasher: &mut StableHasher) {
+impl StableHash for LangItem {
+    fn stable_hash<Hcx: StableHashCtxt>(&self, _: &mut Hcx, hasher: &mut StableHasher) {
         ::std::hash::Hash::hash(self, hasher);
     }
-}
-
-/// Extracts the first `lang = "$name"` out of a list of attributes.
-/// The `#[panic_handler]` attribute is also extracted out when found.
-pub fn extract(attrs: &[impl AttributeExt]) -> Option<(Symbol, Span)> {
-    attrs.iter().find_map(|attr| {
-        Some(match attr {
-            _ if attr.has_name(sym::lang) => (attr.value_str()?, attr.span()),
-            _ if attr.has_name(sym::panic_handler) => (sym::panic_impl, attr.span()),
-            _ => return None,
-        })
-    })
 }
 
 language_item_table! {
@@ -233,6 +221,7 @@ language_item_table! {
     UnsafeCell,              sym::unsafe_cell,         unsafe_cell_type,           Target::Struct,         GenericRequirement::None;
     UnsafePinned,            sym::unsafe_pinned,       unsafe_pinned_type,         Target::Struct,         GenericRequirement::None;
 
+    VaArgSafe,               sym::va_arg_safe,         va_arg_safe,                Target::Trait,          GenericRequirement::None;
     VaList,                  sym::va_list,             va_list,                    Target::Struct,         GenericRequirement::None;
 
     Deref,                   sym::deref,               deref_trait,                Target::Trait,          GenericRequirement::Exact(0);
@@ -332,8 +321,8 @@ language_item_table! {
     FormatArgument,          sym::format_argument,     format_argument,            Target::Struct,         GenericRequirement::None;
     FormatArguments,         sym::format_arguments,    format_arguments,           Target::Struct,         GenericRequirement::None;
 
-    ExchangeMalloc,          sym::exchange_malloc,     exchange_malloc_fn,         Target::Fn,             GenericRequirement::None;
-    DropInPlace,             sym::drop_in_place,       drop_in_place_fn,           Target::Fn,             GenericRequirement::Minimum(1);
+    // Compiler-generated drop glue function, aka `core::ptr::drop_glue`
+    DropGlue,                sym::drop_glue,           drop_glue_fn,               Target::Fn,             GenericRequirement::Exact(1);
     AllocLayout,             sym::alloc_layout,        alloc_layout,               Target::Struct,         GenericRequirement::None;
 
     /// For all binary crates without `#![no_main]`, Rust will generate a "main" function.
@@ -343,7 +332,6 @@ language_item_table! {
     Start,                   sym::start,               start_fn,                   Target::Fn,             GenericRequirement::Exact(1);
 
     EhPersonality,           sym::eh_personality,      eh_personality,             Target::Fn,             GenericRequirement::None;
-    EhCatchTypeinfo,         sym::eh_catch_typeinfo,   eh_catch_typeinfo,          Target::Static,         GenericRequirement::None;
 
     // Profiling markers for move/copy operations (used by -Z annotate-moves)
     CompilerMove,            sym::compiler_move,       compiler_move_fn,           Target::Fn,             GenericRequirement::Exact(2);
@@ -354,7 +342,8 @@ language_item_table! {
 
     PhantomData,             sym::phantom_data,        phantom_data,               Target::Struct,         GenericRequirement::Exact(1);
 
-    ManuallyDrop,            sym::manually_drop,       manually_drop,              Target::Struct,         GenericRequirement::None;
+    ManuallyDrop,            sym::manually_drop,       manually_drop,              Target::Struct,         GenericRequirement::Exact(1);
+    MaybeDangling,           sym::maybe_dangling,      maybe_dangling,             Target::Struct,         GenericRequirement::Exact(1);
     BikeshedGuaranteedNoDrop, sym::bikeshed_guaranteed_no_drop, bikeshed_guaranteed_no_drop, Target::Trait, GenericRequirement::Exact(0);
 
     MaybeUninit,             sym::maybe_uninit,        maybe_uninit,               Target::Union,          GenericRequirement::None;
@@ -447,7 +436,17 @@ language_item_table! {
 
     // Reborrowing related lang-items
     Reborrow,                sym::reborrow,            reborrow,                   Target::Trait,          GenericRequirement::Exact(0);
-    CoerceShared,            sym::coerce_shared,       coerce_shared,              Target::Trait,          GenericRequirement::Exact(0);
+    CoerceShared,            sym::coerce_shared,       coerce_shared,              Target::Trait,          GenericRequirement::Exact(1);
+
+    // Field representing types.
+    FieldRepresentingType,   sym::field_representing_type, field_representing_type,    Target::Struct,         GenericRequirement::Exact(3);
+    Field,                   sym::field,                   field,                      Target::Trait,          GenericRequirement::Exact(0);
+    FieldBase,               sym::field_base,              field_base,                 Target::AssocTy,        GenericRequirement::Exact(0);
+    FieldType,               sym::field_type,              field_type,                 Target::AssocTy,        GenericRequirement::Exact(0);
+    FieldOffset,             sym::field_offset,            field_offset,               Target::AssocConst,     GenericRequirement::Exact(0);
+
+    // Used to fallback `{float}` to `f32` when `f32: From<{float}>`
+    From,                    sym::From,                from_trait,                 Target::Trait,          GenericRequirement::Exact(1);
 }
 
 /// The requirement imposed on the generics of a lang item

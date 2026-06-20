@@ -367,7 +367,7 @@ pub fn inner_docs(attrs: &[impl AttributeExt]) -> bool {
 /// Has `#[rustc_doc_primitive]` or `#[doc(keyword)]` or `#[doc(attribute)]`.
 pub fn has_primitive_or_keyword_or_attribute_docs(attrs: &[impl AttributeExt]) -> bool {
     for attr in attrs {
-        if attr.has_name(sym::rustc_doc_primitive) || attr.is_doc_keyword_or_attribute() {
+        if attr.is_rustc_doc_primitive() || attr.is_doc_keyword_or_attribute() {
             return true;
         }
     }
@@ -409,20 +409,19 @@ pub fn may_be_doc_link(link_type: LinkType) -> bool {
 
 /// Simplified version of `preprocessed_markdown_links` from rustdoc.
 /// Must return at least the same links as it, but may add some more links on top of that.
-pub(crate) fn attrs_to_preprocessed_links<A: AttributeExt + Clone>(attrs: &[A]) -> Vec<Box<str>> {
+pub(crate) fn attrs_to_preprocessed_links(attrs: &[ast::Attribute]) -> Vec<Box<str>> {
     let (doc_fragments, other_attrs) =
         attrs_to_doc_fragments(attrs.iter().map(|attr| (attr, None)), false);
-    let mut doc =
-        prepare_to_doc_link_resolution(&doc_fragments).into_values().next().unwrap_or_default();
+    let doc = prepare_to_doc_link_resolution(&doc_fragments).into_values().next();
+    let mut links = doc.as_deref().map(parse_links).unwrap_or_default();
 
     for attr in other_attrs {
         if let Some(note) = attr.deprecation_note() {
-            doc += note.as_str();
-            doc += "\n";
+            links.extend(parse_links(note.as_str()));
         }
     }
 
-    parse_links(&doc)
+    links
 }
 
 /// Similar version of `markdown_links` from rustdoc.

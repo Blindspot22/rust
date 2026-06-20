@@ -56,13 +56,14 @@
 //! [`Rc`]: rc
 //! [`RefCell`]: core::cell
 
+#![allow(unused_features)]
 #![allow(incomplete_features)]
 #![allow(unused_attributes)]
 #![stable(feature = "alloc", since = "1.36.0")]
 #![doc(
     html_playground_url = "https://play.rust-lang.org/",
     issue_tracker_base_url = "https://github.com/rust-lang/rust/issues/",
-    test(no_crate_inject, attr(allow(unused_variables), deny(warnings)))
+    test(no_crate_inject, attr(allow(unused_variables, duplicate_features), deny(warnings)))
 )]
 #![doc(auto_cfg(hide(no_global_oom_handling, no_rc, no_sync, target_has_atomic = "ptr")))]
 #![doc(rust_logo)]
@@ -72,6 +73,7 @@
 // Lints:
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(fuzzy_provenance_casts)]
+#![deny(lossy_provenance_casts)]
 #![warn(deprecated_in_future)]
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
@@ -85,17 +87,14 @@
 //
 // Library features:
 // tidy-alphabetical-start
-#![cfg_attr(not(no_global_oom_handling), feature(string_replace_in_place))]
-#![feature(alloc_layout_extra)]
 #![feature(allocator_api)]
 #![feature(array_into_iter_constructors)]
 #![feature(ascii_char)]
-#![feature(assert_matches)]
 #![feature(async_fn_traits)]
 #![feature(async_iterator)]
-#![feature(box_vec_non_null)]
 #![feature(bstr)]
 #![feature(bstr_internals)]
+#![feature(case_ignorable)]
 #![feature(cast_maybe_uninit)]
 #![feature(cell_get_cloned)]
 #![feature(char_internals)]
@@ -106,14 +105,18 @@
 #![feature(const_convert)]
 #![feature(const_default)]
 #![feature(const_destruct)]
+#![feature(const_drop_in_place)]
 #![feature(const_eval_select)]
 #![feature(const_heap)]
+#![feature(const_index)]
 #![feature(const_option_ops)]
+#![feature(const_result_trait_fn)]
 #![feature(const_try)]
 #![feature(copied_into_inner)]
 #![feature(core_intrinsics)]
 #![feature(deprecated_suggestion)]
 #![feature(deref_pure_trait)]
+#![feature(diagnostic_on_move)]
 #![feature(dispatch_from_dyn)]
 #![feature(ergonomic_clones)]
 #![feature(error_generic_member_access)]
@@ -139,10 +142,12 @@
 #![feature(pattern)]
 #![feature(pin_coerce_unsized_trait)]
 #![feature(ptr_alignment_type)]
+#![feature(ptr_cast_slice)]
 #![feature(ptr_internals)]
 #![feature(ptr_metadata)]
 #![feature(rev_into_inner)]
 #![feature(set_ptr_value)]
+#![feature(share_trait)]
 #![feature(sized_type_properties)]
 #![feature(slice_from_ptr_range)]
 #![feature(slice_index_methods)]
@@ -150,8 +155,8 @@
 #![feature(slice_ptr_get)]
 #![feature(slice_range)]
 #![feature(std_internals)]
-#![feature(str_internals)]
 #![feature(temporary_niche_types)]
+#![feature(titlecase)]
 #![feature(transmutability)]
 #![feature(trivial_clone)]
 #![feature(trusted_fused)]
@@ -160,7 +165,6 @@
 #![feature(try_blocks)]
 #![feature(try_trait_v2)]
 #![feature(try_trait_v2_residual)]
-#![feature(try_with_capacity)]
 #![feature(tuple_trait)]
 #![feature(ub_checks)]
 #![feature(unicode_internals)]
@@ -174,14 +178,13 @@
 #![feature(allocator_internals)]
 #![feature(allow_internal_unstable)]
 #![feature(cfg_sanitize)]
+#![feature(const_closures)]
 #![feature(const_precise_live_drops)]
 #![feature(const_trait_impl)]
 #![feature(coroutine_trait)]
 #![feature(decl_macro)]
-#![feature(derive_const)]
 #![feature(dropck_eyepatch)]
 #![feature(fundamental)]
-#![feature(hashmap_internals)]
 #![feature(intrinsics)]
 #![feature(lang_items)]
 #![feature(min_specialization)]
@@ -189,7 +192,6 @@
 #![feature(negative_impls)]
 #![feature(never_type)]
 #![feature(optimize_attribute)]
-#![feature(rustc_allow_const_fn_unstable)]
 #![feature(rustc_attrs)]
 #![feature(slice_internals)]
 #![feature(staged_api)]
@@ -231,6 +233,7 @@ pub mod collections;
 #[cfg(all(not(no_rc), not(no_sync), not(no_global_oom_handling)))]
 pub mod ffi;
 pub mod fmt;
+pub mod intrinsics;
 #[cfg(not(no_rc))]
 pub mod rc;
 pub mod slice;

@@ -93,7 +93,6 @@ expression: test --skip=coverage
     - Set({test::compiler/rustc_errors})
     - Set({test::compiler/rustc_expand})
     - Set({test::compiler/rustc_feature})
-    - Set({test::compiler/rustc_fluent_macro})
     - Set({test::compiler/rustc_fs_util})
     - Set({test::compiler/rustc_graphviz})
     - Set({test::compiler/rustc_hashes})
@@ -129,7 +128,6 @@ expression: test --skip=coverage
     - Set({test::compiler/rustc_public})
     - Set({test::compiler/rustc_public_bridge})
     - Set({test::compiler/rustc_query_impl})
-    - Set({test::compiler/rustc_query_system})
     - Set({test::compiler/rustc_resolve})
     - Set({test::compiler/rustc_sanitizers})
     - Set({test::compiler/rustc_serialize})
@@ -182,6 +180,9 @@ expression: test --skip=coverage
 [Test] test::RustcBook
     targets: [x86_64-unknown-linux-gnu]
     - Set({test::src/doc/rustc})
+[Test] test::StdarchVerify
+    targets: [x86_64-unknown-linux-gnu]
+    - Set({test::library/stdarch/crates/stdarch-verify})
 [Test] test::RustdocJSStd
     targets: [x86_64-unknown-linux-gnu]
     - Suite(test::tests/rustdoc-js-std)

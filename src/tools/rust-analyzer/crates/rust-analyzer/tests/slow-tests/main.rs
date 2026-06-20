@@ -15,12 +15,14 @@
 extern crate rustc_driver as _;
 
 mod cli;
+mod flycheck;
 mod ratoml;
 mod support;
 mod testdir;
 
 use std::{collections::HashMap, path::PathBuf, time::Instant};
 
+use ide_db::FxHashMap;
 use lsp_types::{
     CodeActionContext, CodeActionParams, CompletionParams, DidOpenTextDocumentParams,
     DocumentFormattingParams, DocumentRangeFormattingParams, FileRename, FormattingOptions,
@@ -260,7 +262,7 @@ fn main() {}
           {
             "args": {
               "cargoArgs": ["test", "--package", "foo", "--test", "spam"],
-              "executableArgs": ["test_eggs", "--exact", "--nocapture"],
+              "executableArgs": ["test_eggs", "--exact", "--nocapture", "--include-ignored"],
               "overrideCargo": null,
               "cwd": server.path().join("foo"),
               "workspaceRoot": server.path().join("foo")
@@ -669,6 +671,17 @@ fn main() {}
 #[test]
 fn test_format_document_range() {
     if skip_slow_tests() {
+        return;
+    }
+
+    // This test requires a nightly toolchain, so skip if it's not available.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let has_nightly_rustfmt = toolchain::command("rustfmt", cwd, &FxHashMap::default())
+        .args(["+nightly", "--version"])
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !has_nightly_rustfmt {
+        tracing::warn!("skipping test_format_document_range: nightly rustfmt not available");
         return;
     }
 
@@ -1447,7 +1460,27 @@ foo = { path = "../foo" }
     .server()
     .wait_until_workspace_is_loaded();
 
-    server.request::<WorkspaceSymbolRequest>(Default::default(), json!([]));
+    server.request::<WorkspaceSymbolRequest>(
+        Default::default(),
+        json!([
+        {
+          "name": "bar",
+          "kind": 4,
+          "location": {
+            "uri": "file:///[..]bar/src/lib.rs",
+            "range": {
+              "start": {
+                "line": 0,
+                "character": 0
+              },
+              "end": {
+                "line": 0,
+                "character": 0
+              }
+            }
+          }
+        }]),
+    );
 
     let server = Project::with_fixture(
         r#"
@@ -1486,7 +1519,66 @@ version = "0.0.0"
     .server()
     .wait_until_workspace_is_loaded();
 
-    server.request::<WorkspaceSymbolRequest>(Default::default(), json!([]));
+    server.request::<WorkspaceSymbolRequest>(
+        Default::default(),
+        json!([
+        {
+          "name": "baz",
+          "kind": 4,
+          "location": {
+            "uri": "file:///[..]baz/src/lib.rs",
+            "range": {
+              "start": {
+                "line": 0,
+                "character": 0
+              },
+              "end": {
+                "line": 0,
+                "character": 0
+              }
+            }
+          }
+        }]),
+    );
+}
+
+#[test]
+fn test_evaluate_predicate() {
+    if skip_slow_tests() {
+        return;
+    }
+
+    let server = Project::with_fixture(
+        r#"
+//- /Cargo.toml
+[package]
+name = "foo"
+version = "0.0.0"
+
+//- /src/lib.rs
+trait Trait {}
+struct S;
+impl Trait for S {}
+
+fn test<T: Trait>() {
+    let _ = 0;$0
+}
+"#,
+    )
+    .server()
+    .wait_until_workspace_is_loaded();
+
+    let res = server.send_request::<rust_analyzer::lsp::ext::EvaluatePredicate>(
+        rust_analyzer::lsp::ext::EvaluatePredicateParams {
+            text: "T: Trait".to_owned(),
+            text_document: server.doc_id("src/lib.rs"),
+            position: Position::new(5, 14),
+        },
+    );
+
+    let res: rust_analyzer::lsp::ext::EvaluatePredicateResult =
+        serde_json::from_value(res).unwrap();
+    assert_eq!(res.status, rust_analyzer::lsp::ext::PredicateEvaluationStatus::Holds);
 }
 
 #[test]
@@ -1524,6 +1616,6 @@ fn test() {
 
     let res: serde_json::Value = serde_json::from_str(res.as_str().unwrap()).unwrap();
     let arr = res.as_array().unwrap();
-    assert_eq!(arr.len(), 2);
+    assert_eq!(arr.len(), 1);
     expect![[r#"{"goal":"Goal { param_env: ParamEnv { clauses: [] }, predicate: Binder { value: TraitPredicate(usize: Trait, polarity:Positive), bound_vars: [] } }","result":"Err(NoSolution)","depth":0,"candidates":[]}"#]].assert_eq(&arr[0].to_string());
 }

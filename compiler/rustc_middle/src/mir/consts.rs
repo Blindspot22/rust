@@ -2,7 +2,7 @@ use std::fmt::{self, Debug, Display, Formatter};
 
 use rustc_abi::{HasDataLayout, Size};
 use rustc_hir::def_id::DefId;
-use rustc_macros::{HashStable, Lift, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
+use rustc_macros::{Lift, StableHash, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
 use rustc_span::{DUMMY_SP, RemapPathScopeComponents, Span, Symbol};
 use rustc_type_ir::TypeVisitableExt;
 
@@ -18,7 +18,7 @@ use crate::ty::{self, ConstKind, GenericArgsRef, ScalarInt, Ty, TyCtxt};
 /// Represents the result of const evaluation via the `eval_to_allocation` query.
 /// Not to be confused with `ConstAllocation`, which directly refers to the underlying data!
 /// Here we indirect via an `AllocId`.
-#[derive(Copy, Clone, HashStable, TyEncodable, TyDecodable, Debug, Hash, Eq, PartialEq)]
+#[derive(Copy, Clone, StableHash, TyEncodable, TyDecodable, Debug, Hash, Eq, PartialEq)]
 pub struct ConstAlloc<'tcx> {
     /// The value lives here, at offset 0, and that allocation definitely is an `AllocKind::Memory`
     /// (so you can use `AllocMap::unwrap_memory`).
@@ -29,7 +29,7 @@ pub struct ConstAlloc<'tcx> {
 /// Represents a constant value in Rust. `Scalar` and `Slice` are optimizations for
 /// array length computations, enum discriminants and the pattern matching logic.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, TyEncodable, TyDecodable, Hash)]
-#[derive(HashStable)]
+#[derive(StableHash)]
 pub enum ConstValue {
     /// Used for types with `layout::abi::Scalar` ABI.
     ///
@@ -181,26 +181,6 @@ impl ConstValue {
         Some(data.inner().inspect_with_uninit_and_ptr_outside_interpreter(start..end))
     }
 
-    /// Check if a constant may contain provenance information. This is used by MIR opts.
-    /// Can return `true` even if there is no provenance.
-    pub fn may_have_provenance(&self, tcx: TyCtxt<'_>, size: Size) -> bool {
-        match *self {
-            ConstValue::ZeroSized | ConstValue::Scalar(Scalar::Int(_)) => return false,
-            ConstValue::Scalar(Scalar::Ptr(..)) => return true,
-            // It's hard to find out the part of the allocation we point to;
-            // just conservatively check everything.
-            ConstValue::Slice { alloc_id, meta: _ } => {
-                !tcx.global_alloc(alloc_id).unwrap_memory().inner().provenance().ptrs().is_empty()
-            }
-            ConstValue::Indirect { alloc_id, offset } => !tcx
-                .global_alloc(alloc_id)
-                .unwrap_memory()
-                .inner()
-                .provenance()
-                .range_empty(AllocRange::from(offset..offset + size), &tcx),
-        }
-    }
-
     /// Check if a constant only contains uninitialized bytes.
     pub fn all_bytes_uninit(&self, tcx: TyCtxt<'_>) -> bool {
         let ConstValue::Indirect { alloc_id, .. } = self else {
@@ -227,7 +207,7 @@ impl ConstValue {
 ///////////////////////////////////////////////////////////////////////////
 /// Constants
 
-#[derive(Clone, Copy, PartialEq, Eq, TyEncodable, TyDecodable, Hash, HashStable, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, TyEncodable, TyDecodable, Hash, StableHash, Debug)]
 #[derive(TypeFoldable, TypeVisitable, Lift)]
 pub enum Const<'tcx> {
     /// This constant came from the type system.
@@ -474,44 +454,11 @@ impl<'tcx> Const<'tcx> {
         let val = ConstValue::Scalar(s);
         Self::Val(val, ty)
     }
-
-    /// Return true if any evaluation of this constant always returns the same value,
-    /// taking into account even pointer identity tests.
-    pub fn is_deterministic(&self) -> bool {
-        // Some constants may generate fresh allocations for pointers they contain,
-        // so using the same constant twice can yield two different results.
-        // Notably, valtrees purposefully generate new allocations.
-        match self {
-            Const::Ty(_, c) => match c.kind() {
-                ty::ConstKind::Param(..) => true,
-                // A valtree may be a reference. Valtree references correspond to a
-                // different allocation each time they are evaluated. Valtrees for primitive
-                // types are fine though.
-                ty::ConstKind::Value(cv) => cv.ty.is_primitive(),
-                ty::ConstKind::Unevaluated(..) | ty::ConstKind::Expr(..) => false,
-                // This can happen if evaluation of a constant failed. The result does not matter
-                // much since compilation is doomed.
-                ty::ConstKind::Error(..) => false,
-                // Should not appear in runtime MIR.
-                ty::ConstKind::Infer(..)
-                | ty::ConstKind::Bound(..)
-                | ty::ConstKind::Placeholder(..) => bug!(),
-            },
-            Const::Unevaluated(..) => false,
-            Const::Val(
-                ConstValue::Slice { .. }
-                | ConstValue::ZeroSized
-                | ConstValue::Scalar(_)
-                | ConstValue::Indirect { .. },
-                _,
-            ) => true,
-        }
-    }
 }
 
 /// An unevaluated (potentially generic) constant used in MIR.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, TyEncodable, TyDecodable)]
-#[derive(Hash, HashStable, TypeFoldable, TypeVisitable, Lift)]
+#[derive(Hash, StableHash, TypeFoldable, TypeVisitable, Lift)]
 pub struct UnevaluatedConst<'tcx> {
     pub def: DefId,
     pub args: GenericArgsRef<'tcx>,
@@ -520,9 +467,13 @@ pub struct UnevaluatedConst<'tcx> {
 
 impl<'tcx> UnevaluatedConst<'tcx> {
     #[inline]
-    pub fn shrink(self) -> ty::UnevaluatedConst<'tcx> {
+    pub fn shrink(self, tcx: TyCtxt<'tcx>) -> ty::UnevaluatedConst<'tcx> {
         assert_eq!(self.promoted, None);
-        ty::UnevaluatedConst { def: self.def, args: self.args }
+        ty::UnevaluatedConst::new(
+            tcx,
+            ty::UnevaluatedConstKind::new_from_def_id(tcx, self.def),
+            self.args,
+        )
     }
 }
 
@@ -546,7 +497,7 @@ impl<'tcx> Display for Const<'tcx> {
             // FIXME(valtrees): Correctly print mir constants.
             Const::Unevaluated(c, _ty) => {
                 ty::tls::with(move |tcx| {
-                    let c = tcx.lift(c).unwrap();
+                    let c = tcx.lift(c);
                     // Matches `GlobalId` printing.
                     let instance =
                         with_no_trimmed_paths!(tcx.def_path_str_with_args(c.def, c.args));

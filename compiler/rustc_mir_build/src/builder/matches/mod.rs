@@ -5,13 +5,12 @@
 //! This also includes code for pattern bindings in `let` statements and
 //! function parameters.
 
-use std::assert_matches::debug_assert_matches;
 use std::borrow::Borrow;
-use std::mem;
 use std::sync::Arc;
+use std::{debug_assert_matches, mem};
 
 use itertools::{Itertools, Position};
-use rustc_abi::{FIRST_VARIANT, VariantIdx};
+use rustc_abi::{FIRST_VARIANT, FieldIdx, VariantIdx};
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_hir::{BindingMode, ByRef, LangItem, LetStmt, LocalSource, Node};
@@ -29,7 +28,7 @@ use crate::builder::ForGuard::{self, OutsideGuard, RefWithinGuard};
 use crate::builder::expr::as_place::PlaceBuilder;
 use crate::builder::matches::buckets::PartitionedCandidates;
 use crate::builder::matches::user_ty::ProjectedUserTypesNode;
-use crate::builder::scope::DropKind;
+use crate::builder::scope::{DropKind, LintLevel};
 use crate::builder::{
     BlockAnd, BlockAndExtension, Builder, GuardFrame, GuardFrameLocal, LocalsForNode,
 };
@@ -182,9 +181,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 this.break_for_else(success_block, args.variable_source_info);
                 failure_block.unit()
             }
-            ExprKind::Scope { region_scope, lint_level, value } => {
+            ExprKind::Scope { region_scope, hir_id, value } => {
                 let region_scope = (region_scope, this.source_info(expr_span));
-                this.in_scope(region_scope, lint_level, |this| {
+                this.in_scope(region_scope, LintLevel::Explicit(hir_id), |this| {
                     this.then_else_break_inner(block, value, args)
                 })
             }
@@ -377,7 +376,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             &scrutinee_place,
             match_start_span,
             patterns,
-            false,
+            Exhaustive::Yes,
         );
 
         self.lower_match_arms(
@@ -434,7 +433,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 let guard_scope = arm
                     .guard
                     .map(|_| region::Scope { data: region::ScopeData::MatchGuard, ..arm.scope });
-                self.in_scope(arm_scope, arm.lint_level, |this| {
+                self.in_scope(arm_scope, LintLevel::Explicit(arm.hir_id), |this| {
                     this.opt_in_scope(guard_scope.map(|scope| (scope, arm_source_info)), |this| {
                         // `if let` guard temps needing deduplicating will be in the guard scope.
                         let old_dedup_scope =
@@ -650,7 +649,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             &initializer,
             irrefutable_pat.span,
             vec![(irrefutable_pat, HasMatchGuard::No)],
-            false,
+            Exhaustive::Yes,
         );
         let [branch] = built_tree.branches.try_into().unwrap();
 
@@ -909,7 +908,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | PatKind::Never
             | PatKind::Error(_) => {}
 
-            PatKind::Deref { ref subpattern } => {
+            PatKind::Deref { pin: Pinnedness::Pinned, ref subpattern } => {
+                // Project into the `Pin(_)` struct, then deref the inner `&` or `&mut`.
+                visit_subpat(self, subpattern, &user_tys.leaf(FieldIdx::ZERO).deref(), f);
+            }
+            PatKind::Deref { pin: Pinnedness::Not, ref subpattern } => {
                 visit_subpat(self, subpattern, &user_tys.deref(), f);
             }
 
@@ -940,6 +943,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 for subpattern in pats.iter() {
                     visit_subpat(self, subpattern, user_tys, f);
                 }
+            }
+            PatKind::Guard { ref subpattern, .. } => {
+                visit_subpat(self, subpattern, user_tys, f);
             }
         }
     }
@@ -991,24 +997,6 @@ struct FlatPat<'tcx> {
     match_pairs: Vec<MatchPairTree<'tcx>>,
 
     extra_data: PatternExtraData<'tcx>,
-}
-
-impl<'tcx> FlatPat<'tcx> {
-    /// Creates a `FlatPat` containing a simplified [`MatchPairTree`] list/forest
-    /// for the given pattern.
-    fn new(place: PlaceBuilder<'tcx>, pattern: &Pat<'tcx>, cx: &mut Builder<'_, 'tcx>) -> Self {
-        // Recursively build a tree of match pairs for the given pattern.
-        let mut match_pairs = vec![];
-        let mut extra_data = PatternExtraData {
-            span: pattern.span,
-            bindings: Vec::new(),
-            ascriptions: Vec::new(),
-            is_never: pattern.is_never_pattern(),
-        };
-        MatchPairTree::for_pattern(place, pattern, cx, &mut match_pairs, &mut extra_data);
-
-        Self { match_pairs, extra_data }
-    }
 }
 
 /// Candidates are a generalization of (a) top-level match arms, and
@@ -1220,7 +1208,7 @@ struct Ascription<'tcx> {
 /// and helps [`TestKind::Switch`] and [`TestKind::SwitchInt`] know what target
 /// values to use.
 ///
-/// Created by [`MatchPairTree::for_pattern`], and then inspected primarily by:
+/// Created by [`MatchPairTree`], and then inspected primarily by:
 /// - [`Builder::pick_test_for_match_pair`] (to choose a test)
 /// - [`Builder::choose_bucket_for_candidate`] (to see how the test interacts with a match pair)
 ///
@@ -1271,7 +1259,7 @@ enum PatConstKind {
 /// tested, and a test to perform on that place.
 ///
 /// Each node also has a list of subpairs (possibly empty) that must also match,
-/// and a reference to the THIR pattern it represents.
+/// and some additional information from the THIR pattern it represents.
 #[derive(Debug, Clone)]
 pub(crate) struct MatchPairTree<'tcx> {
     /// This place...
@@ -1295,9 +1283,7 @@ pub(crate) struct MatchPairTree<'tcx> {
     /// that tests its field for the value `3`.
     subpairs: Vec<Self>,
 
-    /// Type field of the pattern this node was created from.
-    pattern_ty: Ty<'tcx>,
-    /// Span field of the pattern this node was created from.
+    /// Span field of the THIR pattern this node was created from.
     pattern_span: Span,
 }
 
@@ -1339,19 +1325,13 @@ enum TestKind<'tcx> {
 
     /// Tests the place against a string constant using string equality.
     StringEq {
-        /// Constant `&str` value to test against.
+        /// Constant string value to test against.
+        /// Note that this value has type `str` (not `&str`).
         value: ty::Value<'tcx>,
-        /// Type of the corresponding pattern node. Usually `&str`, but could
-        /// be `str` for patterns like `deref!("..."): String`.
-        pat_ty: Ty<'tcx>,
     },
 
     /// Tests the place against a constant using scalar equality.
-    ScalarEq {
-        value: ty::Value<'tcx>,
-        /// Type of the corresponding pattern node.
-        pat_ty: Ty<'tcx>,
-    },
+    ScalarEq { value: ty::Value<'tcx> },
 
     /// Test whether the value falls within an inclusive or exclusive range.
     Range(Arc<PatRange<'tcx>>),
@@ -1567,6 +1547,14 @@ pub(crate) enum HasMatchGuard {
     No,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Exhaustive {
+    /// `let` and `match` are exhaustive.
+    Yes,
+    /// `if let` and `let else` are not exhaustive.
+    No,
+}
+
 impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// The entrypoint of the matching algorithm. Create the decision tree for the match expression,
     /// starting from `block`.
@@ -1574,9 +1562,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// `patterns` is a list of patterns, one for each arm. The associated boolean indicates whether
     /// the arm has a guard.
     ///
-    /// `refutable` indicates whether the candidate list is refutable (for `if let` and `let else`)
-    /// or not (for `let` and `match`). In the refutable case we return the block to which we branch
-    /// on failure.
+    /// `exhaustive` indicates whether the candidate list is exhaustive (for `if let` and `let else`)
+    /// or not (for `let` and `match`). In the non-exhaustive case we return the block to which we
+    /// branch on failure.
     pub(crate) fn lower_match_tree(
         &mut self,
         block: BasicBlock,
@@ -1584,7 +1572,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         scrutinee_place_builder: &PlaceBuilder<'tcx>,
         match_start_span: Span,
         patterns: Vec<(&Pat<'tcx>, HasMatchGuard)>,
-        refutable: bool,
+        exhaustive: Exhaustive,
     ) -> BuiltMatchTree<'tcx> {
         // Assemble the initial list of candidates. These top-level candidates are 1:1 with the
         // input patterns, but other parts of match lowering also introduce subcandidates (for
@@ -1613,9 +1601,12 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
         // Set up false edges so that the borrow-checker cannot make use of the specific CFG we
         // generated. We falsely branch from each candidate to the one below it to make it as if we
-        // were testing match branches one by one in order. In the refutable case we also want a
+        // were testing match branches one by one in order. In the non-exhaustive case we also want a
         // false edge to the final failure block.
-        let mut next_candidate_start_block = if refutable { Some(otherwise_block) } else { None };
+        let mut next_candidate_start_block = match exhaustive {
+            Exhaustive::Yes => None,
+            Exhaustive::No => Some(otherwise_block),
+        };
         for candidate in candidates.iter_mut().rev() {
             let has_guard = candidate.has_guard;
             candidate.visit_leaves_rev(|leaf_candidate| {
@@ -1649,8 +1640,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             });
         }
 
-        if !refutable {
-            // Match checking ensures `otherwise_block` is actually unreachable in irrefutable
+        if exhaustive == Exhaustive::Yes {
+            // Match checking ensures `otherwise_block` is actually unreachable in exhaustive
             // cases.
             let source_info = self.source_info(scrutinee_span);
 
@@ -2364,7 +2355,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             &scrutinee,
             pat.span,
             vec![(pat, HasMatchGuard::No)],
-            true,
+            Exhaustive::No,
         );
         let [branch] = built_tree.branches.try_into().unwrap();
 
@@ -2739,7 +2730,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 self.schedule_drop_for_binding(binding.var_id, binding.span, OutsideGuard);
             }
             let rvalue = match binding.binding_mode.0 {
-                ByRef::No => Rvalue::Use(self.consume_by_copy_or_move(binding.source)),
+                ByRef::No => {
+                    Rvalue::Use(self.consume_by_copy_or_move(binding.source), WithRetag::Yes)
+                }
                 ByRef::Yes(pinnedness, mutbl) => {
                     let rvalue =
                         Rvalue::Ref(re_erased, util::ref_pat_borrow_kind(mutbl), binding.source);
@@ -2943,12 +2936,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
         match pat.ctor() {
             Constructor::Variant(variant_index) => {
-                let ValTreeKind::Branch(box [actual_variant_idx]) = *valtree else {
+                let ValTreeKind::Branch(branch) = *valtree else {
                     bug!("malformed valtree for an enum")
                 };
-
-                let ValTreeKind::Leaf(actual_variant_idx) = *actual_variant_idx.to_value().valtree
-                else {
+                if branch.len() != 1 {
+                    bug!("malformed valtree for an enum")
+                };
+                let ValTreeKind::Leaf(actual_variant_idx) = **branch[0].to_value().valtree else {
                     bug!("malformed valtree for an enum")
                 };
 

@@ -1,5 +1,6 @@
-//@revisions: stack tree
+//@revisions: stack tree tree_implicit_writes
 //@compile-flags: -Zmiri-strict-provenance
+//@[tree_implicit_writes]compile-flags: -Zmiri-tree-borrows -Zmiri-tree-borrows-implicit-writes
 //@[tree]compile-flags: -Zmiri-tree-borrows
 #![feature(iter_advance_by, iter_next_chunk)]
 
@@ -178,6 +179,24 @@ fn extract_if() {
     }
 }
 
+fn vec_macro_cleanup() {
+    // Ensure memory gets deallocated when control flow leaves the `vec!` macro.
+    #[allow(unreachable_code)]
+    loop {
+        let _v = vec![Box::new(0), break];
+    }
+
+    fn panic<T>() -> T {
+        panic!()
+    }
+    // Ensure all memory gets deallocated on a panic: the `Box` we construct, and the `Box`
+    // constructed inside `vec!` to eventually turn into a `Vec`.
+    std::panic::catch_unwind(|| {
+        let _v = vec![Box::new(0), panic()];
+    })
+    .unwrap_err();
+}
+
 fn main() {
     assert_eq!(vec_reallocate().len(), 5);
 
@@ -209,4 +228,5 @@ fn main() {
     reverse();
     miri_issue_2759();
     extract_if();
+    vec_macro_cleanup();
 }

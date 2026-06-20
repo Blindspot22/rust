@@ -14,7 +14,7 @@
 use crate::convert::FloatToInt;
 use crate::num::FpCategory;
 #[cfg(not(test))]
-use crate::num::libm;
+use crate::num::imp::libm;
 use crate::panic::const_assert;
 use crate::{intrinsics, mem};
 
@@ -35,14 +35,13 @@ pub mod consts {
     pub const TAU: f16 = 6.28318530717958647692528676655900577_f16;
 
     /// The golden ratio (φ)
+    #[doc(alias = "phi")]
     #[unstable(feature = "f16", issue = "116909")]
-    // Also, #[unstable(feature = "more_float_constants", issue = "146939")]
-    pub const PHI: f16 = 1.618033988749894848204586834365638118_f16;
+    pub const GOLDEN_RATIO: f16 = 1.618033988749894848204586834365638118_f16;
 
     /// The Euler-Mascheroni constant (γ)
     #[unstable(feature = "f16", issue = "116909")]
-    // Also, #[unstable(feature = "more_float_constants", issue = "146939")]
-    pub const EGAMMA: f16 = 0.577215664901532860606512090082402431_f16;
+    pub const EULER_GAMMA: f16 = 0.577215664901532860606512090082402431_f16;
 
     /// π/2
     #[unstable(feature = "f16", issue = "116909")]
@@ -105,6 +104,16 @@ pub mod consts {
     // Also, #[unstable(feature = "more_float_constants", issue = "146939")]
     pub const FRAC_1_SQRT_3: f16 = 0.577350269189625764509148780501957456_f16;
 
+    /// sqrt(5)
+    #[unstable(feature = "more_float_constants", issue = "146939")]
+    // Also, #[unstable(feature = "f16", issue = "116909")]
+    pub const SQRT_5: f16 = 2.23606797749978969640917366873127623_f16;
+
+    /// 1/sqrt(5)
+    #[unstable(feature = "more_float_constants", issue = "146939")]
+    // Also, #[unstable(feature = "f16", issue = "116909")]
+    pub const FRAC_1_SQRT_5: f16 = 0.44721359549995793928183473374625524_f16;
+
     /// Euler's number (e)
     #[unstable(feature = "f16", issue = "116909")]
     pub const E: f16 = 2.71828182845904523536028747135266250_f16;
@@ -134,13 +143,19 @@ pub mod consts {
     pub const LN_10: f16 = 2.30258509299404568401799145468436421_f16;
 }
 
+#[doc(test(attr(
+    feature(cfg_target_has_reliable_f16_f128),
+    allow(internal_features, unused_features)
+)))]
 impl f16 {
-    // FIXME(f16_f128): almost all methods in this `impl` are missing examples and a const
-    // implementation. Add these once we can run code on all platforms and have f16/f128 in CTFE.
-
     /// The radix or base of the internal representation of `f16`.
     #[unstable(feature = "f16", issue = "116909")]
     pub const RADIX: u32 = 2;
+
+    /// The size of this float type in bits.
+    // #[unstable(feature = "f16", issue = "116909")]
+    #[unstable(feature = "float_bits_const", issue = "151073")]
+    pub const BITS: u32 = 16;
 
     /// Number of significant digits in base 2.
     ///
@@ -255,14 +270,144 @@ impl f16 {
     #[unstable(feature = "f16", issue = "116909")]
     pub const NEG_INFINITY: f16 = -1.0_f16 / 0.0_f16;
 
-    /// Sign bit
-    pub(crate) const SIGN_MASK: u16 = 0x8000;
+    /// Maximum integer that can be represented exactly in an [`f16`] value,
+    /// with no other integer converting to the same floating point value.
+    ///
+    /// For an integer `x` which satisfies `MIN_EXACT_INTEGER <= x <= MAX_EXACT_INTEGER`,
+    /// there is a "one-to-one" mapping between [`i16`] and [`f16`] values.
+    /// `MAX_EXACT_INTEGER + 1` also converts losslessly to [`f16`] and back to
+    /// [`i16`], but `MAX_EXACT_INTEGER + 2` converts to the same [`f16`] value
+    /// (and back to `MAX_EXACT_INTEGER + 1` as an integer) so there is not a
+    /// "one-to-one" mapping.
+    ///
+    /// [`MAX_EXACT_INTEGER`]: f16::MAX_EXACT_INTEGER
+    /// [`MIN_EXACT_INTEGER`]: f16::MIN_EXACT_INTEGER
+    /// ```
+    /// #![feature(f16)]
+    /// #![feature(float_exact_integer_constants)]
+    /// # // FIXME(#152635): Float rounding on `i586` does not adhere to IEEE 754
+    /// # #[cfg(not(all(target_arch = "x86", not(target_feature = "sse"))))] {
+    /// # #[cfg(target_has_reliable_f16)] {
+    /// let max_exact_int = f16::MAX_EXACT_INTEGER;
+    /// assert_eq!(max_exact_int, max_exact_int as f16 as i16);
+    /// assert_eq!(max_exact_int + 1, (max_exact_int + 1) as f16 as i16);
+    /// assert_ne!(max_exact_int + 2, (max_exact_int + 2) as f16 as i16);
+    ///
+    /// // Beyond `f16::MAX_EXACT_INTEGER`, multiple integers can map to one float value
+    /// assert_eq!((max_exact_int + 1) as f16, (max_exact_int + 2) as f16);
+    /// # }}
+    /// ```
+    // #[unstable(feature = "f16", issue = "116909")]
+    #[unstable(feature = "float_exact_integer_constants", issue = "152466")]
+    pub const MAX_EXACT_INTEGER: i16 = (1 << Self::MANTISSA_DIGITS) - 1;
 
-    /// Exponent mask
-    pub(crate) const EXP_MASK: u16 = 0x7c00;
+    /// Minimum integer that can be represented exactly in an [`f16`] value,
+    /// with no other integer converting to the same floating point value.
+    ///
+    /// For an integer `x` which satisfies `MIN_EXACT_INTEGER <= x <= MAX_EXACT_INTEGER`,
+    /// there is a "one-to-one" mapping between [`i16`] and [`f16`] values.
+    /// `MAX_EXACT_INTEGER + 1` also converts losslessly to [`f16`] and back to
+    /// [`i16`], but `MAX_EXACT_INTEGER + 2` converts to the same [`f16`] value
+    /// (and back to `MAX_EXACT_INTEGER + 1` as an integer) so there is not a
+    /// "one-to-one" mapping.
+    ///
+    /// This constant is equivalent to `-MAX_EXACT_INTEGER`.
+    ///
+    /// [`MAX_EXACT_INTEGER`]: f16::MAX_EXACT_INTEGER
+    /// [`MIN_EXACT_INTEGER`]: f16::MIN_EXACT_INTEGER
+    /// ```
+    /// #![feature(f16)]
+    /// #![feature(float_exact_integer_constants)]
+    /// # // FIXME(#152635): Float rounding on `i586` does not adhere to IEEE 754
+    /// # #[cfg(not(all(target_arch = "x86", not(target_feature = "sse"))))] {
+    /// # #[cfg(target_has_reliable_f16)] {
+    /// let min_exact_int = f16::MIN_EXACT_INTEGER;
+    /// assert_eq!(min_exact_int, min_exact_int as f16 as i16);
+    /// assert_eq!(min_exact_int - 1, (min_exact_int - 1) as f16 as i16);
+    /// assert_ne!(min_exact_int - 2, (min_exact_int - 2) as f16 as i16);
+    ///
+    /// // Below `f16::MIN_EXACT_INTEGER`, multiple integers can map to one float value
+    /// assert_eq!((min_exact_int - 1) as f16, (min_exact_int - 2) as f16);
+    /// # }}
+    /// ```
+    // #[unstable(feature = "f16", issue = "116909")]
+    #[unstable(feature = "float_exact_integer_constants", issue = "152466")]
+    pub const MIN_EXACT_INTEGER: i16 = -Self::MAX_EXACT_INTEGER;
 
-    /// Mantissa mask
-    pub(crate) const MAN_MASK: u16 = 0x03ff;
+    /// The mask of the bit used to encode the sign of an [`f16`].
+    ///
+    /// This bit is set when the sign is negative and unset when the sign is
+    /// positive.
+    /// If you only need to check whether a value is positive or negative,
+    /// [`is_sign_positive`] or [`is_sign_negative`] can be used.
+    ///
+    /// [`is_sign_positive`]: f16::is_sign_positive
+    /// [`is_sign_negative`]: f16::is_sign_negative
+    /// ```rust
+    /// #![feature(float_masks)]
+    /// #![feature(f16)]
+    /// # #[cfg(target_has_reliable_f16)] {
+    /// let sign_mask = f16::SIGN_MASK;
+    /// let a = 1.6552f16;
+    /// let a_bits = a.to_bits();
+    ///
+    /// assert_eq!(a_bits & sign_mask, 0x0);
+    /// assert_eq!(f16::from_bits(a_bits ^ sign_mask), -a);
+    /// assert_eq!(sign_mask, (-0.0f16).to_bits());
+    /// # }
+    /// ```
+    #[unstable(feature = "float_masks", issue = "154064")]
+    pub const SIGN_MASK: u16 = 0x8000;
+
+    /// The mask of the bits used to encode the exponent of an [`f16`].
+    ///
+    /// Note that the exponent is stored as a biased value, with a bias of 15 for `f16`.
+    ///
+    /// ```rust
+    /// #![feature(float_masks)]
+    /// #![feature(f16)]
+    /// # #[cfg(target_has_reliable_f16)] {
+    /// let exponent_mask = f16::EXPONENT_MASK;
+    ///
+    /// fn get_exp(a: f16) -> i16 {
+    ///     let bias = 15;
+    ///     let biased = a.to_bits() & f16::EXPONENT_MASK;
+    ///     (biased >> (f16::MANTISSA_DIGITS - 1)).cast_signed() - bias
+    /// }
+    ///
+    /// assert_eq!(get_exp(0.5), -1);
+    /// assert_eq!(get_exp(1.0), 0);
+    /// assert_eq!(get_exp(2.0), 1);
+    /// assert_eq!(get_exp(4.0), 2);
+    /// # }
+    /// ```
+    #[unstable(feature = "float_masks", issue = "154064")]
+    pub const EXPONENT_MASK: u16 = 0x7c00;
+
+    /// The mask of the bits used to encode the mantissa of an [`f16`].
+    ///
+    /// ```rust
+    /// #![feature(float_masks)]
+    /// #![feature(f16)]
+    /// # #[cfg(target_has_reliable_f16)] {
+    /// let mantissa_mask = f16::MANTISSA_MASK;
+    ///
+    /// assert_eq!(0f16.to_bits() & mantissa_mask, 0x0);
+    /// assert_eq!(1f16.to_bits() & mantissa_mask, 0x0);
+    ///
+    /// // multiplying a finite value by a power of 2 doesn't change its mantissa
+    /// // unless the result or initial value is not normal.
+    /// let a = 1.6552f16;
+    /// let b = 4.0 * a;
+    /// assert_eq!(a.to_bits() & mantissa_mask, b.to_bits() & mantissa_mask);
+    ///
+    /// // The maximum and minimum values have a saturated significand
+    /// assert_eq!(f16::MAX.to_bits() & f16::MANTISSA_MASK, f16::MANTISSA_MASK);
+    /// assert_eq!(f16::MIN.to_bits() & f16::MANTISSA_MASK, f16::MANTISSA_MASK);
+    /// # }
+    /// ```
+    #[unstable(feature = "float_masks", issue = "154064")]
+    pub const MANTISSA_MASK: u16 = 0x03ff;
 
     /// Minimum representable positive value (min subnormal)
     const TINY_BITS: u16 = 0x1;
@@ -274,7 +419,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let nan = f16::NAN;
     /// let f = 7.0_f16;
@@ -296,7 +441,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let f = 7.0f16;
     /// let inf = f16::INFINITY;
@@ -321,7 +466,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let f = 7.0f16;
     /// let inf: f16 = f16::INFINITY;
@@ -349,7 +494,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let min = f16::MIN_POSITIVE; // 6.1035e-5
     /// let max = f16::MAX;
@@ -378,7 +523,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let min = f16::MIN_POSITIVE; // 6.1035e-5
     /// let max = f16::MAX;
@@ -409,7 +554,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// use std::num::FpCategory;
     ///
@@ -422,11 +567,12 @@ impl f16 {
     /// ```
     #[inline]
     #[unstable(feature = "f16", issue = "116909")]
+    #[must_use]
     pub const fn classify(self) -> FpCategory {
         let b = self.to_bits();
-        match (b & Self::MAN_MASK, b & Self::EXP_MASK) {
-            (0, Self::EXP_MASK) => FpCategory::Infinite,
-            (_, Self::EXP_MASK) => FpCategory::Nan,
+        match (b & Self::MANTISSA_MASK, b & Self::EXPONENT_MASK) {
+            (0, Self::EXPONENT_MASK) => FpCategory::Infinite,
+            (_, Self::EXPONENT_MASK) => FpCategory::Nan,
             (0, 0) => FpCategory::Zero,
             (_, 0) => FpCategory::Subnormal,
             _ => FpCategory::Normal,
@@ -445,8 +591,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # // FIXME(f16_f128): LLVM crashes on s390x, llvm/llvm-project#50374
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let f = 7.0_f16;
     /// let g = -7.0_f16;
@@ -474,8 +619,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # // FIXME(f16_f128): LLVM crashes on s390x, llvm/llvm-project#50374
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let f = 7.0_f16;
     /// let g = -7.0_f16;
@@ -509,8 +653,7 @@ impl f16 {
     ///
     /// ```rust
     /// #![feature(f16)]
-    /// # // FIXME(f16_f128): ABI issues on MSVC
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// // f16::EPSILON is the difference between 1.0 and the next number up.
     /// assert_eq!(1.0f16.next_up(), 1.0 + f16::EPSILON);
@@ -529,6 +672,7 @@ impl f16 {
     #[inline]
     #[doc(alias = "nextUp")]
     #[unstable(feature = "f16", issue = "116909")]
+    #[must_use = "method returns a new number and does not mutate the original value"]
     pub const fn next_up(self) -> Self {
         // Some targets violate Rust's assumption of IEEE semantics, e.g. by flushing
         // denormals to zero. This is in general unsound and unsupported, but here
@@ -564,8 +708,7 @@ impl f16 {
     ///
     /// ```rust
     /// #![feature(f16)]
-    /// # // FIXME(f16_f128): ABI issues on MSVC
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let x = 1.0f16;
     /// // Clamp value into range [0, 1).
@@ -584,6 +727,7 @@ impl f16 {
     #[inline]
     #[doc(alias = "nextDown")]
     #[unstable(feature = "f16", issue = "116909")]
+    #[must_use = "method returns a new number and does not mutate the original value"]
     pub const fn next_down(self) -> Self {
         // Some targets violate Rust's assumption of IEEE semantics, e.g. by flushing
         // denormals to zero. This is in general unsound and unsupported, but here
@@ -608,8 +752,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # // FIXME(f16_f128): extendhfsf2, truncsfhf2, __gnu_h2f_ieee, __gnu_f2h_ieee missing for many platforms
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let x = 2.0_f16;
     /// let abs_difference = (x.recip() - (1.0 / x)).abs();
@@ -635,8 +778,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # // FIXME(f16_f128): extendhfsf2, truncsfhf2, __gnu_h2f_ieee, __gnu_f2h_ieee missing for many platforms
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let angle = std::f16::consts::PI;
     ///
@@ -665,8 +807,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # // FIXME(f16_f128): extendhfsf2, truncsfhf2, __gnu_h2f_ieee, __gnu_f2h_ieee missing for many platforms
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let angle = 180.0f16;
     ///
@@ -699,7 +840,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(target_arch = "aarch64")] { // FIXME(f16_F128): rust-lang/rust#123885
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let x = 1.0f16;
     /// let y = 2.0f16;
@@ -713,7 +854,7 @@ impl f16 {
     #[rustc_const_unstable(feature = "f16", issue = "116909")]
     #[must_use = "this returns the result of the comparison, without modifying either input"]
     pub const fn max(self, other: f16) -> f16 {
-        intrinsics::maxnumf16(self, other)
+        intrinsics::maximum_number_nsz_f16(self, other)
     }
 
     /// Returns the minimum of the two numbers, ignoring NaN.
@@ -730,7 +871,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(target_arch = "aarch64")] { // FIXME(f16_F128): rust-lang/rust#123885
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let x = 1.0f16;
     /// let y = 2.0f16;
@@ -744,7 +885,7 @@ impl f16 {
     #[rustc_const_unstable(feature = "f16", issue = "116909")]
     #[must_use = "this returns the result of the comparison, without modifying either input"]
     pub const fn min(self, other: f16) -> f16 {
-        intrinsics::minnumf16(self, other)
+        intrinsics::minimum_number_nsz_f16(self, other)
     }
 
     /// Returns the maximum of the two numbers, propagating NaN.
@@ -762,7 +903,7 @@ impl f16 {
     /// ```
     /// #![feature(f16)]
     /// #![feature(float_minimum_maximum)]
-    /// # #[cfg(target_arch = "aarch64")] { // FIXME(f16_F128): rust-lang/rust#123885
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let x = 1.0f16;
     /// let y = 2.0f16;
@@ -794,7 +935,7 @@ impl f16 {
     /// ```
     /// #![feature(f16)]
     /// #![feature(float_minimum_maximum)]
-    /// # #[cfg(target_arch = "aarch64")] { // FIXME(f16_F128): rust-lang/rust#123885
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let x = 1.0f16;
     /// let y = 2.0f16;
@@ -820,7 +961,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(target_arch = "aarch64")] { // FIXME(f16_F128): rust-lang/rust#123885
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// assert_eq!(1f16.midpoint(4.0), 2.5);
     /// assert_eq!((-5.5f16).midpoint(8.0), 1.25);
@@ -830,8 +971,10 @@ impl f16 {
     #[doc(alias = "average")]
     #[unstable(feature = "f16", issue = "116909")]
     #[rustc_const_unstable(feature = "f16", issue = "116909")]
+    #[must_use = "this returns the result of the operation, \
+                  without modifying the original"]
     pub const fn midpoint(self, other: f16) -> f16 {
-        const HI: f16 = f16::MAX / 2.;
+        const HI: f16 = f16::MAX * 0.5;
 
         let (a, b) = (self, other);
         let abs_a = a.abs();
@@ -839,9 +982,9 @@ impl f16 {
 
         if abs_a <= HI && abs_b <= HI {
             // Overflow is impossible
-            (a + b) / 2.
+            (a + b) * 0.5
         } else {
-            (a / 2.) + (b / 2.)
+            (a * 0.5) + (b * 0.5)
         }
     }
 
@@ -850,7 +993,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let value = 4.6_f16;
     /// let rounded = unsafe { value.to_int_unchecked::<u16>() };
@@ -893,10 +1036,9 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
-    /// # // FIXME(f16_f128): enable this once const casting works
-    /// # // assert_ne!((1f16).to_bits(), 1f16 as u128); // to_bits() is not casting!
+    /// assert_ne!((1f16).to_bits(), 1f16 as u16); // to_bits() is not casting!
     /// assert_eq!((12.5f16).to_bits(), 0x4a40);
     /// # }
     /// ```
@@ -941,7 +1083,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let v = f16::from_bits(0x4a40);
     /// assert_eq!(v, 12.5);
@@ -967,8 +1109,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # // FIXME(f16_f128): LLVM crashes on s390x, llvm/llvm-project#50374
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let bytes = 12.5f16.to_be_bytes();
     /// assert_eq!(bytes, [0x4a, 0x40]);
@@ -991,8 +1132,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # // FIXME(f16_f128): LLVM crashes on s390x, llvm/llvm-project#50374
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let bytes = 12.5f16.to_le_bytes();
     /// assert_eq!(bytes, [0x40, 0x4a]);
@@ -1021,8 +1161,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # // FIXME(f16_f128): LLVM crashes on s390x, llvm/llvm-project#50374
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let bytes = 12.5f16.to_ne_bytes();
     /// assert_eq!(
@@ -1051,7 +1190,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let value = f16::from_be_bytes([0x4a, 0x40]);
     /// assert_eq!(value, 12.5);
@@ -1073,7 +1212,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let value = f16::from_le_bytes([0x40, 0x4a]);
     /// assert_eq!(value, 12.5);
@@ -1102,7 +1241,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let value = f16::from_ne_bytes(if cfg!(target_endian = "big") {
     ///     [0x4a, 0x40]
@@ -1152,8 +1291,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # // FIXME(f16_f128): extendhfsf2, truncsfhf2, __gnu_h2f_ieee, __gnu_f2h_ieee missing for many platforms
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// struct GoodBoy {
     ///     name: &'static str,
@@ -1236,7 +1374,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// assert!((-3.0f16).clamp(-2.0, 1.0) == -2.0);
     /// assert!((0.0f16).clamp(-2.0, 1.0) == 0.0);
@@ -1287,7 +1425,7 @@ impl f16 {
     /// ```
     /// #![feature(f16)]
     /// #![feature(clamp_magnitude)]
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     /// assert_eq!(5.0f16.clamp_magnitude(3.0), 3.0);
     /// assert_eq!((-5.0f16).clamp_magnitude(3.0), -3.0);
     /// assert_eq!(2.0f16.clamp_magnitude(3.0), 2.0);
@@ -1311,7 +1449,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let x = 3.5_f16;
     /// let y = -3.5_f16;
@@ -1327,8 +1465,7 @@ impl f16 {
     #[rustc_const_unstable(feature = "f16", issue = "116909")]
     #[must_use = "method returns a new number and does not mutate the original value"]
     pub const fn abs(self) -> Self {
-        // FIXME(f16_f128): replace with `intrinsics::fabsf16` when available
-        Self::from_bits(self.to_bits() & !(1 << 15))
+        intrinsics::fabs(self)
     }
 
     /// Returns a number that represents the sign of `self`.
@@ -1341,7 +1478,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let f = 3.5_f16;
     ///
@@ -1377,7 +1514,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(all(target_arch = "x86_64", target_os = "linux"))] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let f = 3.5_f16;
     ///
@@ -1401,8 +1538,8 @@ impl f16 {
     ///
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
-    #[unstable(feature = "float_algebraic", issue = "136469")]
-    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
+    #[unstable(feature = "f16", issue = "116909")]
+    #[rustc_const_unstable(feature = "f16", issue = "116909")]
     #[inline]
     pub const fn algebraic_add(self, rhs: f16) -> f16 {
         intrinsics::fadd_algebraic(self, rhs)
@@ -1412,8 +1549,8 @@ impl f16 {
     ///
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
-    #[unstable(feature = "float_algebraic", issue = "136469")]
-    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
+    #[unstable(feature = "f16", issue = "116909")]
+    #[rustc_const_unstable(feature = "f16", issue = "116909")]
     #[inline]
     pub const fn algebraic_sub(self, rhs: f16) -> f16 {
         intrinsics::fsub_algebraic(self, rhs)
@@ -1423,8 +1560,8 @@ impl f16 {
     ///
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
-    #[unstable(feature = "float_algebraic", issue = "136469")]
-    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
+    #[unstable(feature = "f16", issue = "116909")]
+    #[rustc_const_unstable(feature = "f16", issue = "116909")]
     #[inline]
     pub const fn algebraic_mul(self, rhs: f16) -> f16 {
         intrinsics::fmul_algebraic(self, rhs)
@@ -1434,8 +1571,8 @@ impl f16 {
     ///
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
-    #[unstable(feature = "float_algebraic", issue = "136469")]
-    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
+    #[unstable(feature = "f16", issue = "116909")]
+    #[rustc_const_unstable(feature = "f16", issue = "116909")]
     #[inline]
     pub const fn algebraic_div(self, rhs: f16) -> f16 {
         intrinsics::fdiv_algebraic(self, rhs)
@@ -1445,8 +1582,8 @@ impl f16 {
     ///
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
-    #[unstable(feature = "float_algebraic", issue = "136469")]
-    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
+    #[unstable(feature = "f16", issue = "116909")]
+    #[rustc_const_unstable(feature = "f16", issue = "116909")]
     #[inline]
     pub const fn algebraic_rem(self, rhs: f16) -> f16 {
         intrinsics::frem_algebraic(self, rhs)
@@ -1456,7 +1593,11 @@ impl f16 {
 // Functions in this module fall into `core_float_math`
 // #[unstable(feature = "core_float_math", issue = "137578")]
 #[cfg(not(test))]
-#[doc(test(attr(feature(cfg_target_has_reliable_f16_f128), expect(internal_features))))]
+#[doc(test(attr(
+    feature(cfg_target_has_reliable_f16_f128),
+    expect(internal_features),
+    allow(unused_features)
+)))]
 impl f16 {
     /// Returns the largest integer less than or equal to `self`.
     ///
@@ -1466,8 +1607,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(not(miri))]
-    /// # #[cfg(target_has_reliable_f16_math)] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let f = 3.7_f16;
     /// let g = 3.0_f16;
@@ -1495,8 +1635,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(not(miri))]
-    /// # #[cfg(target_has_reliable_f16_math)] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let f = 3.01_f16;
     /// let g = 4.0_f16;
@@ -1524,8 +1663,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(not(miri))]
-    /// # #[cfg(target_has_reliable_f16_math)] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let f = 3.3_f16;
     /// let g = -3.3_f16;
@@ -1558,8 +1696,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(not(miri))]
-    /// # #[cfg(target_has_reliable_f16_math)] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let f = 3.3_f16;
     /// let g = -3.3_f16;
@@ -1590,8 +1727,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(not(miri))]
-    /// # #[cfg(target_has_reliable_f16_math)] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let f = 3.7_f16;
     /// let g = 3.0_f16;
@@ -1620,8 +1756,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(not(miri))]
-    /// # #[cfg(target_has_reliable_f16_math)] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let x = 3.6_f16;
     /// let y = -3.6_f16;
@@ -1659,8 +1794,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(not(miri))]
-    /// # #[cfg(target_has_reliable_f16_math)] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let m = 10.0_f16;
     /// let x = 4.0_f16;
@@ -1704,8 +1838,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(not(miri))]
-    /// # #[cfg(target_has_reliable_f16_math)] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let a: f16 = 7.0;
     /// let b = 4.0;
@@ -1748,8 +1881,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(not(miri))]
-    /// # #[cfg(target_has_reliable_f16_math)] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let a: f16 = 7.0;
     /// let b = 4.0;
@@ -1791,12 +1923,11 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(not(miri))]
     /// # #[cfg(target_has_reliable_f16_math)] {
     ///
     /// let x = 2.0_f16;
     /// let abs_difference = (x.powi(2) - (x * x)).abs();
-    /// assert!(abs_difference <= f16::EPSILON);
+    /// assert!(abs_difference <= 0.1);
     ///
     /// assert_eq!(f16::powi(f16::NAN, 0), 1.0);
     /// assert_eq!(f16::powi(0.0, 0), 1.0);
@@ -1824,8 +1955,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(not(miri))]
-    /// # #[cfg(target_has_reliable_f16_math)] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let positive = 4.0_f16;
     /// let negative = -4.0_f16;
@@ -1859,8 +1989,7 @@ impl f16 {
     ///
     /// ```
     /// #![feature(f16)]
-    /// # #[cfg(not(miri))]
-    /// # #[cfg(target_has_reliable_f16_math)] {
+    /// # #[cfg(target_has_reliable_f16)] {
     ///
     /// let x = 8.0f16;
     ///

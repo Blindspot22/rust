@@ -1,7 +1,8 @@
 use rustc_abi::Endian;
 
 use crate::spec::{
-    Abi, Arch, Cc, LinkerFlavor, Lld, StackProbeType, Target, TargetMetadata, TargetOptions, base,
+    Arch, Cc, CfgAbi, LinkerFlavor, Lld, LlvmAbi, StackProbeType, Target, TargetMetadata,
+    TargetOptions, base,
 };
 
 pub(crate) fn target() -> Target {
@@ -10,15 +11,15 @@ pub(crate) fn target() -> Target {
     base.add_pre_link_args(LinkerFlavor::Gnu(Cc::Yes, Lld::No), &["-m64"]);
     base.max_atomic_width = Some(64);
     base.stack_probes = StackProbeType::Inline;
-    base.abi = Abi::ElfV2;
-    base.llvm_abiname = "elfv2".into();
+    base.cfg_abi = CfgAbi::ElfV2;
+    base.llvm_abiname = LlvmAbi::ElfV2;
 
     Target {
         llvm_target: "powerpc64-unknown-linux-musl".into(),
         metadata: TargetMetadata {
             description: Some("64-bit PowerPC Linux with musl 1.2.5".into()),
-            tier: Some(3),
-            host_tools: Some(false),
+            tier: Some(2),
+            host_tools: Some(true),
             std: Some(true),
         },
         pointer_width: 64,

@@ -1,25 +1,26 @@
 use std::sync::Arc;
 
 use rustc_ast::{self as ast, *};
+use rustc_errors::StashKey;
 use rustc_hir::def::{DefKind, PartialRes, PerNS, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::{self as hir, GenericArg};
 use rustc_middle::{span_bug, ty};
-use rustc_session::parse::add_feature_diagnostics;
+use rustc_session::errors::add_feature_diagnostics;
 use rustc_span::{BytePos, DUMMY_SP, DesugaringKind, Ident, Span, Symbol, sym};
 use smallvec::smallvec;
 use tracing::{debug, instrument};
 
-use super::errors::{
+use crate::diagnostics::{
     AsyncBoundNotOnTrait, AsyncBoundOnlyForFnTraits, BadReturnTypeNotation,
     GenericTypeWithParentheses, RTNSuggestion, UseAngleBrackets,
 };
-use super::{
+use crate::{
     AllowReturnTypeNotation, GenericArgsCtor, GenericArgsMode, ImplTraitContext, ImplTraitPosition,
-    LifetimeRes, LoweringContext, ParamMode, ResolverAstLoweringExt,
+    LifetimeRes, LoweringContext, ParamMode,
 };
 
-impl<'a, 'hir> LoweringContext<'a, 'hir> {
+impl<'hir> LoweringContext<'_, 'hir> {
     #[instrument(level = "trace", skip(self))]
     pub(crate) fn lower_qpath(
         &mut self,
@@ -40,8 +41,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                 self.lower_ty_alloc(&q.ty, ImplTraitContext::Disallowed(ImplTraitPosition::Path))
             });
 
-        let partial_res =
-            self.resolver.get_partial_res(id).unwrap_or_else(|| PartialRes::new(Res::Err));
+        let partial_res = self.get_partial_res(id).unwrap_or_else(|| PartialRes::new(Res::Err));
         let base_res = partial_res.base_res();
         let unresolved_segments = partial_res.unresolved_segments();
 
@@ -112,7 +112,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                         }
                         // `a::b::Trait(Args)::TraitItem`
                         Res::Def(DefKind::AssocFn, _)
-                        | Res::Def(DefKind::AssocConst, _)
+                        | Res::Def(DefKind::AssocConst { .. }, _)
                         | Res::Def(DefKind::AssocTy, _)
                             if i + 2 == proj_start =>
                         {
@@ -298,7 +298,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                                 sym::return_type_notation,
                             );
                         }
-                        err.emit();
+                        err.stash(path_span, StashKey::ReturnTypeNotation);
                         (
                             GenericArgsCtor {
                                 args: Default::default(),
@@ -422,7 +422,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         segment_ident_span: Span,
         generic_args: &mut GenericArgsCtor<'hir>,
     ) {
-        let (start, end) = match self.resolver.get_lifetime_res(segment_id) {
+        let (start, end) = match self.owner.get_lifetime_res(segment_id) {
             Some(LifetimeRes::ElidedAnchor { start, end }) => (start, end),
             None => return,
             Some(res) => {

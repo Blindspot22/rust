@@ -52,7 +52,7 @@ jobs:
       run_type: ${{ steps.jobs.outputs.run_type }}
     steps:
       - name: Checkout the source code
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Test citool
         # Only test citool on the auto branch, to reduce latency of the calculate matrix job
         # on PR/try builds.
@@ -94,6 +94,10 @@ jobs:
       CACHE_DOMAIN: ci-caches.rust-lang.org
     continue-on-error: ${{ matrix.continue_on_error || false }}
     strategy:
+      # If the user starts multiple jobs in a try build, let them all finish.
+      # Try builds are sometimes used to test several jobs at once, and it is useful to know which
+      # of them would succeed or not.
+      fail-fast: ${{ needs.calculate_matrix.outputs.run_type != 'try' }}
       matrix:
         # Check the `calculate_matrix` job to see how is the matrix defined.
         include: ${{ fromJSON(needs.calculate_matrix.outputs.jobs) }}
@@ -113,7 +117,7 @@ jobs:
         run: git config --global core.autocrlf false
 
       - name: checkout the source code
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 2
 
@@ -164,9 +168,6 @@ jobs:
 
       - name: install sccache
         run: src/ci/scripts/install-sccache.sh
-
-      - name: select Xcode
-        run: src/ci/scripts/select-xcode.sh
 
       - name: install clang
         run: src/ci/scripts/install-clang.sh
@@ -253,7 +254,7 @@ jobs:
           df -h
 
       - name: upload artifacts to github
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           # name is set in previous step
           name: ${{ env.DOC_ARTIFACT_NAME }}
@@ -314,7 +315,7 @@ jobs:
     environment: ${{ (github.repository == 'rust-lang/rust' && 'bors') || '' }}
     steps:
       - name: checkout the source code
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 2
       # Publish the toolstate if an auto build succeeds (just before push to the default branch)

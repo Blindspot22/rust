@@ -61,8 +61,9 @@ pub mod from_path;
 fn t1() {}
 
 #[must_use]
-#[must_use = "some message"] //~ ERROR unused attribute
-//~^ WARN this was previously accepted
+#[must_use = "some message"]
+//~^ ERROR unused attribute
+//~| WARN this was previously accepted
 // No warnings for #[repr], would require more logic.
 #[repr(C)]
 #[repr(C)]
@@ -89,15 +90,15 @@ pub fn xyz() {}
 #[link(name = "rust_test_helpers", kind = "static")]
 #[link(name = "rust_test_helpers", kind = "static")]
 extern "C" {
-    #[link_name = "this_does_not_exist"] //~ ERROR unused attribute
+    #[link_name = "this_does_not_exist"]
+    #[link_name = "rust_dbg_extern_identity_u32"] //~ ERROR unused attribute
     //~^ WARN this was previously accepted
-    #[link_name = "rust_dbg_extern_identity_u32"]
     pub fn name_in_rust(v: u32) -> u32;
 }
 
-#[export_name = "exported_symbol_name"] //~ ERROR unused attribute
+#[export_name = "exported_symbol_name"]
+#[export_name = "exported_symbol_name2"] //~ ERROR unused attribute
 //~^ WARN this was previously accepted
-#[export_name = "exported_symbol_name2"]
 pub fn export_test() {}
 
 #[no_mangle]
@@ -108,10 +109,10 @@ pub fn no_mangle_test() {}
 #[used] //~ ERROR unused attribute
 static FOO: u32 = 0;
 
-#[link_section = ".text"]
+#[link_section = "__TEXT,__text"]
+#[link_section = "__DATA,__mod_init_func"]
 //~^ ERROR unused attribute
 //~| WARN this was previously accepted
-#[link_section = ".bss"]
 pub extern "C" fn example() {}
 
 fn main() {}

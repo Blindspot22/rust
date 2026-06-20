@@ -4,11 +4,11 @@ use rustc_span::Symbol;
 use rustc_target::callconv::FnAbi;
 
 use self::shims::unix::linux::mem::EvalContextExt as _;
-use self::shims::unix::linux_like::epoll::EvalContextExt as _;
 use self::shims::unix::linux_like::eventfd::EvalContextExt as _;
 use self::shims::unix::linux_like::syscall::syscall;
 use crate::machine::{SIGRTMAX, SIGRTMIN};
 use crate::shims::unix::foreign_items::EvalContextExt as _;
+use crate::shims::unix::linux_like::thread::prctl;
 use crate::shims::unix::*;
 use crate::*;
 
@@ -45,6 +45,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write_scalar(result, dest)?;
             }
             "pread64" => {
+                // FIXME: This does not have a direct test (#3179).
                 let [fd, buf, count, offset] = this.check_shim_sig(
                     shim_sig!(extern "C" fn(i32, *mut _, usize, libc::off64_t) -> isize),
                     link_name,
@@ -58,6 +59,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.read(fd, buf, count, Some(offset), dest)?;
             }
             "pwrite64" => {
+                // FIXME: This does not have a direct test (#3179).
                 let [fd, buf, n, offset] = this.check_shim_sig(
                     shim_sig!(extern "C" fn(i32, *const _, usize, libc::off64_t) -> isize),
                     link_name,
@@ -72,6 +74,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write(fd, buf, count, Some(offset), dest)?;
             }
             "lseek64" => {
+                // FIXME: This does not have a direct test (#3179).
                 let [fd, offset, whence] = this.check_shim_sig(
                     shim_sig!(extern "C" fn(i32, libc::off64_t, i32) -> libc::off64_t),
                     link_name,
@@ -81,7 +84,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let fd = this.read_scalar(fd)?.to_i32()?;
                 let offset = this.read_scalar(offset)?.to_int(offset.layout.size)?;
                 let whence = this.read_scalar(whence)?.to_i32()?;
-                this.lseek64(fd, offset, whence, dest)?;
+                this.lseek(fd, offset, whence, dest)?;
             }
             "ftruncate64" => {
                 let [fd, length] = this.check_shim_sig(
@@ -112,8 +115,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
             "readdir64" => {
                 let [dirp] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
-                let result = this.readdir64("dirent64", dirp)?;
-                this.write_scalar(result, dest)?;
+                this.readdir(dirp, dest)?;
             }
             "sync_file_range" => {
                 let [fd, offset, nbytes, flags] =
@@ -162,7 +164,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 )? {
                     ThreadNameResult::Ok => Scalar::from_u32(0),
                     ThreadNameResult::NameTooLong => this.eval_libc("ERANGE"),
-                    // Act like we faild to open `/proc/self/task/$tid/comm`.
+                    // Act like we failed to open `/proc/self/task/$tid/comm`.
                     ThreadNameResult::ThreadNotFound => this.eval_libc("ENOENT"),
                 };
                 this.write_scalar(res, dest)?;
@@ -183,7 +185,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     )? {
                         ThreadNameResult::Ok => Scalar::from_u32(0),
                         ThreadNameResult::NameTooLong => unreachable!(),
-                        // Act like we faild to open `/proc/self/task/$tid/comm`.
+                        // Act like we failed to open `/proc/self/task/$tid/comm`.
                         ThreadNameResult::ThreadNotFound => this.eval_libc("ENOENT"),
                     }
                 } else {
@@ -196,6 +198,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let result = this.unix_gettid(link_name.as_str())?;
                 this.write_scalar(result, dest)?;
             }
+            "prctl" => prctl(this, link_name, abi, args, dest)?,
 
             // Dynamically invoked syscalls
             "syscall" => {
@@ -244,6 +247,17 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let [_thread, _attr] =
                     this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 this.write_null(dest)?;
+            }
+            "gnu_get_libc_version"
+                if this.frame_in_std()
+                    && this.tcx.sess.target.env == rustc_target::spec::Env::Gnu =>
+            {
+                let [] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
+                // We have to be at least version 2.26 so that std does not call `res_init`.
+                // This returns a C string, so we have to add a null terminator.
+                let version = "2.26\0";
+                let version = this.allocate_str_dedup(version)?;
+                this.write_pointer(version.ptr(), dest)?;
             }
 
             _ => return interp_ok(EmulateItemResult::NotSupported),

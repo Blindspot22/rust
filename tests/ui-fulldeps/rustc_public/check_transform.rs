@@ -6,8 +6,6 @@
 //@ ignore-remote
 
 #![feature(rustc_private)]
-#![feature(assert_matches)]
-#![feature(ascii_char, ascii_char_variants)]
 
 extern crate rustc_hir;
 extern crate rustc_middle;
@@ -63,7 +61,7 @@ fn check_msg(body: &Body, expected: &str) {
                             .find_map(|stmt| match &stmt.kind {
                                 StatementKind::Assign(
                                     destination,
-                                    Rvalue::Use(Operand::Constant(msg_const)),
+                                    Rvalue::Use(Operand::Constant(msg_const), _),
                                 ) if destination == place => Some(msg_const),
                                 _ => None,
                             })

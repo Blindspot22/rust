@@ -3,6 +3,7 @@
 mod init_mask;
 mod provenance_map;
 
+use std::alloc::{self, Layout};
 use std::borrow::Cow;
 use std::hash::Hash;
 use std::ops::{Deref, DerefMut, Range};
@@ -15,7 +16,7 @@ use provenance_map::*;
 use rustc_abi::{Align, HasDataLayout, Size};
 use rustc_ast::Mutability;
 use rustc_data_structures::intern::Interned;
-use rustc_macros::HashStable;
+use rustc_macros::StableHash;
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 
 use super::{
@@ -90,7 +91,7 @@ impl AllocBytes for Box<[u8]> {
 // Note: for performance reasons when interning, some of the `Allocation` fields can be partially
 // hashed. (see the `Hash` impl below for more details), so the impl is not derived.
 #[derive(Clone, Eq, PartialEq)]
-#[derive(HashStable)]
+#[derive(StableHash)]
 pub struct Allocation<Prov: Provenance = CtfeProvenance, Extra = (), Bytes = Box<[u8]>> {
     /// The actual bytes of the allocation.
     /// Note that the bytes of a pointer represent the offset of the pointer.
@@ -280,7 +281,7 @@ impl hash::Hash for Allocation {
 /// Here things are different because only const allocations are interned. This
 /// means that both the inner type (`Allocation`) and the outer type
 /// (`ConstAllocation`) are used quite a bit.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, HashStable)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, StableHash)]
 #[rustc_pass_by_value]
 pub struct ConstAllocation<'tcx>(pub Interned<'tcx, Allocation>);
 
@@ -340,13 +341,13 @@ impl AllocError {
 }
 
 /// The information that makes up a memory access: offset and size.
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub struct AllocRange {
     pub start: Size,
     pub size: Size,
 }
 
-impl fmt::Debug for AllocRange {
+impl fmt::Display for AllocRange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[{:#x}..{:#x}]", self.start.bytes(), self.end().bytes())
     }
@@ -434,7 +435,7 @@ impl<Prov: Provenance, Bytes: AllocBytes> Allocation<Prov, (), Bytes> {
         // available to the compiler can change between runs. Normally queries are always
         // deterministic. However, we can be non-deterministic here because all uses of const
         // evaluation (including ConstProp!) will make compilation fail (via hard error
-        // or ICE) upon encountering a `MemoryExhausted` error.
+        // or OOM) upon encountering a `MemoryExhausted` error.
         let bytes = Bytes::zeroed(size, align, params).ok_or_else(fail)?;
 
         Ok(Allocation {
@@ -468,7 +469,7 @@ impl<Prov: Provenance, Bytes: AllocBytes> Allocation<Prov, (), Bytes> {
         .into()
     }
 
-    /// Try to create an Allocation of `size` bytes, panics if there is not enough memory
+    /// Try to create an Allocation of `size` bytes. Aborts if there is not enough memory
     /// available to the compiler to do so.
     ///
     /// Example use case: To obtain an Allocation filled with specific data,
@@ -480,10 +481,15 @@ impl<Prov: Provenance, Bytes: AllocBytes> Allocation<Prov, (), Bytes> {
         params: <Bytes as AllocBytes>::AllocParams,
     ) -> Self {
         match Self::new_inner(size, align, init, params, || {
-            panic!(
-                "interpreter ran out of memory: cannot create allocation of {} bytes",
-                size.bytes()
-            );
+            // `size` may actually be bigger than isize::MAX since it is a *target* size.
+            // Clamp it to isize::MAX to still give a somewhat reasonable error message.
+            alloc::handle_alloc_error(
+                Layout::from_size_align(
+                    size.bytes().min(isize::MAX as u64) as usize,
+                    align.bytes_usize(),
+                )
+                .unwrap(),
+            )
         }) {
             Ok(x) => x,
             Err(x) => x,

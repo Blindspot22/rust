@@ -24,30 +24,32 @@ fn foo() -> i32 {
             let crate_def_map = module.def_map(&db);
             visit_module(&db, crate_def_map, module, &mut |def| {
                 if let ModuleDefId::FunctionId(it) = def {
-                    InferenceResult::for_body(&db, it.into());
+                    InferenceResult::of(&db, DefWithBodyId::from(it));
                 }
             });
         },
         &[("InferenceResult::for_body_", 1)],
         expect_test::expect![[r#"
             [
+                "source_root_crates",
                 "crate_local_def_map",
                 "file_item_tree_query",
-                "ast_id_map_shim",
-                "parse_shim",
-                "real_span_map_shim",
+                "ast_id_map",
+                "parse",
+                "real_span_map",
                 "InferenceResult::for_body_",
-                "function_signature_shim",
-                "function_signature_with_source_map_shim",
+                "FunctionSignature::of_",
+                "FunctionSignature::with_source_map_",
                 "AttrFlags::query_",
-                "body_shim",
-                "body_with_source_map_shim",
+                "Body::of_",
+                "Body::with_source_map_",
                 "trait_environment_query",
                 "lang_items",
                 "crate_lang_items",
                 "GenericPredicates::query_with_diagnostics_",
                 "ImplTraits::return_type_impl_traits_",
-                "expr_scopes_shim",
+                "ExprScopes::body_expr_scopes_",
+                "body_upvars_mentioned",
             ]
         "#]],
     );
@@ -68,22 +70,22 @@ fn foo() -> i32 {
             let crate_def_map = module.def_map(&db);
             visit_module(&db, crate_def_map, module, &mut |def| {
                 if let ModuleDefId::FunctionId(it) = def {
-                    InferenceResult::for_body(&db, it.into());
+                    InferenceResult::of(&db, DefWithBodyId::from(it));
                 }
             });
         },
         &[("InferenceResult::for_body_", 0)],
         expect_test::expect![[r#"
             [
-                "parse_shim",
-                "ast_id_map_shim",
+                "parse",
+                "ast_id_map",
                 "file_item_tree_query",
-                "real_span_map_shim",
+                "real_span_map",
                 "AttrFlags::query_",
-                "function_signature_with_source_map_shim",
-                "function_signature_shim",
-                "body_with_source_map_shim",
-                "body_shim",
+                "FunctionSignature::with_source_map_",
+                "FunctionSignature::of_",
+                "Body::with_source_map_",
+                "Body::of_",
             ]
         "#]],
     );
@@ -111,50 +113,54 @@ fn baz() -> i32 {
             let crate_def_map = module.def_map(&db);
             visit_module(&db, crate_def_map, module, &mut |def| {
                 if let ModuleDefId::FunctionId(it) = def {
-                    InferenceResult::for_body(&db, it.into());
+                    InferenceResult::of(&db, DefWithBodyId::from(it));
                 }
             });
         },
         &[("InferenceResult::for_body_", 3)],
         expect_test::expect![[r#"
             [
+                "source_root_crates",
                 "crate_local_def_map",
                 "file_item_tree_query",
-                "ast_id_map_shim",
-                "parse_shim",
-                "real_span_map_shim",
+                "ast_id_map",
+                "parse",
+                "real_span_map",
                 "InferenceResult::for_body_",
-                "function_signature_shim",
-                "function_signature_with_source_map_shim",
+                "FunctionSignature::of_",
+                "FunctionSignature::with_source_map_",
                 "AttrFlags::query_",
-                "body_shim",
-                "body_with_source_map_shim",
+                "Body::of_",
+                "Body::with_source_map_",
                 "trait_environment_query",
                 "lang_items",
                 "crate_lang_items",
                 "GenericPredicates::query_with_diagnostics_",
                 "ImplTraits::return_type_impl_traits_",
-                "expr_scopes_shim",
+                "ExprScopes::body_expr_scopes_",
+                "body_upvars_mentioned",
                 "InferenceResult::for_body_",
-                "function_signature_shim",
-                "function_signature_with_source_map_shim",
+                "FunctionSignature::of_",
+                "FunctionSignature::with_source_map_",
                 "AttrFlags::query_",
-                "body_shim",
-                "body_with_source_map_shim",
+                "Body::of_",
+                "Body::with_source_map_",
                 "trait_environment_query",
                 "GenericPredicates::query_with_diagnostics_",
                 "ImplTraits::return_type_impl_traits_",
-                "expr_scopes_shim",
+                "ExprScopes::body_expr_scopes_",
+                "body_upvars_mentioned",
                 "InferenceResult::for_body_",
-                "function_signature_shim",
-                "function_signature_with_source_map_shim",
+                "FunctionSignature::of_",
+                "FunctionSignature::with_source_map_",
                 "AttrFlags::query_",
-                "body_shim",
-                "body_with_source_map_shim",
+                "Body::of_",
+                "Body::with_source_map_",
                 "trait_environment_query",
                 "GenericPredicates::query_with_diagnostics_",
                 "ImplTraits::return_type_impl_traits_",
-                "expr_scopes_shim",
+                "ExprScopes::body_expr_scopes_",
+                "body_upvars_mentioned",
             ]
         "#]],
     );
@@ -180,34 +186,35 @@ fn baz() -> i32 {
             let crate_def_map = module.def_map(&db);
             visit_module(&db, crate_def_map, module, &mut |def| {
                 if let ModuleDefId::FunctionId(it) = def {
-                    InferenceResult::for_body(&db, it.into());
+                    InferenceResult::of(&db, DefWithBodyId::from(it));
                 }
             });
         },
         &[("InferenceResult::for_body_", 1)],
         expect_test::expect![[r#"
             [
-                "parse_shim",
-                "ast_id_map_shim",
+                "parse",
+                "ast_id_map",
                 "file_item_tree_query",
-                "real_span_map_shim",
+                "real_span_map",
                 "AttrFlags::query_",
-                "function_signature_with_source_map_shim",
-                "function_signature_shim",
-                "body_with_source_map_shim",
-                "body_shim",
+                "FunctionSignature::with_source_map_",
+                "FunctionSignature::of_",
+                "Body::with_source_map_",
+                "Body::of_",
                 "AttrFlags::query_",
-                "function_signature_with_source_map_shim",
-                "function_signature_shim",
-                "body_with_source_map_shim",
-                "body_shim",
+                "FunctionSignature::with_source_map_",
+                "FunctionSignature::of_",
+                "Body::with_source_map_",
+                "Body::of_",
                 "InferenceResult::for_body_",
-                "expr_scopes_shim",
+                "ExprScopes::body_expr_scopes_",
+                "body_upvars_mentioned",
                 "AttrFlags::query_",
-                "function_signature_with_source_map_shim",
-                "function_signature_shim",
-                "body_with_source_map_shim",
-                "body_shim",
+                "FunctionSignature::with_source_map_",
+                "FunctionSignature::of_",
+                "Body::with_source_map_",
+                "Body::of_",
             ]
         "#]],
     );
@@ -237,11 +244,12 @@ $0",
         &[("TraitImpls::for_crate_", 1)],
         expect_test::expect![[r#"
             [
+                "source_root_crates",
                 "crate_local_def_map",
                 "file_item_tree_query",
-                "ast_id_map_shim",
-                "parse_shim",
-                "real_span_map_shim",
+                "ast_id_map",
+                "parse",
+                "real_span_map",
                 "TraitImpls::for_crate_",
                 "lang_items",
                 "crate_lang_items",
@@ -275,10 +283,10 @@ pub struct NewStruct {
         &[("TraitImpls::for_crate_", 1)],
         expect_test::expect![[r#"
             [
-                "parse_shim",
-                "ast_id_map_shim",
+                "parse",
+                "ast_id_map",
                 "file_item_tree_query",
-                "real_span_map_shim",
+                "real_span_map",
                 "crate_local_def_map",
                 "TraitImpls::for_crate_",
                 "crate_lang_items",
@@ -311,11 +319,12 @@ $0",
         &[("TraitImpls::for_crate_", 1)],
         expect_test::expect![[r#"
             [
+                "source_root_crates",
                 "crate_local_def_map",
                 "file_item_tree_query",
-                "ast_id_map_shim",
-                "parse_shim",
-                "real_span_map_shim",
+                "ast_id_map",
+                "parse",
+                "real_span_map",
                 "TraitImpls::for_crate_",
                 "lang_items",
                 "crate_lang_items",
@@ -350,10 +359,10 @@ pub enum SomeEnum {
         &[("TraitImpls::for_crate_", 1)],
         expect_test::expect![[r#"
             [
-                "parse_shim",
-                "ast_id_map_shim",
+                "parse",
+                "ast_id_map",
                 "file_item_tree_query",
-                "real_span_map_shim",
+                "real_span_map",
                 "crate_local_def_map",
                 "TraitImpls::for_crate_",
                 "crate_lang_items",
@@ -386,11 +395,12 @@ $0",
         &[("TraitImpls::for_crate_", 1)],
         expect_test::expect![[r#"
             [
+                "source_root_crates",
                 "crate_local_def_map",
                 "file_item_tree_query",
-                "ast_id_map_shim",
-                "parse_shim",
-                "real_span_map_shim",
+                "ast_id_map",
+                "parse",
+                "real_span_map",
                 "TraitImpls::for_crate_",
                 "lang_items",
                 "crate_lang_items",
@@ -422,10 +432,10 @@ fn bar() -> f32 {
         &[("TraitImpls::for_crate_", 1)],
         expect_test::expect![[r#"
             [
-                "parse_shim",
-                "ast_id_map_shim",
+                "parse",
+                "ast_id_map",
                 "file_item_tree_query",
-                "real_span_map_shim",
+                "real_span_map",
                 "crate_local_def_map",
                 "TraitImpls::for_crate_",
                 "crate_lang_items",
@@ -462,11 +472,12 @@ $0",
         &[("TraitImpls::for_crate_", 1)],
         expect_test::expect![[r#"
             [
+                "source_root_crates",
                 "crate_local_def_map",
                 "file_item_tree_query",
-                "ast_id_map_shim",
-                "parse_shim",
-                "real_span_map_shim",
+                "ast_id_map",
+                "parse",
+                "real_span_map",
                 "TraitImpls::for_crate_",
                 "lang_items",
                 "crate_lang_items",
@@ -506,10 +517,10 @@ impl SomeStruct {
         &[("TraitImpls::for_crate_", 1)],
         expect_test::expect![[r#"
             [
-                "parse_shim",
-                "ast_id_map_shim",
+                "parse",
+                "ast_id_map",
                 "file_item_tree_query",
-                "real_span_map_shim",
+                "real_span_map",
                 "crate_local_def_map",
                 "TraitImpls::for_crate_",
                 "crate_lang_items",
@@ -556,59 +567,61 @@ fn main() {
             });
 
             for def in defs {
-                let _inference_result = InferenceResult::for_body(&db, def);
+                let _inference_result = InferenceResult::of(&db, def);
             }
         },
         &[("trait_solve_shim", 0)],
         expect_test::expect![[r#"
             [
+                "source_root_crates",
                 "crate_local_def_map",
                 "file_item_tree_query",
-                "ast_id_map_shim",
-                "parse_shim",
-                "real_span_map_shim",
+                "ast_id_map",
+                "parse",
+                "real_span_map",
                 "TraitItems::query_with_diagnostics_",
-                "body_shim",
-                "body_with_source_map_shim",
+                "Body::of_",
+                "Body::with_source_map_",
                 "AttrFlags::query_",
                 "ImplItems::of_",
                 "InferenceResult::for_body_",
-                "trait_signature_shim",
-                "trait_signature_with_source_map_shim",
+                "TraitSignature::of_",
+                "TraitSignature::with_source_map_",
                 "AttrFlags::query_",
-                "function_signature_shim",
-                "function_signature_with_source_map_shim",
+                "FunctionSignature::of_",
+                "FunctionSignature::with_source_map_",
                 "AttrFlags::query_",
-                "body_shim",
-                "body_with_source_map_shim",
+                "Body::of_",
+                "Body::with_source_map_",
                 "trait_environment_query",
                 "lang_items",
                 "crate_lang_items",
                 "GenericPredicates::query_with_diagnostics_",
                 "GenericPredicates::query_with_diagnostics_",
                 "ImplTraits::return_type_impl_traits_",
+                "body_upvars_mentioned",
                 "InferenceResult::for_body_",
-                "function_signature_shim",
-                "function_signature_with_source_map_shim",
+                "FunctionSignature::of_",
+                "FunctionSignature::with_source_map_",
                 "trait_environment_query",
                 "GenericPredicates::query_with_diagnostics_",
                 "ImplTraits::return_type_impl_traits_",
-                "expr_scopes_shim",
-                "struct_signature_shim",
-                "struct_signature_with_source_map_shim",
+                "ExprScopes::body_expr_scopes_",
+                "StructSignature::of_",
+                "StructSignature::with_source_map_",
                 "AttrFlags::query_",
                 "GenericPredicates::query_with_diagnostics_",
-                "value_ty_query",
                 "InherentImpls::for_crate_",
-                "callable_item_signature_query",
+                "callable_item_signature_with_diagnostics",
                 "TraitImpls::for_crate_and_deps_",
                 "TraitImpls::for_crate_",
-                "impl_trait_with_diagnostics_query",
-                "impl_signature_shim",
-                "impl_signature_with_source_map_shim",
-                "impl_self_ty_with_diagnostics_query",
+                "impl_trait_with_diagnostics",
+                "ImplSignature::of_",
+                "ImplSignature::with_source_map_",
+                "impl_self_ty_with_diagnostics",
                 "AttrFlags::query_",
                 "GenericPredicates::query_with_diagnostics_",
+                "body_upvars_mentioned",
             ]
         "#]],
     );
@@ -651,51 +664,53 @@ fn main() {
             });
 
             for def in defs {
-                let _inference_result = InferenceResult::for_body(&db, def);
+                let _inference_result = InferenceResult::of(&db, def);
             }
         },
         &[("trait_solve_shim", 0)],
         expect_test::expect![[r#"
             [
-                "parse_shim",
-                "ast_id_map_shim",
+                "parse",
+                "ast_id_map",
                 "file_item_tree_query",
-                "real_span_map_shim",
+                "real_span_map",
                 "crate_local_def_map",
                 "TraitItems::query_with_diagnostics_",
-                "body_with_source_map_shim",
+                "Body::with_source_map_",
                 "AttrFlags::query_",
-                "body_shim",
+                "Body::of_",
                 "ImplItems::of_",
                 "InferenceResult::for_body_",
                 "AttrFlags::query_",
-                "trait_signature_with_source_map_shim",
+                "TraitSignature::with_source_map_",
                 "AttrFlags::query_",
-                "function_signature_with_source_map_shim",
-                "function_signature_shim",
-                "body_with_source_map_shim",
-                "body_shim",
+                "FunctionSignature::with_source_map_",
+                "FunctionSignature::of_",
+                "Body::with_source_map_",
+                "Body::of_",
                 "crate_lang_items",
                 "GenericPredicates::query_with_diagnostics_",
                 "GenericPredicates::query_with_diagnostics_",
                 "ImplTraits::return_type_impl_traits_",
+                "body_upvars_mentioned",
                 "InferenceResult::for_body_",
-                "function_signature_with_source_map_shim",
+                "FunctionSignature::with_source_map_",
                 "GenericPredicates::query_with_diagnostics_",
                 "ImplTraits::return_type_impl_traits_",
-                "expr_scopes_shim",
-                "struct_signature_with_source_map_shim",
+                "ExprScopes::body_expr_scopes_",
+                "StructSignature::with_source_map_",
                 "AttrFlags::query_",
                 "GenericPredicates::query_with_diagnostics_",
                 "InherentImpls::for_crate_",
-                "callable_item_signature_query",
+                "callable_item_signature_with_diagnostics",
                 "TraitImpls::for_crate_",
-                "impl_signature_with_source_map_shim",
-                "impl_signature_shim",
-                "impl_trait_with_diagnostics_query",
-                "impl_self_ty_with_diagnostics_query",
+                "ImplSignature::with_source_map_",
+                "ImplSignature::of_",
+                "impl_trait_with_diagnostics",
+                "impl_self_ty_with_diagnostics",
                 "AttrFlags::query_",
                 "GenericPredicates::query_with_diagnostics_",
+                "body_upvars_mentioned",
             ]
         "#]],
     );
@@ -709,6 +724,7 @@ fn execute_assert_events(
 ) {
     crate::attach_db(db, || {
         let (executed, events) = db.log_executed(f);
+        expect.assert_debug_eq(&executed);
         for (event, count) in required {
             let n = executed.iter().filter(|it| it.contains(event)).count();
             assert_eq!(
@@ -724,6 +740,5 @@ fn execute_assert_events(
                     .collect::<Vec<_>>(),
             );
         }
-        expect.assert_debug_eq(&executed);
     });
 }

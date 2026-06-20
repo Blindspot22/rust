@@ -3,9 +3,6 @@
 use std::fmt;
 
 use rustc_data_structures::fx::FxHashSet;
-use rustc_data_structures::graph::linked_graph::{
-    Direction, INCOMING, LinkedGraph, NodeIndex, OUTGOING,
-};
 use rustc_data_structures::intern::Interned;
 use rustc_data_structures::unord::UnordSet;
 use rustc_index::{IndexSlice, IndexVec};
@@ -18,10 +15,13 @@ use rustc_span::Span;
 use tracing::{debug, instrument};
 
 use super::outlives::test_type_match;
+use crate::infer::lexical_region_resolve::indexed_edges::{EdgeDirection, IndexedConstraintEdges};
 use crate::infer::region_constraints::{
-    Constraint, ConstraintKind, GenericKind, RegionConstraintData, VarInfos, VerifyBound,
+    ConstraintKind, GenericKind, RegionConstraintData, VarInfos, VerifyBound,
 };
 use crate::infer::{RegionRelations, RegionVariableOrigin, SubregionOrigin};
+
+mod indexed_edges;
 
 /// This function performs lexical region resolution given a complete
 /// set of constraints and variable origins. It performs a fixed-point
@@ -34,6 +34,18 @@ pub(crate) fn resolve<'tcx>(
     var_infos: VarInfos<'tcx>,
     data: RegionConstraintData<'tcx>,
 ) -> (LexicalRegionResolutions<'tcx>, Vec<RegionResolutionError<'tcx>>) {
+    assert!(
+        data.constraints.iter().all(|(c, _)| match c.kind {
+            ConstraintKind::VarSubVar
+            | ConstraintKind::RegSubVar
+            | ConstraintKind::VarSubReg
+            | ConstraintKind::RegSubReg => true,
+
+            ConstraintKind::VarEqVar | ConstraintKind::VarEqReg | ConstraintKind::RegEqReg => false,
+        }),
+        "Every constraint should be decomposed into outlives here"
+    );
+
     let mut errors = vec![];
     let mut resolver = LexicalResolver { region_rels, var_infos, data };
     let values = resolver.infer_variable_values(&mut errors);
@@ -118,8 +130,6 @@ struct RegionAndOrigin<'tcx> {
     origin: SubregionOrigin<'tcx>,
 }
 
-type RegionGraph<'tcx> = LinkedGraph<(), Constraint<'tcx>>;
-
 struct LexicalResolver<'cx, 'tcx> {
     region_rels: &'cx RegionRelations<'cx, 'tcx>,
     var_infos: VarInfos<'tcx>,
@@ -139,7 +149,11 @@ impl<'cx, 'tcx> LexicalResolver<'cx, 'tcx> {
 
         // Deduplicating constraints is shown to have a positive perf impact.
         let mut seen = UnordSet::default();
-        self.data.constraints.retain(|(constraint, _)| seen.insert(*constraint));
+        self.data.constraints.retain_mut(|(constraint, _)| {
+            // We don't want to discern constraints by leak check visibility here
+            constraint.visible_for_leak_check = ty::VisibleForLeakCheck::Unreachable;
+            seen.insert(*constraint)
+        });
 
         if cfg!(debug_assertions) {
             self.dump_constraints();
@@ -280,6 +294,10 @@ impl<'cx, 'tcx> LexicalResolver<'cx, 'tcx> {
                     // These constraints are checked after expansion
                     // is done, in `collect_errors`.
                     continue;
+                }
+
+                ConstraintKind::VarEqVar | ConstraintKind::VarEqReg | ConstraintKind::RegEqReg => {
+                    unreachable!()
                 }
             }
         }
@@ -577,6 +595,10 @@ impl<'cx, 'tcx> LexicalResolver<'cx, 'tcx> {
                         *sub_data = VarValue::ErrorValue;
                     }
                 }
+
+                ConstraintKind::VarEqVar | ConstraintKind::VarEqReg | ConstraintKind::RegEqReg => {
+                    unreachable!()
+                }
             }
         }
 
@@ -626,9 +648,8 @@ impl<'cx, 'tcx> LexicalResolver<'cx, 'tcx> {
         // overlapping locations.
         let mut dup_vec = IndexVec::from_elem_n(None, self.num_vars());
 
-        // Only construct the graph when necessary, because it's moderately
-        // expensive.
-        let mut graph = None;
+        // Only construct the edge index when necessary, because it's moderately expensive.
+        let mut edges: Option<IndexedConstraintEdges<'_, 'tcx>> = None;
 
         for (node_vid, value) in var_data.values.iter_enumerated() {
             match *value {
@@ -662,56 +683,18 @@ impl<'cx, 'tcx> LexicalResolver<'cx, 'tcx> {
                     // influence the constraints on this value for
                     // richer diagnostics in `static_impl_trait`.
 
-                    let g = graph.get_or_insert_with(|| self.construct_graph());
-                    self.collect_error_for_expanding_node(g, &mut dup_vec, node_vid, errors);
+                    let e = edges.get_or_insert_with(|| {
+                        IndexedConstraintEdges::build_index(self.num_vars(), &self.data)
+                    });
+                    self.collect_error_for_expanding_node(e, &mut dup_vec, node_vid, errors);
                 }
             }
         }
-    }
-
-    fn construct_graph(&self) -> RegionGraph<'tcx> {
-        let num_vars = self.num_vars();
-
-        let mut graph = LinkedGraph::new();
-
-        for _ in 0..num_vars {
-            graph.add_node(());
-        }
-
-        // Issue #30438: two distinct dummy nodes, one for incoming
-        // edges (dummy_source) and another for outgoing edges
-        // (dummy_sink). In `dummy -> a -> b -> dummy`, using one
-        // dummy node leads one to think (erroneously) there exists a
-        // path from `b` to `a`. Two dummy nodes sidesteps the issue.
-        let dummy_source = graph.add_node(());
-        let dummy_sink = graph.add_node(());
-
-        for (c, _) in &self.data.constraints {
-            match c.kind {
-                ConstraintKind::VarSubVar => {
-                    let sub_vid = c.sub.as_var();
-                    let sup_vid = c.sup.as_var();
-                    graph.add_edge(NodeIndex(sub_vid.index()), NodeIndex(sup_vid.index()), *c);
-                }
-                ConstraintKind::RegSubVar => {
-                    graph.add_edge(dummy_source, NodeIndex(c.sup.as_var().index()), *c);
-                }
-                ConstraintKind::VarSubReg => {
-                    graph.add_edge(NodeIndex(c.sub.as_var().index()), dummy_sink, *c);
-                }
-                ConstraintKind::RegSubReg => {
-                    // this would be an edge from `dummy_source` to
-                    // `dummy_sink`; just ignore it.
-                }
-            }
-        }
-
-        graph
     }
 
     fn collect_error_for_expanding_node(
         &self,
-        graph: &RegionGraph<'tcx>,
+        edges: &IndexedConstraintEdges<'_, 'tcx>,
         dup_vec: &mut IndexSlice<RegionVid, Option<RegionVid>>,
         node_idx: RegionVid,
         errors: &mut Vec<RegionResolutionError<'tcx>>,
@@ -719,9 +702,9 @@ impl<'cx, 'tcx> LexicalResolver<'cx, 'tcx> {
         // Errors in expanding nodes result from a lower-bound that is
         // not contained by an upper-bound.
         let (mut lower_bounds, lower_vid_bounds, lower_dup) =
-            self.collect_bounding_regions(graph, node_idx, INCOMING, Some(dup_vec));
+            self.collect_bounding_regions(edges, node_idx, EdgeDirection::In, Some(dup_vec));
         let (mut upper_bounds, _, upper_dup) =
-            self.collect_bounding_regions(graph, node_idx, OUTGOING, Some(dup_vec));
+            self.collect_bounding_regions(edges, node_idx, EdgeDirection::Out, Some(dup_vec));
 
         if lower_dup || upper_dup {
             return;
@@ -829,9 +812,9 @@ impl<'cx, 'tcx> LexicalResolver<'cx, 'tcx> {
     ///   those returned by a previous call for another region.
     fn collect_bounding_regions(
         &self,
-        graph: &RegionGraph<'tcx>,
+        edges: &IndexedConstraintEdges<'_, 'tcx>,
         orig_node_idx: RegionVid,
-        dir: Direction,
+        dir: EdgeDirection,
         mut dup_vec: Option<&mut IndexSlice<RegionVid, Option<RegionVid>>>,
     ) -> (Vec<RegionAndOrigin<'tcx>>, FxHashSet<RegionVid>, bool) {
         struct WalkState<'tcx> {
@@ -850,7 +833,7 @@ impl<'cx, 'tcx> LexicalResolver<'cx, 'tcx> {
 
         // to start off the process, walk the source node in the
         // direction specified
-        process_edges(&self.data, &mut state, graph, orig_node_idx, dir);
+        process_edges(&mut state, edges, orig_node_idx, dir);
 
         while let Some(node_idx) = state.stack.pop() {
             // check whether we've visited this node on some previous walk
@@ -867,30 +850,25 @@ impl<'cx, 'tcx> LexicalResolver<'cx, 'tcx> {
                 );
             }
 
-            process_edges(&self.data, &mut state, graph, node_idx, dir);
+            process_edges(&mut state, edges, node_idx, dir);
         }
 
         let WalkState { result, dup_found, set, .. } = state;
         return (result, set, dup_found);
 
         fn process_edges<'tcx>(
-            this: &RegionConstraintData<'tcx>,
             state: &mut WalkState<'tcx>,
-            graph: &RegionGraph<'tcx>,
+            edges: &IndexedConstraintEdges<'_, 'tcx>,
             source_vid: RegionVid,
-            dir: Direction,
+            dir: EdgeDirection,
         ) {
             debug!("process_edges(source_vid={:?}, dir={:?})", source_vid, dir);
 
-            let source_node_index = NodeIndex(source_vid.index());
-            for (_, edge) in graph.adjacent_edges(source_node_index, dir) {
-                let get_origin =
-                    || this.constraints.iter().find(|(c, _)| *c == edge.data).unwrap().1.clone();
-
-                match edge.data.kind {
+            for (c, origin) in edges.adjacent_edges(source_vid, dir) {
+                match c.kind {
                     ConstraintKind::VarSubVar => {
-                        let from_vid = edge.data.sub.as_var();
-                        let to_vid = edge.data.sup.as_var();
+                        let from_vid = c.sub.as_var();
+                        let to_vid = c.sup.as_var();
                         let opp_vid = if from_vid == source_vid { to_vid } else { from_vid };
                         if state.set.insert(opp_vid) {
                             state.stack.push(opp_vid);
@@ -898,19 +876,23 @@ impl<'cx, 'tcx> LexicalResolver<'cx, 'tcx> {
                     }
 
                     ConstraintKind::RegSubVar => {
-                        let origin = get_origin();
-                        state.result.push(RegionAndOrigin { region: edge.data.sub, origin });
+                        let origin = (*origin).clone();
+                        state.result.push(RegionAndOrigin { region: c.sub, origin });
                     }
 
                     ConstraintKind::VarSubReg => {
-                        let origin = get_origin();
-                        state.result.push(RegionAndOrigin { region: edge.data.sup, origin });
+                        let origin = (*origin).clone();
+                        state.result.push(RegionAndOrigin { region: c.sup, origin });
                     }
 
                     ConstraintKind::RegSubReg => panic!(
                         "cannot reach reg-sub-reg edge in region inference \
                          post-processing"
                     ),
+
+                    ConstraintKind::VarEqVar
+                    | ConstraintKind::VarEqReg
+                    | ConstraintKind::RegEqReg => unreachable!(),
                 }
             }
         }

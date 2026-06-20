@@ -2,6 +2,7 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
+use crate::convert::{BoundedCastFromInt, CheckedCastFromInt};
 use crate::panic::const_panic;
 use crate::str::FromStr;
 use crate::ub_checks::assert_unsafe_precondition;
@@ -27,16 +28,14 @@ macro_rules! sign_dependent_expr {
     };
 }
 
-// All these modules are technically private and only exposed for coretests:
-#[cfg(not(no_fp_fmt_parse))]
-pub mod bignum;
-#[cfg(not(no_fp_fmt_parse))]
-pub mod dec2flt;
-#[cfg(not(no_fp_fmt_parse))]
-pub mod diy_float;
-#[cfg(not(no_fp_fmt_parse))]
-pub mod flt2dec;
-pub mod fmt;
+// These modules are public only for testing.
+#[doc(hidden)]
+#[unstable(
+    feature = "num_internals",
+    reason = "internal routines only exposed for testing",
+    issue = "none"
+)]
+pub mod imp;
 
 #[macro_use]
 mod int_macros; // import int_impl!
@@ -44,28 +43,26 @@ mod int_macros; // import int_impl!
 mod uint_macros; // import uint_impl!
 
 mod error;
-mod int_bits;
-mod int_log10;
-mod int_sqrt;
-pub(crate) mod libm;
+#[cfg(not(no_fp_fmt_parse))]
+mod float_parse;
 mod nonzero;
-mod overflow_panic;
 mod saturating;
+mod traits;
 mod wrapping;
 
 /// 100% perma-unstable
 #[doc(hidden)]
 pub mod niche_types;
 
-#[stable(feature = "rust1", since = "1.0.0")]
-#[cfg(not(no_fp_fmt_parse))]
-pub use dec2flt::ParseFloatError;
 #[stable(feature = "int_error_matching", since = "1.55.0")]
 pub use error::IntErrorKind;
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use error::ParseIntError;
 #[stable(feature = "try_from", since = "1.34.0")]
 pub use error::TryFromIntError;
+#[stable(feature = "rust1", since = "1.0.0")]
+#[cfg(not(no_fp_fmt_parse))]
+pub use float_parse::ParseFloatError;
 #[stable(feature = "generic_nonzero", since = "1.79.0")]
 pub use nonzero::NonZero;
 #[unstable(
@@ -244,6 +241,137 @@ macro_rules! midpoint_impl {
     };
 }
 
+macro_rules! widening_mul_impl {
+    ($SelfT:ty, $WideT:ty) => {
+        /// Widening multiplication. Computes `self * rhs`, widening to a larger integer.
+        ///
+        /// The returned value is always exact and can never overflow.
+        ///
+        /// Note that this method is semantically equivalent to [`carrying_mul`] with a
+        /// carry of zero, with the latter instead returning a tuple denoting the low and
+        /// high parts of the result. Consider using it instead if you need
+        /// interoperability with other big int helper functions, or if this method isn't
+        /// available for a given type.
+        ///
+        /// [`carrying_mul`]: Self::carrying_mul
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// #![feature(widening_mul)]
+        ///
+        #[doc = concat!("assert_eq!(", stringify!($SelfT), "::MAX.widening_mul(0_", stringify!($SelfT), "), 0);")]
+        #[doc = concat!("assert_eq!(", stringify!($SelfT), "::MAX.widening_mul(", stringify!($SelfT), "::MAX), ", stringify!($SelfT), "::MAX as ", stringify!($WideT), " * ", stringify!($SelfT), "::MAX as ", stringify!($WideT), ");")]
+        /// ```
+        #[unstable(feature = "widening_mul", issue = "152016")]
+        #[rustc_const_unstable(feature = "widening_mul", issue = "152016")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        pub const fn widening_mul(self, rhs: Self) -> $WideT {
+            self as $WideT * rhs as $WideT
+        }
+    }
+}
+
+macro_rules! widening_carryless_mul_impl {
+    ($SelfT:ty, $WideT:ty) => {
+        /// Performs a widening carry-less multiplication.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// #![feature(uint_carryless_mul)]
+        ///
+        #[doc = concat!("assert_eq!(", stringify!($SelfT), "::MAX.widening_carryless_mul(",
+                                stringify!($SelfT), "::MAX), ", stringify!($WideT), "::MAX / 3);")]
+        /// ```
+        #[rustc_const_unstable(feature = "uint_carryless_mul", issue = "152080")]
+        #[doc(alias = "clmul")]
+        #[unstable(feature = "uint_carryless_mul", issue = "152080")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        pub const fn widening_carryless_mul(self, rhs: $SelfT) -> $WideT {
+            (self as $WideT).carryless_mul(rhs as $WideT)
+        }
+    }
+}
+
+macro_rules! carrying_carryless_mul_impl {
+    (u128, u256) => {
+        carrying_carryless_mul_impl! { @internal u128 =>
+            pub const fn carrying_carryless_mul(self, rhs: Self, carry: Self) -> (Self, Self) {
+                let x0 = self as u64;
+                let x1 = (self >> 64) as u64;
+                let y0 = rhs as u64;
+                let y1 = (rhs >> 64) as u64;
+
+                let z0 = u64::widening_carryless_mul(x0, y0);
+                let z2 = u64::widening_carryless_mul(x1, y1);
+
+                // The grade school algorithm would compute:
+                // z1 = x0y1 ^ x1y0
+
+                // Instead, Karatsuba first computes:
+                let z3 = u64::widening_carryless_mul(x0 ^ x1, y0 ^ y1);
+                // Since it distributes over XOR,
+                // z3 == x0y0 ^ x0y1 ^ x1y0 ^ x1y1
+                //       |--|   |---------|   |--|
+                //    ==  z0  ^     z1      ^  z2
+                // so we can compute z1 as
+                let z1 = z3 ^ z0 ^ z2;
+
+                let lo = z0 ^ (z1 << 64);
+                let hi = z2 ^ (z1 >> 64);
+
+                (lo ^ carry, hi)
+            }
+        }
+    };
+    ($SelfT:ty, $WideT:ty) => {
+        carrying_carryless_mul_impl! { @internal $SelfT =>
+            pub const fn carrying_carryless_mul(self, rhs: Self, carry: Self) -> (Self, Self) {
+                // Can't use widening_carryless_mul because it's not implemented for usize.
+                let p = (self as $WideT).carryless_mul(rhs as $WideT);
+
+                let lo = (p as $SelfT);
+                let hi = (p  >> Self::BITS) as $SelfT;
+
+                (lo ^ carry, hi)
+            }
+        }
+    };
+    (@internal $SelfT:ty => $($fn:tt)*) => {
+        /// Calculates the "full carryless multiplication" without the possibility to overflow.
+        ///
+        /// This returns the low-order (wrapping) bits and the high-order (overflow) bits
+        /// of the result as two separate values, in that order.
+        ///
+        /// # Examples
+        ///
+        /// Please note that this example is shared among integer types, which is why `u8` is used.
+        ///
+        /// ```
+        /// #![feature(uint_carryless_mul)]
+        ///
+        /// assert_eq!(0b1000_0000u8.carrying_carryless_mul(0b1000_0000, 0b0000), (0, 0b0100_0000));
+        /// assert_eq!(0b1000_0000u8.carrying_carryless_mul(0b1000_0000, 0b1111), (0b1111, 0b0100_0000));
+        #[doc = concat!("assert_eq!(",
+            stringify!($SelfT), "::MAX.carrying_carryless_mul(", stringify!($SelfT), "::MAX, ", stringify!($SelfT), "::MAX), ",
+            "(!(", stringify!($SelfT), "::MAX / 3), ", stringify!($SelfT), "::MAX / 3));"
+        )]
+        /// ```
+        #[rustc_const_unstable(feature = "uint_carryless_mul", issue = "152080")]
+        #[doc(alias = "clmul")]
+        #[unstable(feature = "uint_carryless_mul", issue = "152080")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        $($fn)*
+    }
+}
+
 impl i8 {
     int_impl! {
         Self = i8,
@@ -266,6 +394,7 @@ impl i8 {
         bound_condition = "",
     }
     midpoint_impl! { i8, i16, signed }
+    widening_mul_impl! { i8, i16 }
 }
 
 impl i16 {
@@ -290,6 +419,7 @@ impl i16 {
         bound_condition = "",
     }
     midpoint_impl! { i16, i32, signed }
+    widening_mul_impl! { i16, i32 }
 }
 
 impl i32 {
@@ -314,6 +444,7 @@ impl i32 {
         bound_condition = "",
     }
     midpoint_impl! { i32, i64, signed }
+    widening_mul_impl! { i32, i64 }
 }
 
 impl i64 {
@@ -338,6 +469,7 @@ impl i64 {
         bound_condition = "",
     }
     midpoint_impl! { i64, signed }
+    widening_mul_impl! { i64, i128 }
 }
 
 impl i128 {
@@ -366,6 +498,7 @@ impl i128 {
     midpoint_impl! { i128, signed }
 }
 
+#[doc(auto_cfg = false)]
 #[cfg(target_pointer_width = "16")]
 impl isize {
     int_impl! {
@@ -391,6 +524,7 @@ impl isize {
     midpoint_impl! { isize, i32, signed }
 }
 
+#[doc(auto_cfg = false)]
 #[cfg(target_pointer_width = "32")]
 impl isize {
     int_impl! {
@@ -416,6 +550,7 @@ impl isize {
     midpoint_impl! { isize, i64, signed }
 }
 
+#[doc(auto_cfg = false)]
 #[cfg(target_pointer_width = "64")]
 impl isize {
     int_impl! {
@@ -458,6 +593,9 @@ impl u8 {
         fsh_op = "0x36",
         fshl_result = "0x8",
         fshr_result = "0x8d",
+        clmul_lhs = "0x12",
+        clmul_rhs = "0x34",
+        clmul_result = "0x28",
         swap_op = "0x12",
         swapped = "0x12",
         reversed = "0x48",
@@ -468,6 +606,9 @@ impl u8 {
         bound_condition = "",
     }
     midpoint_impl! { u8, u16, unsigned }
+    widening_mul_impl! { u8, u16 }
+    widening_carryless_mul_impl! { u8, u16 }
+    carrying_carryless_mul_impl! { u8, u16 }
 
     /// Checks if the value is within the ASCII range.
     ///
@@ -887,7 +1028,8 @@ impl u8 {
         matches!(*self, b'0'..=b'9') | matches!(*self, b'A'..=b'F') | matches!(*self, b'a'..=b'f')
     }
 
-    /// Checks if the value is an ASCII punctuation character:
+    /// Checks if the value is an ASCII punctuation or symbol character
+    /// (i.e. not alphanumeric, whitespace, or control):
     ///
     /// - U+0021 ..= U+002F `! " # $ % & ' ( ) * + , - . /`, or
     /// - U+003A ..= U+0040 `: ; < = > ? @`, or
@@ -928,7 +1070,8 @@ impl u8 {
             | matches!(*self, b'{'..=b'~')
     }
 
-    /// Checks if the value is an ASCII graphic character:
+    /// Checks if the value is an ASCII graphic character
+    /// (i.e. not whitespace or control):
     /// U+0021 '!' ..= U+007E '~'.
     ///
     /// # Examples
@@ -965,6 +1108,9 @@ impl u8 {
     /// Checks if the value is an ASCII whitespace character:
     /// U+0020 SPACE, U+0009 HORIZONTAL TAB, U+000A LINE FEED,
     /// U+000C FORM FEED, or U+000D CARRIAGE RETURN.
+    ///
+    /// **Warning:** Because the list above excludes U+000B VERTICAL TAB,
+    /// `b.is_ascii_whitespace()` is **not** equivalent to `char::from(b).is_whitespace()`.
     ///
     /// Rust uses the WhatWG Infra Standard's [definition of ASCII
     /// whitespace][infra-aw]. There are several other definitions in
@@ -1095,6 +1241,9 @@ impl u16 {
         fsh_op = "0x2de",
         fshl_result = "0x30",
         fshr_result = "0x302d",
+        clmul_lhs = "0x9012",
+        clmul_rhs = "0xcd34",
+        clmul_result = "0x928",
         swap_op = "0x1234",
         swapped = "0x3412",
         reversed = "0x2c48",
@@ -1105,6 +1254,9 @@ impl u16 {
         bound_condition = "",
     }
     midpoint_impl! { u16, u32, unsigned }
+    widening_mul_impl! { u16, u32 }
+    widening_carryless_mul_impl! { u16, u32 }
+    carrying_carryless_mul_impl! { u16, u32 }
 
     /// Checks if the value is a Unicode surrogate code point, which are disallowed values for [`char`].
     ///
@@ -1145,6 +1297,9 @@ impl u32 {
         fsh_op = "0x2fe78e45",
         fshl_result = "0xb32f",
         fshr_result = "0xb32fe78e",
+        clmul_lhs = "0x56789012",
+        clmul_rhs = "0xf52ecd34",
+        clmul_result = "0x9b980928",
         swap_op = "0x12345678",
         swapped = "0x78563412",
         reversed = "0x1e6a2c48",
@@ -1155,6 +1310,9 @@ impl u32 {
         bound_condition = "",
     }
     midpoint_impl! { u32, u64, unsigned }
+    widening_mul_impl! { u32, u64 }
+    widening_carryless_mul_impl! { u32, u64 }
+    carrying_carryless_mul_impl! { u32, u64 }
 }
 
 impl u64 {
@@ -1171,6 +1329,9 @@ impl u64 {
         fsh_op = "0x2fe78e45983acd98",
         fshl_result = "0x6e12fe",
         fshr_result = "0x6e12fe78e45983ac",
+        clmul_lhs = "0x7890123456789012",
+        clmul_rhs = "0xdd358416f52ecd34",
+        clmul_result = "0xa6299579b980928",
         swap_op = "0x1234567890123456",
         swapped = "0x5634129078563412",
         reversed = "0x6a2c48091e6a2c48",
@@ -1181,6 +1342,9 @@ impl u64 {
         bound_condition = "",
     }
     midpoint_impl! { u64, u128, unsigned }
+    widening_mul_impl! { u64, u128 }
+    widening_carryless_mul_impl! { u64, u128 }
+    carrying_carryless_mul_impl! { u64, u128 }
 }
 
 impl u128 {
@@ -1197,6 +1361,9 @@ impl u128 {
         fsh_op = "0x2fe78e45983acd98039000008736273",
         fshl_result = "0x4f7602fe",
         fshr_result = "0x4f7602fe78e45983acd9803900000873",
+        clmul_lhs = "0x12345678901234567890123456789012",
+        clmul_rhs = "0x4317e40ab4ddcf05dd358416f52ecd34",
+        clmul_result = "0xb9cf660de35d0c170a6299579b980928",
         swap_op = "0x12345678901234567890123456789012",
         swapped = "0x12907856341290785634129078563412",
         reversed = "0x48091e6a2c48091e6a2c48091e6a2c48",
@@ -1209,8 +1376,10 @@ impl u128 {
         bound_condition = "",
     }
     midpoint_impl! { u128, unsigned }
+    carrying_carryless_mul_impl! { u128, u256 }
 }
 
+#[doc(auto_cfg = false)]
 #[cfg(target_pointer_width = "16")]
 impl usize {
     uint_impl! {
@@ -1223,9 +1392,12 @@ impl usize {
         rot = 4,
         rot_op = "0xa003",
         rot_result = "0x3a",
-        fsh_op = "0x2fe78e45983acd98039000008736273",
-        fshl_result = "0x4f7602fe",
-        fshr_result = "0x4f7602fe78e45983acd9803900000873",
+        fsh_op = "0x2de",
+        fshl_result = "0x30",
+        fshr_result = "0x302d",
+        clmul_lhs = "0x9012",
+        clmul_rhs = "0xcd34",
+        clmul_result = "0x928",
         swap_op = "0x1234",
         swapped = "0x3412",
         reversed = "0x2c48",
@@ -1236,8 +1408,10 @@ impl usize {
         bound_condition = " on 16-bit targets",
     }
     midpoint_impl! { usize, u32, unsigned }
+    carrying_carryless_mul_impl! { usize, u32 }
 }
 
+#[doc(auto_cfg = false)]
 #[cfg(target_pointer_width = "32")]
 impl usize {
     uint_impl! {
@@ -1253,6 +1427,9 @@ impl usize {
         fsh_op = "0x2fe78e45",
         fshl_result = "0xb32f",
         fshr_result = "0xb32fe78e",
+        clmul_lhs = "0x56789012",
+        clmul_rhs = "0xf52ecd34",
+        clmul_result = "0x9b980928",
         swap_op = "0x12345678",
         swapped = "0x78563412",
         reversed = "0x1e6a2c48",
@@ -1263,8 +1440,10 @@ impl usize {
         bound_condition = " on 32-bit targets",
     }
     midpoint_impl! { usize, u64, unsigned }
+    carrying_carryless_mul_impl! { usize, u64 }
 }
 
+#[doc(auto_cfg = false)]
 #[cfg(target_pointer_width = "64")]
 impl usize {
     uint_impl! {
@@ -1280,6 +1459,9 @@ impl usize {
         fsh_op = "0x2fe78e45983acd98",
         fshl_result = "0x6e12fe",
         fshr_result = "0x6e12fe78e45983ac",
+        clmul_lhs = "0x7890123456789012",
+        clmul_rhs = "0xdd358416f52ecd34",
+        clmul_result = "0xa6299579b980928",
         swap_op = "0x1234567890123456",
         swapped = "0x5634129078563412",
         reversed = "0x6a2c48091e6a2c48",
@@ -1290,6 +1472,7 @@ impl usize {
         bound_condition = " on 64-bit targets",
     }
     midpoint_impl! { usize, u128, unsigned }
+    carrying_carryless_mul_impl! { usize, u128 }
 }
 
 impl usize {
@@ -1404,7 +1587,7 @@ macro_rules! from_str_int_impl {
     ($signedness:ident $($int_ty:ty)+) => {$(
         #[stable(feature = "rust1", since = "1.0.0")]
         #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
-        impl const FromStr for $int_ty {
+        const impl FromStr for $int_ty {
             type Err = ParseIntError;
 
             /// Parses an integer from a string slice with decimal digits.

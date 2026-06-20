@@ -2,21 +2,15 @@
 
 use std::cell::OnceCell;
 
-use base_db::FxIndexSet;
+use base_db::{Crate, FxIndexSet};
 use cfg::CfgOptions;
-use hir_expand::{
-    HirFileId,
-    mod_path::PathKind,
-    name::AsName,
-    span_map::{SpanMap, SpanMapRef},
-};
+use hir_expand::{HirFileId, mod_path::PathKind, name::AsName, span_map::SpanMap};
 use la_arena::Arena;
 use span::{AstIdMap, FileAstId, SyntaxContext};
 use syntax::{
     AstNode,
     ast::{self, HasModuleItem, HasName},
 };
-use triomphe::Arc;
 
 use crate::{
     db::DefDatabase,
@@ -29,19 +23,20 @@ use crate::{
     },
 };
 
-pub(super) struct Ctx<'a> {
-    pub(super) db: &'a dyn DefDatabase,
+pub(super) struct Ctx<'db> {
+    pub(super) db: &'db dyn DefDatabase,
     tree: ItemTree,
-    source_ast_id_map: Arc<AstIdMap>,
-    span_map: OnceCell<SpanMap>,
+    source_ast_id_map: &'db AstIdMap,
+    span_map: OnceCell<SpanMap<'db>>,
     file: HirFileId,
-    cfg_options: OnceCell<&'a CfgOptions>,
+    cfg_options: OnceCell<&'db CfgOptions>,
+    krate: Crate,
     top_level: Vec<ModItemId>,
     visibilities: FxIndexSet<RawVisibility>,
 }
 
-impl<'a> Ctx<'a> {
-    pub(super) fn new(db: &'a dyn DefDatabase, file: HirFileId) -> Self {
+impl<'db> Ctx<'db> {
+    pub(super) fn new(db: &'db dyn DefDatabase, file: HirFileId, krate: Crate) -> Self {
         Self {
             db,
             tree: ItemTree::default(),
@@ -51,20 +46,21 @@ impl<'a> Ctx<'a> {
             span_map: OnceCell::new(),
             visibilities: FxIndexSet::default(),
             top_level: Vec::new(),
+            krate,
         }
     }
 
     #[inline]
-    pub(super) fn cfg_options(&self) -> &'a CfgOptions {
-        self.cfg_options.get_or_init(|| self.file.krate(self.db).cfg_options(self.db))
+    pub(super) fn cfg_options(&self) -> &'db CfgOptions {
+        self.cfg_options.get_or_init(|| self.krate.cfg_options(self.db))
     }
 
-    pub(super) fn span_map(&self) -> SpanMapRef<'_> {
-        self.span_map.get_or_init(|| self.db.span_map(self.file)).as_ref()
+    pub(super) fn span_map(&self) -> SpanMap<'_> {
+        *self.span_map.get_or_init(|| self.db.span_map(self.file))
     }
 
     pub(super) fn lower_module_items(mut self, item_owner: &dyn HasModuleItem) -> ItemTree {
-        self.top_level = item_owner.items().flat_map(|item| self.lower_mod_item(&item)).collect();
+        self.top_level = item_owner.items().filter_map(|item| self.lower_mod_item(&item)).collect();
         self.tree.vis.arena = self.visibilities.into_iter().collect();
         self.tree.top_level = self.top_level.into_boxed_slice();
         self.tree
@@ -88,7 +84,7 @@ impl<'a> Ctx<'a> {
                     _ => None,
                 }
             })
-            .flat_map(|item| self.lower_mod_item(&item))
+            .filter_map(|item| self.lower_mod_item(&item))
             .collect();
 
         if let Some(ast::Expr::MacroExpr(tail_macro)) = stmts.expr()
@@ -244,7 +240,9 @@ impl<'a> Ctx<'a> {
             ModKind::Inline {
                 items: module
                     .item_list()
-                    .map(|list| list.items().flat_map(|item| self.lower_mod_item(&item)).collect())
+                    .map(|list| {
+                        list.items().filter_map(|item| self.lower_mod_item(&item)).collect()
+                    })
                     .unwrap_or_else(|| {
                         cov_mark::hit!(name_res_works_for_broken_modules);
                         Box::new([]) as Box<[_]>

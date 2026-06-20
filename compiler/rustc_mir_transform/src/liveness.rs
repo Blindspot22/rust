@@ -1,6 +1,5 @@
 use rustc_abi::FieldIdx;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap, IndexEntry};
-use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def::{CtorKind, DefKind};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::find_attr;
@@ -20,7 +19,7 @@ use rustc_span::Span;
 use rustc_span::edit_distance::find_best_match_for_name;
 use rustc_span::symbol::{Symbol, kw, sym};
 
-use crate::errors;
+use crate::diagnostics;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum AccessKind {
@@ -41,6 +40,8 @@ enum CaptureKind {
 struct Access {
     /// Describe the current access.
     kind: AccessKind,
+    /// MIR location where this access happens.
+    location: Location,
     /// Is the accessed place is live at the current statement?
     /// When we encounter multiple statements at the same location, we only increase the liveness,
     /// in order to avoid false positives.
@@ -63,14 +64,14 @@ pub(crate) fn check_liveness<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> Den
     }
 
     // Don't run unused pass for #[naked]
-    if find_attr!(tcx.get_all_attrs(def_id.to_def_id()), AttributeKind::Naked(..)) {
+    if find_attr!(tcx, def_id.to_def_id(), Naked(..)) {
         return DenseBitSet::new_empty(0);
     }
 
     // Don't run unused pass for #[derive]
-    let parent = tcx.parent(tcx.typeck_root_def_id(def_id.to_def_id()));
+    let parent = tcx.local_parent(tcx.typeck_root_def_id_local(def_id));
     if let DefKind::Impl { of_trait: true } = tcx.def_kind(parent)
-        && find_attr!(tcx.get_all_attrs(parent), AttributeKind::AutomaticallyDerived(..))
+        && find_attr!(tcx, parent, AutomaticallyDerived)
     {
         return DenseBitSet::new_empty(0);
     }
@@ -174,7 +175,7 @@ fn maybe_suggest_unit_pattern_typo<'tcx>(
     name: Symbol,
     span: Span,
     ty: Ty<'tcx>,
-) -> Option<errors::PatternTypo> {
+) -> Option<diagnostics::PatternTypo> {
     if let ty::Adt(adt_def, _) = ty.peel_refs().kind() {
         let variant_names: Vec<_> = adt_def
             .variants()
@@ -188,7 +189,7 @@ fn maybe_suggest_unit_pattern_typo<'tcx>(
                 .iter()
                 .find(|v| v.name == name && matches!(v.ctor, Some((CtorKind::Const, _))))
         {
-            return Some(errors::PatternTypo {
+            return Some(diagnostics::PatternTypo {
                 span,
                 code: with_no_trimmed_paths!(tcx.def_path_str(variant.def_id)),
                 kind: tcx.def_descr(variant.def_id),
@@ -202,8 +203,8 @@ fn maybe_suggest_unit_pattern_typo<'tcx>(
     let constants = tcx
         .hir_body_owners()
         .filter(|&def_id| {
-            matches!(tcx.def_kind(def_id), DefKind::Const)
-                && tcx.type_of(def_id).instantiate_identity() == ty
+            matches!(tcx.def_kind(def_id), DefKind::Const { .. })
+                && tcx.type_of(def_id).instantiate_identity().skip_norm_wip() == ty
                 && tcx.visibility(def_id).is_accessible_from(body_def_id, tcx)
         })
         .collect::<Vec<_>>();
@@ -212,7 +213,7 @@ fn maybe_suggest_unit_pattern_typo<'tcx>(
         && let Some(position) = names.iter().position(|&n| n == item_name)
         && let Some(&def_id) = constants.get(position)
     {
-        return Some(errors::PatternTypo {
+        return Some(diagnostics::PatternTypo {
             span,
             code: with_no_trimmed_paths!(tcx.def_path_str(def_id)),
             kind: "constant",
@@ -243,7 +244,7 @@ fn maybe_drop_guard<'tcx>(
                 | ty::Dynamic(..)
                 | ty::Array(..)
                 | ty::Slice(..)
-                | ty::Alias(ty::Opaque, ..)
+                | ty::Alias(ty::AliasTy { kind: ty::Opaque { .. }, .. })
         ) && ty.needs_drop(tcx, typing_env)
     } else {
         false
@@ -274,7 +275,7 @@ fn annotate_mut_binding_to_immutable_binding<'tcx>(
     body_def_id: LocalDefId,
     assignment_span: Span,
     body: &Body<'tcx>,
-) -> Option<errors::UnusedAssignSuggestion> {
+) -> Option<diagnostics::UnusedAssignSuggestion> {
     use rustc_hir as hir;
     use rustc_hir::intravisit::{self, Visitor};
 
@@ -315,7 +316,7 @@ fn annotate_mut_binding_to_immutable_binding<'tcx>(
         Some(mut_ty.ty.span.shrink_to_lo())
     };
 
-    return Some(errors::UnusedAssignSuggestion {
+    return Some(diagnostics::UnusedAssignSuggestion {
         ty_span,
         pre,
         // Span of the `mut` before the binding.
@@ -368,12 +369,12 @@ fn find_self_assignments<'tcx>(
 
     for (bb, bb_data) in body.basic_blocks.iter_enumerated() {
         for (statement_index, stmt) in bb_data.statements.iter().enumerate() {
-            let StatementKind::Assign(box (first_place, rvalue)) = &stmt.kind else { continue };
+            let StatementKind::Assign((first_place, rvalue)) = &stmt.kind else { continue };
             match rvalue {
                 // For checked binary ops, the MIR builder inserts an assertion in between.
                 Rvalue::BinaryOp(
                     BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow,
-                    box (Operand::Copy(lhs), _),
+                    (Operand::Copy(lhs), _),
                 ) => {
                     // Checked binary ops only appear at the end of the block, before the assertion.
                     if statement_index + 1 != bb_data.statements.len() {
@@ -381,10 +382,7 @@ fn find_self_assignments<'tcx>(
                     }
 
                     let TerminatorKind::Assert {
-                        cond,
-                        target,
-                        msg: box AssertKind::Overflow(..),
-                        ..
+                        cond, target, msg: AssertKind::Overflow(..), ..
                     } = &bb_data.terminator().kind
                     else {
                         continue;
@@ -392,7 +390,7 @@ fn find_self_assignments<'tcx>(
                     let Some(assign) = body.basic_blocks[*target].statements.first() else {
                         continue;
                     };
-                    let StatementKind::Assign(box (dest, Rvalue::Use(Operand::Move(temp)))) =
+                    let StatementKind::Assign((dest, Rvalue::Use(Operand::Move(temp), _))) =
                         assign.kind
                     else {
                         continue;
@@ -436,7 +434,7 @@ fn find_self_assignments<'tcx>(
                     }
                 }
                 // Straight self-assignment.
-                Rvalue::BinaryOp(op, box (Operand::Copy(lhs), _)) => {
+                Rvalue::BinaryOp(op, (Operand::Copy(lhs), _)) => {
                     if lhs != first_place {
                         continue;
                     }
@@ -649,26 +647,30 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
             &checked_places.places,
         );
 
-        let mut check_place =
-            |place: Place<'tcx>, kind, source_info: SourceInfo, live: &DenseBitSet<PlaceIndex>| {
-                if let Some((index, extra_projections)) = checked_places.get(place.as_ref()) {
-                    if !is_indirect(extra_projections) {
-                        let is_direct = extra_projections.is_empty();
-                        match assignments[index].entry(source_info) {
-                            IndexEntry::Vacant(v) => {
-                                let access = Access { kind, live: live.contains(index), is_direct };
-                                v.insert(access);
-                            }
-                            IndexEntry::Occupied(mut o) => {
-                                // There were already a sighting. Mark this statement as live if it
-                                // was, to avoid false positives.
-                                o.get_mut().live |= live.contains(index);
-                                o.get_mut().is_direct &= is_direct;
-                            }
+        let mut check_place = |place: Place<'tcx>,
+                               kind,
+                               source_info: SourceInfo,
+                               location: Location,
+                               live: &DenseBitSet<PlaceIndex>| {
+            if let Some((index, extra_projections)) = checked_places.get(place.as_ref()) {
+                if !is_indirect(extra_projections) {
+                    let is_direct = extra_projections.is_empty();
+                    match assignments[index].entry(source_info) {
+                        IndexEntry::Vacant(v) => {
+                            let access =
+                                Access { kind, location, live: live.contains(index), is_direct };
+                            v.insert(access);
+                        }
+                        IndexEntry::Occupied(mut o) => {
+                            // There were already a sighting. Mark this statement as live if it
+                            // was, to avoid false positives.
+                            o.get_mut().live |= live.contains(index);
+                            o.get_mut().is_direct &= is_direct;
                         }
                     }
                 }
-            };
+            }
+        };
 
         let mut record_drop = |place: Place<'tcx>| {
             if let Some((index, &[])) = checked_places.get(place.as_ref()) {
@@ -685,7 +687,13 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
             match &terminator.kind {
                 TerminatorKind::Call { destination: place, .. }
                 | TerminatorKind::Yield { resume_arg: place, .. } => {
-                    check_place(*place, AccessKind::Assign, terminator.source_info, live);
+                    check_place(
+                        *place,
+                        AccessKind::Assign,
+                        terminator.source_info,
+                        body.terminator_loc(bb),
+                        live,
+                    );
                     record_drop(*place)
                 }
                 TerminatorKind::Drop { place, .. } => record_drop(*place),
@@ -694,7 +702,13 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
                         if let InlineAsmOperand::Out { place: Some(place), .. }
                         | InlineAsmOperand::InOut { out_place: Some(place), .. } = operand
                         {
-                            check_place(*place, AccessKind::Assign, terminator.source_info, live);
+                            check_place(
+                                *place,
+                                AccessKind::Assign,
+                                terminator.source_info,
+                                body.terminator_loc(bb),
+                                live,
+                            );
                         }
                     }
                 }
@@ -702,16 +716,30 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
             }
 
             for (statement_index, statement) in bb_data.statements.iter().enumerate().rev() {
-                cursor.seek_before_primary_effect(Location { block: bb, statement_index });
+                let location = Location { block: bb, statement_index };
+                cursor.seek_before_primary_effect(location);
                 let live = cursor.get();
                 ever_live.union(live);
                 match &statement.kind {
-                    StatementKind::Assign(box (place, _))
-                    | StatementKind::SetDiscriminant { box place, .. } => {
-                        check_place(*place, AccessKind::Assign, statement.source_info, live);
+                    StatementKind::Assign((place, _)) => {
+                        check_place(
+                            *place,
+                            AccessKind::Assign,
+                            statement.source_info,
+                            location,
+                            live,
+                        );
                     }
-                    StatementKind::Retag(_, _)
-                    | StatementKind::StorageLive(_)
+                    StatementKind::SetDiscriminant { place, .. } => {
+                        check_place(
+                            **place,
+                            AccessKind::Assign,
+                            statement.source_info,
+                            location,
+                            live,
+                        );
+                    }
+                    StatementKind::StorageLive(_)
                     | StatementKind::StorageDead(_)
                     | StatementKind::Coverage(_)
                     | StatementKind::Intrinsic(_)
@@ -747,7 +775,12 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
                     continue;
                 };
                 let source_info = body.local_decls[place.local].source_info;
-                let access = Access { kind, live: live.contains(index), is_direct: true };
+                let access = Access {
+                    kind,
+                    location: Location::START,
+                    live: live.contains(index),
+                    is_direct: true,
+                };
                 assignments[index].insert(source_info, access);
             }
         }
@@ -906,7 +939,7 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
                         .split(&brace_name)
                         .any(|c| matches!(c.chars().next(), Some('}' | ':')))
                 })
-                .map(|&(lit, _)| errors::UnusedVariableStringInterp { lit })
+                .map(|&(lit, _)| diagnostics::UnusedVariableStringInterp { lit })
                 .collect::<Vec<_>>()
         };
 
@@ -964,16 +997,16 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
                 }
 
                 let sugg = if from_macro {
-                    errors::UnusedVariableSugg::NoSugg { span: def_span, name }
+                    diagnostics::UnusedVariableSugg::NoSugg { span: def_span, name }
                 } else {
                     let typo = maybe_suggest_typo();
-                    errors::UnusedVariableSugg::TryPrefix { spans: vec![def_span], name, typo }
+                    diagnostics::UnusedVariableSugg::TryPrefix { spans: vec![def_span], name, typo }
                 };
                 tcx.emit_node_span_lint(
                     lint::builtin::UNUSED_VARIABLES,
                     hir_id,
                     def_span,
-                    errors::UnusedVariable {
+                    diagnostics::UnusedVariable {
                         name,
                         string_interp: maybe_suggest_literal_matching_name(name),
                         sugg,
@@ -986,7 +1019,7 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
             // warn twice, for the unused local and for the unused assignment. Therefore, we remove
             // from the list of assignments the ones that happen at the definition site.
             statements.retain(|source_info, _| {
-                source_info.span.find_ancestor_inside(binding.pat_span).is_none()
+                !binding.introductions.iter().any(|intro| intro.span == source_info.span)
             });
 
             // Extra assignments that we recognize thanks to the initialization span. We need to
@@ -1023,7 +1056,7 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
                     lint::builtin::UNUSED_VARIABLES,
                     hir_id,
                     def_span,
-                    errors::UnusedVarAssignedOnly { name, typo },
+                    diagnostics::UnusedVarAssignedOnly { name, typo },
                 );
                 continue;
             }
@@ -1034,8 +1067,8 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
             let any_shorthand = introductions.iter().any(|intro| intro.is_shorthand);
 
             let sugg = if any_shorthand {
-                errors::UnusedVariableSugg::TryIgnore {
-                    name,
+                diagnostics::UnusedVariableSugg::TryIgnore {
+                    name: name.to_ident_string(),
                     shorthands: introductions
                         .iter()
                         .filter_map(
@@ -1052,20 +1085,20 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
                         .collect(),
                 }
             } else if from_macro {
-                errors::UnusedVariableSugg::NoSugg { span: def_span, name }
+                diagnostics::UnusedVariableSugg::NoSugg { span: def_span, name }
             } else if !introductions.is_empty() {
                 let typo = maybe_suggest_typo();
-                errors::UnusedVariableSugg::TryPrefix { name, typo, spans: spans.clone() }
+                diagnostics::UnusedVariableSugg::TryPrefix { name, typo, spans: spans.clone() }
             } else {
                 let typo = maybe_suggest_typo();
-                errors::UnusedVariableSugg::TryPrefix { name, typo, spans: vec![def_span] }
+                diagnostics::UnusedVariableSugg::TryPrefix { name, typo, spans: vec![def_span] }
             };
 
             tcx.emit_node_span_lint(
                 lint::builtin::UNUSED_VARIABLES,
                 hir_id,
                 spans,
-                errors::UnusedVariable {
+                diagnostics::UnusedVariable {
                     name,
                     string_interp: maybe_suggest_literal_matching_name(name),
                     sugg,
@@ -1095,19 +1128,47 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
                 self.body,
             );
 
+            // By convention, underscore-prefixed bindings are allowed to be unused explicitly.
+            if name.as_str().starts_with('_') {
+                continue;
+            }
+
+            let mut next_direct_assignments: Vec<(Span, Location)> = Vec::new();
+            let mut dead_statements = Vec::with_capacity(statements.len());
+
+            for (source_info, Access { live, kind, is_direct, location }) in statements.into_iter()
+            {
+                let direct_assignment = kind == AccessKind::Assign && is_direct;
+                let should_report = !live && (is_direct || !is_maybe_drop_guard);
+
+                let overwrite = if should_report && direct_assignment {
+                    next_direct_assignments
+                        .iter()
+                        .rfind(|(_, overwrite_location)| {
+                            location.is_predecessor_of(*overwrite_location, self.body)
+                        })
+                        .map(|&(overwrite_span, _)| diagnostics::UnusedAssignOverwrite {
+                            assigned_span: source_info.span,
+                            overwrite_span,
+                            name,
+                        })
+                } else {
+                    None
+                };
+
+                if direct_assignment {
+                    next_direct_assignments.push((source_info.span, location));
+                }
+
+                if !should_report {
+                    continue;
+                }
+                dead_statements.push((source_info, kind, is_direct, overwrite));
+            }
+
             // We probed MIR in reverse order for dataflow.
-            // We revert the vector to give a consistent order to the user.
-            for (source_info, Access { live, kind, is_direct }) in statements.into_iter().rev() {
-                if live {
-                    continue;
-                }
-
-                // If this place was dropped and has non-trivial drop,
-                // skip reporting field assignments.
-                if !is_direct && is_maybe_drop_guard {
-                    continue;
-                }
-
+            // Emit diagnostics in source order instead.
+            for (source_info, kind, is_direct, overwrite) in dead_statements.into_iter().rev() {
                 // Report the dead assignment.
                 let Some(hir_id) = source_info.scope.lint_root(&self.body.source_scopes) else {
                     continue;
@@ -1122,24 +1183,27 @@ impl<'a, 'tcx> AssignmentResult<'a, 'tcx> {
                             source_info.span,
                             self.body,
                         );
+                        let overwrite =
+                            if suggestion.is_none() && is_direct { overwrite } else { None };
+                        let help = suggestion.is_none() && overwrite.is_none();
                         tcx.emit_node_span_lint(
                             lint::builtin::UNUSED_ASSIGNMENTS,
                             hir_id,
                             source_info.span,
-                            errors::UnusedAssign { name, help: suggestion.is_none(), suggestion },
+                            diagnostics::UnusedAssign { name, overwrite, help, suggestion },
                         )
                     }
                     AccessKind::Param => tcx.emit_node_span_lint(
                         lint::builtin::UNUSED_ASSIGNMENTS,
                         hir_id,
                         source_info.span,
-                        errors::UnusedAssignPassed { name },
+                        diagnostics::UnusedAssignPassed { name },
                     ),
                     AccessKind::Capture => tcx.emit_node_span_lint(
                         lint::builtin::UNUSED_ASSIGNMENTS,
                         hir_id,
                         decl_span,
-                        errors::UnusedCaptureMaybeCaptureRef { name },
+                        diagnostics::UnusedCaptureMaybeCaptureRef { name },
                     ),
                 }
             }
@@ -1238,16 +1302,19 @@ struct TransferFunction<'a, 'tcx> {
 impl<'tcx> Visitor<'tcx> for TransferFunction<'_, 'tcx> {
     fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
         match statement.kind {
-            // `ForLet(None)` fake read erroneously marks the just-assigned local as live.
-            // This defeats the purpose of the analysis for `let` bindings.
-            StatementKind::FakeRead(box (FakeReadCause::ForLet(None), _)) => return,
+            // `ForLet(None)` and `ForGuardBinding` fake reads erroneously mark the just-assigned
+            // locals as live. This defeats the purpose of the analysis for such bindings.
+            StatementKind::FakeRead((
+                FakeReadCause::ForLet(None) | FakeReadCause::ForGuardBinding,
+                _,
+            )) => return,
             // Handle self-assignment by restricting the read/write they do.
-            StatementKind::Assign(box (ref dest, ref rvalue))
+            StatementKind::Assign((ref dest, ref rvalue))
                 if self.self_assignment.contains(&location) =>
             {
                 if let Rvalue::BinaryOp(
                     BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow,
-                    box (_, rhs),
+                    (_, rhs),
                 ) = rvalue
                 {
                     // We are computing the binary operation:
@@ -1259,7 +1326,7 @@ impl<'tcx> Visitor<'tcx> for TransferFunction<'_, 'tcx> {
                         PlaceContext::MutatingUse(MutatingUseContext::Store),
                         location,
                     );
-                } else if let Rvalue::BinaryOp(_, box (_, rhs)) = rvalue {
+                } else if let Rvalue::BinaryOp(_, (_, rhs)) = rvalue {
                     // We are computing the binary operation:
                     // - the LHS is being updated, so we don't read it;
                     // - the RHS still needs to be read.
@@ -1283,6 +1350,7 @@ impl<'tcx> Visitor<'tcx> for TransferFunction<'_, 'tcx> {
             TerminatorKind::Return
             | TerminatorKind::Yield { .. }
             | TerminatorKind::Goto { target: START_BLOCK } // Inserted for the `FnMut` case.
+            | TerminatorKind::Call { target: None, .. } // unwinding could be caught
                 if self.capture_kind != CaptureKind::None =>
             {
                 // All indirect captures have an effect on the environment, so we mark them as live.
@@ -1308,7 +1376,7 @@ impl<'tcx> Visitor<'tcx> for TransferFunction<'_, 'tcx> {
             // captures as live in the surrounding function. This allows to report unused variables,
             // even if they have been (uselessly) captured.
             Rvalue::Aggregate(
-                box AggregateKind::Closure(def_id, _) | box AggregateKind::Coroutine(def_id, _),
+                AggregateKind::Closure(def_id, _) | AggregateKind::Coroutine(def_id, _),
                 operands,
             ) => {
                 if let Some(def_id) = def_id.as_local() {

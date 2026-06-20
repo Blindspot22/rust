@@ -9,7 +9,7 @@ use crate::{
 use hir::{
     AsAssocItem, AssocItem, CallableKind, FileRange, HasCrate, InFile, ModuleDef, Semantics, sym,
 };
-use ide_db::{MiniCore, ra_fixture::UpmapFromRaFixture};
+use ide_db::ra_fixture::{RaFixtureConfig, UpmapFromRaFixture};
 use ide_db::{
     RootDatabase, SymbolKind,
     base_db::{AnchoredPath, SourceDatabase},
@@ -26,7 +26,7 @@ use syntax::{
 
 #[derive(Debug)]
 pub struct GotoDefinitionConfig<'a> {
-    pub minicore: MiniCore<'a>,
+    pub ra_fixture: RaFixtureConfig<'a>,
 }
 
 // Feature: Go to Definition
@@ -95,10 +95,22 @@ pub(crate) fn goto_definition(
             continue;
         }
 
+        if let Some(n) = find_definition_for_comparison_operators(sema, &token.value) {
+            navs.extend(n);
+            continue;
+        }
+
+        let parent = token.value.parent()?;
+
+        if let Some(question_mark_conversion) = goto_question_mark_conversions(sema, &parent) {
+            navs.extend(def_to_nav(sema, question_mark_conversion.into()));
+            continue;
+        }
+
         if let Some(token) = ast::String::cast(token.value.clone())
             && let Some(original_token) = ast::String::cast(original_token.clone())
             && let Some((analysis, fixture_analysis)) =
-                Analysis::from_ra_fixture(sema, original_token, &token, config.minicore)
+                Analysis::from_ra_fixture(sema, original_token, &token, &config.ra_fixture)
             && let Some((virtual_file_id, file_offset)) = fixture_analysis.map_offset_down(offset)
         {
             return hir::attach_db_allow_change(&analysis.db, || {
@@ -112,8 +124,6 @@ pub(crate) fn goto_definition(
                 navs.upmap_from_ra_fixture(&fixture_analysis, virtual_file_id, file_id).ok()
             });
         }
-
-        let parent = token.value.parent()?;
 
         let token_file_id = token.file_id;
         if let Some(token) = ast::String::cast(token.value.clone())
@@ -147,6 +157,45 @@ pub(crate) fn goto_definition(
     let navs = navs.into_iter().unique().collect();
 
     Some(RangeInfo::new(original_token.text_range(), navs))
+}
+
+/// When the `?` operator is used on `Result`, go to the `From` impl if it exists as this provides more value.
+fn goto_question_mark_conversions(
+    sema: &Semantics<'_, RootDatabase>,
+    node: &SyntaxNode,
+) -> Option<hir::Function> {
+    let node = ast::TryExpr::cast(node.clone())?;
+    let try_expr_ty = sema.type_of_expr(&node.expr()?)?.adjusted();
+
+    let fd = FamousDefs(sema, try_expr_ty.krate(sema.db));
+    let result_enum = fd.core_result_Result()?.into();
+
+    let (try_expr_ty_adt, try_expr_ty_args) = try_expr_ty.as_adt_with_args()?;
+    if try_expr_ty_adt != result_enum {
+        // FIXME: Support `Poll<Result>`.
+        return None;
+    }
+    let original_err_ty = try_expr_ty_args.get(1)?.clone()?;
+
+    let returned_ty = sema.try_expr_returned_type(&node)?;
+    let (returned_adt, returned_ty_args) = returned_ty.as_adt_with_args()?;
+    if returned_adt != result_enum {
+        return None;
+    }
+    let returned_err_ty = returned_ty_args.get(1)?.clone()?;
+
+    if returned_err_ty.could_unify_with_deeply(sema.db, &original_err_ty) {
+        return None;
+    }
+
+    let from_trait = fd.core_convert_From()?;
+    let from_fn = from_trait.function(sema.db, sym::from)?;
+    sema.resolve_trait_impl_method(
+        returned_err_ty.clone(),
+        from_trait,
+        from_fn,
+        [returned_err_ty, original_err_ty],
+    )
 }
 
 // If the token is into(), try_into(), search the definition of From, TryFrom.
@@ -220,6 +269,62 @@ fn find_definition_for_known_blanket_dual_impls(
     Some(def_to_nav(sema, def))
 }
 
+// If the token is a comparison operator (!=, <, <=, >, >=) that resolves to a default trait method, navigate to the corresponding primary method (eq for ne, partial_cmp for the others).
+fn find_definition_for_comparison_operators(
+    sema: &Semantics<'_, RootDatabase>,
+    original_token: &SyntaxToken,
+) -> Option<Vec<NavigationTarget>> {
+    let bin_expr = ast::BinExpr::cast(original_token.parent()?)?;
+
+    let f = sema.resolve_bin_expr(&bin_expr)?;
+    let assoc = f.as_assoc_item(sema.db)?;
+
+    let lhs_type = sema.type_of_expr(&bin_expr.lhs()?)?.original;
+    let rhs_type = sema.type_of_expr(&bin_expr.rhs()?)?.original;
+
+    let t = match assoc.container(sema.db) {
+        hir::AssocItemContainer::Trait(t) => t,
+        hir::AssocItemContainer::Impl(_) => return None, // Already implemented by the type
+    };
+
+    let fn_name = f.name(sema.db);
+    let fn_name_str = fn_name.as_str();
+
+    let trait_name = t.name(sema.db);
+    let trait_name_str = trait_name.as_str();
+
+    let (target_fn_name, expected_trait) = match fn_name_str {
+        "ne" => ("eq", "PartialEq"),
+        "lt" | "le" | "gt" | "ge" => ("partial_cmp", "PartialOrd"),
+        _ => return None,
+    };
+
+    if trait_name_str != expected_trait {
+        return None;
+    }
+
+    let primary_f = t.items(sema.db).into_iter().find_map(|item| {
+        if let hir::AssocItem::Function(func) = item
+            && func.name(sema.db).as_str() == target_fn_name
+        {
+            return Some(func);
+        }
+        None
+    })?;
+
+    // Chalk requires ALL trait substitutions, including `Self`!
+    // We must pass [Self, Rhs]
+    let resolved_f = sema.resolve_trait_impl_method(
+        lhs_type.clone(),
+        t,
+        primary_f,
+        [lhs_type.clone(), rhs_type.clone()],
+    )?;
+
+    let def = Definition::from(resolved_f);
+
+    Some(def_to_nav(sema, def))
+}
 fn try_lookup_include_path(
     sema: &Semantics<'_, RootDatabase>,
     token: InFile<ast::String>,
@@ -332,7 +437,7 @@ pub(crate) fn find_fn_or_blocks(
                     ast::BlockExpr(blk) => {
                         match blk.modifier() {
                             Some(ast::BlockModifier::Async(_)) => blk.syntax().clone(),
-                            Some(ast::BlockModifier::Try(_)) if token_kind != T![return] => blk.syntax().clone(),
+                            Some(ast::BlockModifier::Try { .. }) if token_kind != T![return] => blk.syntax().clone(),
                             _ => continue,
                         }
                     },
@@ -404,8 +509,8 @@ fn nav_for_exit_points(
                                 let blk_in_file = InFile::new(file_id, blk.into());
                                 Some(expr_to_nav(db, blk_in_file, Some(async_tok)))
                             },
-                            Some(ast::BlockModifier::Try(_)) if token_kind != T![return] => {
-                                let try_tok = blk.try_token()?.text_range();
+                            Some(ast::BlockModifier::Try { .. }) if token_kind != T![return] => {
+                                let try_tok = blk.try_block_modifier()?.try_token()?.text_range();
                                 let blk_in_file = InFile::new(file_id, blk.into());
                                 Some(expr_to_nav(db, blk_in_file, Some(try_tok)))
                             },
@@ -561,11 +666,11 @@ fn expr_to_nav(
 #[cfg(test)]
 mod tests {
     use crate::{GotoDefinitionConfig, fixture};
-    use ide_db::{FileRange, MiniCore};
+    use ide_db::{FileRange, ra_fixture::RaFixtureConfig};
     use itertools::Itertools;
 
     const TEST_CONFIG: GotoDefinitionConfig<'_> =
-        GotoDefinitionConfig { minicore: MiniCore::default() };
+        GotoDefinitionConfig { ra_fixture: RaFixtureConfig::default() };
 
     #[track_caller]
     fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
@@ -4033,5 +4138,63 @@ where
 }
 "#,
         )
+    }
+
+    #[test]
+    fn question_mark_on_result_goes_to_conversion() {
+        check(
+            r#"
+//- minicore: try, result, from
+
+struct Foo;
+struct Bar;
+impl From<Foo> for Bar {
+    fn from(_: Foo) -> Bar { Bar }
+    // ^^^^
+}
+
+fn foo() -> Result<(), Bar> {
+    Err(Foo)?$0;
+    Ok(())
+}
+        "#,
+        );
+    }
+
+    #[test]
+    fn goto_definition_for_comparison_operators() {
+        check(
+            r#"
+//- minicore: eq, ord
+struct Foo;
+impl PartialEq for Foo {
+    fn eq(&self, other: &Self) -> bool { true }
+     //^^
+}
+
+fn main() {
+    let a = Foo;
+    let b = Foo;
+    let _ = a !=$0 b;
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn ide_features_work_in_field_default() {
+        check(
+            r#"
+struct S;
+impl S {
+    fn foo(&self) {}
+    // ^^^
+}
+
+struct Struct {
+    field: () = S.foo$0(),
+}
+        "#,
+        );
     }
 }

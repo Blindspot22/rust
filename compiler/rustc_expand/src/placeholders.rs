@@ -186,6 +186,11 @@ pub(crate) fn placeholder(
             ty: ty(),
             vis,
             is_placeholder: true,
+            mut_restriction: ast::MutRestriction {
+                kind: ast::RestrictionKind::Unrestricted,
+                span: DUMMY_SP,
+                tokens: None,
+            },
             safety: Safety::Default,
             default: None,
         }]),
@@ -218,12 +223,17 @@ pub(crate) fn placeholder(
     }
 }
 
-#[derive(Default)]
 pub(crate) struct PlaceholderExpander {
     expanded_fragments: FxHashMap<ast::NodeId, AstFragment>,
 }
 
 impl PlaceholderExpander {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        PlaceholderExpander {
+            expanded_fragments: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+        }
+    }
+
     pub(crate) fn add(&mut self, id: ast::NodeId, mut fragment: AstFragment) {
         fragment.mut_visit_with(self);
         self.expanded_fragments.insert(id, fragment);

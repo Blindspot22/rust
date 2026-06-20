@@ -133,7 +133,7 @@ impl Step for ToolBuild {
                 RustcLto::ThinLocal => None,
             };
             if let Some(lto) = lto {
-                cargo.env(cargo_profile_var("LTO", &builder.config), lto);
+                cargo.env(cargo_profile_var("LTO", &builder.config, self.mode), lto);
             }
         }
 
@@ -223,6 +223,12 @@ pub fn prepare_tool_cargo(
     // clippy tests need to know about the stage sysroot. Set them consistently while building to
     // avoid rebuilding when running tests.
     cargo.env("SYSROOT", builder.sysroot(compiler));
+
+    // Make sure we explicitly add rustc_private libs to path centrally here so that
+    // RustcPrivate tools can pick them up.
+    if mode == Mode::ToolRustcPrivate {
+        cargo.add_rustc_lib_path(builder);
+    }
 
     // if tools are using lzma we want to force the build script to build its
     // own copy
@@ -600,6 +606,12 @@ impl Step for ErrorIndex {
     }
 
     fn run(self, builder: &Builder<'_>) -> ToolBuildResult {
+        builder.require_submodule(
+            "src/doc/reference",
+            Some("error_index_generator requires mdbook-spec"),
+        );
+        builder
+            .require_submodule("src/doc/book", Some("error_index_generator requires mdbook-trpl"));
         builder.ensure(ToolBuild {
             build_compiler: self.compilers.build_compiler,
             target: self.compilers.target(),
@@ -683,7 +695,7 @@ impl Step for Rustdoc {
     const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.path("src/tools/rustdoc").path("src/librustdoc")
+        run.selectors(&["src/tools/rustdoc", "src/librustdoc"])
     }
 
     fn is_default_step(_builder: &Builder<'_>) -> bool {

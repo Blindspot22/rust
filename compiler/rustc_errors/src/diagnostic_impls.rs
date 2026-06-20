@@ -1,15 +1,11 @@
 use std::borrow::Cow;
 
-use rustc_abi::TargetDataLayoutErrors;
 use rustc_error_messages::{DiagArgValue, IntoDiagArg};
 use rustc_macros::Subdiagnostic;
 use rustc_span::{Span, Symbol};
 
 use crate::diagnostic::DiagLocation;
-use crate::{
-    Diag, DiagCtxtHandle, Diagnostic, EmissionGuarantee, Level, Subdiagnostic,
-    fluent_generated as fluent,
-};
+use crate::{Diag, EmissionGuarantee, Subdiagnostic};
 
 impl IntoDiagArg for DiagLocation {
     fn into_diag_arg(self, _: &mut Option<std::path::PathBuf>) -> DiagArgValue {
@@ -40,53 +36,6 @@ impl<S: std::fmt::Display> IntoDiagArg for DiagSymbolList<S> {
     }
 }
 
-impl<G: EmissionGuarantee> Diagnostic<'_, G> for TargetDataLayoutErrors<'_> {
-    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_, G> {
-        match self {
-            TargetDataLayoutErrors::InvalidAddressSpace { addr_space, err, cause } => {
-                Diag::new(dcx, level, fluent::errors_target_invalid_address_space)
-                    .with_arg("addr_space", addr_space)
-                    .with_arg("cause", cause)
-                    .with_arg("err", err)
-            }
-            TargetDataLayoutErrors::InvalidBits { kind, bit, cause, err } => {
-                Diag::new(dcx, level, fluent::errors_target_invalid_bits)
-                    .with_arg("kind", kind)
-                    .with_arg("bit", bit)
-                    .with_arg("cause", cause)
-                    .with_arg("err", err)
-            }
-            TargetDataLayoutErrors::MissingAlignment { cause } => {
-                Diag::new(dcx, level, fluent::errors_target_missing_alignment)
-                    .with_arg("cause", cause)
-            }
-            TargetDataLayoutErrors::InvalidAlignment { cause, err } => {
-                Diag::new(dcx, level, fluent::errors_target_invalid_alignment)
-                    .with_arg("cause", cause)
-                    .with_arg("err_kind", err.diag_ident())
-                    .with_arg("align", err.align())
-            }
-            TargetDataLayoutErrors::InconsistentTargetArchitecture { dl, target } => {
-                Diag::new(dcx, level, fluent::errors_target_inconsistent_architecture)
-                    .with_arg("dl", dl)
-                    .with_arg("target", target)
-            }
-            TargetDataLayoutErrors::InconsistentTargetPointerWidth { pointer_size, target } => {
-                Diag::new(dcx, level, fluent::errors_target_inconsistent_pointer_width)
-                    .with_arg("pointer_size", pointer_size)
-                    .with_arg("target", target)
-            }
-            TargetDataLayoutErrors::InvalidBitsSize { err } => {
-                Diag::new(dcx, level, fluent::errors_target_invalid_bits_size).with_arg("err", err)
-            }
-            TargetDataLayoutErrors::UnknownPointerSpecification { err } => {
-                Diag::new(dcx, level, fluent::errors_target_invalid_datalayout_pointer_spec)
-                    .with_arg("err", err)
-            }
-        }
-    }
-}
-
 /// Utility struct used to apply a single label while highlighting multiple spans
 pub struct SingleLabelManySpans {
     pub spans: Vec<Span>,
@@ -99,7 +48,12 @@ impl Subdiagnostic for SingleLabelManySpans {
 }
 
 #[derive(Subdiagnostic)]
-#[label(errors_expected_lifetime_parameter)]
+#[label(
+    "expected lifetime {$count ->
+        [1] parameter
+        *[other] parameters
+    }"
+)]
 pub struct ExpectedLifetimeParameter {
     #[primary_span]
     pub span: Span,
@@ -107,7 +61,14 @@ pub struct ExpectedLifetimeParameter {
 }
 
 #[derive(Subdiagnostic)]
-#[suggestion(errors_indicate_anonymous_lifetime, code = "{suggestion}", style = "verbose")]
+#[suggestion(
+    "indicate the anonymous {$count ->
+        [1] lifetime
+        *[other] lifetimes
+    }",
+    code = "{suggestion}",
+    style = "verbose"
+)]
 pub struct IndicateAnonymousLifetime {
     #[primary_span]
     pub span: Span,

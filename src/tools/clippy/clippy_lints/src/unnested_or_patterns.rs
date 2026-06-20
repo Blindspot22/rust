@@ -10,7 +10,6 @@ use rustc_ast::mut_visit::*;
 use rustc_ast::{self as ast, DUMMY_NODE_ID, Mutability, Pat, PatKind, Pinnedness};
 use rustc_ast_pretty::pprust;
 use rustc_data_structures::thin_vec::{ThinVec, thin_vec};
-use rustc_data_structures::thinvec::ExtractIf;
 use rustc_errors::Applicability;
 use rustc_lint::{EarlyContext, EarlyLintPass};
 use rustc_session::impl_lint_pass;
@@ -49,6 +48,8 @@ declare_clippy_lint! {
     "unnested or-patterns, e.g., `Foo(Bar) | Foo(Baz) instead of `Foo(Bar | Baz)`"
 }
 
+impl_lint_pass!(UnnestedOrPatterns => [UNNESTED_OR_PATTERNS]);
+
 pub struct UnnestedOrPatterns {
     msrv: MsrvStack,
 }
@@ -60,8 +61,6 @@ impl UnnestedOrPatterns {
         }
     }
 }
-
-impl_lint_pass!(UnnestedOrPatterns => [UNNESTED_OR_PATTERNS]);
 
 impl EarlyLintPass for UnnestedOrPatterns {
     fn check_arm(&mut self, cx: &EarlyContext<'_>, a: &ast::Arm) {
@@ -152,7 +151,12 @@ fn insert_necessary_parens(pat: &mut Pat) {
             walk_pat(self, pat);
             let target = match &mut pat.kind {
                 // `i @ a | b`, `box a | b`, and `& mut? a | b`.
-                Ident(.., Some(p)) | Box(p) | Ref(p, _, _) if matches!(&p.kind, Or(ps) if ps.len() > 1) => p,
+                Ident(.., Some(p)) | Box(p) | Ref(p, _, _)
+                    if let Or(ps) = &p.kind
+                        && ps.len() > 1 =>
+                {
+                    p
+                },
                 // `&(mut x)`
                 Ref(p, Pinnedness::Not, Mutability::Not) if matches!(p.kind, Ident(BindingMode::MUT, ..)) => p,
                 _ => return,
@@ -417,9 +421,7 @@ fn drain_matching(
     let mut tail_or = ThinVec::new();
     let mut idx = 0;
 
-    // FIXME: once `thin-vec` releases a new version, change this to `alternatives.extract_if()`
-    // See https://github.com/mozilla/thin-vec/issues/77
-    for pat in ExtractIf::new(alternatives, |p| {
+    for pat in alternatives.extract_if(.., |p| {
         // Check if we should extract, but only if `idx >= start`.
         idx += 1;
         idx > start && predicate(&p.kind)

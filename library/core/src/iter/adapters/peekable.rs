@@ -21,7 +21,7 @@ pub struct Peekable<I: Iterator> {
 }
 
 impl<I: Iterator> Peekable<I> {
-    pub(in crate::iter) fn new(iter: I) -> Peekable<I> {
+    pub(in crate::iter) const fn new(iter: I) -> Peekable<I> {
         Peekable { iter, peeked: None }
     }
 }
@@ -406,7 +406,7 @@ impl<I: Iterator> Peekable<I> {
     ///#     ],
     ///# )
     /// ```
-    #[stable(feature = "peekable_next_if_map", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "peekable_next_if_map", since = "1.94.0")]
     pub fn next_if_map<R>(&mut self, f: impl FnOnce(I::Item) -> Result<R, I::Item>) -> Option<R> {
         let unpeek = if let Some(item) = self.next() {
             match f(item) {
@@ -443,7 +443,7 @@ impl<I: Iterator> Peekable<I> {
     /// assert_eq!(line_num, 125);
     /// assert_eq!(iter.collect::<String>(), " GOTO 10");
     /// ```
-    #[stable(feature = "peekable_next_if_map", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "peekable_next_if_map", since = "1.94.0")]
     pub fn next_if_map_mut<R>(&mut self, f: impl FnOnce(&mut I::Item) -> Option<R>) -> Option<R> {
         let unpeek = if let Some(mut item) = self.next() {
             match f(&mut item) {

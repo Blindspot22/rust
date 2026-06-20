@@ -13,13 +13,16 @@ use rustc_type_ir::{
     solve::SizedTraitKind,
 };
 
-use crate::next_solver::{
-    BoundConst, FxIndexMap, ParamEnv, Placeholder, PlaceholderConst, PlaceholderRegion,
-    PolyTraitRef,
-    infer::{
-        InferCtxt,
-        traits::{Obligation, ObligationCause, PredicateObligation},
+use crate::{
+    next_solver::{
+        BoundConst, FxIndexMap, ParamEnv, PlaceholderConst, PlaceholderRegion, PlaceholderType,
+        PolyTraitRef,
+        infer::{
+            InferCtxt,
+            traits::{Obligation, ObligationCause, PredicateObligation},
+        },
     },
+    representability::Representability,
 };
 
 use super::{
@@ -419,10 +422,18 @@ pub fn sizedness_constraint_for_ty<'db>(
             .next_back()
             .and_then(|ty| sizedness_constraint_for_ty(interner, sizedness, ty)),
 
-        Adt(adt, args) => adt.struct_tail_ty(interner).and_then(|tail_ty| {
-            let tail_ty = tail_ty.instantiate(interner, args);
-            sizedness_constraint_for_ty(interner, sizedness, tail_ty)
-        }),
+        Adt(adt, args) => {
+            if crate::representability::representability(interner.db, adt.def_id())
+                == Representability::Infinite
+            {
+                return None;
+            }
+
+            adt.struct_tail_ty(interner).and_then(|tail_ty| {
+                let tail_ty = tail_ty.instantiate(interner, args).skip_norm_wip();
+                sizedness_constraint_for_ty(interner, sizedness, tail_ty)
+            })
+        }
 
         Placeholder(..) | Bound(..) | Infer(..) => {
             panic!("unexpected type `{ty:?}` in sizedness_constraint_for_ty")
@@ -435,9 +446,10 @@ pub fn apply_args_to_binder<'db, T: TypeFoldable<DbInterner<'db>>>(
     args: GenericArgs<'db>,
     interner: DbInterner<'db>,
 ) -> T {
-    let types = &mut |ty: BoundTy| args.as_slice()[ty.var.index()].expect_ty();
-    let regions = &mut |region: BoundRegion| args.as_slice()[region.var.index()].expect_region();
-    let consts = &mut |const_: BoundConst| args.as_slice()[const_.var.index()].expect_const();
+    let types = &mut |ty: BoundTy<'db>| args.as_slice()[ty.var.index()].expect_ty();
+    let regions =
+        &mut |region: BoundRegion<'db>| args.as_slice()[region.var.index()].expect_region();
+    let consts = &mut |const_: BoundConst<'db>| args.as_slice()[const_.var.index()].expect_const();
     let mut instantiate = BoundVarReplacer::new(interner, FnMutDelegate { types, regions, consts });
     b.skip_binder().fold_with(&mut instantiate)
 }
@@ -450,6 +462,21 @@ pub fn explicit_item_bounds<'db>(
     let clauses = match def_id {
         SolverDefId::TypeAliasId(type_alias) => crate::lower::type_alias_bounds(db, type_alias),
         SolverDefId::InternedOpaqueTyId(id) => id.predicates(db),
+        _ => panic!("Unexpected GenericDefId"),
+    };
+    clauses.map_bound(|clauses| clauses.iter().copied())
+}
+
+pub fn explicit_item_self_bounds<'db>(
+    interner: DbInterner<'db>,
+    def_id: SolverDefId,
+) -> EarlyBinder<'db, impl DoubleEndedIterator<Item = Clause<'db>> + ExactSizeIterator> {
+    let db = interner.db();
+    let clauses = match def_id {
+        SolverDefId::TypeAliasId(type_alias) => {
+            crate::lower::type_alias_self_bounds(db, type_alias)
+        }
+        SolverDefId::InternedOpaqueTyId(id) => id.self_predicates(db),
         _ => panic!("Unexpected GenericDefId"),
     };
     clauses.map_bound(|clauses| clauses.iter().copied())
@@ -471,9 +498,9 @@ impl<'db> TypeVisitor<DbInterner<'db>> for ContainsTypeErrors {
 /// The inverse of [`BoundVarReplacer`]: replaces placeholders with the bound vars from which they came.
 pub struct PlaceholderReplacer<'a, 'db> {
     infcx: &'a InferCtxt<'db>,
-    mapped_regions: FxIndexMap<PlaceholderRegion, BoundRegion>,
-    mapped_types: FxIndexMap<Placeholder<BoundTy>, BoundTy>,
-    mapped_consts: FxIndexMap<PlaceholderConst, BoundConst>,
+    mapped_regions: FxIndexMap<PlaceholderRegion<'db>, BoundRegion<'db>>,
+    mapped_types: FxIndexMap<PlaceholderType<'db>, BoundTy<'db>>,
+    mapped_consts: FxIndexMap<PlaceholderConst<'db>, BoundConst<'db>>,
     universe_indices: &'a [Option<UniverseIndex>],
     current_index: DebruijnIndex,
 }
@@ -481,9 +508,9 @@ pub struct PlaceholderReplacer<'a, 'db> {
 impl<'a, 'db> PlaceholderReplacer<'a, 'db> {
     pub fn replace_placeholders<T: TypeFoldable<DbInterner<'db>>>(
         infcx: &'a InferCtxt<'db>,
-        mapped_regions: FxIndexMap<PlaceholderRegion, BoundRegion>,
-        mapped_types: FxIndexMap<Placeholder<BoundTy>, BoundTy>,
-        mapped_consts: FxIndexMap<PlaceholderConst, BoundConst>,
+        mapped_regions: FxIndexMap<PlaceholderRegion<'db>, BoundRegion<'db>>,
+        mapped_types: FxIndexMap<PlaceholderType<'db>, BoundTy<'db>>,
+        mapped_consts: FxIndexMap<PlaceholderConst<'db>, BoundConst<'db>>,
         universe_indices: &'a [Option<UniverseIndex>],
         value: T,
     ) -> T {
@@ -690,7 +717,7 @@ pub(crate) fn clauses_as_obligations<'db>(
     param_env: ParamEnv<'db>,
 ) -> impl Iterator<Item = PredicateObligation<'db>> {
     clauses.into_iter().map(move |clause| Obligation {
-        cause: cause.clone(),
+        cause,
         param_env,
         predicate: clause.as_predicate(),
         recursion_depth: 0,

@@ -82,13 +82,13 @@ pub(crate) trait DocFolder: Sized {
             | StaticItem(_)
             | ConstantItem(..)
             | TraitAliasItem(_)
-            | RequiredMethodItem(_)
-            | MethodItem(_, _)
+            | RequiredMethodItem(..)
+            | MethodItem(..)
             | StructFieldItem(_)
             | ForeignFunctionItem(..)
             | ForeignStaticItem(..)
             | ForeignTypeItem
-            | MacroItem(_)
+            | MacroItem(..)
             | ProcMacroItem(_)
             | PrimitiveItem(_)
             | RequiredAssocConstItem(..)
@@ -97,14 +97,15 @@ pub(crate) trait DocFolder: Sized {
             | RequiredAssocTypeItem(..)
             | AssocTypeItem(..)
             | KeywordItem
-            | AttributeItem => kind,
+            | AttributeItem
+            | PlaceholderImplItem => kind,
         }
     }
 
     /// don't override!
     fn fold_item_recur(&mut self, mut item: Item) -> Item {
         item.inner.kind = match item.inner.kind {
-            StrippedItem(box i) => StrippedItem(Box::new(self.fold_inner_recur(i))),
+            StrippedItem(i) => StrippedItem(Box::new(self.fold_inner_recur(*i))),
             _ => self.fold_inner_recur(item.inner.kind),
         };
         item

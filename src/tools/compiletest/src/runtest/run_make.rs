@@ -190,8 +190,8 @@ impl TestCx<'_> {
             // through a specific CI runner).
             .env("LLVM_COMPONENTS", &self.config.llvm_components);
 
-        // Only `run-make-cargo` test suite gets an in-tree `cargo`, not `run-make`.
-        if self.config.suite == TestSuite::RunMakeCargo {
+        // The `run-make-cargo` and `build-std` suites need an in-tree `cargo`, `run-make` does not.
+        if matches!(self.config.suite, TestSuite::RunMakeCargo | TestSuite::BuildStd) {
             cmd.env(
                 "CARGO",
                 self.config.cargo_path.as_ref().expect("cargo must be built and made available"),
@@ -231,6 +231,13 @@ impl TestCx<'_> {
         }
 
         // Guard against externally-set env vars.
+        // Set env var to enable verbose output for successful commands.
+        // Only set when --verbose-run-make-subprocess-output is passed.
+        cmd.env_remove("__RMAKE_VERBOSE_SUBPROCESS_OUTPUT");
+        if self.config.verbose_run_make_subprocess_output {
+            cmd.env("__RMAKE_VERBOSE_SUBPROCESS_OUTPUT", "1");
+        }
+
         cmd.env_remove("__RUSTC_DEBUG_ASSERTIONS_ENABLED");
         if self.config.with_rustc_debug_assertions {
             // Used for `run_make_support::env::rustc_debug_assertions_enabled`.

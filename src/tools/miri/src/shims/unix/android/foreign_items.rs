@@ -3,11 +3,11 @@ use rustc_middle::ty::Ty;
 use rustc_span::Symbol;
 use rustc_target::callconv::FnAbi;
 
-use crate::shims::unix::android::thread::prctl;
 use crate::shims::unix::env::EvalContextExt as _;
 use crate::shims::unix::linux_like::epoll::EvalContextExt as _;
 use crate::shims::unix::linux_like::eventfd::EvalContextExt as _;
 use crate::shims::unix::linux_like::syscall::syscall;
+use crate::shims::unix::linux_like::thread::prctl;
 use crate::shims::unix::*;
 use crate::*;
 
@@ -27,22 +27,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let this = self.eval_context_mut();
         match link_name.as_str() {
             // File related shims
-            "stat" => {
-                let [path, buf] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
-                let result = this.stat(path, buf)?;
-                this.write_scalar(result, dest)?;
-            }
-            "lstat" => {
-                let [path, buf] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
-                let result = this.lstat(path, buf)?;
-                this.write_scalar(result, dest)?;
-            }
-            "readdir" => {
-                let [dirp] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
-                let result = this.readdir64("dirent", dirp)?;
-                this.write_scalar(result, dest)?;
-            }
             "pread64" => {
+                // FIXME: This does not have a direct test (#3179).
                 let [fd, buf, count, offset] = this.check_shim_sig(
                     shim_sig!(extern "C" fn(i32, *mut _, usize, libc::off64_t) -> isize),
                     link_name,
@@ -56,6 +42,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.read(fd, buf, count, Some(offset), dest)?;
             }
             "pwrite64" => {
+                // FIXME: This does not have a direct test (#3179).
                 let [fd, buf, n, offset] = this.check_shim_sig(
                     shim_sig!(extern "C" fn(i32, *const _, usize, libc::off64_t) -> isize),
                     link_name,
@@ -70,6 +57,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write(fd, buf, count, Some(offset), dest)?;
             }
             "lseek64" => {
+                // FIXME: This does not have a direct test (#3179).
                 let [fd, offset, whence] = this.check_shim_sig(
                     shim_sig!(extern "C" fn(i32, libc::off64_t, i32) -> libc::off64_t),
                     link_name,
@@ -79,7 +67,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let fd = this.read_scalar(fd)?.to_i32()?;
                 let offset = this.read_scalar(offset)?.to_int(offset.layout.size)?;
                 let whence = this.read_scalar(whence)?.to_i32()?;
-                this.lseek64(fd, offset, whence, dest)?;
+                this.lseek(fd, offset, whence, dest)?;
             }
             "ftruncate64" => {
                 let [fd, length] = this.check_shim_sig(

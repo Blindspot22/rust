@@ -2,7 +2,6 @@ use rustc_abi::FIRST_VARIANT;
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_hir as hir;
-use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def::DefKind;
 use rustc_hir::find_attr;
 use rustc_middle::query::Providers;
@@ -18,7 +17,7 @@ pub(crate) fn provide(providers: &mut Providers) {
     *providers = Providers { clashing_extern_declarations, ..*providers };
 }
 
-pub(crate) fn get_lints() -> LintVec {
+pub(crate) fn lint_vec() -> LintVec {
     vec![CLASHING_EXTERN_DECLARATIONS]
 }
 
@@ -124,7 +123,7 @@ impl ClashingExternDeclarations {
         let Some(existing_did) = self.insert(tcx, this_fi) else { return };
 
         let existing_decl_ty = tcx.type_of(existing_did).skip_binder();
-        let this_decl_ty = tcx.type_of(this_fi.owner_id).instantiate_identity();
+        let this_decl_ty = tcx.type_of(this_fi.owner_id).instantiate_identity().skip_norm_wip();
         debug!(
             "ClashingExternDeclarations: Comparing existing {:?}: {:?} to this {:?}: {:?}",
             existing_did, existing_decl_ty, this_fi.owner_id, this_decl_ty
@@ -183,11 +182,7 @@ fn name_of_extern_decl(tcx: TyCtxt<'_>, fi: hir::OwnerId) -> SymbolName {
             // information, we could have codegen_fn_attrs also give span information back for
             // where the attribute was defined. However, until this is found to be a
             // bottleneck, this does just fine.
-            (
-                overridden_link_name,
-                find_attr!(tcx.get_all_attrs(fi), AttributeKind::LinkName {span, ..} => *span)
-                    .unwrap(),
-            )
+            (overridden_link_name, find_attr!(tcx, fi, LinkName {span, ..} => *span).unwrap())
         })
     {
         SymbolName::Link(overridden_link_name, overridden_link_name_span)
@@ -251,7 +246,7 @@ fn structurally_same_type_impl<'tcx>(
                     // continue with `ty`'s non-ZST field,
                     // otherwise `ty` is a ZST and we can return
                     if let Some(field) = types::transparent_newtype_field(tcx, v) {
-                        ty = field.ty(tcx, args);
+                        ty = field.ty(tcx, args).skip_norm_wip();
                         continue;
                     }
                 }
@@ -302,8 +297,8 @@ fn structurally_same_type_impl<'tcx>(
                                 seen_types,
                                 tcx,
                                 typing_env,
-                                tcx.type_of(a_did).instantiate(tcx, a_gen_args),
-                                tcx.type_of(b_did).instantiate(tcx, b_gen_args),
+                                tcx.type_of(a_did).instantiate(tcx, a_gen_args).skip_norm_wip(),
+                                tcx.type_of(b_did).instantiate(tcx, b_gen_args).skip_norm_wip(),
                             )
                         },
                     )
@@ -334,8 +329,8 @@ fn structurally_same_type_impl<'tcx>(
                     let a_sig = tcx.instantiate_bound_regions_with_erased(a_poly_sig);
                     let b_sig = tcx.instantiate_bound_regions_with_erased(b_poly_sig);
 
-                    (a_sig.abi, a_sig.safety, a_sig.c_variadic)
-                        == (b_sig.abi, b_sig.safety, b_sig.c_variadic)
+                    (a_sig.abi(), a_sig.safety(), a_sig.c_variadic())
+                        == (b_sig.abi(), b_sig.safety(), b_sig.c_variadic())
                         && a_sig.inputs().iter().eq_by(b_sig.inputs().iter(), |a, b| {
                             structurally_same_type_impl(seen_types, tcx, typing_env, *a, *b)
                         })
@@ -359,9 +354,18 @@ fn structurally_same_type_impl<'tcx>(
                 | (ty::Closure(..), ty::Closure(..))
                 | (ty::Coroutine(..), ty::Coroutine(..))
                 | (ty::CoroutineWitness(..), ty::CoroutineWitness(..))
-                | (ty::Alias(ty::Projection, ..), ty::Alias(ty::Projection, ..))
-                | (ty::Alias(ty::Inherent, ..), ty::Alias(ty::Inherent, ..))
-                | (ty::Alias(ty::Opaque, ..), ty::Alias(ty::Opaque, ..)) => false,
+                | (
+                    ty::Alias(ty::AliasTy { kind: ty::Projection { .. }, .. }),
+                    ty::Alias(ty::AliasTy { kind: ty::Projection { .. }, .. }),
+                )
+                | (
+                    ty::Alias(ty::AliasTy { kind: ty::Inherent { .. }, .. }),
+                    ty::Alias(ty::AliasTy { kind: ty::Inherent { .. }, .. }),
+                )
+                | (
+                    ty::Alias(ty::AliasTy { kind: ty::Opaque { .. }, .. }),
+                    ty::Alias(ty::AliasTy { kind: ty::Opaque { .. }, .. }),
+                ) => false,
 
                 // These definitely should have been caught above.
                 (ty::Bool, ty::Bool)

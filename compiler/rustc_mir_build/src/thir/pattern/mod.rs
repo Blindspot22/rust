@@ -4,33 +4,37 @@ mod check_match;
 mod const_to_pat;
 mod migration;
 
-use std::assert_matches::assert_matches;
+use std::assert_matches;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
 use rustc_abi::{FieldIdx, Integer};
+use rustc_ast::LitKind;
 use rustc_errors::codes::*;
 use rustc_hir::def::{CtorOf, DefKind, Res};
 use rustc_hir::pat_util::EnumerateAndAdjustIterator;
 use rustc_hir::{self as hir, RangeEnd};
 use rustc_index::Idx;
-use rustc_middle::mir::interpret::LitToConstInput;
 use rustc_middle::thir::{
     Ascription, DerefPatBorrowMode, FieldPat, LocalVarId, Pat, PatKind, PatRange, PatRangeBoundary,
 };
 use rustc_middle::ty::adjustment::{PatAdjust, PatAdjustment};
 use rustc_middle::ty::layout::IntegerExt;
-use rustc_middle::ty::{self, CanonicalUserTypeAnnotation, Ty, TyCtxt};
+use rustc_middle::ty::{
+    self, CanonicalUserTypeAnnotation, LitToConstInput, Ty, TyCtxt, const_lit_matches_ty,
+};
 use rustc_middle::{bug, span_bug};
 use rustc_span::ErrorGuaranteed;
 use tracing::{debug, instrument};
 
 pub(crate) use self::check_match::check_match;
 use self::migration::PatMigration;
-use crate::errors::*;
+use crate::diagnostics::*;
+use crate::thir::cx::ThirBuildCx;
 
 /// Context for lowering HIR patterns to THIR patterns.
-struct PatCtxt<'tcx> {
+struct PatCtxt<'tcx, 'ptcx> {
+    upper: &'ptcx mut ThirBuildCx<'tcx>,
     tcx: TyCtxt<'tcx>,
     typing_env: ty::TypingEnv<'tcx>,
     typeck_results: &'tcx ty::TypeckResults<'tcx>,
@@ -39,8 +43,9 @@ struct PatCtxt<'tcx> {
     rust_2024_migration: Option<PatMigration<'tcx>>,
 }
 
-#[instrument(level = "debug", skip(tcx, typing_env, typeck_results), ret)]
-pub(super) fn pat_from_hir<'tcx>(
+#[instrument(level = "debug", skip(upper, tcx, typing_env, typeck_results), ret)]
+pub(super) fn pat_from_hir<'tcx, 'ptcx>(
+    upper: &'ptcx mut ThirBuildCx<'tcx>,
     tcx: TyCtxt<'tcx>,
     typing_env: ty::TypingEnv<'tcx>,
     typeck_results: &'tcx ty::TypeckResults<'tcx>,
@@ -49,6 +54,7 @@ pub(super) fn pat_from_hir<'tcx>(
     let_stmt_type: Option<&hir::Ty<'tcx>>,
 ) -> Box<Pat<'tcx>> {
     let mut pcx = PatCtxt {
+        upper,
         tcx,
         typing_env,
         typeck_results,
@@ -85,7 +91,7 @@ pub(super) fn pat_from_hir<'tcx>(
     thir_pat
 }
 
-impl<'tcx> PatCtxt<'tcx> {
+impl<'tcx, 'ptcx> PatCtxt<'tcx, 'ptcx> {
     fn lower_pattern(&mut self, pat: &'tcx hir::Pat<'tcx>) -> Box<Pat<'tcx>> {
         let adjustments: &[PatAdjustment<'tcx>] =
             self.typeck_results.pat_adjustments().get(pat.hir_id).map_or(&[], |v| &**v);
@@ -132,12 +138,16 @@ impl<'tcx> PatCtxt<'tcx> {
             debug!("{:?}: wrapping pattern with adjustment {:?}", thir_pat, adjust);
             let span = thir_pat.span;
             let kind = match adjust.kind {
-                PatAdjust::BuiltinDeref => PatKind::Deref { subpattern: thir_pat },
+                PatAdjust::BuiltinDeref => {
+                    PatKind::Deref { pin: hir::Pinnedness::Not, subpattern: thir_pat }
+                }
                 PatAdjust::OverloadedDeref => {
                     let borrow = self.typeck_results.deref_pat_borrow_mode(adjust.source, pat);
                     PatKind::DerefPattern { subpattern: thir_pat, borrow }
                 }
-                PatAdjust::PinDeref => PatKind::Deref { subpattern: thir_pat },
+                PatAdjust::PinDeref => {
+                    PatKind::Deref { pin: hir::Pinnedness::Pinned, subpattern: thir_pat }
+                }
             };
             Box::new(Pat { span, ty: adjust.source, kind, extra: None })
         });
@@ -167,7 +177,7 @@ impl<'tcx> PatCtxt<'tcx> {
         // Lower the endpoint into a temporary `thir::Pat` that will then be
         // deconstructed to obtain the constant value and other data.
         let endpoint_pat: Box<Pat<'tcx>> = self.lower_pat_expr(pat, expr);
-        let box Pat { ref kind, extra, .. } = endpoint_pat;
+        let Pat { ref kind, extra, .. } = endpoint_pat;
 
         // Preserve any ascriptions from endpoint constants.
         if let Some(extra) = extra {
@@ -193,8 +203,6 @@ impl<'tcx> PatCtxt<'tcx> {
         expr: Option<&'tcx hir::PatExpr<'tcx>>,
         ty: Ty<'tcx>,
     ) -> Result<(), ErrorGuaranteed> {
-        use rustc_ast::ast::LitKind;
-
         let Some(expr) = expr else {
             return Ok(());
         };
@@ -334,7 +342,7 @@ impl<'tcx> PatCtxt<'tcx> {
                 let borrow = self.typeck_results.deref_pat_borrow_mode(ty, subpattern);
                 PatKind::DerefPattern { subpattern: self.lower_pattern(subpattern), borrow }
             }
-            hir::PatKind::Ref(subpattern, _, _) => {
+            hir::PatKind::Ref(subpattern, pin, _) => {
                 // Track the default binding mode for the Rust 2024 migration suggestion.
                 let opt_old_mode_span =
                     self.rust_2024_migration.as_mut().and_then(|s| s.visit_explicit_deref());
@@ -342,7 +350,7 @@ impl<'tcx> PatCtxt<'tcx> {
                 if let Some(s) = &mut self.rust_2024_migration {
                     s.leave_ref(opt_old_mode_span);
                 }
-                PatKind::Deref { subpattern }
+                PatKind::Deref { pin, subpattern }
             }
             hir::PatKind::Box(subpattern) => PatKind::DerefPattern {
                 subpattern: self.lower_pattern(subpattern),
@@ -439,8 +447,10 @@ impl<'tcx> PatCtxt<'tcx> {
 
             hir::PatKind::Or(pats) => PatKind::Or { pats: self.lower_patterns(pats) },
 
-            // FIXME(guard_patterns): implement guard pattern lowering
-            hir::PatKind::Guard(pat, _) => self.lower_pattern(pat).kind,
+            hir::PatKind::Guard(pat, condition) => PatKind::Guard {
+                subpattern: self.lower_pattern(pat),
+                condition: self.upper.mirror_expr(condition),
+            },
 
             hir::PatKind::Err(guar) => PatKind::Error(guar),
         };
@@ -631,7 +641,8 @@ impl<'tcx> PatCtxt<'tcx> {
         let res = self.typeck_results.qpath_res(qpath, id);
 
         let (def_id, user_ty) = match res {
-            Res::Def(DefKind::Const, def_id) | Res::Def(DefKind::AssocConst, def_id) => {
+            Res::Def(DefKind::Const { .. }, def_id)
+            | Res::Def(DefKind::AssocConst { .. }, def_id) => {
                 (def_id, self.typeck_results.user_provided_types().get(id))
             }
 
@@ -646,7 +657,14 @@ impl<'tcx> PatCtxt<'tcx> {
         let args = self.typeck_results.node_args(id);
         // FIXME(mgca): we will need to special case IACs here to have type system compatible
         // generic args, instead of how we represent them in body expressions.
-        let c = ty::Const::new_unevaluated(self.tcx, ty::UnevaluatedConst { def: def_id, args });
+        let c = ty::Const::new_unevaluated(
+            self.tcx,
+            ty::UnevaluatedConst::new(
+                self.tcx,
+                ty::UnevaluatedConstKind::new_from_def_id(self.tcx, def_id),
+                args,
+            ),
+        );
         let mut pattern = self.const_to_pat(c, ty, id, span);
 
         // If this is an associated constant with an explicit user-written
@@ -691,8 +709,18 @@ impl<'tcx> PatCtxt<'tcx> {
                 // patterns to `str`, and byte-string literal patterns to `[u8; N]` or `[u8]`.
 
                 let pat_ty = self.typeck_results.node_type(pat.hir_id);
-                let lit_input = LitToConstInput { lit: lit.node, ty: pat_ty, neg: *negated };
-                let constant = self.tcx.at(expr.span).lit_to_const(lit_input);
+                let lit_input = LitToConstInput { lit: lit.node, ty: Some(pat_ty), neg: *negated };
+                let constant = const_lit_matches_ty(self.tcx, &lit.node, pat_ty, *negated)
+                    .then(|| self.tcx.at(expr.span).lit_to_const(lit_input))
+                    .flatten()
+                    .map(|v| ty::Const::new_value(self.tcx, v.valtree, pat_ty))
+                    .unwrap_or_else(|| {
+                        ty::Const::new_error_with_message(
+                            self.tcx,
+                            expr.span,
+                            "literal does not match expected type",
+                        )
+                    });
                 self.const_to_pat(constant, pat_ty, expr.hir_id, lit.span)
             }
         }

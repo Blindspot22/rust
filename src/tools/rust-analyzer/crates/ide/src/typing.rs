@@ -17,7 +17,7 @@ mod on_enter;
 
 use either::Either;
 use hir::EditionedFileId;
-use ide_db::{FilePosition, RootDatabase, base_db::RootQueryDb};
+use ide_db::{FilePosition, RootDatabase, base_db::relevant_crates};
 use span::Edition;
 use std::iter;
 
@@ -70,16 +70,12 @@ pub(crate) fn on_char_typed(
     if !TRIGGER_CHARS.contains(&char_typed) {
         return None;
     }
-    // FIXME: We need to figure out the edition of the file here, but that means hitting the
-    // database for more than just parsing the file which is bad.
-    // FIXME: We are hitting the database here, if we are unlucky this call might block momentarily
-    // causing the editor to feel sluggish!
-    let edition = Edition::CURRENT_FIXME;
-    let editioned_file_id_wrapper = EditionedFileId::from_span_guess_origin(
-        db,
-        span::EditionedFileId::new(position.file_id, edition),
-    );
-    let file = &db.parse(editioned_file_id_wrapper);
+    let edition = relevant_crates(db, position.file_id)
+        .first()
+        .copied()
+        .map_or(Edition::CURRENT, |krate| krate.data(db).edition);
+    let editioned_file_id_wrapper = EditionedFileId::new(db, position.file_id, edition);
+    let file = &editioned_file_id_wrapper.parse(db);
     let char_matches_position =
         file.tree().syntax().text().char_at(position.offset) == Some(char_typed);
     if !stdx::always!(char_matches_position) {
@@ -457,8 +453,8 @@ mod tests {
         let (offset, mut before) = extract_offset(before);
         let edit = TextEdit::insert(offset, char_typed.to_string());
         edit.apply(&mut before);
-        let parse = SourceFile::parse(&before, span::Edition::CURRENT_FIXME);
-        on_char_typed_(&parse, offset, char_typed, span::Edition::CURRENT_FIXME).map(|it| {
+        let parse = SourceFile::parse(&before, span::Edition::CURRENT);
+        on_char_typed_(&parse, offset, char_typed, span::Edition::CURRENT).map(|it| {
             it.apply(&mut before);
             before.to_string()
         })
@@ -1243,12 +1239,6 @@ sdasdasdasdasd
     #[test]
     fn parenthesis_noop_in_item_position_with_macro() {
         type_char_noop('(', r#"$0println!();"#);
-        type_char_noop(
-            '(',
-            r#"
-fn main() $0println!("hello");
-}"#,
-        );
     }
 
     #[test]

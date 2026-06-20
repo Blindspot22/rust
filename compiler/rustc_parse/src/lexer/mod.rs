@@ -4,12 +4,11 @@ use rustc_ast::token::{self, CommentKind, Delimiter, IdentIsRaw, Token, TokenKin
 use rustc_ast::tokenstream::TokenStream;
 use rustc_ast::util::unicode::{TEXT_FLOW_CONTROL_CHARS, contains_text_flow_control_chars};
 use rustc_errors::codes::*;
-use rustc_errors::{Applicability, Diag, DiagCtxtHandle, StashKey};
+use rustc_errors::{Applicability, Diag, DiagCtxtHandle, Diagnostic, StashKey};
 use rustc_lexer::{
     Base, Cursor, DocStyle, FrontmatterAllowed, LiteralKind, RawStrError, is_horizontal_whitespace,
 };
 use rustc_literal_escaper::{EscapeError, Mode, check_for_errors};
-use rustc_session::lint::BuiltinLintDiag;
 use rustc_session::lint::builtin::{
     RUST_2021_PREFIXES_INCOMPATIBLE_SYNTAX, RUST_2024_GUARDED_STRING_INCOMPATIBLE_SYNTAX,
     TEXT_DIRECTION_CODEPOINT_IN_COMMENT, TEXT_DIRECTION_CODEPOINT_IN_LITERAL,
@@ -116,7 +115,7 @@ pub(crate) fn lex_token_trees<'psess, 'src>(
         Err(errs) => {
             // We emit delimiter mismatch errors first, then emit the unclosing delimiter mismatch
             // because the delimiter mismatch is more likely to be the root cause of error
-            unmatched_closing_delims.extend(errs);
+            unmatched_closing_delims.push(errs);
             Err(unmatched_closing_delims)
         }
     }
@@ -388,7 +387,10 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
                             RUST_2021_PREFIXES_INCOMPATIBLE_SYNTAX,
                             prefix_span,
                             ast::CRATE_NODE_ID,
-                            BuiltinLintDiag::RawPrefix(prefix_span),
+                            errors::RawPrefix {
+                                label: prefix_span,
+                                suggestion: prefix_span.shrink_to_hi()
+                            },
                         );
 
                         // Reset the state so we just lex the `'r`.
@@ -459,8 +461,8 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
                         span: self.mk_sp(start, self.pos + Pos::from_usize(repeats * c.len_utf8())),
                         escaped: escaped_char(c),
                         sugg,
-                        null: if c == '\x00' { Some(errors::UnknownTokenNull) } else { None },
-                        invisible: if INVISIBLE_CHARACTERS.contains(&c) { Some(errors::InvisibleCharacter) } else { None },
+                        null: c == '\x00',
+                        invisible: INVISIBLE_CHARACTERS.contains(&c),
                         repeat: if repeats > 0 {
                             swallow_next_invalid = repeats;
                             Some(errors::UnknownTokenRepeat { repeats })
@@ -498,11 +500,41 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
         let content = self.str_from(content_start);
         if contains_text_flow_control_chars(content) {
             let span = self.mk_sp(start, self.pos);
-            self.psess.buffer_lint(
+            let content = content.to_string();
+            self.psess.dyn_buffer_lint(
                 TEXT_DIRECTION_CODEPOINT_IN_COMMENT,
                 span,
                 ast::CRATE_NODE_ID,
-                BuiltinLintDiag::UnicodeTextFlow(span, content.to_string()),
+                move |dcx, level| {
+                    let spans: Vec<_> = content
+                        .char_indices()
+                        .filter_map(|(i, c)| {
+                            TEXT_FLOW_CONTROL_CHARS.contains(&c).then(|| {
+                                let lo = span.lo() + BytePos(2 + i as u32);
+                                (c, span.with_lo(lo).with_hi(lo + BytePos(c.len_utf8() as u32)))
+                            })
+                        })
+                        .collect();
+                    let characters = spans
+                        .iter()
+                        .map(|&(c, span)| errors::UnicodeCharNoteSub {
+                            span,
+                            c_debug: format!("{c:?}"),
+                        })
+                        .collect();
+                    let suggestions =
+                        (!spans.is_empty()).then_some(errors::UnicodeTextFlowSuggestion {
+                            spans: spans.iter().map(|(_c, span)| *span).collect(),
+                        });
+
+                    errors::UnicodeTextFlow {
+                        comment_span: span,
+                        characters,
+                        suggestions,
+                        num_codepoints: spans.len(),
+                    }
+                    .into_diag(dcx, level)
+                },
             );
         }
     }
@@ -514,6 +546,7 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
                 self.mk_sp(start, self.pos),
                 0,
                 false,
+                true,
                 "doc comment",
             );
         }
@@ -548,6 +581,7 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
             span,
             padding,
             point_at_inner_spans,
+            false,
             label,
         );
     }
@@ -558,6 +592,7 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
         span: Span,
         padding: u32,
         point_at_inner_spans: bool,
+        is_doc_comment: bool,
         label: &str,
     ) {
         // Obtain the `Span`s for each of the forbidden chars.
@@ -578,7 +613,7 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
         let sub = if point_at_inner_spans && !spans.is_empty() {
             errors::HiddenUnicodeCodepointsDiagSub::Escape { spans }
         } else {
-            errors::HiddenUnicodeCodepointsDiagSub::NoEscape { spans }
+            errors::HiddenUnicodeCodepointsDiagSub::NoEscape { spans, is_doc_comment }
         };
 
         self.psess.buffer_lint(
@@ -598,9 +633,9 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
         let s = self.str_from(start);
         let real_start = s.find("---").unwrap();
         let frontmatter_opening_pos = BytePos(real_start as u32) + start;
-        let s_new = &s[real_start..];
-        let within = s_new.trim_start_matches('-');
-        let len_opening = s_new.len() - within.len();
+        let real_s = &s[real_start..];
+        let within = real_s.trim_start_matches('-');
+        let len_opening = real_s.len() - within.len();
 
         let frontmatter_opening_end_pos = frontmatter_opening_pos + BytePos(len_opening as u32);
         if has_invalid_preceding_whitespace {
@@ -614,8 +649,8 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
             });
         }
 
+        let line_end = real_s.find('\n').unwrap_or(real_s.len());
         if invalid_infostring {
-            let line_end = s[real_start..].find('\n').unwrap_or(s[real_start..].len());
             let span = self.mk_sp(
                 frontmatter_opening_end_pos,
                 frontmatter_opening_pos + BytePos(line_end as u32),
@@ -623,10 +658,18 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
             self.dcx().emit_err(errors::FrontmatterInvalidInfostring { span });
         }
 
-        let last_line_start = within.rfind('\n').map_or(0, |i| i + 1);
-        let last_line = &within[last_line_start..];
+        let last_line_start = real_s.rfind('\n').map_or(line_end, |i| i + 1);
+
+        let content = &real_s[line_end..last_line_start];
+        if let Some(cr_offset) = content.find('\r') {
+            let cr_pos = start + BytePos((real_start + line_end + cr_offset) as u32);
+            let span = self.mk_sp(cr_pos, cr_pos + BytePos(1 as u32));
+            self.dcx().emit_err(errors::BareCrFrontmatter { span });
+        }
+
+        let last_line = &real_s[last_line_start..];
         let last_line_trimmed = last_line.trim_start_matches(is_horizontal_whitespace);
-        let last_line_start_pos = frontmatter_opening_end_pos + BytePos(last_line_start as u32);
+        let last_line_start_pos = frontmatter_opening_pos + BytePos(last_line_start as u32);
 
         let frontmatter_span = self.mk_sp(frontmatter_opening_pos, self.pos);
         self.psess.gated_spans.gate(sym::frontmatter, frontmatter_span);
@@ -1030,7 +1073,11 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
                 RUST_2021_PREFIXES_INCOMPATIBLE_SYNTAX,
                 prefix_span,
                 ast::CRATE_NODE_ID,
-                BuiltinLintDiag::ReservedPrefix(prefix_span, prefix.to_string()),
+                errors::ReservedPrefix {
+                    label: prefix_span,
+                    suggestion: prefix_span.shrink_to_hi(),
+                    prefix: prefix.to_string(),
+                },
             );
         }
     }
@@ -1104,11 +1151,18 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
             })
         } else {
             // Before Rust 2024, only emit a lint for migration.
-            self.psess.buffer_lint(
+            self.psess.dyn_buffer_lint(
                 RUST_2024_GUARDED_STRING_INCOMPATIBLE_SYNTAX,
                 span,
                 ast::CRATE_NODE_ID,
-                BuiltinLintDiag::ReservedString { is_string, suggestion: space_span },
+                move |dcx, level| {
+                    if is_string {
+                        errors::ReservedStringLint { suggestion: space_span }.into_diag(dcx, level)
+                    } else {
+                        errors::ReservedMultihashLint { suggestion: space_span }
+                            .into_diag(dcx, level)
+                    }
+                },
             );
 
             // For backwards compatibility, roll back to after just the first `#`

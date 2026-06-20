@@ -94,10 +94,6 @@ pub struct OsString {
     inner: Buf,
 }
 
-/// Allows extension traits within `std`.
-#[unstable(feature = "sealed", issue = "none")]
-impl crate::sealed::Sealed for OsString {}
-
 /// Borrowed reference to an OS string (see [`OsString`]).
 ///
 /// This type represents a borrowed reference to a string in the operating system's preferred
@@ -119,10 +115,6 @@ impl crate::sealed::Sealed for OsString {}
 pub struct OsStr {
     inner: Slice,
 }
-
-/// Allows extension traits within `std`.
-#[unstable(feature = "sealed", issue = "none")]
-impl crate::sealed::Sealed for OsStr {}
 
 impl OsString {
     /// Constructs a new empty `OsString`.
@@ -576,15 +568,21 @@ impl OsString {
 
     /// Truncate the `OsString` to the specified length.
     ///
+    /// If `new_len` is greater than the string's current length, this has no
+    /// effect.
+    ///
     /// # Panics
+    ///
     /// Panics if `len` does not lie on a valid `OsStr` boundary
     /// (as described in [`OsStr::slice_encoded_bytes`]).
     #[inline]
     #[unstable(feature = "os_string_truncate", issue = "133262")]
     pub fn truncate(&mut self, len: usize) {
-        self.as_os_str().inner.check_public_boundary(len);
-        // SAFETY: The length was just checked to be at a valid boundary.
-        unsafe { self.inner.truncate_unchecked(len) };
+        if len <= self.len() {
+            self.as_os_str().inner.check_public_boundary(len);
+            // SAFETY: The length was just checked to be at a valid boundary.
+            unsafe { self.inner.truncate_unchecked(len) };
+        }
     }
 
     /// Provides plumbing to `Vec::extend_from_slice` without giving full
@@ -1047,6 +1045,61 @@ impl OsStr {
     pub fn into_os_string(self: Box<Self>) -> OsString {
         let boxed = unsafe { Box::from_raw(Box::into_raw(self) as *mut Slice) };
         OsString { inner: Buf::from_box(boxed) }
+    }
+
+    /// Divides one string slice into two at an index.
+    ///
+    /// The two slices returned go from the start of the string slice to `mid`, and from `mid` to the end of the string slice.
+    ///
+    /// The argument, `mid`, should be a byte offset from the start of the string.
+    /// It must also be on a valid `OsStr` boundary.
+    /// See [`split_at_checked`][Self::split_at_checked] for the definition of a valid boundary.
+    ///
+    /// Panics
+    ///
+    /// Panics if `mid` is not on a valid boundary, or if it is past the end of the last code point of the string slice.
+    /// For a non-panicking alternative see [`split_at_checked`][Self::split_at_checked].
+    #[unstable(feature = "os_str_split_at", issue = "none")]
+    pub fn split_at(&self, mid: usize) -> (&OsStr, &OsStr) {
+        self.inner.check_public_boundary(mid);
+
+        // SAFETY: we've checked it's in bounds and a valid boundary
+        unsafe { self.split_at_unchecked(mid) }
+    }
+
+    /// Divides one string slice into two at an index.
+    ///
+    /// The two slices returned go from the start of the string slice to `mid`, and from `mid` to the end of the string slice.
+    ///
+    /// The argument, `mid`, should be a valid byte offset from the start of the string.
+    /// It must also be on a valid `OsStr` boundary.
+    /// The method returns `None` if that’s not the case.
+    /// A valid `OsStr` boundary is one of:
+    /// - The start of the string
+    /// - The end of the string
+    /// - The start of a valid non-empty UTF-8 substring
+    /// - Immediately follows a valid non-empty UTF-8 substring
+    #[unstable(feature = "os_str_split_at", issue = "none")]
+    pub fn split_at_checked(&self, mid: usize) -> Option<(&OsStr, &OsStr)> {
+        self.inner.try_check_public_boundary(mid)?;
+
+        // SAFETY: we've checked it's in bounds and a valid boundary
+        unsafe { Some(self.split_at_unchecked(mid)) }
+    }
+
+    /// Splits an `OsStr` without checking if `mid` is a valid boundary.
+    /// You should use `split_at` or `split_at_checked` instead.
+    ///
+    /// # Safety
+    ///
+    /// Any caller must ensure `mid` is within bounds and lies on
+    /// a valid `OsStr` boundary for the platform.
+    unsafe fn split_at_unchecked(&self, mid: usize) -> (&OsStr, &OsStr) {
+        // SAFETY: it's up to the caller to ensure this is safe.
+        unsafe {
+            let (first, second) = self.as_encoded_bytes().split_at_unchecked(mid);
+            (Self::from_encoded_bytes_unchecked(first), Self::from_encoded_bytes_unchecked(second))
+        }
     }
 
     /// Converts an OS string slice to a byte slice.  To convert the byte slice back into an OS
@@ -1565,7 +1618,7 @@ impl Ord for OsStr {
 macro_rules! impl_cmp {
     ($lhs:ty, $rhs: ty) => {
         #[stable(feature = "cmp_os_str", since = "1.8.0")]
-        impl<'a, 'b> PartialEq<$rhs> for $lhs {
+        impl PartialEq<$rhs> for $lhs {
             #[inline]
             fn eq(&self, other: &$rhs) -> bool {
                 <OsStr as PartialEq>::eq(self, other)
@@ -1573,7 +1626,7 @@ macro_rules! impl_cmp {
         }
 
         #[stable(feature = "cmp_os_str", since = "1.8.0")]
-        impl<'a, 'b> PartialEq<$lhs> for $rhs {
+        impl PartialEq<$lhs> for $rhs {
             #[inline]
             fn eq(&self, other: &$lhs) -> bool {
                 <OsStr as PartialEq>::eq(self, other)
@@ -1581,7 +1634,7 @@ macro_rules! impl_cmp {
         }
 
         #[stable(feature = "cmp_os_str", since = "1.8.0")]
-        impl<'a, 'b> PartialOrd<$rhs> for $lhs {
+        impl PartialOrd<$rhs> for $lhs {
             #[inline]
             fn partial_cmp(&self, other: &$rhs) -> Option<cmp::Ordering> {
                 <OsStr as PartialOrd>::partial_cmp(self, other)
@@ -1589,7 +1642,7 @@ macro_rules! impl_cmp {
         }
 
         #[stable(feature = "cmp_os_str", since = "1.8.0")]
-        impl<'a, 'b> PartialOrd<$lhs> for $rhs {
+        impl PartialOrd<$lhs> for $rhs {
             #[inline]
             fn partial_cmp(&self, other: &$lhs) -> Option<cmp::Ordering> {
                 <OsStr as PartialOrd>::partial_cmp(self, other)
@@ -1599,10 +1652,10 @@ macro_rules! impl_cmp {
 }
 
 impl_cmp!(OsString, OsStr);
-impl_cmp!(OsString, &'a OsStr);
-impl_cmp!(Cow<'a, OsStr>, OsStr);
-impl_cmp!(Cow<'a, OsStr>, &'b OsStr);
-impl_cmp!(Cow<'a, OsStr>, OsString);
+impl_cmp!(OsString, &OsStr);
+impl_cmp!(Cow<'_, OsStr>, OsStr);
+impl_cmp!(Cow<'_, OsStr>, &OsStr);
+impl_cmp!(Cow<'_, OsStr>, OsString);
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl Hash for OsStr {
@@ -1697,7 +1750,7 @@ impl ToOwned for OsStr {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
-impl const AsRef<OsStr> for OsStr {
+const impl AsRef<OsStr> for OsStr {
     #[inline]
     fn as_ref(&self) -> &OsStr {
         self

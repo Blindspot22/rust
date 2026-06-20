@@ -12,7 +12,7 @@ use rustc_macros::Diagnostic;
 use rustc_span::{Ident, Span, Symbol, sym};
 use thin_vec::{ThinVec, thin_vec};
 
-use crate::errors;
+use crate::diagnostics;
 
 macro_rules! path {
     ($span:expr, $($part:ident)::*) => { vec![$(Ident::new(sym::$part, $span),)*] }
@@ -136,7 +136,7 @@ pub(crate) fn expand_deriving_coerce_pointee(
                     of_trait: Some(Box::new(ast::TraitImplHeader {
                         safety: ast::Safety::Default,
                         polarity: ast::ImplPolarity::Positive,
-                        defaultness: ast::Defaultness::Final,
+                        defaultness: ast::Defaultness::Implicit,
                         trait_ref,
                     })),
                     constness: ast::Const::No,
@@ -159,7 +159,7 @@ pub(crate) fn expand_deriving_coerce_pointee(
                 of_trait: Some(Box::new(ast::TraitImplHeader {
                     safety: ast::Safety::Default,
                     polarity: ast::ImplPolarity::Positive,
-                    defaultness: ast::Defaultness::Final,
+                    defaultness: ast::Defaultness::Implicit,
                     trait_ref,
                 })),
                 constness: ast::Const::No,
@@ -396,8 +396,7 @@ impl<'a> ast::mut_visit::MutVisitor for TypeSubstitution<'a> {
                     self.visit_param_bound(bound, BoundKind::Bound)
                 }
             }
-            rustc_ast::WherePredicateKind::RegionPredicate(_)
-            | rustc_ast::WherePredicateKind::EqPredicate(_) => {}
+            rustc_ast::WherePredicateKind::RegionPredicate(_) => {}
         }
     }
 }
@@ -409,7 +408,7 @@ struct DetectNonGenericPointeeAttr<'a, 'b> {
 impl<'a, 'b> rustc_ast::visit::Visitor<'a> for DetectNonGenericPointeeAttr<'a, 'b> {
     fn visit_attribute(&mut self, attr: &'a rustc_ast::Attribute) -> Self::Result {
         if attr.has_name(sym::pointee) {
-            self.cx.dcx().emit_err(errors::NonGenericPointee { span: attr.span });
+            self.cx.dcx().emit_err(diagnostics::NonGenericPointee { span: attr.span });
         }
     }
 
@@ -457,50 +456,50 @@ struct AlwaysErrorOnGenericParam<'a, 'b> {
 impl<'a, 'b> rustc_ast::visit::Visitor<'a> for AlwaysErrorOnGenericParam<'a, 'b> {
     fn visit_attribute(&mut self, attr: &'a rustc_ast::Attribute) -> Self::Result {
         if attr.has_name(sym::pointee) {
-            self.cx.dcx().emit_err(errors::NonGenericPointee { span: attr.span });
+            self.cx.dcx().emit_err(diagnostics::NonGenericPointee { span: attr.span });
         }
     }
 }
 
 #[derive(Diagnostic)]
-#[diag(builtin_macros_coerce_pointee_requires_transparent, code = E0802)]
+#[diag("`CoercePointee` can only be derived on `struct`s with `#[repr(transparent)]`", code = E0802)]
 struct RequireTransparent {
     #[primary_span]
     span: Span,
 }
 
 #[derive(Diagnostic)]
-#[diag(builtin_macros_coerce_pointee_requires_one_field, code = E0802)]
+#[diag("`CoercePointee` can only be derived on `struct`s with at least one field", code = E0802)]
 struct RequireOneField {
     #[primary_span]
     span: Span,
 }
 
 #[derive(Diagnostic)]
-#[diag(builtin_macros_coerce_pointee_requires_one_generic, code = E0802)]
+#[diag("`CoercePointee` can only be derived on `struct`s that are generic over at least one type", code = E0802)]
 struct RequireOneGeneric {
     #[primary_span]
     span: Span,
 }
 
 #[derive(Diagnostic)]
-#[diag(builtin_macros_coerce_pointee_requires_one_pointee, code = E0802)]
+#[diag("exactly one generic type parameter must be marked as `#[pointee]` to derive `CoercePointee` traits", code = E0802)]
 struct RequireOnePointee {
     #[primary_span]
     span: Span,
 }
 
 #[derive(Diagnostic)]
-#[diag(builtin_macros_coerce_pointee_too_many_pointees, code = E0802)]
+#[diag("only one type parameter can be marked as `#[pointee]` when deriving `CoercePointee` traits", code = E0802)]
 struct TooManyPointees {
     #[primary_span]
     one: Span,
-    #[label]
+    #[label("here another type parameter is marked as `#[pointee]`")]
     another: Span,
 }
 
 #[derive(Diagnostic)]
-#[diag(builtin_macros_coerce_pointee_requires_maybe_sized, code = E0802)]
+#[diag("`derive(CoercePointee)` requires `{$name}` to be marked `?Sized`", code = E0802)]
 struct RequiresMaybeSized {
     #[primary_span]
     span: Span,

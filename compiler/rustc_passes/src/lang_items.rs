@@ -11,16 +11,15 @@ use rustc_ast as ast;
 use rustc_ast::visit;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_hir::lang_items::{GenericRequirement, extract};
+use rustc_hir::lang_items::GenericRequirement;
 use rustc_hir::{LangItem, LanguageItems, MethodKind, Target};
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{ResolverAstLowering, TyCtxt};
 use rustc_session::cstore::ExternCrate;
-use rustc_span::Span;
+use rustc_span::{Span, Symbol, sym};
 
-use crate::errors::{
+use crate::diagnostics::{
     DuplicateLangItem, IncorrectCrateType, IncorrectTarget, LangItemOnIncorrectTarget,
-    UnknownLangItem,
 };
 use crate::weak_lang_items;
 
@@ -33,7 +32,7 @@ pub(crate) enum Duplicate {
 struct LanguageItemCollector<'ast, 'tcx> {
     items: LanguageItems,
     tcx: TyCtxt<'tcx>,
-    resolver: &'ast ResolverAstLowering,
+    resolver: &'ast ResolverAstLowering<'tcx>,
     // FIXME(#118552): We should probably feed def_span eagerly on def-id creation
     // so we can avoid constructing this map for local def-ids.
     item_spans: FxHashMap<DefId, Span>,
@@ -43,7 +42,7 @@ struct LanguageItemCollector<'ast, 'tcx> {
 impl<'ast, 'tcx> LanguageItemCollector<'ast, 'tcx> {
     fn new(
         tcx: TyCtxt<'tcx>,
-        resolver: &'ast ResolverAstLowering,
+        resolver: &'ast ResolverAstLowering<'tcx>,
     ) -> LanguageItemCollector<'ast, 'tcx> {
         LanguageItemCollector {
             tcx,
@@ -62,7 +61,7 @@ impl<'ast, 'tcx> LanguageItemCollector<'ast, 'tcx> {
         item_span: Span,
         generics: Option<&'ast ast::Generics>,
     ) {
-        if let Some((name, attr_span)) = extract(attrs) {
+        if let Some((name, attr_span)) = extract_ast(attrs) {
             match LangItem::from_name(name) {
                 // Known lang item with attribute on correct target.
                 Some(lang_item) if actual_target == lang_item.target() => {
@@ -86,7 +85,7 @@ impl<'ast, 'tcx> LanguageItemCollector<'ast, 'tcx> {
                 }
                 // Unknown lang item.
                 _ => {
-                    self.tcx.dcx().emit_err(UnknownLangItem { span: attr_span, name });
+                    self.tcx.dcx().delayed_bug("unknown lang item");
                 }
             }
         }
@@ -194,7 +193,7 @@ impl<'ast, 'tcx> LanguageItemCollector<'ast, 'tcx> {
             // one (for the RHS/index), unary operations have none, the closure
             // traits have one for the argument list, coroutines have one for the
             // resume argument, and ordering/equality relations have one for the RHS
-            // Some other types like Box and various functions like drop_in_place
+            // Some other types like Box and various unsizing-related traits
             // have minimum requirements.
 
             // FIXME: This still doesn't count, e.g., elided lifetimes and APITs.
@@ -247,8 +246,9 @@ impl<'ast, 'tcx> LanguageItemCollector<'ast, 'tcx> {
 
 /// Traverses and collects all the lang items in all crates.
 fn get_lang_items(tcx: TyCtxt<'_>, (): ()) -> LanguageItems {
-    let resolver = tcx.resolver_for_lowering().borrow();
-    let (resolver, krate) = &*resolver;
+    let (resolver, krate) = tcx.resolver_for_lowering();
+    let resolver = &*resolver.borrow();
+    let krate = &*krate.borrow();
 
     // Initialize the collector.
     let mut collector = LanguageItemCollector::new(tcx, resolver);
@@ -276,7 +276,7 @@ impl<'ast, 'tcx> visit::Visitor<'ast> for LanguageItemCollector<'ast, 'tcx> {
             ast::ItemKind::ExternCrate(..) => Target::ExternCrate,
             ast::ItemKind::Use(_) => Target::Use,
             ast::ItemKind::Static(_) => Target::Static,
-            ast::ItemKind::Const(_) => Target::Const,
+            ast::ItemKind::Const(_) | ast::ItemKind::ConstBlock(_) => Target::Const,
             ast::ItemKind::Fn(_) | ast::ItemKind::Delegation(..) => Target::Fn,
             ast::ItemKind::Mod(..) => Target::Mod,
             ast::ItemKind::ForeignMod(_) => Target::ForeignFn,
@@ -296,7 +296,7 @@ impl<'ast, 'tcx> visit::Visitor<'ast> for LanguageItemCollector<'ast, 'tcx> {
 
         self.check_for_lang(
             target,
-            self.resolver.node_id_to_def_id[&i.id],
+            self.resolver.owners[&i.id].def_id,
             &i.attrs,
             i.span,
             i.opt_generics(),
@@ -310,7 +310,7 @@ impl<'ast, 'tcx> visit::Visitor<'ast> for LanguageItemCollector<'ast, 'tcx> {
     fn visit_variant(&mut self, variant: &'ast ast::Variant) {
         self.check_for_lang(
             Target::Variant,
-            self.resolver.node_id_to_def_id[&variant.id],
+            self.resolver.owners[&self.parent_item.unwrap().id].node_id_to_def_id[&variant.id],
             &variant.attrs,
             variant.span,
             None,
@@ -347,16 +347,24 @@ impl<'ast, 'tcx> visit::Visitor<'ast> for LanguageItemCollector<'ast, 'tcx> {
             }
         };
 
-        self.check_for_lang(
-            target,
-            self.resolver.node_id_to_def_id[&i.id],
-            &i.attrs,
-            i.span,
-            generics,
-        );
+        self.check_for_lang(target, self.resolver.owners[&i.id].def_id, &i.attrs, i.span, generics);
 
         visit::walk_assoc_item(self, i, ctxt);
     }
+}
+
+/// Extracts the first `lang = "$name"` out of a list of attributes.
+/// The `#[panic_handler]` attribute is also extracted out when found.
+///
+/// This function is used for `ast::Attribute`, for `hir::Attribute` use the `find_attr!` macro with `AttributeKind::Lang`
+pub(crate) fn extract_ast(attrs: &[rustc_ast::ast::Attribute]) -> Option<(Symbol, Span)> {
+    attrs.iter().find_map(|attr| {
+        Some(match attr {
+            _ if attr.has_name(sym::lang) => (attr.value_str()?, attr.span()),
+            _ if attr.has_name(sym::panic_handler) => (sym::panic_impl, attr.span()),
+            _ => return None,
+        })
+    })
 }
 
 pub(crate) fn provide(providers: &mut Providers) {

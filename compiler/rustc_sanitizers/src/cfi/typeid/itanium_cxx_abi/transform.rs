@@ -6,12 +6,12 @@
 
 use std::iter;
 
-use rustc_hir::attrs::AttributeKind;
 use rustc_hir::{self as hir, LangItem, find_attr};
 use rustc_middle::bug;
 use rustc_middle::ty::{
     self, AssocContainer, ExistentialPredicateStableCmpExt as _, Instance, IntTy, List, TraitRef,
     Ty, TyCtxt, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt, UintTy,
+    Unnormalized,
 };
 use rustc_span::DUMMY_SP;
 use rustc_span::def_id::DefId;
@@ -138,16 +138,13 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for TransformTy<'tcx> {
                 {
                     // Don't transform repr(transparent) types with an user-defined CFI encoding to
                     // preserve the user-defined CFI encoding.
-                    if find_attr!(
-                        self.tcx.get_all_attrs(adt_def.did()),
-                        AttributeKind::CfiEncoding { .. }
-                    ) {
+                    if find_attr!(self.tcx, adt_def.did(), CfiEncoding { .. }) {
                         return t;
                     }
                     let variant = adt_def.non_enum_variant();
                     let typing_env = ty::TypingEnv::post_analysis(self.tcx, variant.def_id);
                     let field = variant.fields.iter().find(|field| {
-                        let ty = self.tcx.type_of(field.did).instantiate_identity();
+                        let ty = self.tcx.type_of(field.did).instantiate_identity().skip_norm_wip();
                         let is_zst = self
                             .tcx
                             .layout_of(typing_env.as_query_input(ty))
@@ -218,9 +215,10 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for TransformTy<'tcx> {
                 }
             }
 
-            ty::Alias(..) => self.fold_ty(
-                self.tcx.normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), t),
-            ),
+            ty::Alias(..) => self.fold_ty(self.tcx.normalize_erasing_regions(
+                ty::TypingEnv::fully_monomorphized(),
+                Unnormalized::new_wip(t),
+            )),
 
             ty::Bound(..) | ty::Error(..) | ty::Infer(..) | ty::Param(..) | ty::Placeholder(..) => {
                 bug!("fold_ty: unexpected `{:?}`", t.kind());
@@ -243,24 +241,24 @@ fn trait_object_ty<'tcx>(tcx: TyCtxt<'tcx>, poly_trait_ref: ty::PolyTraitRef<'tc
         .flat_map(|super_poly_trait_ref| {
             tcx.associated_items(super_poly_trait_ref.def_id())
                 .in_definition_order()
-                .filter(|item| item.is_type())
+                .filter(|item| item.is_type() || item.is_type_const())
                 .filter(|item| !tcx.generics_require_sized_self(item.def_id))
-                .map(move |assoc_ty| {
+                .map(move |assoc_item| {
                     super_poly_trait_ref.map_bound(|super_trait_ref| {
-                        let alias_ty =
-                            ty::AliasTy::new_from_args(tcx, assoc_ty.def_id, super_trait_ref.args);
-                        let resolved = tcx.normalize_erasing_regions(
-                            ty::TypingEnv::fully_monomorphized(),
-                            alias_ty.to_ty(tcx),
+                        let projection_term = ty::AliasTerm::new_from_def_id(
+                            tcx,
+                            assoc_item.def_id,
+                            super_trait_ref.args,
                         );
-                        debug!("Resolved {:?} -> {resolved}", alias_ty.to_ty(tcx));
+                        let term = tcx.normalize_erasing_regions(
+                            ty::TypingEnv::fully_monomorphized(),
+                            Unnormalized::new_wip(projection_term.to_term(tcx)),
+                        );
+                        debug!("Projection {:?} -> {term}", projection_term.to_term(tcx),);
                         ty::ExistentialPredicate::Projection(
                             ty::ExistentialProjection::erase_self_ty(
                                 tcx,
-                                ty::ProjectionPredicate {
-                                    projection_term: alias_ty.into(),
-                                    term: resolved.into(),
-                                },
+                                ty::ProjectionPredicate { projection_term, term },
                             ),
                         )
                     })
@@ -311,7 +309,7 @@ pub(crate) fn transform_instance<'tcx>(
 ) -> Instance<'tcx> {
     // FIXME: account for async-drop-glue
     if (matches!(instance.def, ty::InstanceKind::Virtual(..))
-        && tcx.is_lang_item(instance.def_id(), LangItem::DropInPlace))
+        && tcx.is_lang_item(instance.def_id(), LangItem::DropGlue))
         || matches!(instance.def, ty::InstanceKind::DropGlue(..))
     {
         // Adjust the type ids of DropGlues

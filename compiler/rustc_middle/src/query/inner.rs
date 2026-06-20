@@ -1,118 +1,138 @@
 //! Helper functions that serve as the immediate implementation of
 //! `tcx.$query(..)` and its variations.
 
-use std::fmt::Debug;
-
-use rustc_data_structures::fingerprint::Fingerprint;
-use rustc_query_system::dep_graph::{DepKind, DepNodeParams};
-use rustc_query_system::ich::StableHashingContext;
-use rustc_query_system::query::{QueryCache, QueryMode, try_get_cached};
 use rustc_span::{DUMMY_SP, ErrorGuaranteed, Span};
 
 use crate::dep_graph;
-use crate::query::IntoQueryParam;
-use crate::query::erase::{self, Erase, EraseType};
+use crate::dep_graph::DepNodeKey;
+use crate::query::erase::{self, Erasable, Erased};
+use crate::query::{QueryCache, QueryMode, QueryVTable};
 use crate::ty::TyCtxt;
+
+/// Checks whether there is already a value for this key in the in-memory
+/// query cache, returning that value if present.
+///
+/// (Also performs some associated bookkeeping, if a value was found.)
+#[inline(always)]
+fn try_get_cached<'tcx, C>(tcx: TyCtxt<'tcx>, cache: &C, key: C::Key) -> Option<C::Value>
+where
+    C: QueryCache,
+{
+    match cache.lookup(&key) {
+        Some((value, index)) => {
+            tcx.prof.query_cache_hit(index.into());
+            tcx.dep_graph.read_index(index);
+            Some(value)
+        }
+        None => None,
+    }
+}
 
 /// Shared implementation of `tcx.$query(..)` and `tcx.at(span).$query(..)`
 /// for all queries.
 #[inline(always)]
-pub(crate) fn query_get_at<'tcx, Cache>(
+pub(crate) fn query_get_at<'tcx, C>(
     tcx: TyCtxt<'tcx>,
-    execute_query: fn(TyCtxt<'tcx>, Span, Cache::Key, QueryMode) -> Option<Cache::Value>,
-    query_cache: &Cache,
     span: Span,
-    key: Cache::Key,
-) -> Cache::Value
+    query: &'tcx QueryVTable<'tcx, C>,
+    key: C::Key,
+) -> C::Value
 where
-    Cache: QueryCache,
+    C: QueryCache,
 {
-    let key = key.into_query_param();
-    match try_get_cached(tcx, query_cache, &key) {
+    match try_get_cached(tcx, &query.cache, key) {
         Some(value) => value,
-        None => execute_query(tcx, span, key, QueryMode::Get).unwrap(),
+        None => (query.execute_query_fn)(tcx, span, key, QueryMode::Get).unwrap(),
     }
 }
 
-/// Shared implementation of `tcx.ensure_ok().$query(..)` for most queries,
-/// and `tcx.ensure_done().$query(..)` for all queries.
+/// Implementation of `tcx.ensure_ok().$query(..)` for all queries.
 #[inline]
-pub(crate) fn query_ensure<'tcx, Cache>(
+pub(crate) fn query_ensure_ok<'tcx, C>(
     tcx: TyCtxt<'tcx>,
-    execute_query: fn(TyCtxt<'tcx>, Span, Cache::Key, QueryMode) -> Option<Cache::Value>,
-    query_cache: &Cache,
-    key: Cache::Key,
-    check_cache: bool,
+    query: &'tcx QueryVTable<'tcx, C>,
+    key: C::Key,
 ) where
-    Cache: QueryCache,
+    C: QueryCache,
 {
-    let key = key.into_query_param();
-    if try_get_cached(tcx, query_cache, &key).is_none() {
-        execute_query(tcx, DUMMY_SP, key, QueryMode::Ensure { check_cache });
+    match try_get_cached(tcx, &query.cache, key) {
+        Some(_value) => {}
+        None => {
+            (query.execute_query_fn)(tcx, DUMMY_SP, key, QueryMode::EnsureOk);
+        }
     }
 }
 
-/// Shared implementation of `tcx.ensure_ok().$query(..)` for queries that
-/// have the `return_result_from_ensure_ok` modifier.
+/// Implementation of `tcx.ensure_result().$query(..)` for queries that
+/// return `Result<_, ErrorGuaranteed>`.
 #[inline]
-pub(crate) fn query_ensure_error_guaranteed<'tcx, Cache, T>(
+pub(crate) fn query_ensure_result<'tcx, C, T>(
     tcx: TyCtxt<'tcx>,
-    execute_query: fn(TyCtxt<'tcx>, Span, Cache::Key, QueryMode) -> Option<Cache::Value>,
-    query_cache: &Cache,
-    key: Cache::Key,
-    check_cache: bool,
+    query: &'tcx QueryVTable<'tcx, C>,
+    key: C::Key,
 ) -> Result<(), ErrorGuaranteed>
 where
-    Cache: QueryCache<Value = Erase<Result<T, ErrorGuaranteed>>>,
-    Result<T, ErrorGuaranteed>: EraseType,
+    C: QueryCache<Value = Erased<Result<T, ErrorGuaranteed>>>,
+    Result<T, ErrorGuaranteed>: Erasable,
 {
-    let key = key.into_query_param();
-    if let Some(res) = try_get_cached(tcx, query_cache, &key) {
-        erase::restore(res).map(drop)
-    } else {
-        execute_query(tcx, DUMMY_SP, key, QueryMode::Ensure { check_cache })
-            .map(erase::restore)
-            .map(|res| res.map(drop))
-            // Either we actually executed the query, which means we got a full `Result`,
-            // or we can just assume the query succeeded, because it was green in the
-            // incremental cache. If it is green, that means that the previous compilation
-            // that wrote to the incremental cache compiles successfully. That is only
-            // possible if the cache entry was `Ok(())`, so we emit that here, without
-            // actually encoding the `Result` in the cache or loading it from there.
-            .unwrap_or(Ok(()))
+    let convert = |value: Erased<Result<T, ErrorGuaranteed>>| -> Result<(), ErrorGuaranteed> {
+        match erase::restore_val(value) {
+            Ok(_) => Ok(()),
+            Err(guar) => Err(guar),
+        }
+    };
+
+    match try_get_cached(tcx, &query.cache, key) {
+        Some(value) => convert(value),
+        None => {
+            match (query.execute_query_fn)(tcx, DUMMY_SP, key, QueryMode::EnsureOk) {
+                // We executed the query. Convert the successful result.
+                Some(res) => convert(res),
+
+                // Reaching here means we didn't execute the query, but we can just assume the
+                // query succeeded, because it was green in the incremental cache. If it is green,
+                // that means that the previous compilation that wrote to the incremental cache
+                // compiles successfully. That is only possible if the cache entry was `Ok(())`, so
+                // we emit that here, without actually encoding the `Result` in the cache or
+                // loading it from there.
+                None => Ok(()),
+            }
+        }
     }
 }
 
-/// Common implementation of query feeding, used by `define_feedable!`.
-pub(crate) fn query_feed<'tcx, Cache, Value>(
+/// "Feeds" a feedable query by adding a given key/value pair to its in-memory cache.
+/// Called by macro-generated methods of [`rustc_middle::ty::TyCtxtFeed`].
+pub(crate) fn query_feed<'tcx, C>(
     tcx: TyCtxt<'tcx>,
-    dep_kind: DepKind,
-    hasher: Option<fn(&mut StableHashingContext<'_>, &Value) -> Fingerprint>,
-    cache: &Cache,
-    key: Cache::Key,
-    erased: Erase<Value>,
+    query: &'tcx QueryVTable<'tcx, C>,
+    key: C::Key,
+    value: C::Value,
 ) where
-    Cache: QueryCache<Value = Erase<Value>>,
-    Cache::Key: DepNodeParams<TyCtxt<'tcx>>,
-    Value: EraseType + Debug,
+    C: QueryCache,
+    C::Key: DepNodeKey<'tcx>,
 {
-    let value = erase::restore::<Value>(erased);
+    let format_value = query.format_value;
 
-    match try_get_cached(tcx, cache, &key) {
+    // Check whether the in-memory cache already has a value for this key.
+    match try_get_cached(tcx, &query.cache, key) {
         Some(old) => {
-            let old = erase::restore::<Value>(old);
-            if let Some(hasher) = hasher {
-                let (value_hash, old_hash): (Fingerprint, Fingerprint) = tcx
-                    .with_stable_hashing_context(|mut hcx| {
-                        (hasher(&mut hcx, &value), hasher(&mut hcx, &old))
-                    });
+            // The query already has a cached value for this key.
+            // That's OK if both values are the same, i.e. they have the same hash,
+            // so now we check their hashes.
+            if let Some(hash_value_fn) = query.hash_value_fn {
+                let (old_hash, value_hash) = tcx.with_stable_hashing_context(|ref mut hcx| {
+                    (hash_value_fn(hcx, &old), hash_value_fn(hcx, &value))
+                });
                 if old_hash != value_hash {
                     // We have an inconsistency. This can happen if one of the two
                     // results is tainted by errors. In this case, delay a bug to
                     // ensure compilation is doomed, and keep the `old` value.
                     tcx.dcx().delayed_bug(format!(
-                        "Trying to feed an already recorded value for query {dep_kind:?} key={key:?}:\n\
-                        old value: {old:?}\nnew value: {value:?}",
+                        "Trying to feed an already recorded value for query {query:?} key={key:?}:\n\
+                        old value: {old}\nnew value: {value}",
+                        old = format_value(&old),
+                        value = format_value(&value),
                     ));
                 }
             } else {
@@ -120,15 +140,25 @@ pub(crate) fn query_feed<'tcx, Cache, Value>(
                 // If feeding the same value multiple times needs to be supported,
                 // the query should not be marked `no_hash`.
                 bug!(
-                    "Trying to feed an already recorded value for query {dep_kind:?} key={key:?}:\n\
-                    old value: {old:?}\nnew value: {value:?}",
+                    "Trying to feed an already recorded value for query {query:?} key={key:?}:\n\
+                    old value: {old}\nnew value: {value}",
+                    old = format_value(&old),
+                    value = format_value(&value),
                 )
             }
         }
         None => {
-            let dep_node = dep_graph::DepNode::construct(tcx, dep_kind, &key);
-            let dep_node_index = tcx.dep_graph.with_feed_task(dep_node, tcx, &value, hasher);
-            cache.complete(key, erased, dep_node_index);
+            // There is no cached value for this key, so feed the query by
+            // adding the provided value to the cache.
+            let dep_node = dep_graph::DepNode::construct(tcx, query.dep_kind, &key);
+            let dep_node_index = tcx.dep_graph.with_feed_task(
+                dep_node,
+                tcx,
+                &value,
+                query.hash_value_fn,
+                query.format_value,
+            );
+            query.cache.complete(key, value, dep_node_index);
         }
     }
 }

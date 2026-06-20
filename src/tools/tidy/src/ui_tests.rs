@@ -73,6 +73,57 @@ pub fn check(root_path: &Path, tidy_ctx: TidyCtx) {
             ));
         }
     }
+
+    // The list of subdirectories in ui tests.
+    // Compare previous subdirectory with current subdirectory
+    // to sync with `tests/ui/README.md`.
+    // See <https://github.com/rust-lang/rust/issues/150399>
+    let mut prev_line = String::new();
+    let mut is_sorted = true;
+    let documented_subdirs: BTreeSet<_> = include_str!("../../../../tests/ui/README.md")
+        .lines()
+        .filter_map(|line| {
+            static_regex!(r"^##.*?`(?<dir>[^`]+)`").captures(line).map(|cap| {
+                let dir = &cap["dir"];
+                // FIXME(reddevilmidzy) normalize subdirs title in tests/ui/README.md
+                if dir.ends_with('/') {
+                    dir.strip_suffix('/').unwrap().to_string()
+                } else {
+                    dir.to_string()
+                }
+            })
+        })
+        .inspect(|line| {
+            if prev_line.as_str() > line.as_str() {
+                is_sorted = false;
+            }
+
+            prev_line = line.clone();
+        })
+        .collect();
+    let filesystem_subdirs = collect_ui_tests_subdirs(&path);
+    let is_modified = !filesystem_subdirs.eq(&documented_subdirs);
+
+    if !is_sorted {
+        check.error("`tests/ui/README.md` is not in order");
+    }
+    if is_modified {
+        for directory in documented_subdirs.symmetric_difference(&filesystem_subdirs) {
+            if documented_subdirs.contains(directory) {
+                check.error(format!(
+                               "ui subdirectory `{directory}` is listed in `tests/ui/README.md` but does not exist in the filesystem"
+                           ));
+            } else {
+                check.error(format!(
+                               "ui subdirectory `{directory}` exists in the filesystem but is not documented in `tests/ui/README.md`"
+                           ));
+            }
+        }
+        check.error(
+                   "`tests/ui/README.md` subdirectory listing is out of sync with the filesystem. \
+                    Please add or remove subdirectory entries (## headers with backtick-wrapped names) to match the actual directories in `tests/ui/`"
+               );
+    }
 }
 
 fn deny_new_top_level_ui_tests(check: &mut RunningCheck, tests_path: &Path) {
@@ -137,6 +188,24 @@ fn recursively_check_ui_tests<'issues>(
     remaining_issue_names
 }
 
+fn collect_ui_tests_subdirs(path: &Path) -> BTreeSet<String> {
+    let ui = path.join("ui");
+    let entries = std::fs::read_dir(ui.as_path()).unwrap();
+
+    entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .map(|dir_path| {
+            let dir_path = dir_path.strip_prefix(path).unwrap();
+            format!(
+                "tests/{}",
+                dir_path.to_string_lossy().replace(std::path::MAIN_SEPARATOR_STR, "/")
+            )
+        })
+        .collect()
+}
+
 fn check_unexpected_extension(check: &mut RunningCheck, file_path: &Path, ext: &str) {
     const EXPECTED_TEST_FILE_EXTENSIONS: &[&str] = &[
         "rs",     // test source files
@@ -145,12 +214,13 @@ fn check_unexpected_extension(check: &mut RunningCheck, file_path: &Path, ext: &
         "stdout", // expected stdout file, corresponds to a rs file
         "fixed",  // expected source file after applying fixes
         "md",     // test directory descriptions
-        "ftl",    // translation tests
     ];
 
     const EXTENSION_EXCEPTION_PATHS: &[&str] = &[
         "tests/ui/asm/named-asm-labels.s", // loading an external asm file to test named labels lint
+        "tests/ui/asm/normalize-offsets-for-crlf.s", // loading an external asm file to test CRLF normalization
         "tests/ui/codegen/mismatched-data-layout.json", // testing mismatched data layout w/ custom targets
+        "tests/ui/codegen/custom-target-invalid-llvm-target.json", // testing invalid custom targets
         "tests/ui/check-cfg/my-awesome-platform.json",  // testing custom targets with cfgs
         "tests/ui/argfile/commandline-argfile-badutf8.args", // passing args via a file
         "tests/ui/argfile/commandline-argfile.args",    // passing args via a file
@@ -233,7 +303,7 @@ fn deny_new_nondescriptive_test_names(
             && !stripped_path.starts_with("ui/issues/")
         {
             check.error(format!(
-                "file `tests/{stripped_path}` must begin with a descriptive name, consider `{{reason}}-issue-{issue_n}.rs`",
+                "issue-number-only test names are not descriptive, consider renaming file `tests/{stripped_path}` to `{{reason}}-issue-{issue_n}.rs`",
                 issue_n = &test_name[1],
             ));
         }

@@ -3,9 +3,8 @@ use core::ops::ControlFlow;
 use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_apfloat::Float;
 use rustc_data_structures::fx::FxHashSet;
-use rustc_errors::Diag;
+use rustc_errors::{Diag, msg};
 use rustc_hir as hir;
-use rustc_hir::attrs::AttributeKind;
 use rustc_hir::find_attr;
 use rustc_index::Idx;
 use rustc_infer::infer::TyCtxtInferExt;
@@ -14,21 +13,24 @@ use rustc_middle::mir::interpret::ErrorHandled;
 use rustc_middle::span_bug;
 use rustc_middle::thir::{FieldPat, Pat, PatKind};
 use rustc_middle::ty::{
-    self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitableExt, TypeVisitor, ValTree,
+    self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitableExt, TypeVisitor, Unnormalized,
 };
 use rustc_span::def_id::DefId;
 use rustc_span::{DUMMY_SP, Span};
+use rustc_trait_selection::error_reporting::traits::ambiguity::{
+    CandidateSource, compute_applicable_impls_for_diagnostics,
+};
 use rustc_trait_selection::traits::ObligationCause;
 use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt;
 use tracing::{debug, instrument, trace};
 
 use super::PatCtxt;
-use crate::errors::{
+use crate::diagnostics::{
     ConstPatternDependsOnGenericParameter, CouldNotEvalConstPattern, InvalidPattern, NaNPattern,
-    PointerPattern, TypeNotPartialEq, TypeNotStructural, UnionPattern, UnsizedPattern,
+    PointerPattern, SuggestEq, TypeNotPartialEq, TypeNotStructural, UnionPattern, UnsizedPattern,
 };
 
-impl<'tcx> PatCtxt<'tcx> {
+impl<'tcx, 'ptcx> PatCtxt<'tcx, 'ptcx> {
     /// Converts a constant to a pattern (if possible).
     /// This means aggregate values (like structs and enums) are converted
     /// to a pattern that matches the value (as if you'd compared via structural equality).
@@ -48,7 +50,7 @@ impl<'tcx> PatCtxt<'tcx> {
 
         match c.kind() {
             ty::ConstKind::Unevaluated(uv) => convert.unevaluated_to_pat(uv, ty),
-            ty::ConstKind::Value(cv) => convert.valtree_to_pat(cv.valtree, cv.ty),
+            ty::ConstKind::Value(value) => convert.valtree_to_pat(value),
             _ => span_bug!(span, "Invalid `ConstKind` for `const_to_pat`: {:?}", c),
         }
     }
@@ -64,7 +66,7 @@ struct ConstToPat<'tcx> {
 }
 
 impl<'tcx> ConstToPat<'tcx> {
-    fn new(pat_ctxt: &PatCtxt<'tcx>, id: hir::HirId, span: Span, c: ty::Const<'tcx>) -> Self {
+    fn new(pat_ctxt: &PatCtxt<'tcx, '_>, id: hir::HirId, span: Span, c: ty::Const<'tcx>) -> Self {
         trace!(?pat_ctxt.typeck_results.hir_owner);
         ConstToPat { tcx: pat_ctxt.tcx, typing_env: pat_ctxt.typing_env, span, id, c }
     }
@@ -76,18 +78,18 @@ impl<'tcx> ConstToPat<'tcx> {
     /// We errored. Signal that in the pattern, so that follow up errors can be silenced.
     fn mk_err(&self, mut err: Diag<'_>, ty: Ty<'tcx>) -> Box<Pat<'tcx>> {
         if let ty::ConstKind::Unevaluated(uv) = self.c.kind() {
-            let def_kind = self.tcx.def_kind(uv.def);
-            if let hir::def::DefKind::AssocConst = def_kind
-                && let Some(def_id) = uv.def.as_local()
+            if let ty::UnevaluatedConstKind::Projection { def_id }
+            | ty::UnevaluatedConstKind::Inherent { def_id } = uv.kind
+                && let Some(def_id) = def_id.as_local()
             {
                 // Include the container item in the output.
                 err.span_label(self.tcx.def_span(self.tcx.local_parent(def_id)), "");
             }
-            if let hir::def::DefKind::Const | hir::def::DefKind::AssocConst = def_kind {
-                err.span_label(
-                    self.tcx.def_span(uv.def),
-                    crate::fluent_generated::mir_build_const_defined_here,
-                );
+            if let ty::UnevaluatedConstKind::Projection { def_id }
+            | ty::UnevaluatedConstKind::Inherent { def_id }
+            | ty::UnevaluatedConstKind::Free { def_id } = uv.kind
+            {
+                err.span_label(self.tcx.def_span(def_id), msg!("constant defined here"));
             }
         }
         Box::new(Pat { span: self.span, ty, kind: PatKind::Error(err.emit()), extra: None })
@@ -105,77 +107,96 @@ impl<'tcx> ConstToPat<'tcx> {
         //
         // FIXME: `const_eval_resolve_for_typeck` should probably just modify the env itself
         // instead of having this logic here
-        let typing_env = self
-            .tcx
-            .erase_and_anonymize_regions(self.typing_env)
-            .with_post_analysis_normalized(self.tcx);
+        let typing_env =
+            self.tcx.erase_and_anonymize_regions(self.typing_env).with_codegen_normalized(self.tcx);
         let uv = self.tcx.erase_and_anonymize_regions(uv);
 
-        // try to resolve e.g. associated constants to their definition on an impl, and then
-        // evaluate the const.
-        let valtree = match self.tcx.const_eval_resolve_for_typeck(typing_env, uv, self.span) {
-            Ok(Ok(c)) => c,
-            Err(ErrorHandled::Reported(_, _)) => {
-                // Let's tell the use where this failing const occurs.
-                let mut err =
-                    self.tcx.dcx().create_err(CouldNotEvalConstPattern { span: self.span });
-                // We've emitted an error on the original const, it would be redundant to complain
-                // on its use as well.
-                if let ty::ConstKind::Unevaluated(uv) = self.c.kind()
-                    && let hir::def::DefKind::Const | hir::def::DefKind::AssocConst =
-                        self.tcx.def_kind(uv.def)
-                {
-                    err.downgrade_to_delayed_bug();
-                }
+        // FIXME(gca): This will become insufficient once associated constants can be
+        // implemented as `type` consts (project-const-generics#76). At that point it'll
+        // become necessary to just use type system normalization for all const patterns
+        // but that's not yet possible.
+        let mut thir_pat = if uv.kind.is_type_const(self.tcx) {
+            let Ok(normalize) = self
+                .tcx
+                .try_normalize_erasing_regions(self.typing_env, Unnormalized::new_wip(self.c))
+            else {
+                let err = self.tcx.dcx().create_err(CouldNotEvalConstPattern { span: self.span });
                 return self.mk_err(err, ty);
-            }
-            Err(ErrorHandled::TooGeneric(_)) => {
-                let mut e = self
-                    .tcx
-                    .dcx()
-                    .create_err(ConstPatternDependsOnGenericParameter { span: self.span });
-                for arg in uv.args {
-                    if let ty::GenericArgKind::Type(ty) = arg.kind()
-                        && let ty::Param(param_ty) = ty.kind()
+            };
+
+            let ty::ConstKind::Value(value) = normalize.kind() else {
+                let err = self.tcx.dcx().create_err(CouldNotEvalConstPattern { span: self.span });
+                return self.mk_err(err, ty);
+            };
+            self.valtree_to_pat(value)
+        } else {
+            // try to resolve e.g. associated constants to their definition on an impl, and then
+            // evaluate the const.
+            let valtree = match self.tcx.const_eval_resolve_for_typeck(typing_env, uv, self.span) {
+                Ok(Ok(c)) => c,
+                Err(ErrorHandled::Reported(_, _)) => {
+                    // Let's tell the use where this failing const occurs.
+                    let mut err =
+                        self.tcx.dcx().create_err(CouldNotEvalConstPattern { span: self.span });
+                    // We've emitted an error on the original const, it would be redundant to complain
+                    // on its use as well.
+                    if let ty::ConstKind::Unevaluated(uv) = self.c.kind()
+                        && let ty::UnevaluatedConstKind::Projection { .. }
+                        | ty::UnevaluatedConstKind::Inherent { .. }
+                        | ty::UnevaluatedConstKind::Free { .. } = uv.kind
                     {
-                        let def_id = self.tcx.hir_enclosing_body_owner(self.id);
-                        let generics = self.tcx.generics_of(def_id);
-                        let param = generics.type_param(*param_ty, self.tcx);
-                        let span = self.tcx.def_span(param.def_id);
-                        e.span_label(span, "constant depends on this generic parameter");
-                        if let Some(ident) = self.tcx.def_ident_span(def_id)
-                            && self.tcx.sess.source_map().is_multiline(ident.between(span))
+                        err.downgrade_to_delayed_bug();
+                    }
+                    return self.mk_err(err, ty);
+                }
+                Err(ErrorHandled::TooGeneric(_)) => {
+                    let mut e = self
+                        .tcx
+                        .dcx()
+                        .create_err(ConstPatternDependsOnGenericParameter { span: self.span });
+                    for arg in uv.args {
+                        if let ty::GenericArgKind::Type(ty) = arg.kind()
+                            && let ty::Param(param_ty) = ty.kind()
                         {
-                            // Display the `fn` name as well in the diagnostic, as the generic isn't
-                            // in the same line and it could be confusing otherwise.
-                            e.span_label(ident, "");
+                            let def_id = self.tcx.hir_enclosing_body_owner(self.id);
+                            let generics = self.tcx.generics_of(def_id);
+                            let param = generics.type_param(*param_ty, self.tcx);
+                            let span = self.tcx.def_span(param.def_id);
+                            e.span_label(span, "constant depends on this generic parameter");
+                            if let Some(ident) = self.tcx.def_ident_span(def_id)
+                                && self.tcx.sess.source_map().is_multiline(ident.between(span))
+                            {
+                                // Display the `fn` name as well in the diagnostic, as the generic isn't
+                                // in the same line and it could be confusing otherwise.
+                                e.span_label(ident, "");
+                            }
                         }
                     }
+                    return self.mk_err(e, ty);
                 }
-                return self.mk_err(e, ty);
-            }
-            Ok(Err(bad_ty)) => {
-                // The pattern cannot be turned into a valtree.
-                let e = match bad_ty.kind() {
-                    ty::Adt(def, ..) => {
-                        assert!(def.is_union());
-                        self.tcx.dcx().create_err(UnionPattern { span: self.span })
-                    }
-                    ty::FnPtr(..) | ty::RawPtr(..) => {
-                        self.tcx.dcx().create_err(PointerPattern { span: self.span })
-                    }
-                    _ => self.tcx.dcx().create_err(InvalidPattern {
-                        span: self.span,
-                        non_sm_ty: bad_ty,
-                        prefix: bad_ty.prefix_string(self.tcx).to_string(),
-                    }),
-                };
-                return self.mk_err(e, ty);
-            }
-        };
+                Ok(Err(bad_ty)) => {
+                    // The pattern cannot be turned into a valtree.
+                    let e = match bad_ty.kind() {
+                        ty::Adt(def, ..) => {
+                            assert!(def.is_union());
+                            self.tcx.dcx().create_err(UnionPattern { span: self.span })
+                        }
+                        ty::FnPtr(..) | ty::RawPtr(..) => {
+                            self.tcx.dcx().create_err(PointerPattern { span: self.span })
+                        }
+                        _ => self.tcx.dcx().create_err(InvalidPattern {
+                            span: self.span,
+                            non_sm_ty: bad_ty,
+                            prefix: bad_ty.prefix_string(self.tcx).to_string(),
+                        }),
+                    };
+                    return self.mk_err(e, ty);
+                }
+            };
 
-        // Lower the valtree to a THIR pattern.
-        let mut thir_pat = self.valtree_to_pat(valtree, ty);
+            // Lower the valtree to a THIR pattern.
+            self.valtree_to_pat(ty::Value { ty, valtree })
+        };
 
         if !thir_pat.references_error() {
             // Always check for `PartialEq` if we had no other errors yet.
@@ -188,135 +209,231 @@ impl<'tcx> ConstToPat<'tcx> {
 
         // Mark the pattern to indicate that it is the result of lowering a named
         // constant. This is used for diagnostics.
-        thir_pat.extra.get_or_insert_default().expanded_const = Some(uv.def);
+        thir_pat.extra.get_or_insert_default().expanded_const = uv.kind.opt_def_id();
         thir_pat
     }
 
-    fn field_pats(
+    fn lower_field_values_to_fieldpats(
         &self,
-        vals: impl Iterator<Item = (ValTree<'tcx>, Ty<'tcx>)>,
+        values: impl Iterator<Item = ty::Value<'tcx>>,
     ) -> Vec<FieldPat<'tcx>> {
-        vals.enumerate()
-            .map(|(idx, (val, ty))| {
-                let field = FieldIdx::new(idx);
-                // Patterns can only use monomorphic types.
-                let ty = self.tcx.normalize_erasing_regions(self.typing_env, ty);
-                FieldPat { field, pattern: *self.valtree_to_pat(val, ty) }
+        values
+            .enumerate()
+            .map(|(index, value)| FieldPat {
+                field: FieldIdx::new(index),
+                pattern: *self.valtree_to_pat(value),
             })
             .collect()
     }
 
     // Recursive helper for `to_pat`; invoke that (instead of calling this directly).
-    // FIXME(valtrees): Accept `ty::Value` instead of `Ty` and `ty::ValTree` separately.
     #[instrument(skip(self), level = "debug")]
-    fn valtree_to_pat(&self, cv: ValTree<'tcx>, ty: Ty<'tcx>) -> Box<Pat<'tcx>> {
+    fn valtree_to_pat(&self, value: ty::Value<'tcx>) -> Box<Pat<'tcx>> {
         let span = self.span;
         let tcx = self.tcx;
+        let ty::Value { ty, valtree } = value;
+
         let kind = match ty.kind() {
+            // Extremely important check for all ADTs!
+            // Make sure they are eligible to be used in patterns (structural), and if not, emit an
+            // error.
             ty::Adt(adt_def, _) if !self.type_marked_structural(ty) => {
-                // Extremely important check for all ADTs! Make sure they opted-in to be used in
-                // patterns.
-                debug!("adt_def {:?} has !type_marked_structural for cv.ty: {:?}", adt_def, ty);
+                // This ADT cannot be used as a constant in patterns.
+                debug!(?adt_def, ?value.ty, "ADT type in pattern is not `type_marked_structural`");
                 let PartialEqImplStatus {
-                    is_derived, structural_partial_eq, non_blanket_impl, ..
+                    is_derived,
+                    possibly_inapplicable_structural_partial_eq,
+                    non_blanket_impl,
+                    possibly_inapplicable_derived_partial_eq,
+                    has_impl,
+                    ..
                 } = type_has_partial_eq_impl(self.tcx, self.typing_env, ty);
+
+                // If we have a derived PartialEq impl but it does not apply,
+                // then error about that instead, because `TypeNotStructural` gives advice that is
+                // relevant only when the problem is that `ty` does not derive `PartialEq`.
+                //
+                // Note that this is a duplicate of a check in `unevaluated_to_pat()`,
+                // which we would run later if we weren’t emitting an error now.
+                if possibly_inapplicable_derived_partial_eq && !has_impl {
+                    let mut err =
+                        self.tcx.dcx().create_err(TypeNotPartialEq { span: self.span, ty });
+                    extend_type_not_partial_eq(self.tcx, self.typing_env, ty, &mut err);
+                    return self.mk_err(err, ty);
+                }
+
                 let (manual_partialeq_impl_span, manual_partialeq_impl_note) =
-                    match (structural_partial_eq, non_blanket_impl) {
+                    match (possibly_inapplicable_structural_partial_eq, non_blanket_impl) {
                         (true, _) => (None, false),
                         (_, Some(def_id)) if def_id.is_local() && !is_derived => {
                             (Some(tcx.def_span(def_id)), false)
                         }
                         _ => (None, true),
                     };
+                let manual_partialeq_impl =
+                    manual_partialeq_impl_note || manual_partialeq_impl_span.is_some();
+                let is_local = adt_def.did().is_local();
                 let ty_def_span = tcx.def_span(adt_def.did());
+                let suggestion = if let Ok(name) = tcx.sess.source_map().span_to_snippet(self.span)
+                    && (is_local || manual_partialeq_impl)
+                {
+                    let mut hir_id = self.id;
+                    while let hir::Node::Pat(pat) = tcx.parent_hir_node(hir_id) {
+                        hir_id = pat.hir_id;
+                    }
+                    match tcx.parent_hir_node(hir_id) {
+                        hir::Node::Arm(hir::Arm { pat, guard: None, .. }) => {
+                            // Add an if condition to the match arm.
+                            Some(SuggestEq::AddIf {
+                                if_span: pat.span.shrink_to_hi(),
+                                pat_span: self.span,
+                                name,
+                                ty,
+                                manual_partialeq_impl,
+                            })
+                        }
+                        hir::Node::Arm(hir::Arm { guard: Some(guard), .. }) => {
+                            // Modify the the match arm if condition and add a check for equality.
+                            Some(SuggestEq::AddToIf {
+                                span: guard.span.shrink_to_hi(),
+                                pat_span: self.span,
+                                name,
+                                ty,
+                                manual_partialeq_impl,
+                            })
+                        }
+                        hir::Node::Expr(hir::Expr {
+                            kind: hir::ExprKind::Let(let_expr),
+                            span,
+                            ..
+                        }) => {
+                            if let_expr.pat.span == self.span {
+                                // `if let CONST = expr` -> `if CONST == expr`.
+                                Some(SuggestEq::ReplaceWithEq {
+                                    removal: span.until(self.span),
+                                    eq: self.span.between(let_expr.init.span),
+                                    ty,
+                                    manual_partialeq_impl,
+                                })
+                            } else if tcx.sess.edition().at_least_rust_2024() {
+                                // `if let Some(CONST) = expr` ->
+                                // `if let Some(binding) = expr && binding == CONST`.
+                                Some(SuggestEq::AddToLetChain {
+                                    span: span.shrink_to_hi(),
+                                    pat_span: self.span,
+                                    name,
+                                    ty,
+                                    manual_partialeq_impl,
+                                })
+                            } else {
+                                None
+                            }
+                        }
+                        hir::Node::LetStmt(let_stmt)
+                            if let Some(init) = let_stmt.init
+                                && let Some(els) = let_stmt.els
+                                && init.span.ctxt().is_root()
+                                && els.span.ctxt().is_root() =>
+                        {
+                            // `let PAT = expr else {` -> `if PAT == expr {`.
+                            Some(SuggestEq::ReplaceLetElseWithIf {
+                                if_span: let_stmt.span.until(let_stmt.pat.span),
+                                eq: let_stmt.pat.span.between(init.span),
+                                else_span: init.span.between(els.span),
+                                ty,
+                                manual_partialeq_impl,
+                            })
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 let err = TypeNotStructural {
                     span,
                     ty,
                     ty_def_span,
                     manual_partialeq_impl_span,
                     manual_partialeq_impl_note,
+                    is_local,
+                    suggestion,
                 };
                 return self.mk_err(tcx.dcx().create_err(err), ty);
             }
             ty::Adt(adt_def, args) if adt_def.is_enum() => {
-                let (&variant_index, fields) = cv.to_branch().split_first().unwrap();
+                let (&variant_index, fields) = valtree.to_branch().split_first().unwrap();
                 let variant_index = VariantIdx::from_u32(variant_index.to_leaf().to_u32());
                 PatKind::Variant {
                     adt_def: *adt_def,
                     args,
                     variant_index,
-                    subpatterns: self.field_pats(
-                        fields.iter().map(|ct| ct.to_value().valtree).zip(
-                            adt_def.variants()[variant_index]
-                                .fields
-                                .iter()
-                                .map(|field| field.ty(tcx, args)),
-                        ),
-                    ),
+                    subpatterns: self
+                        .lower_field_values_to_fieldpats(fields.iter().map(|ct| ct.to_value())),
                 }
             }
-            ty::Adt(def, args) => {
+            ty::Adt(def, _) => {
                 assert!(!def.is_union()); // Valtree construction would never succeed for unions.
                 PatKind::Leaf {
-                    subpatterns: self.field_pats(
-                        cv.to_branch().iter().map(|ct| ct.to_value().valtree).zip(
-                            def.non_enum_variant().fields.iter().map(|field| field.ty(tcx, args)),
-                        ),
+                    subpatterns: self.lower_field_values_to_fieldpats(
+                        valtree.to_branch().iter().map(|ct| ct.to_value()),
                     ),
                 }
             }
-            ty::Tuple(fields) => PatKind::Leaf {
-                subpatterns: self.field_pats(
-                    cv.to_branch().iter().map(|ct| ct.to_value().valtree).zip(fields.iter()),
+            ty::Tuple(_) => PatKind::Leaf {
+                subpatterns: self.lower_field_values_to_fieldpats(
+                    valtree.to_branch().iter().map(|ct| ct.to_value()),
                 ),
             },
-            ty::Slice(elem_ty) => PatKind::Slice {
-                prefix: cv
+            ty::Slice(_) => PatKind::Slice {
+                prefix: valtree
                     .to_branch()
                     .iter()
-                    .map(|val| *self.valtree_to_pat(val.to_value().valtree, *elem_ty))
+                    .map(|val| *self.valtree_to_pat(val.to_value()))
                     .collect(),
                 slice: None,
                 suffix: Box::new([]),
             },
-            ty::Array(elem_ty, _) => PatKind::Array {
-                prefix: cv
+            ty::Array(_, _) => PatKind::Array {
+                prefix: valtree
                     .to_branch()
                     .iter()
-                    .map(|val| *self.valtree_to_pat(val.to_value().valtree, *elem_ty))
+                    .map(|val| *self.valtree_to_pat(val.to_value()))
                     .collect(),
                 slice: None,
                 suffix: Box::new([]),
             },
             ty::Str => {
-                // String literal patterns may have type `str` if `deref_patterns` is enabled, in
-                // order to allow `deref!("..."): String`. Since we need a `&str` for the comparison
-                // when lowering to MIR in `Builder::perform_test`, treat the constant as a `&str`.
-                // This works because `str` and `&str` have the same valtree representation.
-                let ref_str_ty = Ty::new_imm_ref(tcx, tcx.lifetimes.re_erased, ty);
-                PatKind::Constant { value: ty::Value { ty: ref_str_ty, valtree: cv } }
+                // Constant/literal patterns of type `&str` are lowered to a
+                // `PatKind::Deref` wrapping a `PatKind::Constant` of type `str`.
+                // This pattern node is the `str` constant part.
+                //
+                // Under `feature(deref_patterns)`, string literal patterns can also
+                // have type `str` directly, without the `&`, in order to allow things
+                // like `deref!("...")` to work when the scrutinee is `String`.
+                PatKind::Constant { value }
             }
-            ty::Ref(_, pointee_ty, ..) => match *pointee_ty.kind() {
-                // `&str` is represented as a valtree, let's keep using this
-                // optimization for now.
-                ty::Str => PatKind::Constant { value: ty::Value { ty, valtree: cv } },
-                // All other references are converted into deref patterns and then recursively
-                // convert the dereferenced constant to a pattern that is the sub-pattern of the
-                // deref pattern.
-                _ => {
-                    if !pointee_ty.is_sized(tcx, self.typing_env) && !pointee_ty.is_slice() {
-                        return self.mk_err(
-                            tcx.dcx().create_err(UnsizedPattern { span, non_sm_ty: *pointee_ty }),
-                            ty,
-                        );
-                    } else {
-                        // References have the same valtree representation as their pointee.
-                        PatKind::Deref { subpattern: self.valtree_to_pat(cv, *pointee_ty) }
+            ty::Ref(_, pointee_ty, ..) => {
+                if pointee_ty.is_str()
+                    || pointee_ty.is_slice()
+                    || pointee_ty.is_sized(tcx, self.typing_env)
+                {
+                    PatKind::Deref {
+                        // This node has type `ty::Ref`, so it's not a pin-deref.
+                        pin: hir::Pinnedness::Not,
+                        // Lower the valtree to a pattern as the pointee type.
+                        // This works because references have the same valtree
+                        // representation as their pointee.
+                        subpattern: self.valtree_to_pat(ty::Value { ty: *pointee_ty, valtree }),
                     }
+                } else {
+                    return self.mk_err(
+                        tcx.dcx().create_err(UnsizedPattern { span, non_sm_ty: *pointee_ty }),
+                        ty,
+                    );
                 }
-            },
+            }
             ty::Float(flt) => {
-                let v = cv.to_leaf();
+                let v = valtree.to_leaf();
                 let is_nan = match flt {
                     ty::FloatTy::F16 => v.to_f16().is_nan(),
                     ty::FloatTy::F32 => v.to_f32().is_nan(),
@@ -328,13 +445,13 @@ impl<'tcx> ConstToPat<'tcx> {
                     // Also see <https://github.com/rust-lang/rfcs/pull/3535>.
                     return self.mk_err(tcx.dcx().create_err(NaNPattern { span }), ty);
                 } else {
-                    PatKind::Constant { value: ty::Value { ty, valtree: cv } }
+                    PatKind::Constant { value }
                 }
             }
             ty::Pat(..) | ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::RawPtr(..) => {
                 // The raw pointers we see here have been "vetted" by valtree construction to be
                 // just integers, so we simply allow them.
-                PatKind::Constant { value: ty::Value { ty, valtree: cv } }
+                PatKind::Constant { value }
             }
             ty::FnPtr(..) => {
                 unreachable!(
@@ -394,8 +511,9 @@ fn extend_type_not_partial_eq<'tcx>(
                     let PartialEqImplStatus {
                         has_impl,
                         is_derived,
-                        structural_partial_eq,
+                        possibly_inapplicable_structural_partial_eq: structural_partial_eq,
                         non_blanket_impl,
+                        possibly_inapplicable_derived_partial_eq: _,
                     } = type_has_partial_eq_impl(self.tcx, self.typing_env, ty);
                     match (has_impl, is_derived, structural_partial_eq, non_blanket_impl) {
                         (_, _, true, _) => {}
@@ -464,10 +582,20 @@ fn extend_type_not_partial_eq<'tcx>(
 
 #[derive(Debug)]
 struct PartialEqImplStatus {
+    /// There is a `PartialEq` impl that applies to the type.
     has_impl: bool,
+
+    /// The `PartialEq` impl is `#[automatically_derived]`.
     is_derived: bool,
-    structural_partial_eq: bool,
+    /// The `DefId` of the same impl that `is_derived` refers to.
     non_blanket_impl: Option<DefId>,
+
+    /// If true, there is a `StructuralPartialEq` implementation,
+    /// but its bounds might not be satisfied.
+    possibly_inapplicable_structural_partial_eq: bool,
+    /// If true, there is a derived `PartialEq` implementation for the type,
+    /// but its bounds might not be satisfied.
+    possibly_inapplicable_derived_partial_eq: bool,
 }
 
 #[instrument(level = "trace", skip(tcx), ret)]
@@ -486,24 +614,6 @@ fn type_has_partial_eq_impl<'tcx>(
     let structural_partial_eq_trait_id =
         tcx.require_lang_item(hir::LangItem::StructuralPeq, DUMMY_SP);
 
-    let partial_eq_obligation = Obligation::new(
-        tcx,
-        ObligationCause::dummy(),
-        param_env,
-        ty::TraitRef::new(tcx, partial_eq_trait_id, [ty, ty]),
-    );
-
-    let mut automatically_derived = false;
-    let mut structural_peq = false;
-    let mut impl_def_id = None;
-    for def_id in tcx.non_blanket_impls_for_ty(partial_eq_trait_id, ty) {
-        automatically_derived =
-            find_attr!(tcx.get_all_attrs(def_id), AttributeKind::AutomaticallyDerived(..));
-        impl_def_id = Some(def_id);
-    }
-    for _ in tcx.non_blanket_impls_for_ty(structural_partial_eq_trait_id, ty) {
-        structural_peq = true;
-    }
     // This *could* accept a type that isn't actually `PartialEq`, because region bounds get
     // ignored. However that should be pretty much impossible since consts that do not depend on
     // generics can only mention the `'static` lifetime, and how would one have a type that's
@@ -514,10 +624,60 @@ fn type_has_partial_eq_impl<'tcx>(
     // that patterns can only do things that the code could also do without patterns, but it is
     // needed for backwards compatibility. The actual pattern matching compares primitive values,
     // `PartialEq::eq` never gets invoked, so there's no risk of us running non-const code.
+    let has_impl = {
+        let obligation = Obligation::new(
+            tcx,
+            ObligationCause::dummy(),
+            param_env,
+            ty::TraitRef::new(tcx, partial_eq_trait_id, [ty, ty]),
+        );
+        infcx.predicate_must_hold_modulo_regions(&obligation)
+    };
+
+    // Determine whether there are is a derived `PartialEq` implementation, whether or not its
+    // bounds are met.
+    let possibly_inapplicable_derived_partial_eq = {
+        let obligation = Obligation::new(
+            tcx,
+            ObligationCause::dummy(),
+            param_env,
+            ty::Binder::dummy(ty::TraitRef::new(tcx, partial_eq_trait_id, [ty, ty])),
+        );
+        compute_applicable_impls_for_diagnostics(&infcx, &obligation, true).iter().any(
+            |candidate_source| {
+                matches!(
+                    candidate_source,
+                    &CandidateSource::DefId(def_id)
+                    if find_attr!(tcx, def_id, AutomaticallyDerived)
+                )
+            },
+        )
+    };
+
+    let possibly_inapplicable_structural_partial_eq = {
+        let obligation = Obligation::new(
+            tcx,
+            ObligationCause::dummy(),
+            param_env,
+            ty::Binder::dummy(ty::TraitRef::new(tcx, structural_partial_eq_trait_id, [ty])),
+        );
+        compute_applicable_impls_for_diagnostics(&infcx, &obligation, true)
+            .iter()
+            .any(|candidate_source| matches!(candidate_source, CandidateSource::DefId(_)))
+    };
+
+    let mut automatically_derived = false;
+    let mut impl_def_id = None;
+    for def_id in tcx.non_blanket_impls_for_ty(partial_eq_trait_id, ty) {
+        automatically_derived = find_attr!(tcx, def_id, AutomaticallyDerived);
+        impl_def_id = Some(def_id);
+    }
+
     PartialEqImplStatus {
-        has_impl: infcx.predicate_must_hold_modulo_regions(&partial_eq_obligation),
+        has_impl,
         is_derived: automatically_derived,
-        structural_partial_eq: structural_peq,
+        possibly_inapplicable_structural_partial_eq,
         non_blanket_impl: impl_def_id,
+        possibly_inapplicable_derived_partial_eq,
     }
 }

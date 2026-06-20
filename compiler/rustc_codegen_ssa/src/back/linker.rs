@@ -2,7 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::prelude::*;
 use std::path::{Path, PathBuf};
-use std::{env, io, iter, mem, str};
+use std::{env, iter, mem, str};
 
 use find_msvc_tools;
 use rustc_hir::attrs::WindowsSubsystemKind;
@@ -18,7 +18,7 @@ use rustc_middle::middle::exported_symbols::{
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
 use rustc_session::config::{self, CrateType, DebugInfo, LinkerPluginLto, Lto, OptLevel, Strip};
-use rustc_target::spec::{Abi, Arch, Cc, LinkOutputKind, LinkerFlavor, Lld, Os};
+use rustc_target::spec::{Arch, Cc, CfgAbi, LinkOutputKind, LinkerFlavor, Lld, Os};
 use tracing::{debug, warn};
 
 use super::command::Command;
@@ -84,7 +84,7 @@ pub(crate) fn get_linker<'a>(
     // To comply with the Windows App Certification Kit,
     // MSVC needs to link with the Store versions of the runtime libraries (vcruntime, msvcrt, etc).
     let t = &sess.target;
-    if matches!(flavor, LinkerFlavor::Msvc(..)) && t.abi == Abi::Uwp {
+    if matches!(flavor, LinkerFlavor::Msvc(..)) && t.cfg_abi == CfgAbi::Uwp {
         if let Some(ref tool) = msvc_tool {
             let original_path = tool.path();
             if let Some(root_lib_path) = original_path.ancestors().nth(4) {
@@ -135,7 +135,7 @@ pub(crate) fn get_linker<'a>(
 
     // FIXME: Move `/LIBPATH` addition for uwp targets from the linker construction
     // to the linker args construction.
-    assert!(cmd.get_args().is_empty() || sess.target.abi == Abi::Uwp);
+    assert!(cmd.get_args().is_empty() || sess.target.cfg_abi == CfgAbi::Uwp);
     match flavor {
         LinkerFlavor::Unix(Cc::No) if sess.target.os == Os::L4Re => {
             Box::new(L4Bender::new(cmd, sess)) as Box<dyn Linker>
@@ -161,7 +161,6 @@ pub(crate) fn get_linker<'a>(
         LinkerFlavor::EmCc => Box::new(EmLinker { cmd, sess }) as Box<dyn Linker>,
         LinkerFlavor::Bpf => Box::new(BpfLinker { cmd, sess }) as Box<dyn Linker>,
         LinkerFlavor::Llbc => Box::new(LlbcLinker { cmd, sess }) as Box<dyn Linker>,
-        LinkerFlavor::Ptx => Box::new(PtxLinker { cmd, sess }) as Box<dyn Linker>,
     }
 }
 
@@ -283,7 +282,6 @@ generate_arg_methods! {
     L4Bender<'_>
     AixLinker<'_>
     LlbcLinker<'_>
-    PtxLinker<'_>
     BpfLinker<'_>
     dyn Linker + '_
 }
@@ -352,6 +350,7 @@ pub(crate) trait Linker {
     fn add_no_exec(&mut self) {}
     fn add_as_needed(&mut self) {}
     fn reset_per_library_state(&mut self) {}
+    fn enable_profiling(&mut self) {}
 }
 
 impl dyn Linker + '_ {
@@ -527,7 +526,8 @@ impl<'a> Linker for GccLinker<'a> {
     ) {
         match output_kind {
             LinkOutputKind::DynamicNoPicExe => {
-                if !self.is_ld && self.is_gnu {
+                // noop on windows w/ gcc, warning w/ clang
+                if !self.is_ld && self.is_gnu && !self.sess.target.is_like_windows {
                     self.cc_arg("-no-pie");
                 }
             }
@@ -731,6 +731,21 @@ impl<'a> Linker for GccLinker<'a> {
         self.link_or_cc_args(&["-u", "__llvm_profile_runtime"]);
     }
 
+    fn enable_profiling(&mut self) {
+        // This flag is also used when linking to choose target specific
+        // libraries needed to enable profiling.
+        if !self.is_ld {
+            self.cc_arg("-pg");
+            // On windows-gnu targets, libgmon also needs to be linked, and this
+            // requires readding libraries to satisfy its dependencies.
+            if self.sess.target.is_like_windows {
+                self.cc_arg("-lgmon");
+                self.cc_arg("-lkernel32");
+                self.cc_arg("-lmsvcrt");
+            }
+        }
+    }
+
     fn control_flow_guard(&mut self) {}
 
     fn ehcont_guard(&mut self) {}
@@ -809,7 +824,7 @@ impl<'a> Linker for GccLinker<'a> {
 
         if self.sess.target.is_like_darwin {
             // Write a plain, newline-separated list of symbols
-            let res: io::Result<()> = try {
+            let res = try {
                 let mut f = File::create_buffered(&path)?;
                 for (sym, _) in symbols {
                     debug!("  _{sym}");
@@ -821,7 +836,7 @@ impl<'a> Linker for GccLinker<'a> {
             }
             self.link_arg("-exported_symbols_list").link_arg(path);
         } else if self.sess.target.is_like_windows {
-            let res: io::Result<()> = try {
+            let res = try {
                 let mut f = File::create_buffered(&path)?;
 
                 // .def file similar to MSVC one but without LIBRARY section
@@ -845,7 +860,7 @@ impl<'a> Linker for GccLinker<'a> {
                 self.link_arg("--export").link_arg(sym);
             }
         } else if crate_type == CrateType::Executable && !self.sess.target.is_like_solaris {
-            let res: io::Result<()> = try {
+            let res = try {
                 let mut f = File::create_buffered(&path)?;
                 writeln!(f, "{{")?;
                 for (sym, _) in symbols {
@@ -860,7 +875,7 @@ impl<'a> Linker for GccLinker<'a> {
             self.link_arg("--dynamic-list").link_arg(path);
         } else {
             // Write an LD version script
-            let res: io::Result<()> = try {
+            let res = try {
                 let mut f = File::create_buffered(&path)?;
                 writeln!(f, "{{")?;
                 if !symbols.is_empty() {
@@ -1139,7 +1154,7 @@ impl<'a> Linker for MsvcLinker<'a> {
         }
 
         let path = tmpdir.join("lib.def");
-        let res: io::Result<()> = try {
+        let res = try {
             let mut f = File::create_buffered(&path)?;
 
             // Start off with the standard module name header and then go
@@ -1208,10 +1223,23 @@ impl<'a> Linker for EmLinker<'a> {
 
     fn set_output_kind(
         &mut self,
-        _output_kind: LinkOutputKind,
+        output_kind: LinkOutputKind,
         _crate_type: CrateType,
         _out_filename: &Path,
     ) {
+        match output_kind {
+            LinkOutputKind::DynamicNoPicExe | LinkOutputKind::DynamicPicExe => {
+                self.cmd.arg("-sMAIN_MODULE=2");
+            }
+            LinkOutputKind::DynamicDylib | LinkOutputKind::StaticDylib => {
+                self.cmd.arg("-sSIDE_MODULE=2");
+            }
+            // -fno-pie is the default on Emscripten.
+            LinkOutputKind::StaticNoPicExe | LinkOutputKind::StaticPicExe => {}
+            LinkOutputKind::WasiReactorExe => {
+                unreachable!();
+            }
+        }
     }
 
     fn link_dylib_by_name(&mut self, name: &str, _verbatim: bool, _as_needed: bool) {
@@ -1433,14 +1461,6 @@ impl<'a> Linker for WasmLd<'a> {
     ) {
         for (sym, _) in symbols {
             self.link_args(&["--export", sym]);
-        }
-
-        // LLD will hide these otherwise-internal symbols since it only exports
-        // symbols explicitly passed via the `--export` flags above and hides all
-        // others. Various bits and pieces of wasm32-unknown-unknown tooling use
-        // this, so be sure these symbols make their way out of the linker as well.
-        if matches!(self.sess.target.os, Os::Unknown | Os::None) {
-            self.link_args(&["--export=__heap_base", "--export=__data_end"]);
         }
     }
 
@@ -1722,7 +1742,7 @@ impl<'a> Linker for AixLinker<'a> {
         symbols: &[(String, SymbolExportKind)],
     ) {
         let path = tmpdir.join("list.exp");
-        let res: io::Result<()> = try {
+        let res = try {
             let mut f = File::create_buffered(&path)?;
             // FIXME: use llvm-nm to generate export list.
             for (symbol, _) in symbols {
@@ -1827,9 +1847,9 @@ fn exported_symbols_for_non_proc_macro(
     // Mark allocator shim symbols as exported only if they were generated.
     if export_threshold == SymbolExportLevel::Rust
         && needs_allocator_shim_for_linking(tcx.dependency_formats(()), crate_type)
-        && tcx.allocator_kind(()).is_some()
+        && let Some(kind) = tcx.allocator_kind(())
     {
-        symbols.extend(allocator_shim_symbols(tcx));
+        symbols.extend(allocator_shim_symbols(tcx, kind));
     }
 
     symbols
@@ -1857,7 +1877,7 @@ pub(crate) fn linked_symbols(
         | CrateType::Cdylib
         | CrateType::Dylib
         | CrateType::Sdylib => (),
-        CrateType::Staticlib | CrateType::Rlib => {
+        CrateType::StaticLib | CrateType::Rlib => {
             // These are not linked, so no need to generate symbols.o for them.
             return Vec::new();
         }
@@ -1896,83 +1916,6 @@ pub(crate) fn linked_symbols(
     });
 
     symbols
-}
-
-/// Much simplified and explicit CLI for the NVPTX linker. The linker operates
-/// with bitcode and uses LLVM backend to generate a PTX assembly.
-struct PtxLinker<'a> {
-    cmd: Command,
-    sess: &'a Session,
-}
-
-impl<'a> Linker for PtxLinker<'a> {
-    fn cmd(&mut self) -> &mut Command {
-        &mut self.cmd
-    }
-
-    fn set_output_kind(
-        &mut self,
-        _output_kind: LinkOutputKind,
-        _crate_type: CrateType,
-        _out_filename: &Path,
-    ) {
-    }
-
-    fn link_staticlib_by_name(&mut self, _name: &str, _verbatim: bool, _whole_archive: bool) {
-        panic!("staticlibs not supported")
-    }
-
-    fn link_staticlib_by_path(&mut self, path: &Path, _whole_archive: bool) {
-        self.link_arg("--rlib").link_arg(path);
-    }
-
-    fn debuginfo(&mut self, _strip: Strip, _: &[PathBuf]) {
-        self.link_arg("--debug");
-    }
-
-    fn add_object(&mut self, path: &Path) {
-        self.link_arg("--bitcode").link_arg(path);
-    }
-
-    fn optimize(&mut self) {
-        match self.sess.lto() {
-            Lto::Thin | Lto::Fat | Lto::ThinLocal => {
-                self.link_arg("-Olto");
-            }
-
-            Lto::No => {}
-        }
-    }
-
-    fn full_relro(&mut self) {}
-
-    fn partial_relro(&mut self) {}
-
-    fn no_relro(&mut self) {}
-
-    fn gc_sections(&mut self, _keep_metadata: bool) {}
-
-    fn pgo_gen(&mut self) {}
-
-    fn no_crt_objects(&mut self) {}
-
-    fn no_default_libraries(&mut self) {}
-
-    fn control_flow_guard(&mut self) {}
-
-    fn ehcont_guard(&mut self) {}
-
-    fn export_symbols(
-        &mut self,
-        _tmpdir: &Path,
-        _crate_type: CrateType,
-        _symbols: &[(String, SymbolExportKind)],
-    ) {
-    }
-
-    fn windows_subsystem(&mut self, _subsystem: WindowsSubsystemKind) {}
-
-    fn linker_plugin_lto(&mut self) {}
 }
 
 /// The `self-contained` LLVM bitcode linker
@@ -2122,7 +2065,7 @@ impl<'a> Linker for BpfLinker<'a> {
         symbols: &[(String, SymbolExportKind)],
     ) {
         let path = tmpdir.join("symbols");
-        let res: io::Result<()> = try {
+        let res = try {
             let mut f = File::create_buffered(&path)?;
             for (sym, _) in symbols {
                 writeln!(f, "{sym}")?;

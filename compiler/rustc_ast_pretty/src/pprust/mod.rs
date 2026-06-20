@@ -80,6 +80,14 @@ pub fn vis_to_string(v: &ast::Visibility) -> String {
     State::new().vis_to_string(v)
 }
 
+pub fn impl_restriction_to_string(r: &ast::ImplRestriction) -> String {
+    State::new().impl_restriction_to_string(r)
+}
+
+pub fn mut_restriction_to_string(r: &ast::MutRestriction) -> String {
+    State::new().mut_restriction_to_string(r)
+}
+
 pub fn meta_list_item_to_string(li: &ast::MetaItemInner) -> String {
     State::new().meta_list_item_to_string(li)
 }

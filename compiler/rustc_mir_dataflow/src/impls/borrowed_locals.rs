@@ -78,7 +78,8 @@ where
             // We ignore fake borrows as these get removed after analysis and shouldn't effect
             // the layout of generators.
             Rvalue::RawPtr(_, borrowed_place)
-            | Rvalue::Ref(_, BorrowKind::Mut { .. } | BorrowKind::Shared, borrowed_place) => {
+            | Rvalue::Ref(_, BorrowKind::Mut { .. } | BorrowKind::Shared, borrowed_place)
+            | Rvalue::Reborrow(_, _, borrowed_place) => {
                 if !borrowed_place.is_indirect() {
                     self.trans.gen_(borrowed_place.local);
                 }
@@ -86,7 +87,6 @@ where
 
             Rvalue::Cast(..)
             | Rvalue::Ref(_, BorrowKind::Fake(_), _)
-            | Rvalue::ShallowInitBox(..)
             | Rvalue::Use(..)
             | Rvalue::ThreadLocalRef(..)
             | Rvalue::Repeat(..)

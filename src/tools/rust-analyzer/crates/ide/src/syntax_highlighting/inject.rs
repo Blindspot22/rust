@@ -1,6 +1,6 @@
 //! "Recursive" Syntax highlighting for code in doctests and fixtures.
 
-use hir::{EditionedFileId, HirFileId, InFile, Semantics};
+use hir::{EditionedFileId, HirFileId, InFile, Semantics, db::HirDatabase};
 use ide_db::{
     SymbolKind, defs::Definition, documentation::Documentation, range_mapper::RangeMapper,
     rust_doc::is_rust_fence,
@@ -9,6 +9,7 @@ use syntax::{
     SyntaxNode, TextRange, TextSize,
     ast::{self, IsString},
 };
+use triomphe::Arc;
 
 use crate::{
     Analysis, HlMod, HlRange, HlTag, RootDatabase,
@@ -27,7 +28,7 @@ pub(super) fn ra_fixture(
         sema,
         literal.clone(),
         expanded,
-        config.minicore,
+        &config.ra_fixture,
         &mut |range| {
             hl.add(HlRange {
                 range,
@@ -56,7 +57,7 @@ pub(super) fn ra_fixture(
                     macro_bang: config.macro_bang,
                     // What if there is a fixture inside a fixture? It's fixtures all the way down.
                     // (In fact, we have a fixture inside a fixture in our test suite!)
-                    minicore: config.minicore,
+                    ra_fixture: config.ra_fixture,
                 },
                 tmp_file_id,
             )
@@ -92,6 +93,7 @@ pub(super) fn doc_comment(
         Some(it) => it,
         None => return,
     };
+    let vfs_file_id = src_file_id.file_id(sema.db);
     let src_file_id: HirFileId = src_file_id.into();
     let Some(docs) = attributes.hir_docs(sema.db) else { return };
 
@@ -109,7 +111,7 @@ pub(super) fn doc_comment(
         .for_each(|(range, def)| {
             hl.add(HlRange {
                 range,
-                highlight: module_def_to_hl_tag(def)
+                highlight: module_def_to_hl_tag(sema.db, def)
                     | HlMod::Documentation
                     | HlMod::Injected
                     | HlMod::IntraDocLink,
@@ -171,7 +173,16 @@ pub(super) fn doc_comment(
 
     inj.add_unmapped("\n}");
 
-    let (analysis, tmp_file_id) = Analysis::from_single_file(inj.take_text());
+    let proc_macro_cwd = {
+        match sema.first_crate(vfs_file_id) {
+            Some(krate) => krate.base().data(sema.db).proc_macro_cwd.clone(),
+            None => {
+                // Arbitrarily pick /, since from_single_file treats this file as /main.rs anyway.
+                Arc::new(ide_db::base_db::AbsPathBuf::try_from("/").unwrap())
+            }
+        }
+    };
+    let (analysis, tmp_file_id) = Analysis::from_single_file(inj.take_text(), proc_macro_cwd);
 
     if let Ok(ranges) = analysis.with_db(|db| {
         super::highlight(
@@ -186,7 +197,7 @@ pub(super) fn doc_comment(
                 specialize_operator: config.operator,
                 inject_doc_comment: config.inject_doc_comment,
                 macro_bang: config.macro_bang,
-                minicore: config.minicore,
+                ra_fixture: config.ra_fixture,
             },
             tmp_file_id,
             None,
@@ -200,16 +211,16 @@ pub(super) fn doc_comment(
     }
 }
 
-fn module_def_to_hl_tag(def: Definition) -> HlTag {
+fn module_def_to_hl_tag(db: &dyn HirDatabase, def: Definition) -> HlTag {
     let symbol = match def {
-        Definition::Module(_) | Definition::Crate(_) | Definition::ExternCrateDecl(_) => {
-            SymbolKind::Module
-        }
+        Definition::Crate(_) | Definition::ExternCrateDecl(_) => SymbolKind::CrateRoot,
+        Definition::Module(m) if m.is_crate_root(db) => SymbolKind::CrateRoot,
+        Definition::Module(_) => SymbolKind::Module,
         Definition::Function(_) => SymbolKind::Function,
         Definition::Adt(hir::Adt::Struct(_)) => SymbolKind::Struct,
         Definition::Adt(hir::Adt::Enum(_)) => SymbolKind::Enum,
         Definition::Adt(hir::Adt::Union(_)) => SymbolKind::Union,
-        Definition::Variant(_) => SymbolKind::Variant,
+        Definition::EnumVariant(_) => SymbolKind::Variant,
         Definition::Const(_) => SymbolKind::Const,
         Definition::Static(_) => SymbolKind::Static,
         Definition::Trait(_) => SymbolKind::Trait,

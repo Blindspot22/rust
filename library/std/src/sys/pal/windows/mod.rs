@@ -18,7 +18,6 @@ pub mod c;
 #[cfg(not(target_vendor = "win7"))]
 pub mod futex;
 pub mod handle;
-pub mod os;
 pub mod time;
 cfg_select! {
     // We don't care about printing nice error messages for panic=immediate-abort
@@ -231,6 +230,11 @@ impl_is_zero! { i8 i16 i32 i64 isize u8 u16 u32 u64 usize }
 
 pub fn cvt<I: IsZero>(i: I) -> io::Result<I> {
     if i.is_zero() { Err(io::Error::last_os_error()) } else { Ok(i) }
+}
+
+#[allow(dead_code)]
+pub fn cvt_nz<I: IsZero>(i: I) -> crate::io::Result<()> {
+    if i.is_zero() { Ok(()) } else { Err(crate::io::Error::last_os_error()) }
 }
 
 pub fn dur2timeout(dur: Duration) -> u32 {

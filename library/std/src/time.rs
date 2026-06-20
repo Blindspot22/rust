@@ -112,17 +112,16 @@ use crate::sys::{FromInner, IntoInner, time};
 /// |-----------|----------------------------------------------------------------------|
 /// | SGX       | [`insecure_time` usercall]. More information on [timekeeping in SGX] |
 /// | UNIX      | [clock_gettime] with `CLOCK_MONOTONIC`                               |
+/// | WASI      | [clock_gettime] with `CLOCK_MONOTONIC`                               |
 /// | Darwin    | [clock_gettime] with `CLOCK_UPTIME_RAW`                              |
 /// | VXWorks   | [clock_gettime] with `CLOCK_MONOTONIC`                               |
 /// | SOLID     | `get_tim`                                                            |
-/// | WASI      | [__wasi_clock_time_get] with `monotonic`                             |
 /// | Windows   | [QueryPerformanceCounter]                                            |
 ///
 /// [currently]: crate::io#platform-specific-behavior
 /// [QueryPerformanceCounter]: https://docs.microsoft.com/en-us/windows/win32/api/profileapi/nf-profileapi-queryperformancecounter
 /// [`insecure_time` usercall]: https://edp.fortanix.com/docs/api/fortanix_sgx_abi/struct.Usercalls.html#method.insecure_time
 /// [timekeeping in SGX]: https://edp.fortanix.com/docs/concepts/rust-std/#codestdtimecode
-/// [__wasi_clock_time_get]: https://github.com/WebAssembly/WASI/blob/main/legacy/preview1/docs.md#clock_time_get
 /// [clock_gettime]: https://pubs.opengroup.org/onlinepubs/9799919799/functions/clock_getres.html
 ///
 /// **Disclaimer:** These system calls might change over time.
@@ -138,9 +137,9 @@ use crate::sys::{FromInner, IntoInner, time};
 /// if available, which is the case for all [tier 1] platforms.
 /// In practice such guarantees are – under rare circumstances – broken by hardware, virtualization
 /// or operating system bugs. To work around these bugs and platforms not offering monotonic clocks
-/// [`duration_since`], [`elapsed`] and [`sub`] saturate to zero. In older Rust versions this
-/// lead to a panic instead. [`checked_duration_since`] can be used to detect and handle situations
-/// where monotonicity is violated, or `Instant`s are subtracted in the wrong order.
+/// [`duration_since`], [`elapsed`] and [`sub`](#impl-Sub-for-Instant) saturate to zero. In older
+/// Rust versions this lead to a panic instead. [`checked_duration_since`] can be used to detect and
+/// handle situations where monotonicity is violated, or `Instant`s are subtracted in the wrong order.
 ///
 /// This workaround obscures programming errors where earlier and later instants are accidentally
 /// swapped. For this reason future Rust versions may reintroduce panics.
@@ -224,17 +223,16 @@ pub struct Instant(time::Instant);
 /// |-----------|----------------------------------------------------------------------|
 /// | SGX       | [`insecure_time` usercall]. More information on [timekeeping in SGX] |
 /// | UNIX      | [clock_gettime (Realtime Clock)]                                     |
+/// | WASI      | [clock_gettime (Realtime Clock)]                                     |
 /// | Darwin    | [clock_gettime (Realtime Clock)]                                     |
 /// | VXWorks   | [clock_gettime (Realtime Clock)]                                     |
 /// | SOLID     | `SOLID_RTC_ReadTime`                                                 |
-/// | WASI      | [__wasi_clock_time_get (Realtime Clock)]                             |
 /// | Windows   | [GetSystemTimePreciseAsFileTime] / [GetSystemTimeAsFileTime]         |
 ///
 /// [currently]: crate::io#platform-specific-behavior
 /// [`insecure_time` usercall]: https://edp.fortanix.com/docs/api/fortanix_sgx_abi/struct.Usercalls.html#method.insecure_time
 /// [timekeeping in SGX]: https://edp.fortanix.com/docs/concepts/rust-std/#codestdtimecode
 /// [clock_gettime (Realtime Clock)]: https://pubs.opengroup.org/onlinepubs/9799919799/functions/clock_getres.html
-/// [__wasi_clock_time_get (Realtime Clock)]: https://github.com/WebAssembly/WASI/blob/main/legacy/preview1/docs.md#clock_time_get
 /// [GetSystemTimePreciseAsFileTime]: https://docs.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsystemtimepreciseasfiletime
 /// [GetSystemTimeAsFileTime]: https://docs.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsystemtimeasfiletime
 ///
@@ -425,6 +423,7 @@ impl Add<Duration> for Instant {
     ///
     /// This function may panic if the resulting point in time cannot be represented by the
     /// underlying data structure. See [`Instant::checked_add`] for a version without panic.
+    #[track_caller]
     fn add(self, other: Duration) -> Instant {
         self.checked_add(other).expect("overflow when adding duration to instant")
     }
@@ -441,6 +440,7 @@ impl AddAssign<Duration> for Instant {
 impl Sub<Duration> for Instant {
     type Output = Instant;
 
+    #[track_caller]
     fn sub(self, other: Duration) -> Instant {
         self.checked_sub(other).expect("overflow when subtracting duration from instant")
     }
@@ -682,6 +682,56 @@ impl SystemTime {
     pub fn checked_sub(&self, duration: Duration) -> Option<SystemTime> {
         self.0.checked_sub_duration(&duration).map(SystemTime)
     }
+
+    /// Saturating [`SystemTime`] addition, computing `self + duration`,
+    /// returning [`SystemTime::MAX`] if overflow occurred.
+    ///
+    /// In the case that the `duration` is smaller than the time precision of
+    /// the operating system, `self` will be returned.
+    #[unstable(feature = "time_saturating_systemtime", issue = "151199")]
+    pub fn saturating_add(&self, duration: Duration) -> SystemTime {
+        self.checked_add(duration).unwrap_or(SystemTime::MAX)
+    }
+
+    /// Saturating [`SystemTime`] subtraction, computing `self - duration`,
+    /// returning [`SystemTime::MIN`] if overflow occurred.
+    ///
+    /// In the case that the `duration` is smaller than the time precision of
+    /// the operating system, `self` will be returned.
+    #[unstable(feature = "time_saturating_systemtime", issue = "151199")]
+    pub fn saturating_sub(&self, duration: Duration) -> SystemTime {
+        self.checked_sub(duration).unwrap_or(SystemTime::MIN)
+    }
+
+    /// Saturating computation of time elapsed from an earlier point in time,
+    /// returning [`Duration::ZERO`] in the case that `earlier` is later or
+    /// equal to `self`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// #![feature(time_saturating_systemtime)]
+    /// use std::time::{Duration, SystemTime};
+    ///
+    /// let now = SystemTime::now();
+    /// let prev = now.saturating_sub(Duration::new(1, 0));
+    ///
+    /// // now - prev should return non-zero.
+    /// assert_eq!(now.saturating_duration_since(prev), Duration::new(1, 0));
+    /// assert!(now.duration_since(prev).is_ok());
+    ///
+    /// // prev - now should return zero (and fail with the non-saturating).
+    /// assert_eq!(prev.saturating_duration_since(now), Duration::ZERO);
+    /// assert!(prev.duration_since(now).is_err());
+    ///
+    /// // now - now should return zero (and work with the non-saturating).
+    /// assert_eq!(now.saturating_duration_since(now), Duration::ZERO);
+    /// assert!(now.duration_since(now).is_ok());
+    /// ```
+    #[unstable(feature = "time_saturating_systemtime", issue = "151199")]
+    pub fn saturating_duration_since(&self, earlier: SystemTime) -> Duration {
+        self.duration_since(earlier).unwrap_or(Duration::ZERO)
+    }
 }
 
 #[stable(feature = "time2", since = "1.8.0")]
@@ -692,8 +742,9 @@ impl Add<Duration> for SystemTime {
     ///
     /// This function may panic if the resulting point in time cannot be represented by the
     /// underlying data structure. See [`SystemTime::checked_add`] for a version without panic.
+    #[track_caller]
     fn add(self, dur: Duration) -> SystemTime {
-        self.checked_add(dur).expect("overflow when adding duration to instant")
+        self.checked_add(dur).expect("overflow when adding duration to `SystemTime`")
     }
 }
 
@@ -708,8 +759,9 @@ impl AddAssign<Duration> for SystemTime {
 impl Sub<Duration> for SystemTime {
     type Output = SystemTime;
 
+    #[track_caller]
     fn sub(self, dur: Duration) -> SystemTime {
-        self.checked_sub(dur).expect("overflow when subtracting duration from instant")
+        self.checked_sub(dur).expect("overflow when subtracting duration from `SystemTime`")
     }
 }
 

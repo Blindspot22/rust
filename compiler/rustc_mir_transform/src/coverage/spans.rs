@@ -1,7 +1,7 @@
 use rustc_middle::mir::coverage::{Mapping, MappingKind, START_BCB};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::source_map::SourceMap;
-use rustc_span::{BytePos, DesugaringKind, ExpnId, ExpnKind, MacroKind, Span};
+use rustc_span::{BytePos, DesugaringKind, ExpnKind, MacroKind, Span, SyntaxContext};
 use tracing::instrument;
 
 use crate::coverage::expansion::{ExpnTree, SpanWithBcb};
@@ -28,7 +28,7 @@ pub(super) fn extract_refined_covspans<'tcx>(
 
     // If there somehow isn't an expansion tree node corresponding to the
     // body span, return now and don't create any mappings.
-    let Some(node) = expn_tree.get(hir_info.body_span.ctxt().outer_expn()) else { return };
+    let Some(node) = expn_tree.get(hir_info.body_span.ctxt()) else { return };
 
     let mut covspans = vec![];
 
@@ -38,9 +38,8 @@ pub(super) fn extract_refined_covspans<'tcx>(
 
     // For each expansion with its call-site in the body span, try to
     // distill a corresponding covspan.
-    for &child_expn_id in &node.child_expn_ids {
-        if let Some(covspan) = single_covspan_for_child_expn(tcx, graph, &expn_tree, child_expn_id)
-        {
+    for &child_context in &node.child_contexts {
+        if let Some(covspan) = single_covspan_for_child_context(tcx, &expn_tree, child_context) {
             covspans.push(covspan);
         }
     }
@@ -56,12 +55,11 @@ pub(super) fn extract_refined_covspans<'tcx>(
             }
 
             // Each pushed covspan should have the same context as the body span.
-            // If it somehow doesn't, discard the covspan, or panic in debug builds.
+            // If it somehow doesn't, discard the covspan.
             if !body_span.eq_ctxt(covspan_span) {
-                debug_assert!(
-                    false,
-                    "span context mismatch: body_span={body_span:?}, covspan.span={covspan_span:?}"
-                );
+                // There is currently no known way for this to happen, but if it
+                // does happen then dropping the offending span is better than
+                // having tricky macro expansions trigger an ICE.
                 return false;
             }
 
@@ -125,26 +123,23 @@ pub(super) fn extract_refined_covspans<'tcx>(
 }
 
 /// For a single child expansion, try to distill it into a single span+BCB mapping.
-fn single_covspan_for_child_expn(
+fn single_covspan_for_child_context(
     tcx: TyCtxt<'_>,
-    graph: &CoverageGraph,
     expn_tree: &ExpnTree,
-    expn_id: ExpnId,
+    child_context: SyntaxContext,
 ) -> Option<Covspan> {
-    let node = expn_tree.get(expn_id)?;
-
-    let bcbs =
-        expn_tree.iter_node_and_descendants(expn_id).flat_map(|n| n.spans.iter().map(|s| s.bcb));
+    let node = expn_tree.get(child_context)?;
+    let minmax_bcbs = node.minmax_bcbs?;
 
     let bcb = match node.expn_kind {
         // For bang-macros (e.g. `assert!`, `trace!`) and for `await`, taking
         // the "first" BCB in dominator order seems to give good results.
         ExpnKind::Macro(MacroKind::Bang, _) | ExpnKind::Desugaring(DesugaringKind::Await) => {
-            bcbs.min_by(|&a, &b| graph.cmp_in_dominator_order(a, b))?
+            minmax_bcbs.min
         }
         // For other kinds of expansion, taking the "last" (most-dominated) BCB
         // seems to give good results.
-        _ => bcbs.max_by(|&a, &b| graph.cmp_in_dominator_order(a, b))?,
+        _ => minmax_bcbs.max,
     };
 
     // For bang-macro expansions, limit the call-site span to just the macro

@@ -13,18 +13,20 @@
         loc: DeclarationLocation {
             hir_file_id: FileId(
                 EditionedFileId(
-                    Id(3001),
+                    Id(2c01),
                 ),
             ),
             ptr: SyntaxNodePtr {
                 kind: STRUCT,
                 range: 0..15,
             },
-            name_ptr: AstPtr(
-                SyntaxNodePtr {
-                    kind: NAME,
-                    range: 11..14,
-                },
+            name_ptr: Some(
+                AstPtr(
+                    SyntaxNodePtr {
+                        kind: NAME,
+                        range: 11..14,
+                    },
+                ),
             ),
         },
         container_name: None,
@@ -48,18 +50,20 @@
         loc: DeclarationLocation {
             hir_file_id: FileId(
                 EditionedFileId(
-                    Id(3000),
+                    Id(2c00),
                 ),
             ),
             ptr: SyntaxNodePtr {
                 kind: USE_TREE,
                 range: 17..25,
             },
-            name_ptr: AstPtr(
-                SyntaxNodePtr {
-                    kind: NAME_REF,
-                    range: 22..25,
-                },
+            name_ptr: Some(
+                AstPtr(
+                    SyntaxNodePtr {
+                        kind: NAME_REF,
+                        range: 22..25,
+                    },
+                ),
             ),
         },
         container_name: None,

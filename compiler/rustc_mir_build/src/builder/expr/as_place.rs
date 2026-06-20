@@ -1,7 +1,6 @@
 //! See docs in build/expr/mod.rs
 
-use std::assert_matches::assert_matches;
-use std::iter;
+use std::{assert_matches, iter};
 
 use rustc_abi::{FIRST_VARIANT, FieldIdx, VariantIdx};
 use rustc_hir::def_id::LocalDefId;
@@ -16,6 +15,7 @@ use tracing::{debug, instrument, trace};
 
 use crate::builder::ForGuard::{OutsideGuard, RefWithinGuard};
 use crate::builder::expr::category::Category;
+use crate::builder::scope::LintLevel;
 use crate::builder::{BlockAnd, BlockAndExtension, Builder, Capture, CaptureMap};
 
 /// The "outermost" place that holds this value.
@@ -427,8 +427,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let expr_span = expr.span;
         let source_info = this.source_info(expr_span);
         match expr.kind {
-            ExprKind::Scope { region_scope, lint_level, value } => {
-                this.in_scope((region_scope, source_info), lint_level, |this| {
+            ExprKind::Scope { region_scope, hir_id, value } => {
+                this.in_scope((region_scope, source_info), LintLevel::Explicit(hir_id), |this| {
                     this.expr_as_place(block, value, mutability, fake_borrow_temps)
                 })
             }
@@ -551,7 +551,6 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | ExprKind::Unary { .. }
             | ExprKind::Binary { .. }
             | ExprKind::LogicalOp { .. }
-            | ExprKind::Box { .. }
             | ExprKind::Cast { .. }
             | ExprKind::Use { .. }
             | ExprKind::NeverToAny { .. }
@@ -584,6 +583,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | ExprKind::ThreadLocalRef(_)
             | ExprKind::Call { .. }
             | ExprKind::ByUse { .. }
+            // A reborrow is an rvalue. If a place is needed for it, materialize
+            // the rvalue in a temporary instead of treating the reborrow
+            // expression itself as an assignable place.
+            | ExprKind::Reborrow { .. }
             | ExprKind::WrapUnsafeBinder { .. } => {
                 // these are not places, so we need to make a temporary.
                 debug_assert!(!matches!(Category::of(&expr.kind), Some(Category::Place)));

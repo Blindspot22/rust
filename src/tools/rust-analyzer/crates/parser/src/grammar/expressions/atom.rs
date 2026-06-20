@@ -216,16 +216,19 @@ fn tuple_expr(p: &mut Parser<'_>) -> CompletedMarker {
     let mut saw_comma = false;
     let mut saw_expr = false;
 
-    // test_err tuple_expr_leading_comma
-    // fn foo() {
-    //     (,);
-    // }
-    if p.eat(T![,]) {
-        p.error("expected expression");
-        saw_comma = true;
-    }
-
     while !p.at(EOF) && !p.at(T![')']) {
+        // test_err tuple_expr_empty_expr
+        // fn foo() {
+        //     (,);
+        //     (a, , b);
+        // }
+        if p.current() == T![,] {
+            p.error("expected expression");
+            p.bump(T![,]);
+            saw_comma = true;
+            continue;
+        }
+
         saw_expr = true;
 
         // test tuple_attrs
@@ -317,6 +320,10 @@ fn builtin_expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
         //     builtin#naked_asm("");
         // }
         parse_asm_expr(p, m)
+    } else if p.eat_contextual_kw(T![include_bytes]) {
+        // test include_bytes
+        // fn foo() { builtin # include_bytes }
+        Some(m.complete(p, INCLUDE_BYTES_EXPR))
     } else {
         m.abandon(p);
         None
@@ -407,8 +414,18 @@ pub(crate) fn parse_asm_expr(p: &mut Parser<'_>, m: Marker) -> Option<CompletedM
             op.complete(p, ASM_CONST);
             op_n.complete(p, ASM_OPERAND_NAMED);
         } else if p.eat_contextual_kw(T![sym]) {
+            // test asm_sym_paren
+            // fn foo() {
+            //     builtin#asm("", f = sym (foo::bar));
+            // }
             dir_spec.abandon(p);
-            paths::type_path(p);
+            if p.at(T!['(']) {
+                p.bump(T!['(']);
+                paths::type_path(p);
+                p.expect(T![')']);
+            } else {
+                paths::type_path(p);
+            }
             op.complete(p, ASM_SYM);
             op_n.complete(p, ASM_OPERAND_NAMED);
         } else if allow_templates {
@@ -878,6 +895,10 @@ fn return_expr(p: &mut Parser<'_>) -> CompletedMarker {
     let m = p.start();
     p.bump(T![return]);
     if p.at_ts(EXPR_FIRST) {
+        // test return_attr
+        // fn foo() {
+        //     return #[attr] 1;
+        // }
         expr(p);
     }
     m.complete(p, RETURN_EXPR)
@@ -976,11 +997,17 @@ fn break_expr(p: &mut Parser<'_>, r: Restrictions) -> CompletedMarker {
 // test try_block_expr
 // fn foo() {
 //     let _ = try {};
+//     let _ = try bikeshed T<U> {};
 // }
 fn try_block_expr(p: &mut Parser<'_>, m: Option<Marker>) -> CompletedMarker {
     assert!(p.at(T![try]));
     let m = m.unwrap_or_else(|| p.start());
+    let try_modifier = p.start();
     p.bump(T![try]);
+    if p.eat_contextual_kw(T![bikeshed]) {
+        type_(p);
+    }
+    try_modifier.complete(p, TRY_BLOCK_MODIFIER);
     if p.at(T!['{']) {
         stmt_list(p);
     } else {

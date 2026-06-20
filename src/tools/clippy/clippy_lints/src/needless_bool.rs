@@ -10,6 +10,7 @@ use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::declare_lint_pass;
+use rustc_span::SyntaxContext;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -80,6 +81,7 @@ declare_clippy_lint! {
     complexity,
     "setting the same boolean variable in both branches of an if-statement"
 }
+
 declare_lint_pass!(NeedlessBool => [NEEDLESS_BOOL, NEEDLESS_BOOL_ASSIGN]);
 
 fn condition_needs_parentheses(e: &Expr<'_>) -> bool {
@@ -107,11 +109,11 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessBool {
                 then,
                 r#else: Some(else_expr),
             }) = higher::If::hir(e)
-            && !span_contains_comment(cx.tcx.sess.source_map(), e.span)
+            && !span_contains_comment(cx, e.span)
         {
             let reduce = |ret, not| {
                 let mut applicability = Applicability::MachineApplicable;
-                let snip = Sugg::hir_with_applicability(cx, cond, "<predicate>", &mut applicability);
+                let snip = Sugg::hir_with_context(cx, cond, e.span.ctxt(), "<predicate>", &mut applicability);
                 let mut snip = if not { !snip } else { snip };
 
                 if ret {
@@ -168,7 +170,7 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessBool {
             }
             if let Some((lhs_a, a)) = fetch_assign(then)
                 && let Some((lhs_b, b)) = fetch_assign(else_expr)
-                && SpanlessEq::new(cx).eq_expr(lhs_a, lhs_b)
+                && SpanlessEq::new(cx).eq_expr(SyntaxContext::root(), lhs_a, lhs_b)
             {
                 let mut applicability = Applicability::MachineApplicable;
                 let cond = Sugg::hir_with_context(cx, cond, e.span.ctxt(), "..", &mut applicability);

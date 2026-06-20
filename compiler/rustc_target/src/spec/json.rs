@@ -5,14 +5,14 @@ use rustc_abi::{Align, AlignFromBytesError};
 
 use super::crt_objects::CrtObjects;
 use super::{
-    Abi, Arch, BinaryFormat, CodeModel, DebuginfoKind, Env, FloatAbi, FramePointer, LinkArgsCli,
+    Arch, BinaryFormat, CfgAbi, CodeModel, DebuginfoKind, Env, FloatAbi, FramePointer, LinkArgsCli,
     LinkSelfContainedComponents, LinkSelfContainedDefault, LinkerFlavorCli, LldFlavor,
     MergeFunctions, Os, PanicStrategy, RelocModel, RelroLevel, RustcAbi, SanitizerSet,
     SmallDataThresholdSupport, SplitDebuginfo, StackProbeType, StaticCow, SymbolVisibility, Target,
     TargetKind, TargetOptions, TargetWarnings, TlsModel,
 };
 use crate::json::{Json, ToJson};
-use crate::spec::AbiMap;
+use crate::spec::{AbiMap, LlvmAbi};
 
 impl Target {
     /// Loads a target descriptor from a JSON object.
@@ -42,11 +42,7 @@ impl Target {
         }
 
         let alignment_error = |field_name: &str, error: AlignFromBytesError| -> String {
-            let msg = match error {
-                AlignFromBytesError::NotPowerOfTwo(_) => "not a power of 2 number of bytes",
-                AlignFromBytesError::TooLarge(_) => "too large",
-            };
-            format!("`{}` bits is not a valid value for {field_name}: {msg}", error.align() * 8)
+            format!("invalid value for {field_name}: {error}")
         };
 
         macro_rules! forward {
@@ -73,7 +69,9 @@ impl Target {
         forward_opt!(c_enum_min_bits); // if None, matches c_int_width
         forward!(os);
         forward!(env);
-        forward!(abi);
+        if let Some(abi) = json.abi {
+            base.cfg_abi = abi;
+        }
         forward!(vendor);
         forward_opt!(linker);
         forward!(linker_flavor_json);
@@ -118,6 +116,7 @@ impl Target {
         forward!(asm_args);
         forward!(cpu);
         forward!(need_explicit_cpu);
+        forward!(unsupported_cpus);
         forward!(features);
         forward!(dynamic_linking);
         forward_opt!(direct_access_external_data);
@@ -154,7 +153,6 @@ impl Target {
         forward!(is_like_vexos);
         forward!(binary_format);
         forward!(default_dwarf_version);
-        forward!(allows_weak_linkage);
         forward!(has_rpath);
         forward!(no_default_libraries);
         forward!(position_independent_executables);
@@ -254,7 +252,7 @@ impl ToJson for Target {
             };
             ($attr:ident, $json_name:expr) => {{
                 let name = $json_name;
-                d.insert(name.into(), target.$attr.to_json());
+                d.insert(name.to_string(), target.$attr.to_json());
             }};
         }
 
@@ -264,7 +262,7 @@ impl ToJson for Target {
                 let name = $json_name;
                 #[allow(rustc::bad_opt_access)]
                 if default.$attr != target.$attr {
-                    d.insert(name.into(), target.$attr.to_json());
+                    d.insert(name.to_string(), target.$attr.to_json());
                 }
             }};
             (link_args - $attr:ident, $json_name:expr) => {{
@@ -301,7 +299,7 @@ impl ToJson for Target {
         target_option_val!(c_int_width, "target-c-int-width");
         target_option_val!(os);
         target_option_val!(env);
-        target_option_val!(abi);
+        target_option_val!(cfg_abi, "abi");
         target_option_val!(vendor);
         target_option_val!(linker);
         target_option_val!(linker_flavor_json, "linker-flavor");
@@ -322,6 +320,7 @@ impl ToJson for Target {
         target_option_val!(asm_args);
         target_option_val!(cpu);
         target_option_val!(need_explicit_cpu);
+        target_option_val!(unsupported_cpus);
         target_option_val!(features);
         target_option_val!(dynamic_linking);
         target_option_val!(direct_access_external_data);
@@ -352,7 +351,6 @@ impl ToJson for Target {
         target_option_val!(is_like_vexos);
         target_option_val!(binary_format);
         target_option_val!(default_dwarf_version);
-        target_option_val!(allows_weak_linkage);
         target_option_val!(has_rpath);
         target_option_val!(no_default_libraries);
         target_option_val!(position_independent_executables);
@@ -449,7 +447,6 @@ impl schemars::JsonSchema for EndianWrapper {
             "type": "string",
             "enum": ["big", "little"]
         })
-        .into()
     }
 }
 
@@ -475,7 +472,6 @@ impl schemars::JsonSchema for ExternAbiWrapper {
             "type": "string",
             "enum": all,
         })
-        .into()
     }
 }
 
@@ -509,7 +505,7 @@ struct TargetSpecJson {
     c_enum_min_bits: Option<u64>,
     os: Option<Os>,
     env: Option<Env>,
-    abi: Option<Abi>,
+    abi: Option<CfgAbi>,
     vendor: Option<StaticCow<str>>,
     linker: Option<StaticCow<str>>,
     #[serde(rename = "linker-flavor")]
@@ -545,6 +541,7 @@ struct TargetSpecJson {
     asm_args: Option<StaticCow<[StaticCow<str>]>>,
     cpu: Option<StaticCow<str>>,
     need_explicit_cpu: Option<bool>,
+    unsupported_cpus: Option<StaticCow<[StaticCow<str>]>>,
     features: Option<StaticCow<str>>,
     dynamic_linking: Option<bool>,
     direct_access_external_data: Option<bool>,
@@ -574,7 +571,6 @@ struct TargetSpecJson {
     is_like_vexos: Option<bool>,
     binary_format: Option<BinaryFormat>,
     default_dwarf_version: Option<u32>,
-    allows_weak_linkage: Option<bool>,
     has_rpath: Option<bool>,
     no_default_libraries: Option<bool>,
     position_independent_executables: Option<bool>,
@@ -613,7 +609,7 @@ struct TargetSpecJson {
     #[serde(rename = "target-mcount")]
     mcount: Option<StaticCow<str>>,
     llvm_mcount_intrinsic: Option<StaticCow<str>>,
-    llvm_abiname: Option<StaticCow<str>>,
+    llvm_abiname: Option<LlvmAbi>,
     llvm_floatabi: Option<FloatAbi>,
     rustc_abi: Option<RustcAbi>,
     relax_elf_relocations: Option<bool>,

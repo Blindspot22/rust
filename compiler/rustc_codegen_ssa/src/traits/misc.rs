@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_middle::ty::{self, Instance, Ty};
 use rustc_session::Session;
+use rustc_span::Symbol;
 
 use super::BackendTypes;
 
@@ -25,5 +26,11 @@ pub trait MiscCodegenMethods<'tcx>: BackendTypes {
     fn apply_target_cpu_attr(&self, llfn: Self::Function);
     /// Declares the extern "C" main function for the entry point. Returns None if the symbol
     /// already exists.
-    fn declare_c_main(&self, fn_type: Self::Type) -> Option<Self::Function>;
+    fn declare_c_main(&self, fn_type: Self::FunctionSignature) -> Option<Self::Function>;
+
+    /// Whether `codegen_intrinsic_call` expects to always have a `place_value`
+    /// when emitting code for the intrinsic `name`.
+    ///
+    /// This is discouraged, but here for now to simplify migration to using OperandValues
+    fn intrinsic_call_expects_place_always(&self, name: Symbol) -> bool;
 }

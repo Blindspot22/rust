@@ -87,7 +87,7 @@ impl Step for Std {
             Mode::Std,
             SourceType::InTree,
             target,
-            Kind::Check,
+            builder.config.cmd.kind(),
         );
 
         std_cargo(builder, target, &mut cargo, &self.crates);
@@ -97,7 +97,7 @@ impl Step for Std {
         }
 
         let _guard = builder.msg(
-            Kind::Check,
+            builder.config.cmd.kind(),
             format_args!("library artifacts{}", crate_description(&self.crates)),
             Mode::Std,
             build_compiler,
@@ -706,7 +706,7 @@ macro_rules! tool_check_step {
             const IS_HOST: bool = true;
 
             fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-                run.paths(&[ $path, $( $alt_path ),* ])
+                run.selectors(&[$path $(, $alt_path )*])
             }
 
             fn is_default_step(_builder: &Builder<'_>) -> bool {

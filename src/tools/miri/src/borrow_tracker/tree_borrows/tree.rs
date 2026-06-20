@@ -26,7 +26,7 @@ use super::foreign_access_skipping::IdempotentForeignAccess;
 use super::perms::{PermTransition, Permission};
 use super::tree_visitor::{ChildrenVisitMode, ContinueTraversal, NodeAppArgs, TreeVisitor};
 use super::unimap::{UniIndex, UniKeyMap, UniValMap};
-use super::wildcard::WildcardState;
+use super::wildcard::ExposedCache;
 use crate::borrow_tracker::{AccessKind, GlobalState, ProtectorKind};
 use crate::*;
 
@@ -63,6 +63,7 @@ impl LocationState {
     /// `sifa` is the (strongest) idempotent foreign access, see `foreign_access_skipping.rs`
     pub fn new_non_accessed(permission: Permission, sifa: IdempotentForeignAccess) -> Self {
         assert!(permission.is_initial() || permission.is_disabled());
+        assert!(!permission.is_unique());
         Self { permission, accessed: false, idempotent_foreign_access: sifa }
     }
 
@@ -71,6 +72,12 @@ impl LocationState {
     /// `sifa` is the (strongest) idempotent foreign access, see `foreign_access_skipping.rs`
     pub fn new_accessed(permission: Permission, sifa: IdempotentForeignAccess) -> Self {
         Self { permission, accessed: true, idempotent_foreign_access: sifa }
+    }
+
+    /// Checks whether the current location state is ever reachable in a real execution.
+    pub fn possible(&self) -> bool {
+        // `Unique` can only be reached on actually accessed locations.
+        self.accessed || !self.permission.is_unique()
     }
 
     /// Check if the location has been accessed, i.e. if it has
@@ -89,7 +96,7 @@ impl LocationState {
         &mut self,
         idx: UniIndex,
         nodes: &mut UniValMap<Node>,
-        wildcard_accesses: &mut UniValMap<WildcardState>,
+        exposed_cache: &mut ExposedCache,
         access_kind: AccessKind,
         relatedness: AccessRelatedness,
         protected: bool,
@@ -99,7 +106,7 @@ impl LocationState {
         // ensures it is only called when `skip_if_known_noop` returns
         // `Recurse`, due to the contract of `traverse_this_parents_children_other`.
         self.record_new_access(access_kind, relatedness);
-
+        let old_access_level = self.permission.strongest_allowed_local_access(protected);
         let transition = self.perform_access(access_kind, relatedness, protected)?;
         if !transition.is_noop() {
             let node = nodes.get_mut(idx).unwrap();
@@ -111,8 +118,8 @@ impl LocationState {
             // We need to update the wildcard state, if the permission
             // of an exposed pointer changes.
             if node.is_exposed {
-                let access_type = self.permission.strongest_allowed_local_access(protected);
-                WildcardState::update_exposure(idx, access_type, nodes, wildcard_accesses);
+                let access_level = self.permission.strongest_allowed_local_access(protected);
+                exposed_cache.update_exposure(nodes, idx, old_access_level, access_level);
             }
         }
         Ok(())
@@ -150,6 +157,7 @@ impl LocationState {
         if protected && self.accessed && transition.produces_disabled() {
             return Err(TransitionError::ProtectedDisabled(old_perm));
         }
+        debug_assert!(self.possible());
         Ok(transition)
     }
 
@@ -226,7 +234,7 @@ impl LocationState {
 
     /// Records a new access, so that future access can potentially be skipped
     /// by `skip_if_known_noop`. This must be called on child accesses, and otherwise
-    /// shoud be called on foreign accesses for increased performance. It should not be called
+    /// should be called on foreign accesses for increased performance. It should not be called
     /// when `skip_if_known_noop` indicated skipping, since it then is a no-op.
     /// See `foreign_access_skipping.rs`
     fn record_new_access(&mut self, access_kind: AccessKind, rel_pos: AccessRelatedness) {
@@ -261,14 +269,8 @@ pub struct LocationTree {
     ///
     /// We do uphold the fact that `keys(perms)` is a subset of `keys(nodes)`
     pub perms: UniValMap<LocationState>,
-    /// Maps a tag and a location to its wildcard access tracking information,
-    /// with possible lazy initialization.
-    ///
-    /// If this allocation doesn't have any exposed nodes, then this map doesn't get
-    /// initialized. This way we only need to allocate the map if we need it.
-    ///
-    /// NOTE: same guarantees on entry initialization as for `perms`.
-    pub wildcard_accesses: UniValMap<WildcardState>,
+    /// Caches information about the relatedness of nodes for a wildcard access.
+    pub exposed_cache: ExposedCache,
 }
 /// Tree structure with both parents and children since we want to be
 /// able to traverse the tree efficiently in both directions.
@@ -276,7 +278,7 @@ pub struct LocationTree {
 pub struct Tree {
     /// Mapping from tags to keys. The key obtained can then be used in
     /// any of the `UniValMap` relative to this allocation, i.e.
-    /// `nodes`, `LocationTree::perms` and `LocationTree::wildcard_accesses`
+    /// `nodes`, `LocationTree::perms` and `LocationTree::exposed_cache`
     /// of the same `Tree`.
     /// The parent-child relationship in `Node` is encoded in terms of these same
     /// keys, so traversing the entire tree needs exactly one access to
@@ -372,8 +374,8 @@ impl Tree {
                     IdempotentForeignAccess::None,
                 ),
             );
-            let wildcard_accesses = UniValMap::default();
-            DedupRangeMap::new(size, LocationTree { perms, wildcard_accesses })
+            let exposed_cache = ExposedCache::default();
+            DedupRangeMap::new(size, LocationTree { perms, exposed_cache })
         };
         Self { roots: SmallVec::from_slice(&[root_idx]), nodes, locations, tag_mapping }
     }
@@ -403,6 +405,7 @@ impl<'tcx> Tree {
             ProvenanceExtra::Wildcard => None,
         };
         assert!(outside_perm.is_initial());
+        assert!(!outside_perm.is_unique());
 
         let default_strongest_idempotent =
             outside_perm.strongest_idempotent_foreign_access(protected);
@@ -451,19 +454,9 @@ impl<'tcx> Tree {
             }
         }
 
-        // We need to ensure the consistency of the wildcard access tracking data structure.
-        // For this, we insert the correct entry for this tag based on its parent, if it exists.
-        // If we are inserting a new wildcard root (with Wildcard as parent_prov) then we insert
-        // the special wildcard root initial state instead.
-        for (_range, loc) in self.locations.iter_mut_all() {
-            if let Some(parent_idx) = parent_idx {
-                if let Some(parent_access) = loc.wildcard_accesses.get(parent_idx) {
-                    loc.wildcard_accesses.insert(idx, parent_access.for_new_child());
-                }
-            } else {
-                loc.wildcard_accesses.insert(idx, WildcardState::for_wildcard_root());
-            }
-        }
+        // We don't have to update `exposed_cache` as the new node is not exposed and
+        // has no children so the default counts of 0 are correct.
+
         // If the parent is a wildcard pointer, then it doesn't track SIFA and doesn't need to be updated.
         if let Some(parent_idx) = parent_idx {
             // Inserting the new perms might have broken the SIFA invariant (see
@@ -706,7 +699,7 @@ impl<'tcx> Tree {
         for (loc_range, loc) in self.locations.iter_mut_all() {
             // Only visit accessed permissions
             if let Some(p) = loc.perms.get(source_idx)
-                && let Some(access_kind) = p.permission.protector_end_access()
+                && let Some(access_kind) = p.permission.associated_access()
                 && p.accessed
             {
                 let diagnostics = DiagnosticInfo {
@@ -807,7 +800,7 @@ impl Tree {
         let node = self.nodes.remove(this).unwrap();
         for (_range, loc) in self.locations.iter_mut_all() {
             loc.perms.remove(this);
-            loc.wildcard_accesses.remove(this);
+            loc.exposed_cache.remove(this);
         }
         self.tag_mapping.remove(&node.tag);
     }
@@ -943,7 +936,7 @@ impl<'tcx> LocationTree {
         };
 
         let accessed_root_tag = accessed_root.map(|idx| nodes.get(idx).unwrap().tag);
-        for root in roots {
+        for (i, root) in roots.enumerate() {
             let tag = nodes.get(root).unwrap().tag;
             // On a protector release access we have to skip the children of the accessed tag.
             // However, if the tag has exposed children then some of the wildcard subtrees could
@@ -981,6 +974,7 @@ impl<'tcx> LocationTree {
                 access_kind,
                 global,
                 diagnostics,
+                /*is_wildcard_tree*/ i != 0,
             )?;
         }
         interp_ok(())
@@ -1029,7 +1023,7 @@ impl<'tcx> LocationTree {
                 .perform_transition(
                     args.idx,
                     args.nodes,
-                    &mut args.data.wildcard_accesses,
+                    &mut args.data.exposed_cache,
                     access_kind,
                     args.rel_pos,
                     protected,
@@ -1074,12 +1068,18 @@ impl<'tcx> LocationTree {
         access_kind: AccessKind,
         global: &GlobalState,
         diagnostics: &DiagnosticInfo,
+        is_wildcard_tree: bool,
     ) -> InterpResult<'tcx> {
         let get_relatedness = |idx: UniIndex, node: &Node, loc: &LocationTree| {
-            let wildcard_state = loc.wildcard_accesses.get(idx).cloned().unwrap_or_default();
             // If the tag is larger than `max_local_tag` then the access can only be foreign.
             let only_foreign = max_local_tag.is_some_and(|max_local_tag| max_local_tag < node.tag);
-            wildcard_state.access_relatedness(access_kind, only_foreign)
+            loc.exposed_cache.access_relatedness(
+                root,
+                idx,
+                access_kind,
+                is_wildcard_tree,
+                only_foreign,
+            )
         };
 
         // Whether there is an exposed node in this tree that allows this access.
@@ -1156,7 +1156,7 @@ impl<'tcx> LocationTree {
                 perm.perform_transition(
                     args.idx,
                     args.nodes,
-                    &mut args.data.wildcard_accesses,
+                    &mut args.data.exposed_cache,
                     access_kind,
                     relatedness,
                     protected,
@@ -1175,19 +1175,11 @@ impl<'tcx> LocationTree {
                 })
             },
         )?;
-        // If there is no exposed node in this tree that allows this access, then the
-        // access *must* be foreign. So we check if the root of this tree would allow this
-        // as a foreign access, and if not, then we can error.
-        // In practice, all wildcard trees accept foreign accesses, but the main tree does
-        // not, so this catches UB when none of the nodes in the main tree allows this access.
-        if !has_valid_exposed
-            && self
-                .wildcard_accesses
-                .get(root)
-                .unwrap()
-                .access_relatedness(access_kind, /* only_foreign */ true)
-                .is_none()
-        {
+        // If there is no exposed node in this tree that allows this access, then the access *must*
+        // be foreign to the entire subtree. Foreign accesses are only possible on wildcard subtrees
+        // as there are no ancestors to the main root. So if we do not find a valid exposed node in
+        // the main tree then this access is UB.
+        if !has_valid_exposed && !is_wildcard_tree {
             return Err(no_valid_exposed_references_error(diagnostics)).into();
         }
         interp_ok(())

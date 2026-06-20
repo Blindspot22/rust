@@ -198,5 +198,32 @@ LL |     println!("{x,}, world!",);
    |
    = note: to print `{`, you can escape it using `{{`
 
-error: aborting due to 20 previous errors
+error: invalid format string: python's f-string debug `=` is not supported in rust, use `dbg(x)` instead
+  --> $DIR/format-string-error-2.rs:92:17
+   |
+LL |     println!("{x=}");
+   |               - ^ expected `}` in format string
+   |               |
+   |               because of this opening brace
+   |
+   = note: to print `{`, you can escape it using `{{`
+
+error: 1 positional argument in format string, but no arguments were given
+  --> $DIR/format-string-error-2.rs:96:20
+   |
+LL |           "fn main() {\n\
+   |  ____________________^
+LL | |             \n\
+LL | |         }"
+   | |_________^
+   |
+   = note: if you intended to print `{`, you can escape it with `{{`
+
+error: 1 positional argument in format string, but no arguments were given
+  --> $DIR/format-string-error-2.rs:103:15
+   |
+LL |     println!("{ }");
+   |               ^^^
+
+error: aborting due to 23 previous errors
 

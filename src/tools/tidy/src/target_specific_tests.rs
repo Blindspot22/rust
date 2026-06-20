@@ -13,7 +13,9 @@ const COMPILE_FLAGS_HEADER: &str = "compile-flags:";
 
 #[derive(Default, Debug)]
 struct RevisionInfo<'a> {
+    /// Target architecture specified with `--target=`
     target_arch: Option<Option<&'a str>>,
+    /// LLVM components configured with `//@ needs-llvm-components: ...`
     llvm_components: Option<Vec<&'a str>>,
 }
 
@@ -61,6 +63,22 @@ pub fn check(tests_path: &Path, tidy_ctx: TidyCtx) {
             return;
         }
 
+        // Directives without an explicit revision. These are inherited by all revisions.
+        let global = header_map.remove(&None).unwrap_or_default();
+
+        if header_map.is_empty() {
+            // `//@ revisions` is not used.
+            header_map.insert(None, global);
+        } else {
+            // Make all revisions inherit global directives.
+            for info in header_map.values_mut() {
+                info.target_arch = info.target_arch.or(global.target_arch);
+                if let Some(components) = &global.llvm_components {
+                    info.llvm_components.get_or_insert_with(Vec::new).extend(components);
+                }
+            }
+        }
+
         for (rev, RevisionInfo { target_arch, llvm_components }) in &header_map {
             let rev = rev.unwrap_or("[unspecified]");
             match (target_arch, llvm_components) {
@@ -98,7 +116,7 @@ fn arch_to_llvm_component(arch: &str) -> String {
     // enough for the purpose of this tidy check.
     match arch {
         "amdgcn" => "amdgpu".into(),
-        "aarch64_be" | "arm64_32" | "arm64e" | "arm64ec" => "aarch64".into(),
+        "aarch64v8r" | "aarch64_be" | "arm64_32" | "arm64e" | "arm64ec" => "aarch64".into(),
         "i386" | "i586" | "i686" | "x86" | "x86_64" | "x86_64h" => "x86".into(),
         "loongarch32" | "loongarch64" => "loongarch".into(),
         "nvptx64" => "nvptx".into(),

@@ -103,6 +103,7 @@ use crate::vec::Vec;
 /// and other memory errors.
 #[derive(PartialEq, PartialOrd, Eq, Ord, Hash, Clone)]
 #[rustc_diagnostic_item = "cstring_type"]
+#[rustc_insignificant_dtor]
 #[stable(feature = "alloc_c_string", since = "1.64.0")]
 pub struct CString {
     // Invariant 1: the slice ends with a zero byte and has a length of at least one.
@@ -319,6 +320,10 @@ impl CString {
     /// This method is equivalent to [`CString::new`] except that no runtime
     /// assertion is made that `v` contains no 0 bytes, and it requires an
     /// actual byte vector, not anything that can be converted to one with Into.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `v` contains no nul bytes in its contents.
     ///
     /// # Examples
     ///
@@ -694,7 +699,6 @@ impl CString {
 // memory-unsafe code from working by accident. Inline
 // to prevent LLVM from optimizing it away in debug builds.
 #[stable(feature = "cstring_drop", since = "1.13.0")]
-#[rustc_insignificant_dtor]
 impl Drop for CString {
     #[inline]
     fn drop(&mut self) {
@@ -1073,9 +1077,17 @@ impl ToOwned for CStr {
     }
 
     fn clone_into(&self, target: &mut CString) {
-        let mut b = mem::take(&mut target.inner).into_vec();
-        self.to_bytes_with_nul().clone_into(&mut b);
-        target.inner = b.into_boxed_slice();
+        let src = self.to_bytes_with_nul();
+        // If the lengths match, we can reuse the existing allocation without any overhead.
+        if target.inner.len() == src.len() {
+            target.inner.copy_from_slice(src);
+        } else {
+            // Reuse the existing allocation's capacity by converting to a Vec.
+            // We temporarily replace `target` with a valid dummy to remain panic-safe.
+            let mut b = mem::replace(&mut target.inner, Box::new([0])).into_vec();
+            self.to_bytes_with_nul().clone_into(&mut b);
+            target.inner = b.into_boxed_slice();
+        }
     }
 }
 

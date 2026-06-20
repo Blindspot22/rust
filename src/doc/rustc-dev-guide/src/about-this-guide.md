@@ -10,7 +10,7 @@ There are several parts to this guide:
    about building, debugging, profiling, etc.
 1. [Contributing to Rust][p2]:
    Contains information that should be useful no matter how you are contributing,
-   about procedures for contribution, using git and Github, stabilizing features, etc.
+   about procedures for contribution, using git and GitHub, stabilizing features, etc.
 1. [Bootstrapping][p3]:
    Describes how the Rust compiler builds itself using previous versions, including
    an introduction to the bootstrap process and debugging methods.
@@ -98,14 +98,14 @@ You might also find the following sites useful:
 [gsearchdocs]: https://www.google.com/search?q=site:doc.rust-lang.org+your+query+here
 [stddocs]: https://doc.rust-lang.org/std
 [rif]: http://internals.rust-lang.org
-[rr]: https://doc.rust-lang.org/book/
+[rr]: https://doc.rust-lang.org/reference/
 [rustforge]: https://forge.rust-lang.org/
 [tlgba]: https://tomlee.co/2014/04/a-more-detailed-tour-of-the-rust-compiler/
 [ro]: https://www.rustaceans.org/
 [rctd]: tests/intro.md
-[cheatsheet]: https://bors.rust-lang.org/
+[cheatsheet]: https://bors.rust-lang.org/help
 [Miri]: https://github.com/rust-lang/miri
-[@bors]: https://github.com/bors
+[@bors]: https://github.com/rust-lang/bors
 [a GitHub repository]: https://github.com/rust-lang/rustc-dev-guide/
 [rustc API docs]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle
 [Forge]: https://forge.rust-lang.org/

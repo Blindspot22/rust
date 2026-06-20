@@ -16,10 +16,10 @@ use rustc_session::parse::ParseSess;
 use rustc_span::edition::{DEFAULT_EDITION, Edition};
 use rustc_span::source_map::SourceMap;
 use rustc_span::symbol::sym;
-use rustc_span::{DUMMY_SP, FileName, Span, kw};
+use rustc_span::{DUMMY_SP, FileName, InnerSpan, Span, kw};
 use tracing::debug;
 
-use super::GlobalTestOptions;
+use super::{CodeLineMapping, GlobalTestOptions};
 use crate::config::MergeDoctests;
 use crate::display::Joined as _;
 use crate::html::markdown::LangString;
@@ -47,6 +47,7 @@ pub(crate) struct BuildDocTestBuilder<'a> {
     test_id: Option<String>,
     lang_str: Option<&'a LangString>,
     span: Span,
+    code_mappings: &'a [CodeLineMapping],
     global_crate_attrs: Vec<String>,
 }
 
@@ -60,6 +61,7 @@ impl<'a> BuildDocTestBuilder<'a> {
             test_id: None,
             lang_str: None,
             span: DUMMY_SP,
+            code_mappings: &[],
             global_crate_attrs: Vec::new(),
         }
     }
@@ -95,6 +97,12 @@ impl<'a> BuildDocTestBuilder<'a> {
     }
 
     #[inline]
+    pub(crate) fn code_mappings(mut self, code_mappings: &'a [CodeLineMapping]) -> Self {
+        self.code_mappings = code_mappings;
+        self
+    }
+
+    #[inline]
     pub(crate) fn edition(mut self, edition: Edition) -> Self {
         self.edition = edition;
         self
@@ -116,12 +124,13 @@ impl<'a> BuildDocTestBuilder<'a> {
             test_id,
             lang_str,
             span,
+            code_mappings,
             global_crate_attrs,
         } = self;
 
         let result = rustc_driver::catch_fatal_errors(|| {
             rustc_span::create_session_if_not_set_then(edition, |_| {
-                parse_source(source, &crate_name, dcx, span)
+                parse_source(source, &crate_name, dcx, span, code_mappings)
             })
         });
 
@@ -454,9 +463,10 @@ fn parse_source(
     crate_name: &Option<&str>,
     parent_dcx: Option<DiagCtxtHandle<'_>>,
     span: Span,
+    code_mappings: &[CodeLineMapping],
 ) -> Result<ParseSourceInfo, ()> {
     use rustc_errors::DiagCtxt;
-    use rustc_errors::emitter::HumanEmitter;
+    use rustc_errors::annotate_snippet_emitter_writer::AnnotateSnippetEmitter;
     use rustc_span::source_map::FilePathMapping;
 
     let mut info =
@@ -467,7 +477,6 @@ fn parse_source(
     let filename = FileName::anon_source_code(&wrapped_source);
 
     let sm = Arc::new(SourceMap::new(FilePathMapping::empty()));
-    let translator = rustc_driver::default_translator();
     let supports_color = match get_stderr_color_choice(ColorConfig::Auto, &std::io::stderr()) {
         ColorChoice::Auto => unreachable!(),
         ColorChoice::AlwaysAnsi | ColorChoice::Always => true,
@@ -476,7 +485,7 @@ fn parse_source(
     info.supports_color = supports_color;
     // Any errors in parsing should also appear when the doctest is compiled for real, so just
     // send all the errors that the parser emits directly into a `Sink` instead of stderr.
-    let emitter = HumanEmitter::new(AutoStream::never(Box::new(io::sink())), translator);
+    let emitter = AnnotateSnippetEmitter::new(AutoStream::never(Box::new(io::sink())));
 
     // FIXME(misdreavus): pass `-Z treat-err-as-bug` to the doctest parser
     let dcx = DiagCtxt::new(Box::new(emitter)).disable_warnings();
@@ -503,6 +512,24 @@ fn parse_source(
         }
         s.push_str(&source[*prev_span_hi..hi]);
         *prev_span_hi = hi;
+    }
+
+    fn span_in_doctest_source(span: Span, code_mappings: &[CodeLineMapping]) -> Option<Span> {
+        let extra_len = DOCTEST_CODE_WRAPPER.len();
+        let lo = (span.lo().0 as usize).checked_sub(extra_len)?;
+        let hi = (span.hi().0 as usize).checked_sub(extra_len)?;
+        if hi < lo {
+            return None;
+        }
+        code_mappings.iter().find_map(|mapping| {
+            if mapping.generated.start <= lo && hi <= mapping.generated.end {
+                let start = lo - mapping.generated.start;
+                let end = hi - mapping.generated.start;
+                Some(mapping.original.from_inner(InnerSpan::new(start, end)))
+            } else {
+                None
+            }
+        })
     }
 
     fn check_item(item: &ast::Item, info: &mut ParseSourceInfo, crate_name: &Option<&str>) -> bool {
@@ -539,7 +566,10 @@ fn parse_source(
 
     let mut prev_span_hi = 0;
     let not_crate_attrs = &[sym::forbid, sym::allow, sym::warn, sym::deny, sym::expect];
-    let parsed = parser.parse_item(rustc_parse::parser::ForceCollect::No);
+    let parsed = parser.parse_item(
+        rustc_parse::parser::ForceCollect::No,
+        rustc_parse::parser::AllowConstBlockItems::No,
+    );
 
     let result = match parsed {
         Ok(Some(ref item))
@@ -553,7 +583,10 @@ fn parse_source(
                     // consider it only as a crate-level attribute.
                     if attr.has_name(sym::allow)
                         && let Some(list) = attr.meta_item_list()
-                        && list.iter().any(|sub_attr| sub_attr.has_name(sym::internal_features))
+                        && list.iter().any(|sub_attr| {
+                            sub_attr.has_name(sym::internal_features)
+                                || sub_attr.has_name(sym::incomplete_features)
+                        })
                     {
                         push_to_s(&mut info.crate_attrs, source, attr.span, &mut prev_span_hi);
                     } else {
@@ -569,6 +602,7 @@ fn parse_source(
                 }
             }
             let mut has_non_items = false;
+            let mut first_non_item_span = None;
             for stmt in &body.stmts {
                 let mut is_extern_crate = false;
                 match stmt.kind {
@@ -606,8 +640,12 @@ fn parse_source(
                             return Err(());
                         }
                         has_non_items = true;
+                        first_non_item_span.get_or_insert(stmt.span);
                     }
-                    StmtKind::Let(_) | StmtKind::Semi(_) | StmtKind::Empty => has_non_items = true,
+                    StmtKind::Let(_) | StmtKind::Semi(_) | StmtKind::Empty => {
+                        has_non_items = true;
+                        first_non_item_span.get_or_insert(stmt.span);
+                    }
                 }
 
                 // Weirdly enough, the `Stmt` span doesn't include its attributes, so we need to
@@ -633,12 +671,15 @@ fn parse_source(
                 }
             }
             if has_non_items {
+                let warning_span = first_non_item_span
+                    .and_then(|span| span_in_doctest_source(span, code_mappings))
+                    .unwrap_or(span);
                 if info.has_main_fn
                     && let Some(dcx) = parent_dcx
-                    && !span.is_dummy()
+                    && !warning_span.is_dummy()
                 {
                     dcx.span_warn(
-                        span,
+                        warning_span,
                         "the `main` function of this doctest won't be run as it contains \
                          expressions at the top level, meaning that the whole doctest code will be \
                          wrapped in a function",

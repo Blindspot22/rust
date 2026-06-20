@@ -20,7 +20,7 @@ use rustc_metadata::fs::METADATA_FILENAME;
 use rustc_middle::bug;
 use rustc_session::Session;
 use rustc_span::sym;
-use rustc_target::spec::{Abi, Os, RelocModel, Target, ef_avr_arch};
+use rustc_target::spec::{CfgAbi, LlvmAbi, Os, RelocModel, Target, ef_avr_arch};
 use tracing::debug;
 
 use super::apple;
@@ -36,7 +36,7 @@ use super::apple;
 /// <dd>The metadata can be found in the `.rustc` section of the shared library.</dd>
 /// </dl>
 #[derive(Debug)]
-pub(crate) struct DefaultMetadataLoader;
+pub struct DefaultMetadataLoader;
 
 static AIX_METADATA_SYMBOL_NAME: &'static str = "__aix_rust_metadata";
 
@@ -216,7 +216,9 @@ pub(crate) fn create_object_file(sess: &Session) -> Option<write::Object<'static
     file.set_sub_architecture(sub_architecture);
     if sess.target.is_like_darwin {
         if macho_is_arm64e(&sess.target) {
-            file.set_macho_cpu_subtype(object::macho::CPU_SUBTYPE_ARM64E);
+            file.set_macho_cpu_subtype(
+                object::macho::CPU_SUBTYPE_ARM64E | object::macho::CPU_SUBTYPE_PTRAUTH_ABI,
+            );
         }
 
         file.set_macho_build_version(macho_object_build_version_for_target(sess))
@@ -294,18 +296,13 @@ pub(super) fn elf_e_flags(architecture: Architecture, sess: &Session) -> u32 {
                 _ => elf::EF_MIPS_ARCH_64R2,
             };
 
-            // If the ABI is explicitly given, use it, or default to O32 on 32-bit MIPS,
-            // which is the only "true" 32-bit option that LLVM supports.
-            match sess.target.options.llvm_abiname.as_ref() {
-                "o32" if is_32bit => e_flags |= elf::EF_MIPS_ABI_O32,
-                "n32" if !is_32bit => e_flags |= elf::EF_MIPS_ABI2,
-                "n64" if !is_32bit => {}
-                "" if is_32bit => e_flags |= elf::EF_MIPS_ABI_O32,
-                "" => sess.dcx().fatal("LLVM ABI must be specified for 64-bit MIPS targets"),
-                s if is_32bit => {
-                    sess.dcx().fatal(format!("invalid LLVM ABI `{}` for 32-bit MIPS target", s))
-                }
-                s => sess.dcx().fatal(format!("invalid LLVM ABI `{}` for 64-bit MIPS target", s)),
+            // Use the explicitly given ABI.
+            match &sess.target.options.llvm_abiname {
+                LlvmAbi::O32 if is_32bit => e_flags |= elf::EF_MIPS_ABI_O32,
+                LlvmAbi::N32 if !is_32bit => e_flags |= elf::EF_MIPS_ABI2,
+                LlvmAbi::N64 if !is_32bit => {}
+                // The rest is invalid (which is already ensured by the target spec check).
+                s => bug!("invalid LLVM ABI `{}` for MIPS target", s),
             };
 
             if sess.target.options.relocation_model != RelocModel::Static {
@@ -341,12 +338,12 @@ pub(super) fn elf_e_flags(architecture: Architecture, sess: &Session) -> u32 {
 
             // Set the appropriate flag based on ABI
             // This needs to match LLVM `RISCVELFStreamer.cpp`
-            match &*sess.target.llvm_abiname {
-                "ilp32" | "lp64" => (),
-                "ilp32f" | "lp64f" => e_flags |= elf::EF_RISCV_FLOAT_ABI_SINGLE,
-                "ilp32d" | "lp64d" => e_flags |= elf::EF_RISCV_FLOAT_ABI_DOUBLE,
+            match &sess.target.llvm_abiname {
+                LlvmAbi::Ilp32 | LlvmAbi::Lp64 => (),
+                LlvmAbi::Ilp32f | LlvmAbi::Lp64f => e_flags |= elf::EF_RISCV_FLOAT_ABI_SINGLE,
+                LlvmAbi::Ilp32d | LlvmAbi::Lp64d => e_flags |= elf::EF_RISCV_FLOAT_ABI_DOUBLE,
                 // Note that the `lp64e` is still unstable as it's not (yet) part of the ELF psABI.
-                "ilp32e" | "lp64e" => e_flags |= elf::EF_RISCV_RVE,
+                LlvmAbi::Ilp32e | LlvmAbi::Lp64e => e_flags |= elf::EF_RISCV_RVE,
                 _ => bug!("unknown RISC-V ABI name"),
             }
 
@@ -358,10 +355,10 @@ pub(super) fn elf_e_flags(architecture: Architecture, sess: &Session) -> u32 {
 
             // Set the appropriate flag based on ABI
             // This needs to match LLVM `LoongArchELFStreamer.cpp`
-            match &*sess.target.llvm_abiname {
-                "ilp32s" | "lp64s" => e_flags |= elf::EF_LARCH_ABI_SOFT_FLOAT,
-                "ilp32f" | "lp64f" => e_flags |= elf::EF_LARCH_ABI_SINGLE_FLOAT,
-                "ilp32d" | "lp64d" => e_flags |= elf::EF_LARCH_ABI_DOUBLE_FLOAT,
+            match &sess.target.llvm_abiname {
+                LlvmAbi::Ilp32s | LlvmAbi::Lp64s => e_flags |= elf::EF_LARCH_ABI_SOFT_FLOAT,
+                LlvmAbi::Ilp32f | LlvmAbi::Lp64f => e_flags |= elf::EF_LARCH_ABI_SINGLE_FLOAT,
+                LlvmAbi::Ilp32d | LlvmAbi::Lp64d => e_flags |= elf::EF_LARCH_ABI_DOUBLE_FLOAT,
                 _ => bug!("unknown LoongArch ABI name"),
             }
 
@@ -377,7 +374,7 @@ pub(super) fn elf_e_flags(architecture: Architecture, sess: &Session) -> u32 {
             }
         }
         Architecture::Csky => {
-            if matches!(sess.target.options.abi, Abi::AbiV2) {
+            if matches!(sess.target.options.cfg_abi, CfgAbi::AbiV2) {
                 elf::EF_CSKY_ABIV2
             } else {
                 elf::EF_CSKY_ABIV1
@@ -388,19 +385,20 @@ pub(super) fn elf_e_flags(architecture: Architecture, sess: &Session) -> u32 {
             const EF_PPC64_ABI_ELF_V1: u32 = 1;
             const EF_PPC64_ABI_ELF_V2: u32 = 2;
 
-            match sess.target.options.llvm_abiname.as_ref() {
+            match sess.target.options.llvm_abiname {
                 // If the flags do not correctly indicate the ABI,
                 // linkers such as ld.lld assume that the ppc64 object files are always ELFv2
                 // which leads to broken binaries if ELFv1 is used for the object files.
-                "elfv1" => EF_PPC64_ABI_ELF_V1,
-                "elfv2" => EF_PPC64_ABI_ELF_V2,
-                "" if sess.target.options.binary_format.to_object() == BinaryFormat::Elf => {
-                    bug!("No ABI specified for this PPC64 ELF target");
+                LlvmAbi::ElfV1 => EF_PPC64_ABI_ELF_V1,
+                LlvmAbi::ElfV2 => EF_PPC64_ABI_ELF_V2,
+                _ if sess.target.options.binary_format.to_object() == BinaryFormat::Elf => {
+                    bug!("invalid ABI specified for this PPC64 ELF target");
                 }
                 // Fall back
                 _ => EF_PPC64_ABI_UNKNOWN,
             }
         }
+        Architecture::Sparc32Plus => elf::EF_SPARC_32PLUS,
         _ => 0,
     }
 }

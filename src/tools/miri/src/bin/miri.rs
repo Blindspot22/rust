@@ -1,26 +1,21 @@
-#![feature(rustc_private, stmt_expr_attributes)]
+#![feature(rustc_private, stmt_expr_attributes, cfg_target_has_reliable_f16_f128)]
 #![allow(
+    internal_features, // cfg_target_has_reliable_f16_f128
     clippy::manual_range_contains,
     clippy::useless_format,
     clippy::field_reassign_with_default,
-    clippy::needless_lifetimes,
-    rustc::diagnostic_outside_of_impl,
-    rustc::untranslatable_diagnostic
+    clippy::needless_lifetimes
 )]
 
 // The rustc crates we need
-extern crate rustc_abi;
 extern crate rustc_codegen_ssa;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_hir;
-extern crate rustc_hir_analysis;
 extern crate rustc_interface;
 extern crate rustc_log;
 extern crate rustc_middle;
 extern crate rustc_session;
-extern crate rustc_span;
-extern crate rustc_target;
 
 /// See docs in https://github.com/rust-lang/rust/blob/HEAD/compiler/rustc/src/main.rs
 /// and https://github.com/rust-lang/rust/pull/146627 for why we need this.
@@ -41,22 +36,19 @@ mod log;
 use std::env;
 use std::num::{NonZero, NonZeroI32};
 use std::ops::Range;
+use std::process::ExitCode;
 use std::rc::Rc;
 use std::str::FromStr;
-use std::sync::Once;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use miri::{
-    BacktraceStyle, BorrowTrackerMethod, GenmcConfig, GenmcCtx, MiriConfig, MiriEntryFnType,
-    ProvenanceMode, TreeBorrowsParams, ValidationMode, run_genmc_mode,
+    BacktraceStyle, BorrowTrackerMethod, GenmcConfig, GenmcCtx, MiriConfig, ProvenanceMode,
+    TreeBorrowsParams, ValidationMode, entry_fn, run_genmc_mode,
 };
-use rustc_abi::ExternAbi;
 use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_data_structures::sync::{self, DynSync};
 use rustc_driver::Compilation;
-use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_hir::{self as hir, Node};
-use rustc_hir_analysis::check::check_function_signature;
 use rustc_interface::interface::Config;
 use rustc_interface::util::DummyCodegenBackend;
 use rustc_log::tracing::debug;
@@ -65,12 +57,9 @@ use rustc_middle::middle::exported_symbols::{
     ExportedSymbol, SymbolExportInfo, SymbolExportKind, SymbolExportLevel,
 };
 use rustc_middle::query::LocalCrate;
-use rustc_middle::traits::{ObligationCause, ObligationCauseCode};
-use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_session::EarlyDiagCtxt;
-use rustc_session::config::{CrateType, ErrorOutputType, OptLevel, Options};
-use rustc_span::def_id::DefId;
-use rustc_target::spec::Target;
+use rustc_middle::ty::TyCtxt;
+use rustc_session::config::{CrateType, ErrorOutputType, OptLevel};
+use rustc_session::{EarlyDiagCtxt, Session};
 
 use crate::log::setup::{deinit_loggers, init_early_loggers, init_late_loggers};
 
@@ -87,56 +76,6 @@ struct ManySeedsConfig {
 impl MiriCompilerCalls {
     fn new(miri_config: MiriConfig, many_seeds: Option<ManySeedsConfig>) -> Self {
         Self { miri_config: Some(miri_config), many_seeds }
-    }
-}
-
-fn entry_fn(tcx: TyCtxt<'_>) -> (DefId, MiriEntryFnType) {
-    if let Some((def_id, entry_type)) = tcx.entry_fn(()) {
-        return (def_id, MiriEntryFnType::Rustc(entry_type));
-    }
-    // Look for a symbol in the local crate named `miri_start`, and treat that as the entry point.
-    let sym = tcx.exported_non_generic_symbols(LOCAL_CRATE).iter().find_map(|(sym, _)| {
-        if sym.symbol_name_for_local_instance(tcx).name == "miri_start" { Some(sym) } else { None }
-    });
-    if let Some(ExportedSymbol::NonGeneric(id)) = sym {
-        let start_def_id = id.expect_local();
-        let start_span = tcx.def_span(start_def_id);
-
-        let expected_sig = ty::Binder::dummy(tcx.mk_fn_sig(
-            [tcx.types.isize, Ty::new_imm_ptr(tcx, Ty::new_imm_ptr(tcx, tcx.types.u8))],
-            tcx.types.isize,
-            false,
-            hir::Safety::Safe,
-            ExternAbi::Rust,
-        ));
-
-        let correct_func_sig = check_function_signature(
-            tcx,
-            ObligationCause::new(start_span, start_def_id, ObligationCauseCode::Misc),
-            *id,
-            expected_sig,
-        )
-        .is_ok();
-
-        if correct_func_sig {
-            (*id, MiriEntryFnType::MiriStart)
-        } else {
-            tcx.dcx().fatal(
-                "`miri_start` must have the following signature:\n\
-                fn miri_start(argc: isize, argv: *const *const u8) -> isize",
-            );
-        }
-    } else {
-        tcx.dcx().fatal(
-            "Miri can only run programs that have a main function.\n\
-            Alternatively, you can export a `miri_start` function:\n\
-            \n\
-            #[cfg(miri)]\n\
-            #[unsafe(no_mangle)]\n\
-            fn miri_start(argc: isize, argv: *const *const u8) -> isize {\
-            \n    // Call the actual start function that your project implements, based on your target's conventions.\n\
-            }"
-        );
     }
 }
 
@@ -175,26 +114,42 @@ fn run_many_seeds(
 /// Generates the codegen backend for code that Miri will interpret: we basically
 /// use the dummy backend, except that we put the LLVM backend in charge of
 /// target features.
-fn make_miri_codegen_backend(opts: &Options, target: &Target) -> Box<dyn CodegenBackend> {
-    let early_dcx = EarlyDiagCtxt::new(opts.error_format);
+fn make_miri_codegen_backend(sess: &Session) -> Box<dyn CodegenBackend> {
+    let early_dcx = EarlyDiagCtxt::new(sess.opts.error_format);
 
     // Use the target_config method of the default codegen backend (eg LLVM) to ensure the
     // calculated target features match said backend by respecting eg -Ctarget-cpu.
-    let target_config_backend =
-        rustc_interface::util::get_codegen_backend(&early_dcx, &opts.sysroot, None, target);
-    let target_config_backend_init = Once::new();
+    let target_config_backend = rustc_interface::util::get_codegen_backend(
+        &early_dcx,
+        &sess.opts.sysroot,
+        None,
+        &sess.target,
+    );
+    target_config_backend.init(sess);
 
     Box::new(DummyCodegenBackend {
         target_config_override: Some(Box::new(move |sess| {
-            target_config_backend_init.call_once(|| target_config_backend.init(sess));
-            target_config_backend.target_config(sess)
+            let mut cfg = target_config_backend.target_config(sess);
+            // The basic types and ABI always work.
+            cfg.has_reliable_f16 = true;
+            cfg.has_reliable_f128 = true;
+            // We always provide the f16 intrinsics, but some are provided via the host,
+            // so forward its reliability.
+            cfg.has_reliable_f16_math = cfg!(target_has_reliable_f16_math);
+            // Many f128 operations are still missing.
+            cfg.has_reliable_f128_math = false;
+            cfg
         })),
     })
 }
 
 impl rustc_driver::Callbacks for MiriCompilerCalls {
     fn config(&mut self, config: &mut rustc_interface::interface::Config) {
+        // We never reach codegen anyway.
         config.make_codegen_backend = Some(Box::new(make_miri_codegen_backend));
+
+        // Register our custom extra symbols.
+        config.extra_symbols = miri::sym::EXTRA_SYMBOLS.into();
     }
 
     fn after_analysis<'tcx>(
@@ -306,8 +261,9 @@ impl rustc_driver::Callbacks for MiriDepCompilerCalls {
             // We need to add #[used] symbols to exported_symbols for `lookup_link_section`.
             // FIXME handle this somehow in rustc itself to avoid this hack.
             local_providers.queries.exported_non_generic_symbols = |tcx, LocalCrate| {
-                let reachable_set = tcx
-                    .with_stable_hashing_context(|hcx| tcx.reachable_set(()).to_sorted(&hcx, true));
+                let reachable_set = tcx.with_stable_hashing_context(|mut hcx| {
+                    tcx.reachable_set(()).to_sorted(&mut hcx, true)
+                });
                 tcx.arena.alloc_from_iter(
                     // This is based on:
                     // https://github.com/rust-lang/rust/blob/2962e7c0089d5c136f4e9600b7abccfbbde4973d/compiler/rustc_codegen_ssa/src/back/symbol_export.rs#L62-L63
@@ -355,6 +311,9 @@ impl rustc_driver::Callbacks for MiriDepCompilerCalls {
                 )
             }
         });
+
+        // Register our custom extra symbols.
+        config.extra_symbols = miri::sym::EXTRA_SYMBOLS.into();
     }
 
     fn after_analysis<'tcx>(
@@ -376,7 +335,7 @@ fn exit(exit_code: i32) -> ! {
     // Drop the tracing guard before exiting, so tracing calls are flushed correctly.
     deinit_loggers();
     // Make sure the supervisor knows about the exit code.
-    #[cfg(all(unix, feature = "native-lib"))]
+    #[cfg(all(feature = "native-lib", unix))]
     miri::native_lib::register_retcode_sv(exit_code);
     // Actually exit.
     std::process::exit(exit_code);
@@ -406,7 +365,11 @@ fn run_compiler_and_exit(
     // Invoke compiler, catch any unwinding panics and handle return code.
     let exit_code =
         rustc_driver::catch_with_exit_code(move || rustc_driver::run_compiler(args, callbacks));
-    exit(exit_code)
+    exit(if exit_code == ExitCode::SUCCESS {
+        rustc_driver::EXIT_SUCCESS
+    } else {
+        rustc_driver::EXIT_FAILURE
+    })
 }
 
 /// Parses a comma separated list of `T` from the given string:
@@ -436,7 +399,7 @@ fn parse_range(val: &str) -> Result<Range<u32>, &'static str> {
     Ok(from..to)
 }
 
-fn main() {
+fn main() -> ExitCode {
     let early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
 
     // Snapshot a copy of the environment before `rustc` starts messing with it.
@@ -451,9 +414,7 @@ fn main() {
         if crate_kind == "host" {
             // For host crates like proc macros and build scripts, we are an entirely normal rustc.
             // These eventually produce actual binaries and never run in Miri.
-            match rustc_driver::main() {
-                // Empty match proves this function will never return.
-            }
+            return rustc_driver::main();
         } else if crate_kind != "target" {
             panic!("invalid `MIRI_BE_RUSTC` value: {crate_kind:?}")
         };
@@ -511,6 +472,9 @@ fn main() {
             miri_config.borrow_tracker =
                 Some(BorrowTrackerMethod::TreeBorrows(TreeBorrowsParams {
                     precise_interior_mut: true,
+                    implicit_writes: false,
+                    // We default this to "unique" for now to keep the design space open.
+                    box_custom_allocator_unique: true,
                 }));
         } else if arg == "-Zmiri-tree-borrows-no-precise-interior-mut" {
             match &mut miri_config.borrow_tracker {
@@ -520,6 +484,26 @@ fn main() {
                 _ =>
                     fatal_error!(
                         "`-Zmiri-tree-borrows` is required before `-Zmiri-tree-borrows-no-precise-interior-mut`"
+                    ),
+            };
+        } else if arg == "-Zmiri-tree-borrows-implicit-writes" {
+            match &mut miri_config.borrow_tracker {
+                Some(BorrowTrackerMethod::TreeBorrows(params)) => {
+                    params.implicit_writes = true;
+                }
+                _ =>
+                    fatal_error!(
+                        "`-Zmiri-tree-borrows` is required before `-Zmiri-tree-borrows-implicit-writes`"
+                    ),
+            };
+        } else if arg == "-Zmiri-tree-borrows-relax-custom-allocator-uniqueness" {
+            match &mut miri_config.borrow_tracker {
+                Some(BorrowTrackerMethod::TreeBorrows(params)) => {
+                    params.box_custom_allocator_unique = false;
+                }
+                _ =>
+                    fatal_error!(
+                        "`-Zmiri-tree-borrows` is required before `-Zmiri-tree-borrows-relax-custom-allocator-uniqueness`"
                     ),
             };
         } else if arg == "-Zmiri-disable-data-race-detector" {
@@ -706,11 +690,16 @@ fn main() {
         }
     }
 
+    // Disabling validation also disables aliasing checks (as retags are done during validation).
+    if miri_config.validation == ValidationMode::No {
+        miri_config.borrow_tracker = None;
+    }
+
     // Native calls and strict provenance are not compatible.
     if !miri_config.native_lib.is_empty() && miri_config.provenance_mode == ProvenanceMode::Strict {
         fatal_error!("strict provenance is not compatible with calling native functions");
     }
-    // Native calls and many-seeds are an "intersting" combination.
+    // Native calls and many-seeds are an "interesting" combination.
     if !miri_config.native_lib.is_empty() && many_seeds.is_some() {
         eprintln!(
             "warning: `-Zmiri-many-seeds` runs multiple instances of the program in the same address space, \
@@ -748,7 +737,7 @@ fn main() {
     debug!("crate arguments: {:?}", miri_config.args);
     if !miri_config.native_lib.is_empty() && miri_config.native_lib_enable_tracing {
         // SAFETY: No other threads are running
-        #[cfg(all(unix, feature = "native-lib"))]
+        #[cfg(all(feature = "native-lib", unix))]
         if unsafe { miri::native_lib::init_sv() }.is_err() {
             eprintln!(
                 "warning: The native-lib tracer could not be started. Is this an x86 Linux system, and does Miri have permissions to ptrace?\n\

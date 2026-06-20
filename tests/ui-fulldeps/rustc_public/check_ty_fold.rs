@@ -8,7 +8,6 @@
 //@ edition: 2021
 
 #![feature(rustc_private)]
-#![feature(assert_matches)]
 
 extern crate rustc_middle;
 
@@ -17,6 +16,7 @@ extern crate rustc_interface;
 #[macro_use]
 extern crate rustc_public;
 
+use rustc_public::CrateDefType;
 use rustc_public::mir::{
     Body, FieldIdx, MirVisitor, Place, ProjectionElem,
     visit::{Location, PlaceContext},

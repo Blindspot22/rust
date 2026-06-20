@@ -17,7 +17,7 @@ use rustc_hir as hir;
 use rustc_middle::mir::BinOp;
 use rustc_middle::ty::layout::HasTyCtxt;
 use rustc_middle::ty::{self, Ty};
-use rustc_span::{Span, Symbol, sym};
+use rustc_span::{ErrorGuaranteed, Span, Symbol, sym};
 
 use crate::builder::Builder;
 #[cfg(not(feature = "master"))]
@@ -32,12 +32,12 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
     ret_ty: Ty<'tcx>,
     llret_ty: Type<'gcc>,
     span: Span,
-) -> Result<RValue<'gcc>, ()> {
+) -> Result<RValue<'gcc>, ErrorGuaranteed> {
     // macros for error handling:
     macro_rules! return_error {
         ($err:expr) => {{
-            bx.tcx.dcx().emit_err($err);
-            return Err(());
+            let err = bx.tcx.dcx().emit_err($err);
+            return Err(err);
         }};
     }
     macro_rules! require {
@@ -53,7 +53,7 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
         };
     }
 
-    // TODO(antoyo): refactor with the above require_simd macro that was changed in cg_llvm.
+    // FIXME(antoyo): refactor with the above require_simd macro that was changed in cg_llvm.
     #[cfg(feature = "master")]
     macro_rules! require_simd2 {
         ($ty: expr, $variant:ident) => {{
@@ -119,6 +119,42 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
         let vector_mask = bx.context.new_rvalue_from_vector(None, vector_mask_type, &elements);
 
         return Ok(bx.vector_select(vector_mask, arg1, args[2].immediate()));
+    }
+
+    #[cfg(feature = "master")]
+    if name == sym::simd_splat {
+        let (out_len, out_ty) = require_simd2!(ret_ty, SimdReturn);
+
+        require!(
+            args[0].layout.ty == out_ty,
+            InvalidMonomorphization::ExpectedVectorElementType {
+                span,
+                name,
+                expected_element: out_ty,
+                vector_type: ret_ty,
+            }
+        );
+
+        let vec_ty = llret_ty.unqualified().dyncast_vector().expect("vector return type");
+        let elem_ty = vec_ty.get_element_type();
+
+        // Cast pointer type to usize (GCC does not support pointer SIMD vectors).
+        let value = args[0];
+        let scalar = if value.layout.ty.is_numeric() {
+            value.immediate()
+        } else if value.layout.ty.is_raw_ptr() {
+            bx.ptrtoint(value.immediate(), elem_ty)
+        } else {
+            return_error!(InvalidMonomorphization::UnsupportedOperation {
+                span,
+                name,
+                in_ty: ret_ty,
+                in_elem: value.layout.ty
+            });
+        };
+
+        let elements = vec![scalar; out_len as usize];
+        return Ok(bx.context.new_rvalue_from_vector(bx.location, llret_ty, &elements));
     }
 
     // every intrinsic below takes a SIMD vector as its first argument
@@ -437,14 +473,14 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
             }
         );
 
-        // TODO(antoyo): For simd_insert, check if the index is a constant of the correct size.
+        // FIXME(antoyo): For simd_insert, check if the index is a constant of the correct size.
         let vector = args[0].immediate();
         let index = args[1].immediate();
         let value = args[2].immediate();
         let variable = bx.current_func().new_local(None, vector.get_type(), "new_vector");
         bx.llbb().add_assignment(None, variable, vector);
         let lvalue = bx.context.new_vector_access(None, variable.to_rvalue(), index);
-        // TODO(antoyo): if simd_insert is constant, use BIT_REF.
+        // FIXME(antoyo): if simd_insert is constant, use BIT_REF.
         bx.llbb().add_assignment(None, lvalue, value);
         return Ok(variable.to_rvalue());
     }
@@ -455,7 +491,7 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
             ret_ty == in_elem,
             InvalidMonomorphization::ReturnType { span, name, in_elem, in_ty, ret_ty }
         );
-        // TODO(antoyo): For simd_extract, check if the index is a constant of the correct size.
+        // FIXME(antoyo): For simd_extract, check if the index is a constant of the correct size.
         let vector = args[0].immediate();
         let index = args[1].immediate();
         return Ok(bx.context.new_vector_access(None, vector, index).to_rvalue());
@@ -701,7 +737,7 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
         // endian and MSB-first for big endian.
 
         let vector = args[0].immediate();
-        // TODO(antoyo): dyncast_vector should not require a call to unqualified.
+        // FIXME(antoyo): dyncast_vector should not require a call to unqualified.
         let vector_type = vector.get_type().unqualified().dyncast_vector().expect("vector type");
         let elem_type = vector_type.get_element_type();
 
@@ -767,15 +803,15 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
         bx: &mut Builder<'_, 'gcc, 'tcx>,
         span: Span,
         args: &[OperandRef<'tcx, RValue<'gcc>>],
-    ) -> Result<RValue<'gcc>, ()> {
+    ) -> Result<RValue<'gcc>, ErrorGuaranteed> {
         macro_rules! return_error {
             ($err:expr) => {{
-                bx.tcx.dcx().emit_err($err);
-                return Err(());
+                let err = bx.tcx.dcx().emit_err($err);
+                return Err(err);
             }};
         }
         let ty::Float(ref f) = *in_elem.kind() else {
-            return_error!(InvalidMonomorphization::FloatingPointType { span, name, in_ty });
+            return_error!(InvalidMonomorphization::BasicFloatType { span, name, ty: in_ty });
         };
         let elem_ty = bx.cx.type_float_from_ty(*f);
         let (elem_ty_str, elem_ty, cast_type) = match f.bit_width() {
@@ -786,7 +822,7 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
                 return_error!(InvalidMonomorphization::FloatingPointVector {
                     span,
                     name,
-                    f_ty: *f,
+                    f_ty: f.name_str().to_string(),
                     in_ty
                 });
             }
@@ -796,7 +832,7 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
 
         let intr_name = match name {
             sym::simd_ceil => "ceil",
-            sym::simd_fabs => "fabs", // TODO(antoyo): pand with 170141183420855150465331762880109871103
+            sym::simd_fabs => "fabs", // FIXME(antoyo): pand with 170141183420855150465331762880109871103
             sym::simd_fcos => "cos",
             sym::simd_fexp2 => "exp2",
             sym::simd_fexp => "exp",
@@ -816,7 +852,7 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
         let builtin_name = format!("{}{}", intr_name, elem_ty_str);
         let function = bx.context.get_builtin_function(builtin_name);
 
-        // TODO(antoyo): add platform-specific behavior here for architectures that have these
+        // FIXME(antoyo): add platform-specific behavior here for architectures that have these
         // intrinsics as instructions (for instance, gpus)
         let mut vector_elements = vec![];
         for i in 0..in_len {
@@ -1024,7 +1060,7 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
         assert_eq!(underlying_ty, non_ptr(element_ty0));
 
         // The element type of the third argument must be an integer type of any width:
-        // TODO: also support unsigned integers.
+        // FIXME: also support unsigned integers.
         let (_, element_ty2) = args[2].layout.ty.simd_size_and_type(bx.tcx());
         match *element_ty2.kind() {
             ty::Int(_) => (),
@@ -1139,7 +1175,7 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
         assert_eq!(underlying_ty, non_ptr(element_ty0));
 
         // The element type of the third argument must be a signed integer type of any width:
-        // TODO: also support unsigned integers.
+        // FIXME: also support unsigned integers.
         match *element_ty2.kind() {
             ty::Int(_) => (),
             _ => {
@@ -1186,8 +1222,8 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
         simd_and: Uint, Int => and;
         simd_or: Uint, Int => or; // FIXME(antoyo): calling `or` might not work on vectors.
         simd_xor: Uint, Int => xor;
-        simd_fmin: Float => vector_fmin;
-        simd_fmax: Float => vector_fmax;
+        simd_minimum_number_nsz: Float => vector_minimum_number_nsz;
+        simd_maximum_number_nsz: Float => vector_maximum_number_nsz;
     }
 
     macro_rules! arith_unary {
@@ -1237,10 +1273,10 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
             }
             (true, true) => {
                 // Algorithm from: https://codereview.stackexchange.com/questions/115869/saturated-signed-addition
-                // TODO(antoyo): improve using conditional operators if possible.
-                // TODO(antoyo): dyncast_vector should not require a call to unqualified.
+                // FIXME(antoyo): improve using conditional operators if possible.
+                // FIXME(antoyo): dyncast_vector should not require a call to unqualified.
                 let arg_type = lhs.get_type().unqualified();
-                // TODO(antoyo): convert lhs and rhs to unsigned.
+                // FIXME(antoyo): convert lhs and rhs to unsigned.
                 let sum = lhs + rhs;
                 let vector_type = arg_type.dyncast_vector().expect("vector type");
                 let unit = vector_type.get_num_units();
@@ -1272,13 +1308,13 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
                 res & cmp
             }
             (true, false) => {
-                // TODO(antoyo): dyncast_vector should not require a call to unqualified.
+                // FIXME(antoyo): dyncast_vector should not require a call to unqualified.
                 let arg_type = lhs.get_type().unqualified();
-                // TODO(antoyo): this uses the same algorithm from saturating add, but add the
+                // FIXME(antoyo): this uses the same algorithm from saturating add, but add the
                 // negative of the right operand. Find a proper subtraction algorithm.
                 let rhs = bx.context.new_unary_op(None, UnaryOp::Minus, arg_type, rhs);
 
-                // TODO(antoyo): convert lhs and rhs to unsigned.
+                // FIXME(antoyo): convert lhs and rhs to unsigned.
                 let sum = lhs + rhs;
                 let vector_type = arg_type.dyncast_vector().expect("vector type");
                 let unit = vector_type.get_num_units();
@@ -1355,7 +1391,7 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
         vector_reduce_fadd_reassoc,
         false,
         add,
-        0.0 // TODO: Use this argument.
+        0.0 // FIXME: Use this argument.
     );
     arith_red!(
         simd_reduce_mul_unordered: BinaryOp::Mult,
@@ -1380,7 +1416,7 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
     );
 
     macro_rules! minmax_red {
-        ($name:ident: $int_red:ident, $float_red:ident) => {
+        ($name:ident: $int_red:ident) => {
             if name == sym::$name {
                 require!(
                     ret_ty == in_elem,
@@ -1388,7 +1424,6 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
                 );
                 return match *in_elem.kind() {
                     ty::Int(_) | ty::Uint(_) => Ok(bx.$int_red(args[0].immediate())),
-                    ty::Float(_) => Ok(bx.$float_red(args[0].immediate())),
                     _ => return_error!(InvalidMonomorphization::UnsupportedSymbol {
                         span,
                         name,
@@ -1402,8 +1437,8 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
         };
     }
 
-    minmax_red!(simd_reduce_min: vector_reduce_min, vector_reduce_fmin);
-    minmax_red!(simd_reduce_max: vector_reduce_max, vector_reduce_fmax);
+    minmax_red!(simd_reduce_min: vector_reduce_min);
+    minmax_red!(simd_reduce_max: vector_reduce_max);
 
     macro_rules! bitwise_red {
         ($name:ident : $op:expr, $boolean:expr) => {
@@ -1471,7 +1506,7 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
         // those lanes whose `mask` bit is enabled.
         // The memory addresses corresponding to the “off” lanes are not accessed.
 
-        // TODO: handle the alignment.
+        // FIXME: handle the alignment.
 
         // The element type of the "mask" argument must be a signed integer type of any width
         let mask_ty = in_ty;
@@ -1559,7 +1594,7 @@ pub fn generic_simd_intrinsic<'a, 'gcc, 'tcx>(
         // those lanes whose `mask` bit is enabled.
         // The memory addresses corresponding to the “off” lanes are not accessed.
 
-        // TODO: handle the alignment.
+        // FIXME: handle the alignment.
 
         // The element type of the "mask" argument must be a signed integer type of any width
         let mask_ty = in_ty;

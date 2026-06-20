@@ -1,21 +1,23 @@
-use std::assert_matches::debug_assert_matches;
+pub use std::debug_assert_matches;
 use std::fmt::{self, Display, Write as _};
 use std::sync::LazyLock as Lazy;
 use std::{ascii, mem};
 
+use rustc_ast as ast;
 use rustc_ast::join_path_idents;
+use rustc_ast::token::{Token, TokenKind};
 use rustc_ast::tokenstream::TokenTree;
 use rustc_data_structures::thin_vec::{ThinVec, thin_vec};
-use rustc_hir::Attribute;
-use rustc_hir::attrs::{AttributeKind, DocAttribute};
+use rustc_hir as hir;
+use rustc_hir::attrs::DocAttribute;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LOCAL_CRATE, LocalDefId};
+use rustc_hir::find_attr;
 use rustc_metadata::rendered_const;
 use rustc_middle::mir;
 use rustc_middle::ty::{self, GenericArgKind, GenericArgsRef, TyCtxt, TypeVisitableExt};
 use rustc_span::symbol::{Symbol, kw, sym};
 use tracing::{debug, warn};
-use {rustc_ast as ast, rustc_hir as hir};
 
 use crate::clean::auto_trait::synthesize_auto_trait_impls;
 use crate::clean::blanket_impl::synthesize_blanket_impls;
@@ -71,14 +73,14 @@ pub(crate) fn krate(cx: &mut DocContext<'_>) -> Crate {
                 def_id,
                 Some(prim.as_sym()),
                 ItemKind::PrimitiveItem(prim),
-                cx,
+                cx.tcx,
             )
         }));
         m.items.extend(keywords.map(|(def_id, kw)| {
-            Item::from_def_id_and_parts(def_id, Some(kw), ItemKind::KeywordItem, cx)
+            Item::from_def_id_and_parts(def_id, Some(kw), ItemKind::KeywordItem, cx.tcx)
         }));
         m.items.extend(documented_attributes.into_iter().map(|(def_id, kw)| {
-            Item::from_def_id_and_parts(def_id, Some(kw), ItemKind::AttributeItem, cx)
+            Item::from_def_id_and_parts(def_id, Some(kw), ItemKind::AttributeItem, cx.tcx)
         }));
     }
 
@@ -102,7 +104,7 @@ pub(crate) fn clean_middle_generic_args<'tcx>(
     // to align the arguments and parameters for the iteration below and to enable us to correctly
     // instantiate the generic parameter default later.
     let generics = cx.tcx.generics_of(owner);
-    let args = if !has_self && generics.parent.is_none() && generics.has_self {
+    let args = if !has_self && generics.has_own_self() {
         has_self = true;
         [cx.tcx.types.trait_object_dummy_self.into()]
             .into_iter()
@@ -125,7 +127,7 @@ pub(crate) fn clean_middle_generic_args<'tcx>(
 
         // Elide arguments that coincide with their default.
         if !elision_has_failed_once_before && let Some(default) = param.default_value(cx.tcx) {
-            let default = default.instantiate(cx.tcx, args.as_ref());
+            let default = default.instantiate(cx.tcx, args.as_ref()).skip_norm_wip();
             if can_elide_generic_arg(arg, arg.rebind(default)) {
                 return None;
             }
@@ -134,7 +136,7 @@ pub(crate) fn clean_middle_generic_args<'tcx>(
 
         match arg.skip_binder().kind() {
             GenericArgKind::Lifetime(lt) => Some(GenericArg::Lifetime(
-                clean_middle_region(lt, cx).unwrap_or(Lifetime::elided()),
+                clean_middle_region(lt, cx.tcx).unwrap_or(Lifetime::elided()),
             )),
             GenericArgKind::Type(ty) => Some(GenericArg::Type(clean_middle_ty(
                 arg.rebind(ty),
@@ -147,7 +149,7 @@ pub(crate) fn clean_middle_generic_args<'tcx>(
                 }),
             ))),
             GenericArgKind::Const(ct) => {
-                Some(GenericArg::Const(Box::new(clean_middle_const(arg.rebind(ct), cx))))
+                Some(GenericArg::Const(Box::new(clean_middle_const(arg.rebind(ct)))))
             }
         }
     };
@@ -321,7 +323,7 @@ pub(crate) fn name_from_pat(p: &hir::Pat<'_>) -> Symbol {
             warn!(
                 "tried to get argument name from PatKind::Expr, which is silly in function arguments"
             );
-            return Symbol::intern("()");
+            return sym::empty_parens;
         }
         PatKind::Slice(begin, mid, end) => {
             fn print_pat(pat: &Pat<'_>, wild: bool) -> impl Display {
@@ -346,15 +348,22 @@ pub(crate) fn name_from_pat(p: &hir::Pat<'_>) -> Symbol {
     })
 }
 
-pub(crate) fn print_const(cx: &DocContext<'_>, n: ty::Const<'_>) -> String {
+pub(crate) fn print_const(tcx: TyCtxt<'_>, n: ty::Const<'_>) -> String {
     match n.kind() {
-        ty::ConstKind::Unevaluated(ty::UnevaluatedConst { def, args: _ }) => {
-            if let Some(def) = def.as_local() {
-                rendered_const(cx.tcx, cx.tcx.hir_body_owned_by(def), def)
-            } else {
-                inline::print_inlined_const(cx.tcx, def)
+        ty::ConstKind::Unevaluated(ty::UnevaluatedConst { kind, .. }) => match kind {
+            ty::UnevaluatedConstKind::Projection { def_id }
+            | ty::UnevaluatedConstKind::Inherent { def_id }
+            | ty::UnevaluatedConstKind::Free { def_id }
+            | ty::UnevaluatedConstKind::Anon { def_id } => {
+                if let Some(local_def_id) = def_id.as_local()
+                    && let Some(body_id) = tcx.hir_maybe_body_owned_by(local_def_id)
+                {
+                    rendered_const(tcx, body_id, local_def_id)
+                } else {
+                    inline::print_inlined_const(tcx, def_id)
+                }
             }
-        }
+        },
         // array lengths are obviously usize
         ty::ConstKind::Value(cv) if *cv.ty.kind() == ty::Uint(ty::UintTy::Usize) => {
             cv.to_leaf().to_string()
@@ -370,7 +379,7 @@ pub(crate) fn print_evaluated_const(
     with_type: bool,
 ) -> Option<String> {
     tcx.const_eval_poly(def_id).ok().and_then(|val| {
-        let ty = tcx.type_of(def_id).instantiate_identity();
+        let ty = tcx.type_of(def_id).instantiate_identity().skip_norm_wip();
         match (val, ty.kind()) {
             (_, &ty::Ref(..)) => None,
             (mir::ConstValue::Scalar(_), &ty::Adt(_, _)) => None,
@@ -501,7 +510,7 @@ pub(crate) fn register_res(cx: &mut DocContext<'_>, res: Res) -> DefId {
         Res::Def(
             AssocTy
             | AssocFn
-            | AssocConst
+            | AssocConst { .. }
             | Variant
             | Fn
             | TyAlias
@@ -511,7 +520,7 @@ pub(crate) fn register_res(cx: &mut DocContext<'_>, res: Res) -> DefId {
             | Union
             | Mod
             | ForeignTy
-            | Const
+            | Const { .. }
             | Static { .. }
             | Macro(..)
             | TraitAlias,
@@ -571,10 +580,7 @@ pub(crate) fn has_doc_flag<F: Fn(&DocAttribute) -> bool>(
     did: DefId,
     callback: F,
 ) -> bool {
-    tcx.get_all_attrs(did).iter().any(|attr| match attr {
-        Attribute::Parsed(AttributeKind::Doc(d)) => callback(d),
-        _ => false,
-    })
+    find_attr!(tcx, did, Doc(d) if callback(d))
 }
 
 /// A link to `doc.rust-lang.org` that includes the channel name. Use this instead of manual links
@@ -587,43 +593,77 @@ pub(crate) static RUSTDOC_VERSION: Lazy<&'static str> =
 
 /// Render a sequence of macro arms in a format suitable for displaying to the user
 /// as part of an item declaration.
-fn render_macro_arms<'a>(
+fn render_macro_arms(
     tcx: TyCtxt<'_>,
-    matchers: impl Iterator<Item = &'a TokenTree>,
+    tokens: &rustc_ast::tokenstream::TokenStream,
     arm_delim: &str,
 ) -> String {
+    let mut tokens = tokens.iter();
     let mut out = String::new();
-    for matcher in matchers {
+    while let Some(mut token) = tokens.next() {
+        // If this an attr/derive rule, it looks like `attr() () => {}`, so the token needs to be
+        // handled at the same time as the actual matcher.
+        //
+        // Without that, we would end up with `attr()` on one line and the matcher `()` on another.
+        let pre = if matches!(token, TokenTree::Token(..)) {
+            let pre = format!("{}() ", render_macro_matcher(tcx, token));
+            // Skipping the always empty `()` following the attr/derive ident.
+            tokens.next();
+            let Some(next) = tokens.next() else {
+                return out;
+            };
+            token = next;
+            pre
+        } else {
+            String::new()
+        };
         writeln!(
             out,
-            "    {matcher} => {{ ... }}{arm_delim}",
-            matcher = render_macro_matcher(tcx, matcher),
+            "    {pre}{matcher} => {{ ... }}{arm_delim}",
+            matcher = render_macro_matcher(tcx, token),
         )
         .unwrap();
+        // We skip the `=>`, macro "body" and the delimiter closing that "body" since we don't
+        // render them.
+        let _token = tokens.next();
+        // The `=>`.
+        debug_assert_matches!(
+            _token,
+            Some(TokenTree::Token(Token { kind: TokenKind::FatArrow, .. }, _))
+        );
+        let _token = tokens.next();
+        // The arm body.
+        debug_assert_matches!(_token, Some(TokenTree::Delimited(..)));
+        // The delimiter (which may be omitted on the last arm's body).
+        let _token = tokens.next();
+        debug_assert_matches!(_token, None | Some(TokenTree::Token(Token { .. }, _)));
     }
     out
 }
 
-pub(super) fn display_macro_source(
-    cx: &mut DocContext<'_>,
-    name: Symbol,
-    def: &ast::MacroDef,
-) -> String {
+pub(super) fn display_macro_source(tcx: TyCtxt<'_>, name: Symbol, def: &ast::MacroDef) -> String {
     // Extract the spans of all matchers. They represent the "interface" of the macro.
-    let matchers = def.body.tokens.chunks(4).map(|arm| &arm[0]);
-
     if def.macro_rules {
-        format!("macro_rules! {name} {{\n{arms}}}", arms = render_macro_arms(cx.tcx, matchers, ";"))
+        format!(
+            "macro_rules! {name} {{\n{arms}}}",
+            arms = render_macro_arms(tcx, &def.body.tokens, ";")
+        )
     } else {
-        if matchers.len() <= 1 {
+        if def.body.tokens.len() <= 4 {
             format!(
                 "macro {name}{matchers} {{\n    ...\n}}",
-                matchers = matchers
-                    .map(|matcher| render_macro_matcher(cx.tcx, matcher))
-                    .collect::<String>(),
+                matchers = def
+                    .body
+                    .tokens
+                    .get(0)
+                    .map(|matcher| render_macro_matcher(tcx, matcher))
+                    .unwrap_or_default(),
             )
         } else {
-            format!("macro {name} {{\n{arms}}}", arms = render_macro_arms(cx.tcx, matchers, ","))
+            format!(
+                "macro {name} {{\n{arms}}}",
+                arms = render_macro_arms(tcx, &def.body.tokens, ",")
+            )
         }
     }
 }

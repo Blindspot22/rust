@@ -10,7 +10,7 @@ use rustc_data_structures::profiling::SelfProfilerRef;
 use rustc_index::IndexVec;
 use rustc_middle::ty::TypeVisitableExt;
 use rustc_middle::ty::adjustment::PointerCoercion;
-use rustc_middle::ty::layout::FnAbiOf;
+use rustc_middle::ty::layout::{FnAbiOf, HasTypingEnv as _};
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_session::config::OutputFilenames;
 use rustc_span::Symbol;
@@ -147,7 +147,7 @@ pub(crate) fn codegen_fn<'tcx>(
 }
 
 pub(crate) fn compile_fn(
-    profiler: &SelfProfilerRef,
+    prof: &SelfProfilerRef,
     output_filenames: &OutputFilenames,
     should_write_ir: bool,
     cached_context: &mut Context,
@@ -156,8 +156,7 @@ pub(crate) fn compile_fn(
     global_asm: &mut String,
     codegened_func: CodegenedFunction,
 ) {
-    let _timer =
-        profiler.generic_activity_with_arg("compile function", &*codegened_func.symbol_name);
+    let _timer = prof.generic_activity_with_arg("compile function", &*codegened_func.symbol_name);
 
     let clif_comments = codegened_func.clif_comments;
     global_asm.push_str(&codegened_func.inline_asm);
@@ -196,7 +195,7 @@ pub(crate) fn compile_fn(
     };
 
     // Define function
-    profiler.generic_activity("define function").run(|| {
+    prof.generic_activity("define function").run(|| {
         context.want_disasm = should_write_ir;
         match module.define_function(codegened_func.func_id, context) {
             Ok(()) => {}
@@ -248,7 +247,7 @@ pub(crate) fn compile_fn(
     }
 
     // Define debuginfo for function
-    profiler.generic_activity("generate debug info").run(|| {
+    prof.generic_activity("generate debug info").run(|| {
         if let Some(debug_context) = debug_context {
             codegened_func.func_debug_cx.unwrap().finalize(
                 debug_context,
@@ -582,9 +581,9 @@ fn codegen_fn_body(fx: &mut FunctionCx<'_, '_, '_>, start_block: Block) {
             | TerminatorKind::CoroutineDrop => {
                 bug!("shouldn't exist at codegen {:?}", bb_data.terminator());
             }
-            TerminatorKind::Drop { place, target, unwind, replace: _, drop, async_fut } => {
+            TerminatorKind::Drop { place, target, unwind, replace: _, drop } => {
                 assert!(
-                    async_fut.is_none() && drop.is_none(),
+                    drop.is_none(),
                     "Async Drop must be expanded or reset to sync before codegen"
                 );
                 let drop_place = codegen_place(fx, *place);
@@ -620,7 +619,7 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
             let lval = codegen_place(fx, to_place_and_rval.0);
             let dest_layout = lval.layout();
             match to_place_and_rval.1 {
-                Rvalue::Use(ref operand) => {
+                Rvalue::Use(ref operand, _) => {
                     let val = codegen_operand(fx, operand);
                     lval.write_cvalue(fx, val);
                 }
@@ -628,6 +627,11 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
                     let place = codegen_place(fx, place);
                     let ref_ = place.place_ref(fx, lval.layout());
                     lval.write_cvalue(fx, ref_);
+                }
+                Rvalue::Reborrow(_, _, place) => {
+                    let cplace = codegen_place(fx, place);
+                    let val = cplace.to_cvalue(fx);
+                    lval.write_cvalue(fx, val)
                 }
                 Rvalue::ThreadLocalRef(def_id) => {
                     let val = crate::constant::codegen_tls_ref(fx, def_id, lval.layout());
@@ -902,7 +906,6 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
                     lval.write_cvalue_transmute(fx, operand);
                 }
                 Rvalue::CopyForDeref(_) => bug!("`CopyForDeref` in codegen"),
-                Rvalue::ShallowInitBox(..) => bug!("`ShallowInitBox` in codegen"),
             }
         }
         StatementKind::StorageLive(_)
@@ -910,7 +913,6 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
         | StatementKind::ConstEvalCounter
         | StatementKind::Nop
         | StatementKind::FakeRead(..)
-        | StatementKind::Retag { .. }
         | StatementKind::PlaceMention(..)
         | StatementKind::BackwardIncompatibleDropHint { .. }
         | StatementKind::AscribeUserType(..) => {}
@@ -925,19 +927,26 @@ fn codegen_stmt<'tcx>(fx: &mut FunctionCx<'_, '_, 'tcx>, cur_block: Block, stmt:
                 count,
             }) => {
                 let dst = codegen_operand(fx, dst);
-                let pointee = dst
-                    .layout()
-                    .pointee_info_at(fx, rustc_abi::Size::ZERO)
-                    .expect("Expected pointer");
+
+                let &ty::RawPtr(pointee, _) = dst.layout().ty.kind() else {
+                    bug!("expected pointer")
+                };
+                let pointee_layout = fx
+                    .tcx
+                    .layout_of(fx.typing_env().as_query_input(pointee))
+                    .expect("expected pointee to have a layout");
+                let elem_size: u64 = pointee_layout.layout.size().bytes();
+
                 let dst = dst.load_scalar(fx);
                 let src = codegen_operand(fx, src).load_scalar(fx);
                 let count = codegen_operand(fx, count).load_scalar(fx);
-                let elem_size: u64 = pointee.size.bytes();
+
                 let bytes = if elem_size != 1 {
                     fx.bcx.ins().imul_imm(count, elem_size as i64)
                 } else {
                     count
                 };
+
                 fx.bcx.call_memcpy(fx.target_config, dst, src, bytes);
             }
         },
@@ -1042,7 +1051,7 @@ pub(crate) fn codegen_operand<'tcx>(
         Operand::RuntimeChecks(checks) => {
             let val = checks.value(fx.tcx.sess);
             let layout = fx.layout_of(fx.tcx.types.bool);
-            return CValue::const_val(fx, layout, val.into());
+            CValue::const_val(fx, layout, val.into())
         }
     }
 }

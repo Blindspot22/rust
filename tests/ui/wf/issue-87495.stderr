@@ -11,7 +11,7 @@ note: for a trait to be dyn compatible it needs to allow building a vtable
 LL | trait T {
    |       - this trait is not dyn compatible...
 LL |     const CONST: (bool, dyn T);
-   |           ^^^^^ ...because it contains this associated `const`
+   |           ^^^^^ ...because it contains associated const `CONST`
    = help: consider moving `CONST` to another trait
 help: you might have meant to use `Self` to refer to the implementing type
    |

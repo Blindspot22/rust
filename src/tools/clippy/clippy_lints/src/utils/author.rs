@@ -9,7 +9,7 @@ use rustc_hir::{
     self as hir, BindingMode, CaptureBy, Closure, ClosureKind, ConstArg, ConstArgKind, CoroutineKind, ExprKind,
     FnRetTy, HirId, Lit, PatExprKind, PatKind, QPath, StmtKind, StructTailExpr,
 };
-use rustc_lint::{LateContext, LateLintPass, LintContext};
+use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty::{FloatTy, IntTy, UintTy};
 use rustc_session::declare_lint_pass;
 use rustc_span::symbol::{Ident, Symbol};
@@ -325,7 +325,7 @@ impl<'a, 'tcx> PrintVisitor<'a, 'tcx> {
             ConstArgKind::Infer(..) => chain!(self, "let ConstArgKind::Infer(..) = {const_arg}.kind"),
             ConstArgKind::Error(..) => chain!(self, "let ConstArgKind::Error(..) = {const_arg}.kind"),
             ConstArgKind::Tup(..) => chain!(self, "let ConstArgKind::Tup(..) = {const_arg}.kind"),
-            ConstArgKind::Literal(..) => chain!(self, "let ConstArgKind::Literal(..) = {const_arg}.kind")
+            ConstArgKind::Literal { .. } => chain!(self, "let ConstArgKind::Literal {{ .. }} = {const_arg}.kind"),
         }
     }
 
@@ -673,7 +673,7 @@ impl<'a, 'tcx> PrintVisitor<'a, 'tcx> {
                 bind!(self, qpath, fields);
                 let base = OptionPat::new(match base {
                     StructTailExpr::Base(base) => Some(self.bind("base", base)),
-                    StructTailExpr::None | StructTailExpr::DefaultFields(_) => None,
+                    StructTailExpr::None | StructTailExpr::NoneWithError(_) | StructTailExpr::DefaultFields(_) => None,
                 });
                 kind!("Struct({qpath}, {fields}, {base})");
                 self.qpath(qpath, &expr.name, expr.value.hir_id);
@@ -863,5 +863,5 @@ impl<'a, 'tcx> PrintVisitor<'a, 'tcx> {
 
 fn has_attr(cx: &LateContext<'_>, hir_id: HirId) -> bool {
     let attrs = cx.tcx.hir_attrs(hir_id);
-    get_builtin_attr(cx.sess(), attrs, sym::author).count() > 0
+    get_builtin_attr(attrs, sym::author).count() > 0
 }

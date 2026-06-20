@@ -332,7 +332,7 @@ impl File {
         false
     }
 
-    pub fn read_buf(&self, cursor: BorrowedCursor<'_>) -> io::Result<()> {
+    pub fn read_buf(&self, cursor: BorrowedCursor<'_, u8>) -> io::Result<()> {
         crate::io::default_read_buf(|buf| self.read(buf), cursor)
     }
 
@@ -580,12 +580,18 @@ mod uefi_fs {
     use crate::path::Path;
     use crate::ptr::NonNull;
     use crate::sys::pal::helpers::{self, UefiBox};
-    use crate::sys::time::{self, SystemTime};
+    use crate::sys::pal::system_time;
+    use crate::sys::time::SystemTime;
 
     pub(crate) struct File {
         protocol: NonNull<file::Protocol>,
         path: crate::path::PathBuf,
     }
+
+    // SAFETY: UEFI has no regular threads, and as per <https://github.com/rust-lang/rust/issues/133604>
+    // std does not support being invoked from "irregular threads" such as interrupt handlers or other
+    // CPU cores that run outside the scope of UEFI.
+    unsafe impl Send for File {}
 
     impl File {
         pub(crate) fn from_path(path: &Path, open_mode: u64, attr: u64) -> io::Result<Self> {
@@ -879,7 +885,7 @@ mod uefi_fs {
     /// conversion to SystemTime, we use the current time to get the timezone in such cases.
     pub(crate) fn uefi_to_systemtime(mut time: r_efi::efi::Time) -> Option<SystemTime> {
         time.timezone = if time.timezone == r_efi::efi::UNSPECIFIED_TIMEZONE {
-            time::system_time_internal::now().timezone
+            system_time::now().timezone
         } else {
             time.timezone
         };
@@ -888,7 +894,7 @@ mod uefi_fs {
 
     /// Convert to UEFI Time with the current timezone.
     pub(crate) fn systemtime_to_uefi(time: SystemTime) -> r_efi::efi::Time {
-        let now = time::system_time_internal::now();
+        let now = system_time::now();
         time.to_uefi_loose(now.timezone, now.daylight)
     }
 

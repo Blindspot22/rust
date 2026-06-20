@@ -62,25 +62,7 @@ pub macro thread_local_inner {
     // by translating it into a `cfg`ed block and recursing.
     // https://doc.rust-lang.org/reference/conditional-compilation.html#railroad-ConfigurationPredicate
 
-    (@align $final_align:ident, cfg_attr(true, $($cfg_rhs:tt)*) $(, $($attr_rest:tt)+)?) => {
-        #[cfg(true)]
-        {
-            $crate::thread::local_impl::thread_local_inner!(@align $final_align, $($cfg_rhs)*);
-        }
-
-        $($crate::thread::local_impl::thread_local_inner!(@align $final_align, $($attr_rest)+);)?
-    },
-
-    (@align $final_align:ident, cfg_attr(false, $($cfg_rhs:tt)*) $(, $($attr_rest:tt)+)?) => {
-        #[cfg(false)]
-        {
-            $crate::thread::local_impl::thread_local_inner!(@align $final_align, $($cfg_rhs)*);
-        }
-
-        $($crate::thread::local_impl::thread_local_inner!(@align $final_align, $($attr_rest)+);)?
-    },
-
-    (@align $final_align:ident, cfg_attr($cfg_pred:meta, $($cfg_rhs:tt)*) $(, $($attr_rest:tt)+)?) => {
+    (@align $final_align:ident, cfg_attr($cfg_pred:expr, $($cfg_rhs:tt)*) $(, $($attr_rest:tt)+)?) => {
         #[cfg($cfg_pred)]
         {
             $crate::thread::local_impl::thread_local_inner!(@align $final_align, $($cfg_rhs)*);
@@ -180,6 +162,7 @@ impl<T: 'static, const ALIGN: usize> Storage<T, ALIGN> {
     ///
     /// The resulting pointer may not be used after reentrant inialialization
     /// or thread destruction has occurred.
+    #[inline]
     pub fn get(&'static self, i: Option<&mut Option<T>>, f: impl FnOnce() -> T) -> *const T {
         let key = self.key.force();
         let ptr = unsafe { get(key) as *mut Value<T> };
@@ -196,6 +179,7 @@ impl<T: 'static, const ALIGN: usize> Storage<T, ALIGN> {
     /// # Safety
     /// * `key` must be the result of calling `self.key.force()`
     /// * `ptr` must be the current value associated with `key`.
+    #[cold]
     unsafe fn try_initialize(
         key: Key,
         ptr: *mut Value<T>,

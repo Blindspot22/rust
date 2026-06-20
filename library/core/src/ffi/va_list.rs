@@ -2,10 +2,16 @@
 //!
 //! Better known as "varargs".
 
+#![unstable(
+    feature = "c_variadic",
+    issue = "44930",
+    reason = "the `c_variadic` feature has not been properly tested on all supported platforms"
+)]
+
 #[cfg(not(target_arch = "xtensa"))]
 use crate::ffi::c_void;
 use crate::fmt;
-use crate::intrinsics::{va_arg, va_copy};
+use crate::intrinsics::{va_arg, va_copy, va_end};
 use crate::marker::PhantomCovariantLifetime;
 
 // There are currently three flavors of how a C `va_list` is implemented for
@@ -34,6 +40,10 @@ use crate::marker::PhantomCovariantLifetime;
 //
 // The Clang `BuiltinVaListKind` enumerates the `va_list` variations that Clang supports,
 // and we mirror these here.
+//
+// For all current LLVM targets, `va_copy` lowers to `memcpy`. Hence the inner structs below all
+// derive `Copy`. However, in the future we might want to support a target where `va_copy`
+// allocates, or otherwise violates the requirements of `Copy`. Therefore `VaList` is only `Clone`.
 crate::cfg_select! {
     all(
         target_arch = "aarch64",
@@ -45,10 +55,12 @@ crate::cfg_select! {
         ///
         /// See the [AArch64 Procedure Call Standard] for more details.
         ///
+        /// `va_copy` is `memcpy`: <https://github.com/llvm/llvm-project/blob/5aee01a3df011e660f26660bc30a8c94a1651d8e/llvm/lib/Target/AArch64/AArch64ISelLowering.cpp#L12682-L12700>
+        ///
         /// [AArch64 Procedure Call Standard]:
         /// http://infocenter.arm.com/help/topic/com.arm.doc.ihi0055b/IHI0055B_aapcs64.pdf
         #[repr(C)]
-        #[derive(Debug)]
+        #[derive(Debug, Clone, Copy)]
         struct VaListInner {
             stack: *const c_void,
             gr_top: *const c_void,
@@ -62,11 +74,13 @@ crate::cfg_select! {
         ///
         /// See the [LLVM source] and [GCC header] for more details.
         ///
+        /// `va_copy` is `memcpy`: <https://github.com/llvm/llvm-project/blob/5aee01a3df011e660f26660bc30a8c94a1651d8e/llvm/lib/Target/PowerPC/PPCISelLowering.cpp#L3755-L3764>
+        ///
         /// [LLVM source]:
         /// https://github.com/llvm/llvm-project/blob/af9a4263a1a209953a1d339ef781a954e31268ff/llvm/lib/Target/PowerPC/PPCISelLowering.cpp#L4089-L4111
         /// [GCC header]: https://web.mit.edu/darwin/src/modules/gcc/gcc/ginclude/va-ppc.h
         #[repr(C)]
-        #[derive(Debug)]
+        #[derive(Debug, Clone, Copy)]
         #[rustc_pass_indirectly_in_non_rustic_abis]
         struct VaListInner {
             gpr: u8,
@@ -81,10 +95,12 @@ crate::cfg_select! {
         ///
         /// See the [S/390x ELF Application Binary Interface Supplement] for more details.
         ///
+        /// `va_copy` is `memcpy`: <https://github.com/llvm/llvm-project/blob/5aee01a3df011e660f26660bc30a8c94a1651d8e/llvm/lib/Target/SystemZ/SystemZISelLowering.cpp#L4457-L4472>
+        ///
         /// [S/390x ELF Application Binary Interface Supplement]:
         /// https://docs.google.com/gview?embedded=true&url=https://github.com/IBM/s390x-abi/releases/download/v1.7/lzsabi_s390x.pdf
         #[repr(C)]
-        #[derive(Debug)]
+        #[derive(Debug, Clone, Copy)]
         #[rustc_pass_indirectly_in_non_rustic_abis]
         struct VaListInner {
             gpr: i64,
@@ -98,10 +114,13 @@ crate::cfg_select! {
         ///
         /// See the [System V AMD64 ABI] for more details.
         ///
+        /// `va_copy` is `memcpy`: <https://github.com/llvm/llvm-project/blob/5aee01a3df011e660f26660bc30a8c94a1651d8e/llvm/lib/Target/X86/X86ISelLowering.cpp#26319>
+        /// (github won't render that file, look for `SDValue LowerVACOPY`)
+        ///
         /// [System V AMD64 ABI]:
         /// https://refspecs.linuxbase.org/elf/x86_64-abi-0.99.pdf
         #[repr(C)]
-        #[derive(Debug)]
+        #[derive(Debug, Clone, Copy)]
         #[rustc_pass_indirectly_in_non_rustic_abis]
         struct VaListInner {
             gp_offset: i32,
@@ -115,10 +134,12 @@ crate::cfg_select! {
         ///
         /// See the [LLVM source] for more details.
         ///
+        /// `va_copy` is `memcpy`: <https://github.com/llvm/llvm-project/blob/5aee01a3df011e660f26660bc30a8c94a1651d8e/llvm/lib/Target/Xtensa/XtensaISelLowering.cpp#L1260>
+        ///
         /// [LLVM source]:
         /// https://github.com/llvm/llvm-project/blob/af9a4263a1a209953a1d339ef781a954e31268ff/llvm/lib/Target/Xtensa/XtensaISelLowering.cpp#L1211-L1215
         #[repr(C)]
-        #[derive(Debug)]
+        #[derive(Debug, Clone, Copy)]
         #[rustc_pass_indirectly_in_non_rustic_abis]
         struct VaListInner {
             stk: *const i32,
@@ -132,10 +153,12 @@ crate::cfg_select! {
         ///
         /// See the [LLVM source] for more details. On bare metal Hexagon uses an opaque pointer.
         ///
+        /// `va_copy` is `memcpy`: <https://github.com/llvm/llvm-project/blob/5aee01a3df011e660f26660bc30a8c94a1651d8e/llvm/lib/Target/Hexagon/HexagonISelLowering.cpp#L1087-L1102>
+        ///
         /// [LLVM source]:
         /// https://github.com/llvm/llvm-project/blob/0cdc1b6dd4a870fc41d4b15ad97e0001882aba58/clang/lib/CodeGen/Targets/Hexagon.cpp#L407-L417
         #[repr(C)]
-        #[derive(Debug)]
+        #[derive(Debug, Clone, Copy)]
         #[rustc_pass_indirectly_in_non_rustic_abis]
         struct VaListInner {
             __current_saved_reg_area_pointer: *const c_void,
@@ -156,15 +179,55 @@ crate::cfg_select! {
     // That pointer is probably just the next variadic argument on the caller's stack.
     _ => {
         /// Basic implementation of a `va_list`.
+        ///
+        /// `va_copy` is `memcpy`: <https://github.com/llvm/llvm-project/blob/87e8e7d8f0db53060ef2f6ef4ab612fc0f2b4490/llvm/lib/Transforms/IPO/ExpandVariadics.cpp#L127-L129>
         #[repr(transparent)]
-        #[derive(Debug)]
+        #[derive(Debug, Clone, Copy)]
         struct VaListInner {
             ptr: *const c_void,
         }
     }
 }
 
-/// A variable argument list, equivalent to `va_list` in C.
+/// A variable argument list, ABI-compatible with `va_list` in C.
+///
+/// This type is created in c-variadic functions when `...` is desugared. A `VaList`
+/// is automatically initialized (equivalent to calling `va_start` in C).
+///
+/// ```
+/// #![feature(c_variadic)]
+///
+/// use std::ffi::VaList;
+///
+/// /// # Safety
+/// /// Must be passed at least `count` arguments of type `i32`.
+/// unsafe extern "C" fn my_func(count: u32, ap: ...) -> i32 {
+///     unsafe { vmy_func(count, ap) }
+/// }
+///
+/// /// # Safety
+/// /// Must be passed at least `count` arguments of type `i32`.
+/// unsafe fn vmy_func(count: u32, mut ap: VaList<'_>) -> i32 {
+///     let mut sum = 0;
+///     for _ in 0..count {
+///         sum += unsafe { ap.next_arg::<i32>() };
+///     }
+///     sum
+/// }
+///
+/// assert_eq!(unsafe { my_func(1, 42i32) }, 42);
+/// assert_eq!(unsafe { my_func(3, 42i32, -7i32, 20i32) }, 55);
+/// ```
+///
+/// The [`VaList::next_arg`] method reads the next argument from the variable argument list,
+/// and is equivalent to C `va_arg`.
+///
+/// Cloning a `VaList` performs the equivalent of C `va_copy`, producing an independent cursor
+/// that arguments can be read from without affecting the original. Dropping a `VaList` performs
+/// the equivalent of C `va_end`.
+///
+/// A `VaList` can be used across an FFI boundary, and fully matches the platform's `va_list` in
+/// terms of layout and ABI.
 #[repr(transparent)]
 #[lang = "va_list"]
 pub struct VaList<'a> {
@@ -179,97 +242,170 @@ impl fmt::Debug for VaList<'_> {
     }
 }
 
-mod sealed {
-    pub trait Sealed {}
-
-    impl Sealed for i32 {}
-    impl Sealed for i64 {}
-    impl Sealed for isize {}
-
-    impl Sealed for u32 {}
-    impl Sealed for u64 {}
-    impl Sealed for usize {}
-
-    impl Sealed for f64 {}
-
-    impl<T> Sealed for *mut T {}
-    impl<T> Sealed for *const T {}
+impl VaList<'_> {
+    // Helper used in the implementation of the `va_copy` intrinsic.
+    pub(crate) const fn duplicate(&self) -> Self {
+        Self { inner: self.inner, _marker: self._marker }
+    }
 }
 
-/// Types that are valid to read using [`VaList::arg`].
+#[rustc_const_unstable(feature = "const_c_variadic", issue = "151787")]
+const impl<'f> Clone for VaList<'f> {
+    /// Clone the [`VaList`], producing a second independent cursor into the variable argument list.
+    ///
+    /// Corresponds to `va_copy` in C.
+    #[inline] // Avoid codegen when not used to help backends that don't support VaList.
+    fn clone(&self) -> Self {
+        // We only implement Clone and not Copy because some future target might not be able to
+        // implement Copy (e.g. because it allocates). For the same reason we use an intrinsic
+        // to do the copying: the fact that on all current targets, this is just `memcpy`, is an implementation
+        // detail. The intrinsic lets Miri catch UB from code incorrectly relying on that implementation detail.
+        va_copy(self)
+    }
+}
+
+#[rustc_const_unstable(feature = "const_c_variadic", issue = "151787")]
+const impl<'f> Drop for VaList<'f> {
+    /// Drop the [`VaList`].
+    ///
+    /// Corresponds to `va_end` in C.
+    #[inline] // Avoid codegen when not used to help backends that don't support VaList.
+    fn drop(&mut self) {
+        // Call the rust `va_end` intrinsic, which is a no-op and does not map to LLVM `va_end`.
+        // The rust intrinsic exists as a hook for Miri to check for UB.
+        //
+        // SAFETY: this variable argument list is being dropped, so won't be read from again.
+        unsafe { va_end(self) }
+    }
+}
+
+/// Types that are valid to read using [`VaList::next_arg`].
+///
+/// This trait is implemented for primitive types that have a variable argument application-binary
+/// interface (ABI) on the current platform. It is always implemented for:
+///
+/// - [`c_int`], [`c_long`] and [`c_longlong`]
+/// - [`c_uint`], [`c_ulong`] and [`c_ulonglong`]
+/// - [`c_double`]
+/// - `*const T` and `*mut T`
+///
+/// Implementations for e.g. `i32` or `usize` shouldn't be relied upon directly,
+/// because they may not be available on all platforms.
 ///
 /// # Safety
 ///
-/// The standard library implements this trait for primitive types that are
-/// expected to have a variable argument application-binary interface (ABI) on all
-/// platforms.
-///
-/// When C passes variable arguments, integers smaller than [`c_int`] and floats smaller
-/// than [`c_double`] are implicitly promoted to [`c_int`] and [`c_double`] respectively.
-/// Implementing this trait for types that are subject to this promotion rule is invalid.
+/// When C passes variable arguments, signed integers smaller than [`c_int`] are promoted
+/// to [`c_int`], unsigned integers smaller than [`c_uint`] are promoted to [`c_uint`],
+/// and [`c_float`] is promoted to [`c_double`]. Implementing this trait for types that are
+/// subject to this promotion rule is invalid.
 ///
 /// [`c_int`]: core::ffi::c_int
+/// [`c_long`]: core::ffi::c_long
+/// [`c_longlong`]: core::ffi::c_longlong
+///
+/// [`c_uint`]: core::ffi::c_uint
+/// [`c_ulong`]: core::ffi::c_ulong
+/// [`c_ulonglong`]: core::ffi::c_ulonglong
+///
+/// [`c_float`]: core::ffi::c_float
 /// [`c_double`]: core::ffi::c_double
 // We may unseal this trait in the future, but currently our `va_arg` implementations don't support
 // types with an alignment larger than 8, or with a non-scalar layout. Inline assembly can be used
 // to accept unsupported types in the meantime.
-pub unsafe trait VaArgSafe: sealed::Sealed {}
+#[lang = "va_arg_safe"]
+pub impl(self) unsafe trait VaArgSafe: Copy {}
 
-// i8 and i16 are implicitly promoted to c_int in C, and cannot implement `VaArgSafe`.
+crate::cfg_select! {
+    any(target_arch = "avr", target_arch = "msp430") => {
+        // c_int/c_uint are i16/u16 on these targets.
+        //
+        // - i8 is implicitly promoted to c_int in C, and cannot implement `VaArgSafe`.
+        // - u8 is implicitly promoted to c_uint in C, and cannot implement `VaArgSafe`.
+        unsafe impl VaArgSafe for i16 {}
+        unsafe impl VaArgSafe for u16 {}
+    }
+    _ => {
+        // c_int/c_uint are i32/u32 on this target.
+        //
+        // - i8 and i16 are implicitly promoted to c_int in C, and cannot implement `VaArgSafe`.
+        // - u8 and u16 are implicitly promoted to c_uint in C, and cannot implement `VaArgSafe`.
+    }
+}
+
+crate::cfg_select! {
+    target_arch = "avr" => {
+        // c_double is f32 on this target.
+        unsafe impl VaArgSafe for f32 {}
+    }
+    _ => {
+        // c_double is f64 on this target.
+        //
+        // - f32 is implicitly promoted to c_double in C, and cannot implement `VaArgSafe`.
+    }
+}
+
 unsafe impl VaArgSafe for i32 {}
 unsafe impl VaArgSafe for i64 {}
 unsafe impl VaArgSafe for isize {}
 
-// u8 and u16 are implicitly promoted to c_int in C, and cannot implement `VaArgSafe`.
 unsafe impl VaArgSafe for u32 {}
 unsafe impl VaArgSafe for u64 {}
 unsafe impl VaArgSafe for usize {}
 
-// f32 is implicitly promoted to c_double in C, and cannot implement `VaArgSafe`.
 unsafe impl VaArgSafe for f64 {}
 
 unsafe impl<T> VaArgSafe for *mut T {}
 unsafe impl<T> VaArgSafe for *const T {}
 
+// Check that relevant `core::ffi` types implement `VaArgSafe`.
+const _: () = {
+    const fn va_arg_safe_check<T: VaArgSafe>() {}
+
+    va_arg_safe_check::<crate::ffi::c_int>();
+    va_arg_safe_check::<crate::ffi::c_uint>();
+    va_arg_safe_check::<crate::ffi::c_long>();
+
+    va_arg_safe_check::<crate::ffi::c_ulong>();
+    va_arg_safe_check::<crate::ffi::c_longlong>();
+    va_arg_safe_check::<crate::ffi::c_ulonglong>();
+
+    va_arg_safe_check::<crate::ffi::c_double>();
+
+    va_arg_safe_check::<*const crate::ffi::c_void>();
+    va_arg_safe_check::<*mut crate::ffi::c_void>();
+
+    va_arg_safe_check::<*const crate::ffi::c_char>();
+    va_arg_safe_check::<*mut crate::ffi::c_char>();
+};
+
 impl<'f> VaList<'f> {
-    /// Advance to and read the next variable argument.
+    /// Read the next argument from the variable argument list.
+    ///
+    /// Only types that implement [`VaArgSafe`] can be read from a variable argument list.
     ///
     /// # Safety
     ///
-    /// This function is only sound to call when:
+    /// This function is safe to call only if all of the following conditions are satisfied:
     ///
-    /// - there is a next variable argument available.
-    /// - the next argument's type must be ABI-compatible with the type `T`.
-    /// - the next argument must have a properly initialized value of type `T`.
+    /// - There is another c-variadic argument to read.
+    /// - The actual type of the argument `U` is compatible with `T` (as defined below).
+    /// - If `U` and `T` are both integer types, then the value passed by the caller must be
+    /// representable in both types.
     ///
-    /// Calling this function with an incompatible type, an invalid value, or when there
-    /// are no more variable arguments, is unsound.
+    /// Types `T` and `U` are compatible when:
     ///
-    /// [valid]: https://doc.rust-lang.org/nightly/nomicon/what-unsafe-does.html
-    #[inline]
-    pub unsafe fn arg<T: VaArgSafe>(&mut self) -> T {
+    /// - `T` and `U` are the same type.
+    /// - `T` and `U` are integer types of the same size.
+    /// - `T` and `U` are both pointers, and their target types are compatible.
+    /// - `T` is a pointer to [`c_void`] and `U` is a pointer to [`i8`] or [`u8`], or vice versa.
+    ///
+    /// [`c_void`]: core::ffi::c_void
+    #[inline] // Avoid codegen when not used to help backends that don't support VaList.
+    #[rustc_const_unstable(feature = "const_c_variadic", issue = "151787")]
+    #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    pub const unsafe fn next_arg<T: VaArgSafe>(&mut self) -> T {
         // SAFETY: the caller must uphold the safety contract for `va_arg`.
         unsafe { va_arg(self) }
-    }
-}
-
-impl<'f> Clone for VaList<'f> {
-    #[inline]
-    fn clone(&self) -> Self {
-        let mut dest = crate::mem::MaybeUninit::uninit();
-        // SAFETY: we write to the `MaybeUninit`, thus it is initialized and `assume_init` is legal.
-        unsafe {
-            va_copy(dest.as_mut_ptr(), self);
-            dest.assume_init()
-        }
-    }
-}
-
-impl<'f> Drop for VaList<'f> {
-    fn drop(&mut self) {
-        // Rust requires that not calling `va_end` on a `va_list` does not cause undefined behaviour
-        // (as it is safe to leak values). As `va_end` is a no-op on all current LLVM targets, this
-        // destructor is empty.
     }
 }
 

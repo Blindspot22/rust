@@ -138,7 +138,7 @@ macro_rules! assert_ne {
 /// be disabled. See [`debug_assert_matches!`] for assertions that are disabled in
 /// release builds by default.
 ///
-/// [`debug_assert_matches!`]: crate::assert_matches::debug_assert_matches
+/// [`debug_assert_matches!`]: crate::debug_assert_matches
 ///
 /// On panic, this macro will print the value of the expression with its debug representation.
 ///
@@ -147,9 +147,7 @@ macro_rules! assert_ne {
 /// # Examples
 ///
 /// ```
-/// #![feature(assert_matches)]
-///
-/// use std::assert_matches::assert_matches;
+/// use std::assert_matches;
 ///
 /// let a = Some(345);
 /// let b = Some(56);
@@ -166,11 +164,11 @@ macro_rules! assert_ne {
 /// assert_matches!(a, Some(x) if x > 100);
 /// // assert_matches!(a, Some(x) if x < 100); // panics
 /// ```
-#[unstable(feature = "assert_matches", issue = "82775")]
+#[stable(feature = "assert_matches", since = "1.96.0")]
 #[allow_internal_unstable(panic_internals)]
 #[rustc_macro_transparency = "semiopaque"]
 pub macro assert_matches {
-    ($left:expr, $(|)? $( $pattern:pat_param )|+ $( if $guard: expr )? $(,)?) => {
+    ($left:expr, $(|)? $( $pattern:pat_param )|+ $( if $guard: expr )? $(,)?) => {{
         match $left {
             $( $pattern )|+ $( if $guard )? => {}
             ref left_val => {
@@ -181,8 +179,8 @@ pub macro assert_matches {
                 );
             }
         }
-    },
-    ($left:expr, $(|)? $( $pattern:pat_param )|+ $( if $guard: expr )?, $($arg:tt)+) => {
+    }},
+    ($left:expr, $(|)? $( $pattern:pat_param )|+ $( if $guard: expr )?, $($arg:tt)+) => {{
         match $left {
             $( $pattern )|+ $( if $guard )? => {}
             ref left_val => {
@@ -193,7 +191,7 @@ pub macro assert_matches {
                 );
             }
         }
-    },
+    }},
 }
 
 /// Selects code at compile-time based on `cfg` predicates.
@@ -208,8 +206,6 @@ pub macro assert_matches {
 /// # Example
 ///
 /// ```
-/// #![feature(cfg_select)]
-///
 /// cfg_select! {
 ///     unix => {
 ///         fn foo() { /* unix specific functionality */ }
@@ -227,14 +223,13 @@ pub macro assert_matches {
 /// right-hand side:
 ///
 /// ```
-/// #![feature(cfg_select)]
-///
 /// let _some_string = cfg_select! {
 ///     unix => "With great power comes great electricity bills",
 ///     _ => { "Behind every successful diet is an unwatched pizza" }
 /// };
 /// ```
-#[unstable(feature = "cfg_select", issue = "115585")]
+#[stable(feature = "cfg_select", since = "1.95.0")]
+#[doc(alias = "cfg_if", alias = "cfg-if")]
 #[rustc_diagnostic_item = "cfg_select"]
 #[rustc_builtin_macro]
 pub macro cfg_select($($tt:tt)*) {
@@ -380,9 +375,7 @@ macro_rules! debug_assert_ne {
 /// # Examples
 ///
 /// ```
-/// #![feature(assert_matches)]
-///
-/// use std::assert_matches::debug_assert_matches;
+/// use std::debug_assert_matches;
 ///
 /// let a = Some(345);
 /// let b = Some(56);
@@ -399,12 +392,12 @@ macro_rules! debug_assert_ne {
 /// debug_assert_matches!(a, Some(x) if x > 100);
 /// // debug_assert_matches!(a, Some(x) if x < 100); // panics
 /// ```
-#[unstable(feature = "assert_matches", issue = "82775")]
+#[stable(feature = "assert_matches", since = "1.96.0")]
 #[allow_internal_unstable(assert_matches)]
 #[rustc_macro_transparency = "semiopaque"]
 pub macro debug_assert_matches($($arg:tt)*) {
     if $crate::cfg!(debug_assertions) {
-        $crate::assert_matches::assert_matches!($($arg)*);
+        $crate::assert_matches!($($arg)*);
     }
 }
 
@@ -449,7 +442,7 @@ macro_rules! matches {
 /// [raw-identifier syntax][ris]: `r#try`.
 ///
 /// [propagating-errors]: https://doc.rust-lang.org/book/ch09-02-recoverable-errors-with-result.html#a-shortcut-for-propagating-errors-the--operator
-/// [ris]: https://doc.rust-lang.org/nightly/rust-by-example/compatibility/raw_identifiers.html
+/// [ris]: ../rust-by-example/compatibility/raw_identifiers.html
 ///
 /// `try!` matches the given [`Result`]. In case of the `Ok` variant, the
 /// expression has the value of the wrapped value.
@@ -611,6 +604,9 @@ macro_rules! write {
     ($dst:expr, $($arg:tt)*) => {
         $dst.write_fmt($crate::format_args!($($arg)*))
     };
+    ($($arg:tt)*) => {
+        compile_error!("requires a destination and format arguments, like `write!(dest, \"format string\", args...)`")
+    };
 }
 
 /// Writes formatted data into a buffer, with a newline appended.
@@ -648,6 +644,9 @@ macro_rules! writeln {
     };
     ($dst:expr, $($arg:tt)*) => {
         $dst.write_fmt($crate::format_args_nl!($($arg)*))
+    };
+    ($($arg:tt)*) => {
+        compile_error!("requires a destination and format arguments, like `writeln!(dest, \"format string\", args...)`")
     };
 }
 
@@ -1629,6 +1628,48 @@ pub(crate) mod builtin {
         /* compiler built-in */
     }
 
+    /// The `offload_kernel` macro is applied to a function to generate two separate
+    /// definitions: a host-side wrapper for dispatch and a device-side kernel.
+    ///
+    /// The macro does not perform the offload itself. It generates the necessary
+    /// code required by the compiler's offloading infrastructure.
+    ///
+    /// ### Usage example:
+    ///
+    /// ```rust,ignore (offload requires a -Z flag)
+    /// #[offload_kernel]
+    /// fn foo(a: &[f32], b: &[f32], c: *mut f32) {
+    ///     *c = a[0] + b[0];
+    /// }
+    /// ```
+    ///
+    /// This expands to the host-side function:
+    ///
+    /// ```rust,ignore (offload requires a -Z flag)
+    /// #[unsafe(no_mangle)]
+    /// #[inline(never)]
+    /// fn foo(_: &[f32], _: &[f32], _: *mut f32) {
+    ///     ::core::panicking::panic("not implemented")
+    /// }
+    /// ```
+    ///
+    /// And the device-side kernel:
+    ///
+    /// ```rust,ignore (offload requires a -Z flag)
+    /// #[rustc_offload_kernel]
+    /// #[unsafe(no_mangle)]
+    /// unsafe extern "gpu-kernel" fn foo(a: &[f32], b: &[f32], c: *mut f32) {
+    ///     *c = a[0] + b[0];
+    /// }
+    /// ```
+    #[unstable(feature = "gpu_offload", issue = "131513")]
+    #[allow_internal_unstable(rustc_attrs)]
+    #[allow_internal_unstable(core_intrinsics)]
+    #[rustc_builtin_macro]
+    pub macro offload_kernel($item:item) {
+        /* compiler built-in */
+    }
+
     /// Asserts that a boolean expression is `true` at runtime.
     ///
     /// This will invoke the [`panic!`] macro if the provided expression cannot be
@@ -1722,7 +1763,7 @@ pub(crate) mod builtin {
     ///
     /// See [the reference] for more info.
     ///
-    /// [the reference]: ../../../reference/attributes/derive.html
+    /// [the reference]: ../reference/attributes/derive.html
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_builtin_macro]
     pub macro derive($item:item) {
@@ -1781,7 +1822,7 @@ pub(crate) mod builtin {
     ///
     /// See also [`std::alloc::GlobalAlloc`](../../../std/alloc/trait.GlobalAlloc.html).
     #[stable(feature = "global_allocator", since = "1.28.0")]
-    #[allow_internal_unstable(rustc_attrs)]
+    #[allow_internal_unstable(rustc_attrs, ptr_alignment_type)]
     #[rustc_builtin_macro]
     pub macro global_allocator($item:item) {
         /* compiler built-in */

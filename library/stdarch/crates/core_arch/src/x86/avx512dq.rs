@@ -6865,7 +6865,7 @@ pub fn _mm_maskz_reduce_ss<const IMM8: i32>(k: __mmask8, a: __m128, b: __m128) -
 #[stable(feature = "stdarch_x86_avx512", since = "1.89")]
 pub fn _mm_fpclass_pd_mask<const IMM8: i32>(a: __m128d) -> __mmask8 {
     static_assert_uimm_bits!(IMM8, 8);
-    _mm_mask_fpclass_pd_mask::<IMM8>(0xff, a)
+    unsafe { vfpclasspd_128(a.as_f64x2(), IMM8) }
 }
 
 /// Test packed double-precision (64-bit) floating-point elements in a for special categories specified
@@ -6889,10 +6889,7 @@ pub fn _mm_fpclass_pd_mask<const IMM8: i32>(a: __m128d) -> __mmask8 {
 #[rustc_legacy_const_generics(2)]
 #[stable(feature = "stdarch_x86_avx512", since = "1.89")]
 pub fn _mm_mask_fpclass_pd_mask<const IMM8: i32>(k1: __mmask8, a: __m128d) -> __mmask8 {
-    unsafe {
-        static_assert_uimm_bits!(IMM8, 8);
-        transmute(vfpclasspd_128(a.as_f64x2(), IMM8, k1))
-    }
+    _mm_fpclass_pd_mask::<IMM8>(a) & k1
 }
 
 /// Test packed double-precision (64-bit) floating-point elements in a for special categories specified
@@ -6916,7 +6913,7 @@ pub fn _mm_mask_fpclass_pd_mask<const IMM8: i32>(k1: __mmask8, a: __m128d) -> __
 #[stable(feature = "stdarch_x86_avx512", since = "1.89")]
 pub fn _mm256_fpclass_pd_mask<const IMM8: i32>(a: __m256d) -> __mmask8 {
     static_assert_uimm_bits!(IMM8, 8);
-    _mm256_mask_fpclass_pd_mask::<IMM8>(0xff, a)
+    unsafe { vfpclasspd_256(a.as_f64x4(), IMM8) }
 }
 
 /// Test packed double-precision (64-bit) floating-point elements in a for special categories specified
@@ -6940,10 +6937,7 @@ pub fn _mm256_fpclass_pd_mask<const IMM8: i32>(a: __m256d) -> __mmask8 {
 #[rustc_legacy_const_generics(2)]
 #[stable(feature = "stdarch_x86_avx512", since = "1.89")]
 pub fn _mm256_mask_fpclass_pd_mask<const IMM8: i32>(k1: __mmask8, a: __m256d) -> __mmask8 {
-    unsafe {
-        static_assert_uimm_bits!(IMM8, 8);
-        transmute(vfpclasspd_256(a.as_f64x4(), IMM8, k1))
-    }
+    _mm256_fpclass_pd_mask::<IMM8>(a) & k1
 }
 
 /// Test packed double-precision (64-bit) floating-point elements in a for special categories specified
@@ -6967,7 +6961,7 @@ pub fn _mm256_mask_fpclass_pd_mask<const IMM8: i32>(k1: __mmask8, a: __m256d) ->
 #[stable(feature = "stdarch_x86_avx512", since = "1.89")]
 pub fn _mm512_fpclass_pd_mask<const IMM8: i32>(a: __m512d) -> __mmask8 {
     static_assert_uimm_bits!(IMM8, 8);
-    _mm512_mask_fpclass_pd_mask::<IMM8>(0xff, a)
+    unsafe { vfpclasspd_512(a.as_f64x8(), IMM8) }
 }
 
 /// Test packed double-precision (64-bit) floating-point elements in a for special categories specified
@@ -6991,10 +6985,7 @@ pub fn _mm512_fpclass_pd_mask<const IMM8: i32>(a: __m512d) -> __mmask8 {
 #[rustc_legacy_const_generics(2)]
 #[stable(feature = "stdarch_x86_avx512", since = "1.89")]
 pub fn _mm512_mask_fpclass_pd_mask<const IMM8: i32>(k1: __mmask8, a: __m512d) -> __mmask8 {
-    unsafe {
-        static_assert_uimm_bits!(IMM8, 8);
-        transmute(vfpclasspd_512(a.as_f64x8(), IMM8, k1))
-    }
+    _mm512_fpclass_pd_mask::<IMM8>(a) & k1
 }
 
 /// Test packed single-precision (32-bit) floating-point elements in a for special categories specified
@@ -7018,7 +7009,7 @@ pub fn _mm512_mask_fpclass_pd_mask<const IMM8: i32>(k1: __mmask8, a: __m512d) ->
 #[stable(feature = "stdarch_x86_avx512", since = "1.89")]
 pub fn _mm_fpclass_ps_mask<const IMM8: i32>(a: __m128) -> __mmask8 {
     static_assert_uimm_bits!(IMM8, 8);
-    _mm_mask_fpclass_ps_mask::<IMM8>(0xff, a)
+    unsafe { vfpclassps_128(a.as_f32x4(), IMM8) }
 }
 
 /// Test packed single-precision (32-bit) floating-point elements in a for special categories specified
@@ -7042,10 +7033,7 @@ pub fn _mm_fpclass_ps_mask<const IMM8: i32>(a: __m128) -> __mmask8 {
 #[rustc_legacy_const_generics(2)]
 #[stable(feature = "stdarch_x86_avx512", since = "1.89")]
 pub fn _mm_mask_fpclass_ps_mask<const IMM8: i32>(k1: __mmask8, a: __m128) -> __mmask8 {
-    unsafe {
-        static_assert_uimm_bits!(IMM8, 8);
-        transmute(vfpclassps_128(a.as_f32x4(), IMM8, k1))
-    }
+    _mm_fpclass_ps_mask::<IMM8>(a) & k1
 }
 
 /// Test packed single-precision (32-bit) floating-point elements in a for special categories specified
@@ -7069,7 +7057,7 @@ pub fn _mm_mask_fpclass_ps_mask<const IMM8: i32>(k1: __mmask8, a: __m128) -> __m
 #[stable(feature = "stdarch_x86_avx512", since = "1.89")]
 pub fn _mm256_fpclass_ps_mask<const IMM8: i32>(a: __m256) -> __mmask8 {
     static_assert_uimm_bits!(IMM8, 8);
-    _mm256_mask_fpclass_ps_mask::<IMM8>(0xff, a)
+    unsafe { vfpclassps_256(a.as_f32x8(), IMM8) }
 }
 
 /// Test packed single-precision (32-bit) floating-point elements in a for special categories specified
@@ -7093,10 +7081,7 @@ pub fn _mm256_fpclass_ps_mask<const IMM8: i32>(a: __m256) -> __mmask8 {
 #[rustc_legacy_const_generics(2)]
 #[stable(feature = "stdarch_x86_avx512", since = "1.89")]
 pub fn _mm256_mask_fpclass_ps_mask<const IMM8: i32>(k1: __mmask8, a: __m256) -> __mmask8 {
-    unsafe {
-        static_assert_uimm_bits!(IMM8, 8);
-        transmute(vfpclassps_256(a.as_f32x8(), IMM8, k1))
-    }
+    _mm256_fpclass_ps_mask::<IMM8>(a) & k1
 }
 
 /// Test packed single-precision (32-bit) floating-point elements in a for special categories specified
@@ -7120,7 +7105,7 @@ pub fn _mm256_mask_fpclass_ps_mask<const IMM8: i32>(k1: __mmask8, a: __m256) -> 
 #[stable(feature = "stdarch_x86_avx512", since = "1.89")]
 pub fn _mm512_fpclass_ps_mask<const IMM8: i32>(a: __m512) -> __mmask16 {
     static_assert_uimm_bits!(IMM8, 8);
-    _mm512_mask_fpclass_ps_mask::<IMM8>(0xffff, a)
+    unsafe { vfpclassps_512(a.as_f32x16(), IMM8) }
 }
 
 /// Test packed single-precision (32-bit) floating-point elements in a for special categories specified
@@ -7144,10 +7129,7 @@ pub fn _mm512_fpclass_ps_mask<const IMM8: i32>(a: __m512) -> __mmask16 {
 #[rustc_legacy_const_generics(2)]
 #[stable(feature = "stdarch_x86_avx512", since = "1.89")]
 pub fn _mm512_mask_fpclass_ps_mask<const IMM8: i32>(k1: __mmask16, a: __m512) -> __mmask16 {
-    unsafe {
-        static_assert_uimm_bits!(IMM8, 8);
-        transmute(vfpclassps_512(a.as_f32x16(), IMM8, k1))
-    }
+    _mm512_fpclass_ps_mask::<IMM8>(a) & k1
 }
 
 /// Test the lower double-precision (64-bit) floating-point element in a for special categories specified
@@ -7377,19 +7359,19 @@ unsafe extern "C" {
     #[link_name = "llvm.x86.avx512.mask.reduce.ss"]
     fn vreducess(a: f32x4, b: f32x4, src: f32x4, k: __mmask8, imm8: i32, sae: i32) -> f32x4;
 
-    #[link_name = "llvm.x86.avx512.mask.fpclass.pd.128"]
-    fn vfpclasspd_128(a: f64x2, imm8: i32, k: __mmask8) -> __mmask8;
-    #[link_name = "llvm.x86.avx512.mask.fpclass.pd.256"]
-    fn vfpclasspd_256(a: f64x4, imm8: i32, k: __mmask8) -> __mmask8;
-    #[link_name = "llvm.x86.avx512.mask.fpclass.pd.512"]
-    fn vfpclasspd_512(a: f64x8, imm8: i32, k: __mmask8) -> __mmask8;
+    #[link_name = "llvm.x86.avx512.fpclass.pd.128"]
+    fn vfpclasspd_128(a: f64x2, imm8: i32) -> __mmask8;
+    #[link_name = "llvm.x86.avx512.fpclass.pd.256"]
+    fn vfpclasspd_256(a: f64x4, imm8: i32) -> __mmask8;
+    #[link_name = "llvm.x86.avx512.fpclass.pd.512"]
+    fn vfpclasspd_512(a: f64x8, imm8: i32) -> __mmask8;
 
-    #[link_name = "llvm.x86.avx512.mask.fpclass.ps.128"]
-    fn vfpclassps_128(a: f32x4, imm8: i32, k: __mmask8) -> __mmask8;
-    #[link_name = "llvm.x86.avx512.mask.fpclass.ps.256"]
-    fn vfpclassps_256(a: f32x8, imm8: i32, k: __mmask8) -> __mmask8;
-    #[link_name = "llvm.x86.avx512.mask.fpclass.ps.512"]
-    fn vfpclassps_512(a: f32x16, imm8: i32, k: __mmask16) -> __mmask16;
+    #[link_name = "llvm.x86.avx512.fpclass.ps.128"]
+    fn vfpclassps_128(a: f32x4, imm8: i32) -> __mmask8;
+    #[link_name = "llvm.x86.avx512.fpclass.ps.256"]
+    fn vfpclassps_256(a: f32x8, imm8: i32) -> __mmask8;
+    #[link_name = "llvm.x86.avx512.fpclass.ps.512"]
+    fn vfpclassps_512(a: f32x16, imm8: i32) -> __mmask16;
 
     #[link_name = "llvm.x86.avx512.mask.fpclass.sd"]
     fn vfpclasssd(a: f64x2, imm8: i32, k: __mmask8) -> __mmask8;
@@ -7401,27 +7383,25 @@ unsafe extern "C" {
 mod tests {
     use super::*;
     use crate::core_arch::assert_eq_const as assert_eq;
+    use crate::core_arch::x86::*;
 
     use stdarch_test::simd_test;
 
-    use crate::core_arch::x86::*;
-    use crate::mem::transmute;
+    const OPRND1_64: f64 = f64::from_bits(0x3333333333333333);
+    const OPRND2_64: f64 = f64::from_bits(0x5555555555555555);
 
-    const OPRND1_64: f64 = unsafe { transmute(0x3333333333333333_u64) };
-    const OPRND2_64: f64 = unsafe { transmute(0x5555555555555555_u64) };
+    const AND_64: f64 = f64::from_bits(0x1111111111111111);
+    const ANDN_64: f64 = f64::from_bits(0x4444444444444444);
+    const OR_64: f64 = f64::from_bits(0x7777777777777777);
+    const XOR_64: f64 = f64::from_bits(0x6666666666666666);
 
-    const AND_64: f64 = unsafe { transmute(0x1111111111111111_u64) };
-    const ANDN_64: f64 = unsafe { transmute(0x4444444444444444_u64) };
-    const OR_64: f64 = unsafe { transmute(0x7777777777777777_u64) };
-    const XOR_64: f64 = unsafe { transmute(0x6666666666666666_u64) };
+    const OPRND1_32: f32 = f32::from_bits(0x33333333);
+    const OPRND2_32: f32 = f32::from_bits(0x55555555);
 
-    const OPRND1_32: f32 = unsafe { transmute(0x33333333_u32) };
-    const OPRND2_32: f32 = unsafe { transmute(0x55555555_u32) };
-
-    const AND_32: f32 = unsafe { transmute(0x11111111_u32) };
-    const ANDN_32: f32 = unsafe { transmute(0x44444444_u32) };
-    const OR_32: f32 = unsafe { transmute(0x77777777_u32) };
-    const XOR_32: f32 = unsafe { transmute(0x66666666_u32) };
+    const AND_32: f32 = f32::from_bits(0x11111111);
+    const ANDN_32: f32 = f32::from_bits(0x44444444);
+    const OR_32: f32 = f32::from_bits(0x77777777);
+    const XOR_32: f32 = f32::from_bits(0x66666666);
 
     #[simd_test(enable = "avx512dq,avx512vl")]
     const fn test_mm_mask_and_pd() {
@@ -10023,11 +10003,11 @@ mod tests {
     }
 
     #[simd_test(enable = "avx512dq")]
-    const unsafe fn test_kortest_mask8_u8() {
+    const fn test_kortest_mask8_u8() {
         let a: __mmask8 = 0b01101001;
         let b: __mmask8 = 0b10110110;
         let mut all_ones: u8 = 0;
-        let r = _kortest_mask8_u8(a, b, &mut all_ones);
+        let r = unsafe { _kortest_mask8_u8(a, b, &mut all_ones) };
         assert_eq!(r, 0);
         assert_eq!(all_ones, 1);
     }
@@ -10049,7 +10029,7 @@ mod tests {
     }
 
     #[simd_test(enable = "avx512dq")]
-    const unsafe fn test_kshiftli_mask8() {
+    const fn test_kshiftli_mask8() {
         let a: __mmask8 = 0b01101001;
         let r = _kshiftli_mask8::<3>(a);
         let e: __mmask8 = 0b01001000;
@@ -10089,11 +10069,11 @@ mod tests {
     }
 
     #[simd_test(enable = "avx512dq")]
-    const unsafe fn test_ktest_mask8_u8() {
+    const fn test_ktest_mask8_u8() {
         let a: __mmask8 = 0b01101001;
         let b: __mmask8 = 0b10010110;
         let mut and_not: u8 = 0;
-        let r = _ktest_mask8_u8(a, b, &mut and_not);
+        let r = unsafe { _ktest_mask8_u8(a, b, &mut and_not) };
         assert_eq!(r, 1);
         assert_eq!(and_not, 0);
     }
@@ -10115,11 +10095,11 @@ mod tests {
     }
 
     #[simd_test(enable = "avx512dq")]
-    const unsafe fn test_ktest_mask16_u8() {
+    const fn test_ktest_mask16_u8() {
         let a: __mmask16 = 0b0110100100111100;
         let b: __mmask16 = 0b1001011011000011;
         let mut and_not: u8 = 0;
-        let r = _ktest_mask16_u8(a, b, &mut and_not);
+        let r = unsafe { _ktest_mask16_u8(a, b, &mut and_not) };
         assert_eq!(r, 1);
         assert_eq!(and_not, 0);
     }
@@ -10141,18 +10121,20 @@ mod tests {
     }
 
     #[simd_test(enable = "avx512dq")]
-    const unsafe fn test_load_mask8() {
+    const fn test_load_mask8() {
         let a: __mmask8 = 0b01101001;
-        let r = _load_mask8(&a);
+        let r = unsafe { _load_mask8(&a) };
         let e: __mmask8 = 0b01101001;
         assert_eq!(r, e);
     }
 
     #[simd_test(enable = "avx512dq")]
-    const unsafe fn test_store_mask8() {
+    const fn test_store_mask8() {
         let a: __mmask8 = 0b01101001;
         let mut r = 0;
-        _store_mask8(&mut r, a);
+        unsafe {
+            _store_mask8(&mut r, a);
+        }
         let e: __mmask8 = 0b01101001;
         assert_eq!(r, e);
     }

@@ -418,7 +418,7 @@ pub const fn _mm_min_epu32(a: __m128i, b: __m128i) -> __m128i {
     unsafe { simd_imin(a.as_u32x4(), b.as_u32x4()).as_m128i() }
 }
 
-/// Converts packed 32-bit integers from `a` and `b` to packed 16-bit integers
+/// Converts packed signed 32-bit integers from `a` and `b` to packed 16-bit integers
 /// using unsigned saturation
 ///
 /// [Intel's documentation](https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=_mm_packus_epi32)
@@ -426,8 +426,26 @@ pub const fn _mm_min_epu32(a: __m128i, b: __m128i) -> __m128i {
 #[target_feature(enable = "sse4.1")]
 #[cfg_attr(test, assert_instr(packusdw))]
 #[stable(feature = "simd_x86", since = "1.27.0")]
-pub fn _mm_packus_epi32(a: __m128i, b: __m128i) -> __m128i {
-    unsafe { transmute(packusdw(a.as_i32x4(), b.as_i32x4())) }
+#[rustc_const_unstable(feature = "stdarch_const_x86", issue = "149298")]
+pub const fn _mm_packus_epi32(a: __m128i, b: __m128i) -> __m128i {
+    unsafe {
+        let max = simd_splat(u16::MAX as i32);
+        let min = simd_splat(u16::MIN as i32);
+
+        let clamped_a = simd_imax(simd_imin(a.as_i32x4(), max), min)
+            .as_m128i()
+            .as_i16x8();
+        let clamped_b = simd_imax(simd_imin(b.as_i32x4(), max), min)
+            .as_m128i()
+            .as_i16x8();
+
+        // Shuffle the low u16 of each i32 from two concatenated vectors into
+        // the low bits of the result register.
+        const IDXS: [u32; 8] = [0, 2, 4, 6, 8, 10, 12, 14];
+        let result: i16x8 = simd_shuffle!(clamped_a, clamped_b, IDXS);
+
+        result.as_m128i()
+    }
 }
 
 /// Compares packed 64-bit integers in `a` and `b` for equality
@@ -1166,8 +1184,6 @@ pub unsafe fn _mm_stream_load_si128(mem_addr: *const __m128i) -> __m128i {
 unsafe extern "C" {
     #[link_name = "llvm.x86.sse41.insertps"]
     fn insertps(a: __m128, b: __m128, imm8: u8) -> __m128;
-    #[link_name = "llvm.x86.sse41.packusdw"]
-    fn packusdw(a: i32x4, b: i32x4) -> u16x8;
     #[link_name = "llvm.x86.sse41.dppd"]
     fn dppd(a: __m128d, b: __m128d, imm8: u8) -> __m128d;
     #[link_name = "llvm.x86.sse41.dpps"]
@@ -1219,20 +1235,20 @@ mod tests {
     }
 
     #[simd_test(enable = "sse4.1")]
-    const unsafe fn test_mm_blendv_pd() {
+    const fn test_mm_blendv_pd() {
         let a = _mm_set1_pd(0.0);
         let b = _mm_set1_pd(1.0);
-        let mask = transmute(_mm_setr_epi64x(0, -1));
+        let mask = _mm_castsi128_pd(_mm_setr_epi64x(0, -1));
         let r = _mm_blendv_pd(a, b, mask);
         let e = _mm_setr_pd(0.0, 1.0);
         assert_eq_m128d(r, e);
     }
 
     #[simd_test(enable = "sse4.1")]
-    const unsafe fn test_mm_blendv_ps() {
+    const fn test_mm_blendv_ps() {
         let a = _mm_set1_ps(0.0);
         let b = _mm_set1_ps(1.0);
-        let mask = transmute(_mm_setr_epi32(0, -1, 0, -1));
+        let mask = _mm_castsi128_ps(_mm_setr_epi32(0, -1, 0, -1));
         let r = _mm_blendv_ps(a, b, mask);
         let e = _mm_setr_ps(0.0, 1.0, 0.0, 1.0);
         assert_eq_m128(r, e);
@@ -1455,7 +1471,7 @@ mod tests {
     }
 
     #[simd_test(enable = "sse4.1")]
-    fn test_mm_packus_epi32() {
+    const fn test_mm_packus_epi32() {
         let a = _mm_setr_epi32(1, 2, 3, 4);
         let b = _mm_setr_epi32(-1, -2, -3, -4);
         let r = _mm_packus_epi32(a, b);
@@ -1949,9 +1965,9 @@ mod tests {
     }
 
     #[simd_test(enable = "sse4.1")]
-    unsafe fn test_mm_stream_load_si128() {
+    fn test_mm_stream_load_si128() {
         let a = _mm_set_epi64x(5, 6);
-        let r = _mm_stream_load_si128(core::ptr::addr_of!(a) as *const _);
+        let r = unsafe { _mm_stream_load_si128(core::ptr::addr_of!(a) as *const _) };
         assert_eq_m128i(a, r);
     }
 }

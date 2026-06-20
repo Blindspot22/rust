@@ -4,15 +4,12 @@ error[E0507]: cannot move out of `arg.field` as enum variant `Some` which is beh
 LL |     match arg.field {
    |           ^^^^^^^^^
 LL |         Some(s) => s.push('a'),
-   |              -
-   |              |
-   |              data moved here
-   |              move occurs because `s` has type `String`, which does not implement the `Copy` trait
+   |              - data moved here because `s` has type `String`, which does not implement the `Copy` trait
    |
-help: consider borrowing here
+help: consider borrowing the pattern binding
    |
-LL |     match &arg.field {
-   |           +
+LL |         Some(ref s) => s.push('a'),
+   |              +++
 
 error[E0596]: cannot borrow `s` as mutable, as it is not declared as mutable
   --> $DIR/mut-pattern-of-immutable-borrow.rs:7:20
@@ -31,10 +28,7 @@ error[E0507]: cannot move out of a shared reference
 LL |     match &arg.field {
    |           ^^^^^^^^^^
 LL |         Some(mut s) => s.push('a'),
-   |              -----
-   |              |
-   |              data moved here
-   |              move occurs because `s` has type `String`, which does not implement the `Copy` trait
+   |              ----- data moved here because `s` has type `String`, which does not implement the `Copy` trait
    |
 help: consider borrowing the pattern binding
    |

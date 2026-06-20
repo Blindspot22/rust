@@ -117,6 +117,7 @@ function getOrCreateSection(id, classes) {
         el = document.createElement("section");
         el.id = id;
         el.className = classes;
+        // MAIN_ID exists, and is not the root
         // @ts-expect-error
         insertAfter(el, document.getElementById(MAIN_ID));
     }
@@ -154,8 +155,7 @@ function switchDisplayedElement(elemToDisplay) {
     const el = getAlternativeDisplayElem();
 
     if (el.children.length > 0) {
-        // @ts-expect-error
-        getNotDisplayedElem().appendChild(el.firstElementChild);
+        getNotDisplayedElem().appendChild(nonnull(el.firstElementChild));
     }
     if (elemToDisplay === null) {
         addClass(el, "hidden");
@@ -202,7 +202,7 @@ function preLoadCss(cssUrl) {
     /**
      * Run a JavaScript file asynchronously.
      * @param {string} url
-     * @param {function(): any} errorCallback
+     * @param {function(): any} [errorCallback]
      */
     function loadScript(url, errorCallback) {
         const script = document.createElement("script");
@@ -224,14 +224,12 @@ function preLoadCss(cssUrl) {
             event.preventDefault();
             // Sending request for the CSS and the JS files at the same time so it will
             // hopefully be loaded when the JS will generate the settings content.
-            // @ts-expect-error
             loadScript(getVar("static-root-path") + getVar("settings-js"));
             // Pre-load all theme CSS files, so that switching feels seamless.
             //
             // When loading settings.html as a standalone page, the equivalent HTML is
             // generated in context.rs.
             setTimeout(() => {
-                // @ts-expect-error
                 const themes = getVar("themes").split(",");
                 for (const theme of themes) {
                     // if there are no themes, do nothing
@@ -415,12 +413,10 @@ function preLoadCss(cssUrl) {
                     }
                     window.StringdexOnload.push(() => {
                         loadScript(
-                            // @ts-expect-error
                             getVar("static-root-path") + getVar("search-js"),
                             sendSearchForm,
                         );
                     });
-                    // @ts-expect-error
                     loadScript(getVar("static-root-path") + getVar("stringdex-js"), sendSearchForm);
                     loadScript(resourcePath("search.index/root", ".js"), sendSearchForm);
                 }
@@ -622,8 +618,7 @@ function preLoadCss(cssUrl) {
      */
     function openParentDetails(elem) {
         while (elem) {
-            if (elem.tagName === "DETAILS") {
-                // @ts-expect-error
+            if (elem instanceof HTMLDetailsElement) {
                 elem.open = true;
             }
             elem = elem.parentElement;
@@ -659,10 +654,8 @@ function preLoadCss(cssUrl) {
         }
 
         if (document.activeElement &&
-            document.activeElement.tagName === "INPUT" &&
-            // @ts-expect-error
+            document.activeElement instanceof HTMLInputElement &&
             document.activeElement.type !== "checkbox" &&
-            // @ts-expect-error
             document.activeElement.type !== "radio") {
             switch (getVirtualKey(ev)) {
             case "Escape":
@@ -737,12 +730,15 @@ function preLoadCss(cssUrl) {
             const ul = document.createElement("ul");
             ul.className = "block " + shortty;
 
-            for (const name of filtered) {
+            for (const item of filtered) {
+                const [name, isMacro] = Array.isArray(item) ? [item[0], true] : [item, false];
                 let path;
                 if (shortty === "mod") {
                     path = `${modpath}${name}/index.html`;
-                } else {
+                } else if (!isMacro) {
                     path = `${modpath}${shortty}.${name}.html`;
+                } else {
+                    path = `${modpath}macro.${name}.html`;
                 }
                 let current_page = document.location.href.toString();
                 if (current_page.endsWith("/")) {
@@ -791,7 +787,7 @@ function preLoadCss(cssUrl) {
             //block("associatedconstant", "associated-consts", "Associated Constants");
             block("foreigntype", "foreign-types", "Foreign Types");
             block("keyword", "keywords", "Keywords");
-            block("attribute", "attributes", "Attributes");
+            block("attribute", "attribute-docs", "Attributes");
             block("attr", "attributes", "Attribute Macros");
             block("derive", "derives", "Derive Macros");
             block("traitalias", "trait-aliases", "Trait Aliases");
@@ -814,6 +810,7 @@ function preLoadCss(cssUrl) {
         }
         const implementors = implementorsElems("implementors-list");
         const syntheticImplementors = implementorsElems("synthetic-implementors-list");
+        /** @type {Set<string>} */
         const inlined_types = new Set();
 
         const TEXT_IDX = 0;
@@ -832,17 +829,14 @@ function preLoadCss(cssUrl) {
                 if (!aliases) {
                     return;
                 }
-                // @ts-expect-error
-                aliases.split(",").forEach(alias => {
+                aliases.split(",").forEach(/** @param {string} alias */ alias => {
                     inlined_types.add(alias);
                 });
             });
         }
 
-        // @ts-expect-error
-        let currentNbImpls = implementors[0].getElementsByClassName("impl").length;
-        // @ts-expect-error
-        const traitName = document.querySelector(".main-heading h1 > .trait").textContent;
+        let currentNbImpls = nonnull(implementors[0]).getElementsByClassName("impl").length;
+        const traitName = nonnull(document.querySelector(".main-heading h1 > .trait")).textContent;
         const baseIdName = "impl-" + traitName + "-";
         const libs = Object.getOwnPropertyNames(imp);
         // We don't want to include impls from this JS file, when the HTML already has them.
@@ -862,7 +856,8 @@ function preLoadCss(cssUrl) {
 
             struct_loop:
             for (const struct of structs) {
-                const list = struct[SYNTHETIC_IDX] ? syntheticImplementors : implementors;
+                const [impList, negImpMarker] =
+                    struct[SYNTHETIC_IDX] ? syntheticImplementors : implementors;
 
                 // The types list is only used for synthetic impls.
                 // If this changes, `main.js` and `write_shared.rs` both need changed.
@@ -901,11 +896,9 @@ function preLoadCss(cssUrl) {
                 // If this is a negative implementor, we put it into the right location (just
                 // before the negative impl marker).
                 if (struct[IS_NEG_IDX]) {
-                    // @ts-expect-error
-                    list[1].before(display);
+                    nonnull(negImpMarker).before(display);
                 } else {
-                    // @ts-expect-error
-                    list[0].appendChild(display);
+                    nonnull(impList).appendChild(display);
                 }
                 currentNbImpls += 1;
             }
@@ -969,20 +962,19 @@ function preLoadCss(cssUrl) {
         const selfPath = script ? script.getAttribute("data-self-path") : null;
 
         // These sidebar blocks need filled in, too.
-        const mainContent = document.querySelector("#main-content");
-        const sidebarSection = document.querySelector(".sidebar section");
+        const mainContent = nonnull(document.querySelector("#main-content"));
+        const sidebarSection = nonnull(document.querySelector(".sidebar section"));
         let methods = document.querySelector(".sidebar .block.method");
         let associatedTypes = document.querySelector(".sidebar .block.associatedtype");
         let associatedConstants = document.querySelector(".sidebar .block.associatedconstant");
         let sidebarTraitList = document.querySelector(".sidebar .block.trait-implementation");
 
-        // @ts-expect-error
-        for (const impList of imp[window.currentCrate]) {
+        for (const impList of imp[nonnull(window.currentCrate)]) {
             const types = impList.slice(2);
             const text = impList[0];
-            const isTrait = impList[1] !== 0;
             const traitName = impList[1];
-            if (types.indexOf(selfPath) === -1) {
+            const isTrait = typeof traitName === "string";
+            if (selfPath === null || types.indexOf(selfPath) === -1) {
                 continue;
             }
             let outputList = isTrait ? trait_implementations : implementations;
@@ -1005,28 +997,19 @@ function preLoadCss(cssUrl) {
                     h.appendChild(link);
                     trait_implementations = outputList;
                     trait_implementations_header = outputListHeader;
-                    // @ts-expect-error
                     sidebarSection.appendChild(h);
                     sidebarTraitList = document.createElement("ul");
                     sidebarTraitList.className = "block trait-implementation";
-                    // @ts-expect-error
                     sidebarSection.appendChild(sidebarTraitList);
-                    // @ts-expect-error
                     mainContent.appendChild(outputListHeader);
-                    // @ts-expect-error
                     mainContent.appendChild(outputList);
                 } else {
                     implementations = outputList;
                     if (trait_implementations) {
-                        // @ts-expect-error
                         mainContent.insertBefore(outputListHeader, trait_implementations_header);
-                        // @ts-expect-error
                         mainContent.insertBefore(outputList, trait_implementations_header);
                     } else {
-                        const mainContent = document.querySelector("#main-content");
-                        // @ts-expect-error
                         mainContent.appendChild(outputListHeader);
-                        // @ts-expect-error
                         mainContent.appendChild(outputList);
                     }
                 }
@@ -1071,8 +1054,7 @@ function preLoadCss(cssUrl) {
             if (isTrait) {
                 const li = document.createElement("li");
                 const a = document.createElement("a");
-                // @ts-expect-error
-                a.href = `#${template.content.querySelector(".impl").id}`;
+                a.href = `#${nonnull(template.content.querySelector(".impl")).id}`;
                 a.textContent = traitName;
                 li.appendChild(a);
                 // @ts-expect-error
@@ -1099,14 +1081,10 @@ function preLoadCss(cssUrl) {
                         const insertionReference = methods || sidebarTraitList;
                         if (insertionReference) {
                             const insertionReferenceH = insertionReference.previousElementSibling;
-                            // @ts-expect-error
                             sidebarSection.insertBefore(blockHeader, insertionReferenceH);
-                            // @ts-expect-error
                             sidebarSection.insertBefore(block, insertionReferenceH);
                         } else {
-                            // @ts-expect-error
                             sidebarSection.appendChild(blockHeader);
-                            // @ts-expect-error
                             sidebarSection.appendChild(block);
                         }
                         if (hasClass(item, "associatedtype")) {
@@ -1692,7 +1670,7 @@ function preLoadCss(cssUrl) {
 
         const container = document.createElement("div");
         if (!isHelpPage) {
-            container.className = "popover content";
+            container.className = "popover";
         }
         container.id = "help";
 
@@ -1701,9 +1679,14 @@ function preLoadCss(cssUrl) {
         side_by_side.appendChild(div_shortcuts);
         side_by_side.appendChild(div_infos);
 
-        container.appendChild(book_info);
-        container.appendChild(side_by_side);
-        container.appendChild(rustdoc_version);
+        const content = document.createElement("div");
+        content.className = "content";
+
+        content.appendChild(book_info);
+        content.appendChild(side_by_side);
+        content.appendChild(rustdoc_version);
+
+        container.appendChild(content);
 
         if (isHelpPage) {
             const help_section = document.createElement("section");
@@ -2138,20 +2121,27 @@ function preLoadCss(cssUrl) {
         return;
     }
     but.onclick = () => {
-        // Most page titles are '<Item> in <path::to::module> - Rust', except
-        // modules (which don't have the first part) and keywords/primitives
-        // (which don't have a module path)
-        const titleElement = document.querySelector("title");
-        const title = titleElement && titleElement.textContent ?
-                      titleElement.textContent.replace(" - Rust", "") : "";
-        const [item, module] = title.split(" in ");
-        const path = [item];
-        if (module !== undefined) {
-            path.unshift(module);
-        }
+        // We get the path from the "breadcrumbs" and the actual item name.
+        let path = "";
+        // @ts-expect-error
+        const heading = document.getElementById(MAIN_ID).querySelector(".main-heading");
 
-        copyContentToClipboard(path.join("::"));
-        copyButtonAnimation(but);
+        if (heading) {
+            const breadcrumbs = heading.querySelector(".rustdoc-breadcrumbs");
+            if (breadcrumbs) {
+                // @ts-expect-error
+                path = breadcrumbs.innerText;
+                if (path.length > 0) {
+                    path += "::";
+                }
+            }
+
+            // @ts-expect-error
+            path += heading.querySelector("h1 > span").innerText;
+
+            copyContentToClipboard(path);
+            copyButtonAnimation(but);
+        }
     };
 
     /**

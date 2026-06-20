@@ -297,6 +297,7 @@ pub fn sync_channel<T>(cap: usize) -> (Sender<T>, Receiver<T>) {
 /// assert_eq!(3, msg + msg2);
 /// ```
 #[unstable(feature = "mpmc_channel", issue = "126840")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "MpmcSender")]
 pub struct Sender<T> {
     flavor: SenderFlavor<T>,
 }
@@ -623,6 +624,33 @@ impl<T> Sender<T> {
             _ => false,
         }
     }
+
+    /// Returns `true` if the channel is disconnected.
+    ///
+    /// Note that a return value of `false` does not guarantee the channel will
+    /// remain connected. The channel may be disconnected immediately after this method
+    /// returns, so a subsequent [`Sender::send`] may still fail with [`SendError`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(mpmc_channel)]
+    ///
+    /// use std::sync::mpmc::channel;
+    ///
+    /// let (tx, rx) = channel::<i32>();
+    /// assert!(!tx.is_disconnected());
+    /// drop(rx);
+    /// assert!(tx.is_disconnected());
+    /// ```
+    #[unstable(feature = "mpmc_channel", issue = "126840")]
+    pub fn is_disconnected(&self) -> bool {
+        match &self.flavor {
+            SenderFlavor::Array(chan) => chan.is_disconnected(),
+            SenderFlavor::List(chan) => chan.is_disconnected(),
+            SenderFlavor::Zero(chan) => chan.is_disconnected(),
+        }
+    }
 }
 
 #[unstable(feature = "mpmc_channel", issue = "126840")]
@@ -695,6 +723,7 @@ impl<T> fmt::Debug for Sender<T> {
 /// rx_thread_2.join().unwrap();
 /// ```
 #[unstable(feature = "mpmc_channel", issue = "126840")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "MpmcReceiver")]
 pub struct Receiver<T> {
     flavor: ReceiverFlavor<T>,
 }
@@ -1348,6 +1377,33 @@ impl<T> Receiver<T> {
     #[unstable(feature = "mpmc_channel", issue = "126840")]
     pub fn iter(&self) -> Iter<'_, T> {
         Iter { rx: self }
+    }
+
+    /// Returns `true` if the channel is disconnected.
+    ///
+    /// Note that a return value of `false` does not guarantee the channel will
+    /// remain connected. The channel may be disconnected immediately after this method
+    /// returns, so a subsequent [`Receiver::recv`] may still fail with [`RecvError`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(mpmc_channel)]
+    ///
+    /// use std::sync::mpmc::channel;
+    ///
+    /// let (tx, rx) = channel::<i32>();
+    /// assert!(!rx.is_disconnected());
+    /// drop(tx);
+    /// assert!(rx.is_disconnected());
+    /// ```
+    #[unstable(feature = "mpmc_channel", issue = "126840")]
+    pub fn is_disconnected(&self) -> bool {
+        match &self.flavor {
+            ReceiverFlavor::Array(chan) => chan.is_disconnected(),
+            ReceiverFlavor::List(chan) => chan.is_disconnected(),
+            ReceiverFlavor::Zero(chan) => chan.is_disconnected(),
+        }
     }
 }
 

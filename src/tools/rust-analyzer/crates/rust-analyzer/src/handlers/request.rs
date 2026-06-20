@@ -7,9 +7,9 @@ use anyhow::Context;
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use ide::{
-    AssistKind, AssistResolveStrategy, Cancellable, CompletionFieldsToResolve, FilePosition,
-    FileRange, FileStructureConfig, FindAllRefsConfig, HoverAction, HoverGotoTypeData,
-    InlayFieldsToResolve, Query, RangeInfo, ReferenceCategory, Runnable, RunnableKind,
+    AssistKind, AssistResolveStrategy, Cancellable, CompletionFieldsToResolve,
+    CompletionItemImport, FilePosition, FileRange, FileStructureConfig, FindAllRefsConfig,
+    HoverAction, HoverGotoTypeData, InlayFieldsToResolve, Query, RangeInfo, Runnable, RunnableKind,
     SingleResolve, SourceChange, TextEdit,
 };
 use ide_db::{FxHashMap, SymbolKind};
@@ -332,7 +332,7 @@ pub(crate) fn handle_view_crate_graph(
     params: ViewCrateGraphParams,
 ) -> anyhow::Result<String> {
     let _p = tracing::info_span!("handle_view_crate_graph").entered();
-    let dot = snap.analysis.view_crate_graph(params.full)?.map_err(anyhow::Error::msg)?;
+    let dot = snap.analysis.view_crate_graph(params.full)?;
     Ok(dot)
 }
 
@@ -1049,7 +1049,6 @@ pub(crate) fn handle_runnables(
                         all_targets = if all_targets { " --all-targets" } else { "" }
                     ),
                     location: None,
-                    kind: lsp_ext::RunnableKind::Cargo,
                     args: lsp_ext::RunnableArgs::Cargo(lsp_ext::CargoRunnableArgs {
                         workspace_root: Some(spec.workspace_root.clone().into()),
                         cwd: cwd.into(),
@@ -1076,7 +1075,6 @@ pub(crate) fn handle_runnables(
                 res.push(lsp_ext::Runnable {
                     label: "cargo check --workspace".to_owned(),
                     location: None,
-                    kind: lsp_ext::RunnableKind::Cargo,
                     args: lsp_ext::RunnableArgs::Cargo(lsp_ext::CargoRunnableArgs {
                         workspace_root: None,
                         cwd: path.as_path().unwrap().to_path_buf().into(),
@@ -1233,7 +1231,10 @@ pub(crate) fn handle_completion_resolve(
             .resolve_completion_edits(
                 &forced_resolve_completions_config,
                 position,
-                resolve_data.imports.into_iter().map(|import| import.full_import_path),
+                resolve_data.imports.into_iter().map(|import| CompletionItemImport {
+                    path: import.full_import_path,
+                    as_underscore: import.as_underscore,
+                }),
             )?
             .into_iter()
             .flat_map(|edit| edit.into_iter().map(|indel| to_proto::text_edit(&line_index, indel)))
@@ -1264,11 +1265,15 @@ pub(crate) fn handle_folding_range(
     params: FoldingRangeParams,
 ) -> anyhow::Result<Option<Vec<FoldingRange>>> {
     let _p = tracing::info_span!("handle_folding_range").entered();
+
     let file_id = try_default!(from_proto::file_id(&snap, &params.text_document.uri)?);
-    let folds = snap.analysis.folding_ranges(file_id)?;
+    let collapsed_text = snap.config.folding_range_collapsed_text();
+    let folds = snap.analysis.folding_ranges(file_id, collapsed_text)?;
+
     let text = snap.analysis.file_text(file_id)?;
     let line_index = snap.file_line_index(file_id)?;
     let line_folding_only = snap.config.line_folding_only();
+
     let res = folds
         .into_iter()
         .map(|it| to_proto::folding_range(&text, &line_index, line_folding_only, it))
@@ -1392,10 +1397,14 @@ pub(crate) fn handle_references(
 
     let exclude_imports = snap.config.find_all_refs_exclude_imports();
     let exclude_tests = snap.config.find_all_refs_exclude_tests();
-
     let Some(refs) = snap.analysis.find_all_refs(
         position,
-        &FindAllRefsConfig { search_scope: None, minicore: snap.minicore() },
+        &FindAllRefsConfig {
+            search_scope: None,
+            ra_fixture: snap.config.ra_fixture(snap.minicore()),
+            exclude_imports,
+            exclude_tests,
+        },
     )?
     else {
         return Ok(None);
@@ -1416,12 +1425,7 @@ pub(crate) fn handle_references(
             refs.references
                 .into_iter()
                 .flat_map(|(file_id, refs)| {
-                    refs.into_iter()
-                        .filter(|&(_, category)| {
-                            (!exclude_imports || !category.contains(ReferenceCategory::IMPORT))
-                                && (!exclude_tests || !category.contains(ReferenceCategory::TEST))
-                        })
-                        .map(move |(range, _)| FileRange { file_id, range })
+                    refs.into_iter().map(move |(range, _)| FileRange { file_id, range })
                 })
                 .chain(decl)
         })
@@ -1658,7 +1662,10 @@ pub(crate) fn handle_code_lens(
                 .map(|spec| {
                     matches!(
                         spec.target_kind(),
-                        TargetKind::Bin | TargetKind::Example | TargetKind::Test
+                        TargetKind::Bin
+                            | TargetKind::Example
+                            | TargetKind::Test
+                            | TargetKind::Bench
                     )
                 })
                 .unwrap_or(false),
@@ -2202,7 +2209,13 @@ fn show_ref_command_link(
             .analysis
             .find_all_refs(
                 *position,
-                &FindAllRefsConfig { search_scope: None, minicore: snap.minicore() },
+                &FindAllRefsConfig {
+                    search_scope: None,
+
+                    ra_fixture: snap.config.ra_fixture(snap.minicore()),
+                    exclude_imports: snap.config.find_all_refs_exclude_imports(),
+                    exclude_tests: snap.config.find_all_refs_exclude_tests(),
+                },
             )
             .unwrap_or(None)
     {
@@ -2335,7 +2348,7 @@ fn should_skip_target(runnable: &Runnable, cargo_spec: Option<&TargetSpec>) -> b
             match &cargo_spec {
                 Some(spec) => !matches!(
                     spec.target_kind(),
-                    TargetKind::Bin | TargetKind::Example | TargetKind::Test
+                    TargetKind::Bin | TargetKind::Example | TargetKind::Test | TargetKind::Bench
                 ),
                 None => true,
             }
@@ -2432,8 +2445,7 @@ fn run_rustfmt(
         }
         RustfmtConfig::CustomCommand { command, args } => {
             let cmd = Utf8PathBuf::from(&command);
-            let target_spec =
-                crates.first().and_then(|&crate_id| snap.target_spec_for_file(file_id, crate_id));
+            let target_spec = TargetSpec::for_file(snap, file_id).ok().flatten();
             let extra_env = snap.config.extra_env(source_root_id);
             let mut cmd = match target_spec {
                 Some(TargetSpec::Cargo(_)) => {
@@ -2443,7 +2455,14 @@ fn run_rustfmt(
                     let cmd_path = if command.contains(std::path::MAIN_SEPARATOR)
                         || (cfg!(windows) && command.contains('/'))
                     {
-                        snap.config.root_path().join(cmd).into()
+                        let project_root = Utf8PathBuf::from_path_buf(current_dir.clone())
+                            .ok()
+                            .and_then(|p| AbsPathBuf::try_from(p).ok());
+                        let project_root = project_root
+                            .as_ref()
+                            .map(|dir| snap.config.workspace_root_for(dir))
+                            .unwrap_or(snap.config.default_root_path());
+                        project_root.join(cmd).into()
                     } else {
                         cmd
                     };
@@ -2577,6 +2596,28 @@ pub(crate) fn internal_testing_fetch_config(
             )
         }
     }))
+}
+
+pub(crate) fn handle_evaluate_predicate(
+    snap: GlobalStateSnapshot,
+    params: lsp_ext::EvaluatePredicateParams,
+) -> anyhow::Result<lsp_ext::EvaluatePredicateResult> {
+    let _p = tracing::info_span!("handle_evaluate_predicate").entered();
+    let file_id = try_default!(from_proto::file_id(&snap, &params.text_document.uri)?);
+    let line_index = snap.file_line_index(file_id)?;
+    let offset = from_proto::offset(&line_index, params.position)?;
+
+    let result = snap.analysis.evaluate_predicate(params.text, FilePosition { file_id, offset })?;
+    let status = match result.status {
+        ide::PredicateEvaluationStatus::Holds => lsp_ext::PredicateEvaluationStatus::Holds,
+        ide::PredicateEvaluationStatus::NotProven => lsp_ext::PredicateEvaluationStatus::NotProven,
+        ide::PredicateEvaluationStatus::Invalid => lsp_ext::PredicateEvaluationStatus::Invalid,
+        ide::PredicateEvaluationStatus::Unsupported => {
+            lsp_ext::PredicateEvaluationStatus::Unsupported
+        }
+    };
+
+    Ok(lsp_ext::EvaluatePredicateResult { status, message: result.message })
 }
 
 pub(crate) fn get_failed_obligations(

@@ -462,6 +462,12 @@ pub enum FullInt {
     U(u128),
 }
 
+impl FullInt {
+    pub fn is_zero(self) -> bool {
+        matches!(self, Self::S(0) | Self::U(0))
+    }
+}
+
 impl PartialEq for FullInt {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
@@ -488,6 +494,25 @@ impl Ord for FullInt {
             (S(s), U(o)) => cmp_s_u(s, o),
             (U(s), S(o)) => cmp_s_u(o, s).reverse(),
         }
+    }
+}
+
+/// Evaluates an expression if it's a builtin integer type.
+pub fn eval_int(cx: &LateContext<'_>, e: &Expr<'_>) -> Option<FullInt> {
+    match e.kind {
+        ExprKind::Lit(lit) if let LitKind::Int(val, _) = lit.node => Some(FullInt::U(val.0)),
+        ExprKind::Unary(UnOp::Neg, e)
+            if let ExprKind::Lit(lit) = e.kind
+                && let LitKind::Int(val, _) = lit.node =>
+        {
+            Some(FullInt::S(val.0.cast_signed().wrapping_neg()))
+        },
+        _ if let ty = cx.typeck_results().expr_ty(e)
+            && let ty::Int(_) | ty::Uint(_) = *ty.kind() =>
+        {
+            ConstEvalCtxt::new(cx).eval(e).and_then(|x| x.int_value(cx.tcx, ty))
+        },
+        _ => None,
     }
 }
 
@@ -753,7 +778,7 @@ impl<'tcx> ConstEvalCtxt<'tcx> {
             QPath::Resolved(None, path)
                 if path.span.ctxt() == self.ctxt.get()
                     && path.segments.iter().all(|s| self.ctxt.get() == s.ident.span.ctxt())
-                    && let Res::Def(DefKind::Const, did) = path.res
+                    && let Res::Def(DefKind::Const { .. }, did) = path.res
                     && (matches!(
                         self.tcx.get_diagnostic_name(did),
                         Some(
@@ -841,11 +866,19 @@ impl<'tcx> ConstEvalCtxt<'tcx> {
                     && ty.span.ctxt() == self.ctxt.get()
                     && ty_name.ident.span.ctxt() == self.ctxt.get()
                     && matches!(ty_path.res, Res::PrimTy(_))
-                    && let Some((DefKind::AssocConst, did)) = self.typeck.type_dependent_def(id) =>
+                    && let Some((DefKind::AssocConst { .. }, did)) = self.typeck.type_dependent_def(id)
+                    && self.tcx.inherent_impl_of_assoc(did).is_some() =>
             {
                 did
             },
-            _ if let Res::Def(DefKind::Const | DefKind::AssocConst, did) = self.typeck.qpath_res(qpath, id) => {
+            // TODO: revisit when feature `min_generic_const_args` is stabilized. In the meantime,
+            // `TyCtxt::const_eval_resolve()` will trigger an ICE when evaluating the body of the
+            // `type const` definition.
+            _ if let Res::Def(
+                DefKind::Const { is_type_const: false } | DefKind::AssocConst { is_type_const: false },
+                did,
+            ) = self.typeck.qpath_res(qpath, id) =>
+            {
                 self.source.set(ConstantSource::NonLocal);
                 did
             },
@@ -1142,7 +1175,7 @@ pub fn const_item_rhs_to_expr<'tcx>(tcx: TyCtxt<'tcx>, ct_rhs: ConstItemRhs<'tcx
             ConstArgKind::Anon(anon) => Some(tcx.hir_body(anon.body).value),
             ConstArgKind::Struct(..)
             | ConstArgKind::Tup(..)
-            | ConstArgKind::Literal(..)
+            | ConstArgKind::Literal { .. }
             | ConstArgKind::TupleCall(..)
             | ConstArgKind::Array(..)
             | ConstArgKind::Path(_)

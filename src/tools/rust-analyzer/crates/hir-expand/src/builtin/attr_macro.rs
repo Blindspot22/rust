@@ -115,14 +115,14 @@ fn dummy_gate_test_expand(
 /// wasting a lot of memory, and it would also require some way to use a path in a way that makes it
 /// always resolve as a derive without nameres recollecting them.
 /// So this hacky approach is a lot more friendly for us, though it does require a bit of support in
-/// [`hir::Semantics`] to make this work.
+/// hir::Semantics to make this work.
 fn derive_expand(
     db: &dyn ExpandDatabase,
     id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    let loc = db.lookup_intern_macro_call(id);
+    let loc = id.loc(db);
     let derives = match &loc.kind {
         MacroCallKind::Attr { attr_args: Some(attr_args), .. } if loc.def.is_attribute_derive() => {
             attr_args

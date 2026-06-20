@@ -51,7 +51,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: checkout the source code
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           submodules: recursive
       - name: install the bootstrap toolchain
@@ -62,21 +62,11 @@ jobs:
           rustup toolchain install --no-self-update --profile minimal $TOOLCHAIN
           rustup default $TOOLCHAIN
 
-      - name: cargo update compiler & tools
-        # Remove first line that always just says "Updating crates.io index"
-        run: |
-          echo -e "\ncompiler & tools dependencies:" >> cargo_update.log
-          cargo update 2>&1 | sed '/crates.io index/d' | tee -a cargo_update.log
-      - name: cargo update library
-        run: |
-          echo -e "\nlibrary dependencies:" >> cargo_update.log
-          cargo update --manifest-path library/Cargo.toml 2>&1 | sed '/crates.io index/d' | tee -a cargo_update.log
-      - name: cargo update rustbook
-        run: |
-          echo -e "\nrustbook dependencies:" >> cargo_update.log
-          cargo update --manifest-path src/tools/rustbook/Cargo.toml 2>&1 | sed '/crates.io index/d' | tee -a cargo_update.log
+      - name: cargo update
+        run: ./src/tools/update-lockfile.sh
+
       - name: upload Cargo.lock artifact for use in PR
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: Cargo-lock
           path: |
@@ -85,7 +75,7 @@ jobs:
             src/tools/rustbook/Cargo.lock
           retention-days: 1
       - name: upload cargo-update log artifact for use in PR
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: cargo-updates
           path: cargo_update.log
@@ -101,14 +91,14 @@ jobs:
       pull-requests: write
     steps:
       - name: checkout the source code
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: download Cargo.lock from update job
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: Cargo-lock
       - name: download cargo-update log from update job
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: cargo-updates
 

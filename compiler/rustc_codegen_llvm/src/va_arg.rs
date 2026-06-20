@@ -1,4 +1,4 @@
-use rustc_abi::{Align, BackendRepr, Endian, HasDataLayout, Primitive, Size};
+use rustc_abi::{Align, BackendRepr, CVariadicStatus, Endian, HasDataLayout, Primitive, Size};
 use rustc_codegen_ssa::MemFlags;
 use rustc_codegen_ssa::common::IntPredicate;
 use rustc_codegen_ssa::mir::operand::OperandRef;
@@ -8,10 +8,10 @@ use rustc_codegen_ssa::traits::{
 use rustc_middle::bug;
 use rustc_middle::ty::Ty;
 use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf, TyAndLayout};
-use rustc_target::spec::{Abi, Arch, Env};
+use rustc_target::spec::{Arch, Env, LlvmAbi, RustcAbi};
 
 use crate::builder::Builder;
-use crate::llvm::{Type, Value};
+use crate::llvm::Value;
 use crate::type_of::LayoutLlvmExt;
 
 fn round_up_to_alignment<'ll>(
@@ -27,13 +27,14 @@ fn round_pointer_up_to_alignment<'ll>(
     bx: &mut Builder<'_, 'll, '_>,
     addr: &'ll Value,
     align: Align,
-    ptr_ty: &'ll Type,
 ) -> &'ll Value {
     let ptr = bx.inbounds_ptradd(addr, bx.const_i32(align.bytes() as i32 - 1));
+    let pointer_width = bx.tcx().sess.target.pointer_width;
+    let mask = align.bytes().wrapping_neg() & (u64::MAX >> (64 - pointer_width));
     bx.call_intrinsic(
         "llvm.ptrmask",
-        &[ptr_ty, bx.type_i32()],
-        &[ptr, bx.const_int(bx.isize_ty, -(align.bytes() as isize) as i64)],
+        &[bx.type_ptr(), bx.type_isize()],
+        &[ptr, bx.const_usize(mask)],
     )
 }
 
@@ -53,7 +54,7 @@ fn emit_direct_ptr_va_arg<'ll, 'tcx>(
     let ptr = bx.load(va_list_ty, va_list_addr, ptr_align_abi);
 
     let (addr, addr_align) = if allow_higher_align && align > slot_size {
-        (round_pointer_up_to_alignment(bx, ptr, align, bx.type_ptr()), align)
+        (round_pointer_up_to_alignment(bx, ptr, align), align)
     } else {
         (ptr, slot_size)
     };
@@ -69,7 +70,8 @@ fn emit_direct_ptr_va_arg<'ll, 'tcx>(
     {
         let adjusted_size = bx.cx().const_i32((slot_size.bytes() - size.bytes()) as i32);
         let adjusted = bx.inbounds_ptradd(addr, adjusted_size);
-        (adjusted, addr_align)
+        // We're in the middle of a slot now, so use the type's alignment, not the slot's.
+        (adjusted, align)
     } else {
         (addr, addr_align)
     }
@@ -86,11 +88,30 @@ enum SlotSize {
     Bytes1 = 1,
 }
 
+/// Whether to respect a value alignment that is higher than the slot alignment.
+///
+/// When `No` the argument is in the next slot, when `Yes` there will be empty slots
+/// until a slot's starting address has the required alignment.
 enum AllowHigherAlign {
     No,
     Yes,
 }
 
+/// Determines where in the slot the value is located. Only takes effect on big-endian targets.
+///
+/// with 8-byte slots, a 32-bit integer is either stored right-adjusted:
+///
+/// ```text
+/// [0x0, 0x0, 0x0, 0x0, 0xaa, 0xaa, 0xaa, 0xaa]
+/// ```
+///
+/// or left-adjusted:
+///
+/// ```text
+/// [0xaa, 0xaa, 0xaa, 0xaa, 0x0, 0x0, 0x0, 0x0]
+/// ```
+///
+/// Most big-endian targets store values as right-adjusted.
 enum ForceRightAdjust {
     No,
     Yes,
@@ -131,7 +152,7 @@ fn emit_ptr_va_arg<'ll, 'tcx>(
     );
     if indirect {
         let tmp_ret = bx.load(llty, addr, addr_align);
-        bx.load(bx.cx.layout_of(target_ty).llvm_type(bx.cx), tmp_ret, align.abi)
+        bx.load(layout.llvm_type(bx.cx), tmp_ret, align.abi)
     } else {
         bx.load(llty, addr, addr_align)
     }
@@ -272,7 +293,7 @@ fn emit_powerpc_va_arg<'ll, 'tcx>(
 
     // Rust does not currently support any powerpc softfloat targets.
     let target = &bx.cx.tcx.sess.target;
-    let is_soft_float_abi = target.abi == Abi::SoftFloat;
+    let is_soft_float_abi = target.rustc_abi == Some(RustcAbi::Softfloat);
     assert!(!is_soft_float_abi);
 
     // All instances of VaArgSafe are passed directly.
@@ -357,12 +378,8 @@ fn emit_powerpc_va_arg<'ll, 'tcx>(
 
         // Round up address of argument to alignment
         if layout.layout.align.abi > overflow_area_align {
-            overflow_area = round_pointer_up_to_alignment(
-                bx,
-                overflow_area,
-                layout.layout.align.abi,
-                bx.type_ptr(),
-            );
+            overflow_area =
+                round_pointer_up_to_alignment(bx, overflow_area, layout.layout.align.abi);
         }
 
         let mem_addr = overflow_area;
@@ -551,7 +568,7 @@ fn emit_x86_64_sysv64_va_arg<'ll, 'tcx>(
             registers_for_primitive(scalar1.primitive());
             registers_for_primitive(scalar2.primitive());
         }
-        BackendRepr::SimdVector { .. } | BackendRepr::ScalableVector { .. } => {
+        BackendRepr::SimdVector { .. } | BackendRepr::SimdScalableVector { .. } => {
             // Because no instance of VaArgSafe uses a non-scalar `BackendRepr`.
             unreachable!(
                 "No x86-64 SysV va_arg implementation for {:?}",
@@ -692,7 +709,7 @@ fn emit_x86_64_sysv64_va_arg<'ll, 'tcx>(
         }
         // The Previous match on `BackendRepr` means control flow already escaped.
         BackendRepr::SimdVector { .. }
-        | BackendRepr::ScalableVector { .. }
+        | BackendRepr::SimdScalableVector { .. }
         | BackendRepr::Memory { .. } => unreachable!(),
     };
 
@@ -827,7 +844,7 @@ fn emit_hexagon_va_arg_musl<'ll, 'tcx>(
     } else {
         Align::from_bytes(4).unwrap()
     };
-    let aligned_current = round_pointer_up_to_alignment(bx, current_ptr, arg_align, bx.type_ptr());
+    let aligned_current = round_pointer_up_to_alignment(bx, current_ptr, arg_align);
 
     // Calculate next pointer position (following LLVM's logic)
     // Arguments <= 32 bits take 4 bytes, > 32 bits take 8 bytes
@@ -849,8 +866,7 @@ fn emit_hexagon_va_arg_musl<'ll, 'tcx>(
     bx.switch_to_block(from_overflow);
 
     // Align overflow pointer using the same alignment rules
-    let aligned_overflow =
-        round_pointer_up_to_alignment(bx, overflow_ptr, arg_align, bx.type_ptr());
+    let aligned_overflow = round_pointer_up_to_alignment(bx, overflow_ptr, arg_align);
 
     let overflow_value_addr = aligned_overflow;
     // Update overflow pointer - use the same size calculation
@@ -890,7 +906,7 @@ fn emit_hexagon_va_arg_bare_metal<'ll, 'tcx>(
     let aligned_ptr = if ty_align.bytes() > 4 {
         // Ensure alignment is a power of 2
         debug_assert!(ty_align.bytes().is_power_of_two(), "Alignment is not power of 2!");
-        round_pointer_up_to_alignment(bx, current_ptr, ty_align, bx.type_ptr())
+        round_pointer_up_to_alignment(bx, current_ptr, ty_align)
     } else {
         current_ptr
     };
@@ -978,7 +994,7 @@ fn emit_xtensa_va_arg<'ll, 'tcx>(
 
     // let offset_next_corrected = offset_corrected + slot_size;
     // va_ndx = offset_next_corrected;
-    let offset_next_corrected = bx.add(offset_next, bx.const_i32(slot_size));
+    let offset_next_corrected = bx.add(offset_corrected, bx.const_i32(slot_size));
     // update va_ndx
     bx.store(offset_next_corrected, offset_ptr, ptr_align_abi);
 
@@ -1007,6 +1023,8 @@ fn emit_xtensa_va_arg<'ll, 'tcx>(
 
 /// Determine the va_arg implementation to use. The LLVM va_arg instruction
 /// is lacking in some instances, so we should only use it as a fallback.
+///
+/// <https://llvm.org/docs/LangRef.html#va-arg-instruction>
 pub(super) fn emit_va_arg<'ll, 'tcx>(
     bx: &mut Builder<'_, 'll, 'tcx>,
     addr: OperandRef<'tcx, &'ll Value>,
@@ -1015,7 +1033,13 @@ pub(super) fn emit_va_arg<'ll, 'tcx>(
     let layout = bx.cx.layout_of(target_ty);
     let target_ty_size = layout.layout.size().bytes();
 
+    // Some ABIs have special behavior for zero-sized types. currently `VaArgSafe` is not
+    // implemented for any zero-sized types, so this assert should always hold.
+    assert!(!bx.layout_of(target_ty).is_zst());
+
     let target = &bx.cx.tcx.sess.target;
+    let stability = target.supports_c_variadic_definitions();
+
     match target.arch {
         Arch::X86 => emit_ptr_va_arg(
             bx,
@@ -1026,17 +1050,24 @@ pub(super) fn emit_va_arg<'ll, 'tcx>(
             if target.is_like_windows { AllowHigherAlign::No } else { AllowHigherAlign::Yes },
             ForceRightAdjust::No,
         ),
-        Arch::AArch64 | Arch::Arm64EC if target.is_like_windows || target.is_like_darwin => {
-            emit_ptr_va_arg(
-                bx,
-                addr,
-                target_ty,
-                PassMode::Direct,
-                SlotSize::Bytes8,
-                if target.is_like_windows { AllowHigherAlign::No } else { AllowHigherAlign::Yes },
-                ForceRightAdjust::No,
-            )
-        }
+        Arch::Arm64EC => emit_ptr_va_arg(
+            bx,
+            addr,
+            target_ty,
+            PassMode::Direct,
+            SlotSize::Bytes8,
+            if target.is_like_windows { AllowHigherAlign::No } else { AllowHigherAlign::Yes },
+            ForceRightAdjust::No,
+        ),
+        Arch::AArch64 if target.is_like_windows || target.is_like_darwin => emit_ptr_va_arg(
+            bx,
+            addr,
+            target_ty,
+            PassMode::Direct,
+            SlotSize::Bytes8,
+            if target.is_like_windows { AllowHigherAlign::No } else { AllowHigherAlign::Yes },
+            ForceRightAdjust::No,
+        ),
         Arch::AArch64 => emit_aapcs_va_arg(bx, addr, target_ty),
         Arch::Arm => {
             // Types wider than 16 bytes are not currently supported. Clang has special logic for
@@ -1064,7 +1095,17 @@ pub(super) fn emit_va_arg<'ll, 'tcx>(
             AllowHigherAlign::Yes,
             ForceRightAdjust::Yes,
         ),
-        Arch::LoongArch32 => emit_ptr_va_arg(
+        Arch::RiscV32 if target.llvm_abiname == LlvmAbi::Ilp32e => {
+            std::assert_matches!(stability, CVariadicStatus::Unstable { .. });
+            // FIXME: clang manually adjusts the alignment for this ABI. It notes:
+            //
+            // > To be compatible with GCC's behaviors, we force arguments with
+            // > 2×XLEN-bit alignment and size at most 2×XLEN bits like `long long`,
+            // > `unsigned long long` and `double` to have 4-byte alignment. This
+            // > behavior may be changed when RV32E/ILP32E is ratified.
+            bug!("c-variadic calls with ilp32e use a custom ABI and are not currently implemented");
+        }
+        Arch::RiscV32 | Arch::LoongArch32 => emit_ptr_va_arg(
             bx,
             addr,
             target_ty,
@@ -1073,7 +1114,7 @@ pub(super) fn emit_va_arg<'ll, 'tcx>(
             AllowHigherAlign::Yes,
             ForceRightAdjust::No,
         ),
-        Arch::LoongArch64 => emit_ptr_va_arg(
+        Arch::RiscV64 | Arch::LoongArch64 => emit_ptr_va_arg(
             bx,
             addr,
             target_ty,
@@ -1100,7 +1141,7 @@ pub(super) fn emit_va_arg<'ll, 'tcx>(
             AllowHigherAlign::Yes,
             ForceRightAdjust::No,
         ),
-        Arch::Wasm32 => emit_ptr_va_arg(
+        Arch::Wasm32 | Arch::Wasm64 => emit_ptr_va_arg(
             bx,
             addr,
             target_ty,
@@ -1113,7 +1154,6 @@ pub(super) fn emit_va_arg<'ll, 'tcx>(
             AllowHigherAlign::Yes,
             ForceRightAdjust::No,
         ),
-        Arch::Wasm64 => bug!("c-variadic functions are not fully implemented for wasm64"),
         Arch::CSky => emit_ptr_va_arg(
             bx,
             addr,
@@ -1140,16 +1180,56 @@ pub(super) fn emit_va_arg<'ll, 'tcx>(
         // This includes `target.is_like_darwin`, which on x86_64 targets is like sysv64.
         Arch::X86_64 => emit_x86_64_sysv64_va_arg(bx, addr, target_ty),
         Arch::Xtensa => emit_xtensa_va_arg(bx, addr, target_ty),
-        Arch::Hexagon => {
-            if target.env == Env::Musl {
-                emit_hexagon_va_arg_musl(bx, addr, target_ty)
-            } else {
-                emit_hexagon_va_arg_bare_metal(bx, addr, target_ty)
-            }
+        Arch::Hexagon => match target.env {
+            Env::Musl => emit_hexagon_va_arg_musl(bx, addr, target_ty),
+            _ => emit_hexagon_va_arg_bare_metal(bx, addr, target_ty),
+        },
+        Arch::Sparc64 => emit_ptr_va_arg(
+            bx,
+            addr,
+            target_ty,
+            if target_ty_size > 2 * 8 { PassMode::Indirect } else { PassMode::Direct },
+            SlotSize::Bytes8,
+            AllowHigherAlign::Yes,
+            // sparc64 is a big-endian target and stores variable arguments right-adjusted.
+            ForceRightAdjust::Yes,
+        ),
+        Arch::Mips | Arch::Mips32r6 | Arch::Mips64 | Arch::Mips64r6 => emit_ptr_va_arg(
+            bx,
+            addr,
+            target_ty,
+            PassMode::Direct,
+            match &target.llvm_abiname {
+                LlvmAbi::N32 | LlvmAbi::N64 => SlotSize::Bytes8,
+                LlvmAbi::O32 => SlotSize::Bytes4,
+                other => bug!("unexpected LLVM ABI {other}"),
+            },
+            AllowHigherAlign::Yes,
+            // In big-endian mode the actual value is stored in the right side of the slot, meaning
+            // that when the value is smaller than a slot, we need to adjust the pointer we read
+            // to somewhere in the middle of the slot.
+            match bx.tcx().sess.target.endian {
+                Endian::Big => ForceRightAdjust::Yes,
+                Endian::Little => ForceRightAdjust::No,
+            },
+        ),
+
+        Arch::Bpf => bug!("bpf does not support c-variadic functions"),
+        Arch::SpirV => bug!("spirv does not support c-variadic functions"),
+
+        Arch::Sparc | Arch::Avr | Arch::M68k | Arch::Msp430 => {
+            std::assert_matches!(stability, CVariadicStatus::Unstable { .. });
+
+            // Clang uses the LLVM implementation for these architectures.
+            bx.va_arg(addr.immediate(), bx.cx.layout_of(target_ty).llvm_type(bx.cx))
         }
-        // For all other architecture/OS combinations fall back to using
-        // the LLVM va_arg instruction.
-        // https://llvm.org/docs/LangRef.html#va-arg-instruction
-        _ => bx.va_arg(addr.immediate(), bx.cx.layout_of(target_ty).llvm_type(bx.cx)),
+
+        Arch::Other(ref arch) => {
+            std::assert_matches!(stability, CVariadicStatus::Unstable { .. });
+
+            // Just to be safe we error out explicitly here, instead of crossing our fingers that
+            // the default LLVM implementation has the correct behavior for this target.
+            bug!("c-variadic functions are not currently implemented for custom target {arch}")
+        }
     }
 }

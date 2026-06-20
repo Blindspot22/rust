@@ -6,8 +6,6 @@ use rustc_ast::{LitKind, MetaItemKind, token};
 use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::jobserver::{self, Proxy};
-use rustc_data_structures::stable_hasher::StableHasher;
-use rustc_errors::registry::Registry;
 use rustc_errors::{DiagCtxtHandle, ErrorGuaranteed};
 use rustc_lint::LintStore;
 use rustc_middle::ty;
@@ -17,14 +15,12 @@ use rustc_parse::lexer::StripTokens;
 use rustc_parse::new_parser_from_source_str;
 use rustc_parse::parser::Recovery;
 use rustc_parse::parser::attr::AllowLeadingUnsafe;
-use rustc_query_impl::QueryCtxt;
-use rustc_query_system::query::print_query_stack;
+use rustc_query_impl::print_query_stack;
 use rustc_session::config::{self, Cfg, CheckCfg, ExpectedValues, Input, OutFileName};
 use rustc_session::parse::ParseSess;
 use rustc_session::{CompilerIO, EarlyDiagCtxt, Session, lint};
 use rustc_span::source_map::{FileLoader, RealFileLoader, SourceMapInputs};
 use rustc_span::{FileName, sym};
-use rustc_target::spec::Target;
 use tracing::trace;
 
 use crate::util;
@@ -54,20 +50,13 @@ pub struct Compiler {
 pub(crate) fn parse_cfg(dcx: DiagCtxtHandle<'_>, cfgs: Vec<String>) -> Cfg {
     cfgs.into_iter()
         .map(|s| {
-            let psess = ParseSess::emitter_with_note(
-                vec![
-                    crate::DEFAULT_LOCALE_RESOURCE,
-                    rustc_parse::DEFAULT_LOCALE_RESOURCE,
-                    rustc_session::DEFAULT_LOCALE_RESOURCE,
-                ],
-                format!("this occurred on the command line: `--cfg={s}`"),
-            );
+            let psess = ParseSess::emitter_with_note(format!(
+                "this occurred on the command line: `--cfg={s}`"
+            ));
             let filename = FileName::cfg_spec_source_code(&s);
 
             macro_rules! error {
                 ($reason: expr) => {
-                    #[allow(rustc::untranslatable_diagnostic)]
-                    #[allow(rustc::diagnostic_outside_of_impl)]
                     dcx.fatal(format!("invalid `--cfg` argument: `{s}` ({})", $reason));
                 };
             }
@@ -132,56 +121,39 @@ pub(crate) fn parse_check_cfg(dcx: DiagCtxtHandle<'_>, specs: Vec<String>) -> Ch
     let mut check_cfg = CheckCfg { exhaustive_names, exhaustive_values, ..CheckCfg::default() };
 
     for s in specs {
-        let psess = ParseSess::emitter_with_note(
-            vec![
-                crate::DEFAULT_LOCALE_RESOURCE,
-                rustc_parse::DEFAULT_LOCALE_RESOURCE,
-                rustc_session::DEFAULT_LOCALE_RESOURCE,
-            ],
-            format!("this occurred on the command line: `--check-cfg={s}`"),
-        );
+        let psess = ParseSess::emitter_with_note(format!(
+            "this occurred on the command line: `--check-cfg={s}`"
+        ));
         let filename = FileName::cfg_spec_source_code(&s);
 
         const VISIT: &str =
             "visit <https://doc.rust-lang.org/nightly/rustc/check-cfg.html> for more details";
 
         macro_rules! error {
-            ($reason:expr) => {
-                #[allow(rustc::untranslatable_diagnostic)]
-                #[allow(rustc::diagnostic_outside_of_impl)]
-                {
-                    let mut diag =
-                        dcx.struct_fatal(format!("invalid `--check-cfg` argument: `{s}`"));
-                    diag.note($reason);
-                    diag.note(VISIT);
-                    diag.emit()
-                }
-            };
-            (in $arg:expr, $reason:expr) => {
-                #[allow(rustc::untranslatable_diagnostic)]
-                #[allow(rustc::diagnostic_outside_of_impl)]
-                {
-                    let mut diag =
-                        dcx.struct_fatal(format!("invalid `--check-cfg` argument: `{s}`"));
+            ($reason:expr) => {{
+                let mut diag = dcx.struct_fatal(format!("invalid `--check-cfg` argument: `{s}`"));
+                diag.note($reason);
+                diag.note(VISIT);
+                diag.emit()
+            }};
+            (in $arg:expr, $reason:expr) => {{
+                let mut diag = dcx.struct_fatal(format!("invalid `--check-cfg` argument: `{s}`"));
 
-                    let pparg = rustc_ast_pretty::pprust::meta_list_item_to_string($arg);
-                    if let Some(lit) = $arg.lit() {
-                        let (lit_kind_article, lit_kind_descr) = {
-                            let lit_kind = lit.as_token_lit().kind;
-                            (lit_kind.article(), lit_kind.descr())
-                        };
-                        diag.note(format!(
-                            "`{pparg}` is {lit_kind_article} {lit_kind_descr} literal"
-                        ));
-                    } else {
-                        diag.note(format!("`{pparg}` is invalid"));
-                    }
-
-                    diag.note($reason);
-                    diag.note(VISIT);
-                    diag.emit()
+                let pparg = rustc_ast_pretty::pprust::meta_list_item_to_string($arg);
+                if let Some(lit) = $arg.lit() {
+                    let (lit_kind_article, lit_kind_descr) = {
+                        let lit_kind = lit.as_token_lit().kind;
+                        (lit_kind.article(), lit_kind.descr())
+                    };
+                    diag.note(format!("`{pparg}` is {lit_kind_article} {lit_kind_descr} literal"));
+                } else {
+                    diag.note(format!("`{pparg}` is invalid"));
                 }
-            };
+
+                diag.note($reason);
+                diag.note(VISIT);
+                diag.emit()
+            }};
         }
 
         let expected_error = || -> ! {
@@ -357,20 +329,16 @@ pub struct Config {
     /// bjorn3 for "hooking rust-analyzer's VFS into rustc at some point for
     /// running rustc without having to save". (See #102759.)
     pub file_loader: Option<Box<dyn FileLoader + Send + Sync>>,
-    /// The list of fluent resources, used for lints declared with
-    /// [`Diagnostic`](rustc_errors::Diagnostic) and [`LintDiagnostic`](rustc_errors::LintDiagnostic).
-    pub locale_resources: Vec<&'static str>,
 
     pub lint_caps: FxHashMap<lint::LintId, lint::Level>,
 
     /// This is a callback from the driver that is called when [`ParseSess`] is created.
     pub psess_created: Option<Box<dyn FnOnce(&mut ParseSess) + Send>>,
 
-    /// This is a callback to hash otherwise untracked state used by the caller, if the
-    /// hash changes between runs the incremental cache will be cleared.
+    /// This is a callback to track otherwise untracked state used by the caller.
     ///
-    /// e.g. used by Clippy to hash its config file
-    pub hash_untracked_state: Option<Box<dyn FnOnce(&Session, &mut StableHasher) + Send>>,
+    /// You can write to `sess.env_depinfo` and `sess.file_depinfo` to track env vars and files.
+    pub track_state: Option<Box<dyn FnOnce(&Session) + Send>>,
 
     /// This is a callback from the driver that is called when we're registering lints;
     /// it is called during lint loading when we have the LintStore in a non-shared state.
@@ -393,11 +361,7 @@ pub struct Config {
     /// hotswapping branch of cg_clif" for "setting the codegen backend from a
     /// custom driver where the custom codegen backend has arbitrary data."
     /// (See #102759.)
-    pub make_codegen_backend:
-        Option<Box<dyn FnOnce(&config::Options, &Target) -> Box<dyn CodegenBackend> + Send>>,
-
-    /// Registry of diagnostics codes.
-    pub registry: Registry,
+    pub make_codegen_backend: Option<Box<dyn FnOnce(&Session) -> Box<dyn CodegenBackend> + Send>>,
 
     /// The inner atomic value is set to true when a feature marked as `internal` is
     /// enabled. Makes it so that "please report a bug" is hidden, as ICEs with
@@ -408,8 +372,6 @@ pub struct Config {
 /// Initialize jobserver before getting `jobserver::client` and `build_session`.
 pub(crate) fn initialize_checked_jobserver(early_dcx: &EarlyDiagCtxt) {
     jobserver::initialize_checked(|err| {
-        #[allow(rustc::untranslatable_diagnostic)]
-        #[allow(rustc::diagnostic_outside_of_impl)]
         early_dcx
             .early_struct_warn(err)
             .with_note("the build environment is likely misconfigured")
@@ -423,7 +385,9 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
     trace!("run_compiler");
 
     // Set parallel mode before thread pool creation, which will create `Lock`s.
-    rustc_data_structures::sync::set_dyn_thread_safe_mode(config.opts.unstable_opts.threads > 1);
+    rustc_data_structures::sync::set_dyn_thread_safe_mode(
+        config.opts.unstable_opts.threads.is_some(),
+    );
 
     // Check jobserver before run_in_thread_pool_with_globals, which call jobserver::acquire_thread
     let early_dcx = EarlyDiagCtxt::new(config.opts.error_format);
@@ -445,7 +409,7 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
     util::run_in_thread_pool_with_globals(
         &early_dcx,
         config.opts.edition,
-        config.opts.unstable_opts.threads,
+        config.opts.unstable_opts.threads.unwrap_or(1),
         &config.extra_symbols,
         SourceMapInputs { file_loader, path_mapping, hash_kind, checksum_hash_kind },
         |current_gcx, jobserver_proxy| {
@@ -453,38 +417,7 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
             // impl `Send`. Creating a new one is fine.
             let early_dcx = EarlyDiagCtxt::new(config.opts.error_format);
 
-            let codegen_backend = match config.make_codegen_backend {
-                None => util::get_codegen_backend(
-                    &early_dcx,
-                    &config.opts.sysroot,
-                    config.opts.unstable_opts.codegen_backend.as_deref(),
-                    &target,
-                ),
-                Some(make_codegen_backend) => {
-                    // N.B. `make_codegen_backend` takes precedence over
-                    // `target.default_codegen_backend`, which is ignored in this case.
-                    make_codegen_backend(&config.opts, &target)
-                }
-            };
-
             let temps_dir = config.opts.unstable_opts.temps_dir.as_deref().map(PathBuf::from);
-
-            let bundle = match rustc_errors::fluent_bundle(
-                &config.opts.sysroot.all_paths().collect::<Vec<_>>(),
-                config.opts.unstable_opts.translate_lang.clone(),
-                config.opts.unstable_opts.translate_additional_ftl.as_deref(),
-                config.opts.unstable_opts.translate_directionality_markers,
-            ) {
-                Ok(bundle) => bundle,
-                Err(e) => {
-                    // We can't translate anything if we failed to load translations
-                    #[allow(rustc::untranslatable_diagnostic)]
-                    early_dcx.early_fatal(format!("failed to load fluent bundle: {e}"))
-                }
-            };
-
-            let mut locale_resources = config.locale_resources;
-            locale_resources.push(codegen_backend.locale_resource());
 
             let mut sess = rustc_session::build_session(
                 config.opts,
@@ -494,9 +427,6 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
                     output_file: config.output_file,
                     temps_dir,
                 },
-                bundle,
-                config.registry,
-                locale_resources,
                 config.lint_caps,
                 target,
                 util::rustc_version_str().unwrap_or("unknown"),
@@ -504,25 +434,39 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
                 config.using_internal_features,
             );
 
+            let codegen_backend = match config.make_codegen_backend {
+                None => util::get_codegen_backend(
+                    &early_dcx,
+                    &sess.opts.sysroot,
+                    sess.opts.unstable_opts.codegen_backend.as_deref(),
+                    &sess.target,
+                ),
+                Some(make_codegen_backend) => {
+                    // N.B. `make_codegen_backend` takes precedence over
+                    // `target.default_codegen_backend`, which is ignored in this case.
+                    make_codegen_backend(&sess)
+                }
+            };
             codegen_backend.init(&sess);
+            sess.replaced_intrinsics = FxHashSet::from_iter(codegen_backend.replaced_intrinsics());
+            sess.fallback_intrinsics = FxHashSet::from_iter(codegen_backend.fallback_intrinsics());
+            sess.thin_lto_supported = codegen_backend.thin_lto_supported();
 
             let cfg = parse_cfg(sess.dcx(), config.crate_cfg);
             let mut cfg = config::build_configuration(&sess, cfg);
             util::add_configuration(&mut cfg, &mut sess, &*codegen_backend);
-            sess.psess.config = cfg;
+            sess.config = cfg;
 
             let mut check_cfg = parse_check_cfg(sess.dcx(), config.crate_check_cfg);
             check_cfg.fill_well_known(&sess.target);
-            sess.psess.check_config = check_cfg;
+            sess.check_config = check_cfg;
 
             if let Some(psess_created) = config.psess_created {
                 psess_created(&mut sess.psess);
             }
 
-            if let Some(hash_untracked_state) = config.hash_untracked_state {
-                let mut hasher = StableHasher::new();
-                hash_untracked_state(&sess, &mut hasher);
-                sess.opts.untracked_state_hash = hasher.finish()
+            if let Some(track_state) = config.track_state {
+                track_state(&sess);
             }
 
             // Even though the session holds the lint store, we can't build the
@@ -597,7 +541,7 @@ pub fn try_print_query_stack(
     let all_frames = ty::tls::with_context_opt(|icx| {
         if let Some(icx) = icx {
             ty::print::with_no_queries!(print_query_stack(
-                QueryCtxt::new(icx.tcx),
+                icx.tcx,
                 icx.query,
                 dcx,
                 limit_frames,

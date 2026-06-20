@@ -91,23 +91,26 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                         fx.bcx.ins().icmp(IntCC::SignedGreaterThanOrEqual, x_lane, y_lane)
                     }
 
+                    // FIXME(bytecodealliance/wasmtime#8312): Replace with Cranelift
+                    // `fcmp` once `f16`/`f128` backend lowerings have been added to
+                    // Cranelift.
                     (ty::Float(_), sym::simd_eq) => {
-                        fx.bcx.ins().fcmp(FloatCC::Equal, x_lane, y_lane)
+                        codegen_f16_f128::fcmp(fx, FloatCC::Equal, x_lane, y_lane)
                     }
                     (ty::Float(_), sym::simd_ne) => {
-                        fx.bcx.ins().fcmp(FloatCC::NotEqual, x_lane, y_lane)
+                        codegen_f16_f128::fcmp(fx, FloatCC::NotEqual, x_lane, y_lane)
                     }
                     (ty::Float(_), sym::simd_lt) => {
-                        fx.bcx.ins().fcmp(FloatCC::LessThan, x_lane, y_lane)
+                        codegen_f16_f128::fcmp(fx, FloatCC::LessThan, x_lane, y_lane)
                     }
                     (ty::Float(_), sym::simd_le) => {
-                        fx.bcx.ins().fcmp(FloatCC::LessThanOrEqual, x_lane, y_lane)
+                        codegen_f16_f128::fcmp(fx, FloatCC::LessThanOrEqual, x_lane, y_lane)
                     }
                     (ty::Float(_), sym::simd_gt) => {
-                        fx.bcx.ins().fcmp(FloatCC::GreaterThan, x_lane, y_lane)
+                        codegen_f16_f128::fcmp(fx, FloatCC::GreaterThan, x_lane, y_lane)
                     }
                     (ty::Float(_), sym::simd_ge) => {
-                        fx.bcx.ins().fcmp(FloatCC::GreaterThanOrEqual, x_lane, y_lane)
+                        codegen_f16_f128::fcmp(fx, FloatCC::GreaterThanOrEqual, x_lane, y_lane)
                     }
 
                     _ => unreachable!(),
@@ -348,6 +351,31 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
             ret.write_cvalue(fx, ret_lane);
         }
 
+        sym::simd_splat => {
+            intrinsic_args!(fx, args => (value); intrinsic);
+
+            if !ret.layout().ty.is_simd() {
+                report_simd_type_validation_error(fx, intrinsic, span, ret.layout().ty);
+                return;
+            }
+            let (lane_count, lane_ty) = ret.layout().ty.simd_size_and_type(fx.tcx);
+
+            if value.layout().ty != lane_ty {
+                fx.tcx.dcx().span_fatal(
+                    span,
+                    format!(
+                        "[simd_splat] expected element type {lane_ty:?}, got {got:?}",
+                        got = value.layout().ty
+                    ),
+                );
+            }
+
+            for i in 0..lane_count {
+                let ret_lane = ret.place_lane(fx, i);
+                ret_lane.write_cvalue(fx, value);
+            }
+        }
+
         sym::simd_neg
         | sym::simd_bswap
         | sym::simd_bitreverse
@@ -366,6 +394,7 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 intrinsic,
             ) {
                 (ty::Int(_), sym::simd_neg) => fx.bcx.ins().ineg(lane),
+                (ty::Float(FloatTy::F16), sym::simd_neg) => codegen_f16_f128::neg_f16(fx, lane),
                 (ty::Float(_), sym::simd_neg) => fx.bcx.ins().fneg(lane),
 
                 (ty::Uint(ty::UintTy::U8) | ty::Int(ty::IntTy::I8), sym::simd_bswap) => lane,
@@ -393,50 +422,65 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
 
             // FIXME use vector instructions when possible
             simd_pair_for_each_lane(fx, x, y, ret, &|fx, lane_ty, _ret_lane_ty, x_lane, y_lane| {
-                match (lane_ty.kind(), intrinsic) {
-                    (ty::Uint(_), sym::simd_add) => fx.bcx.ins().iadd(x_lane, y_lane),
-                    (ty::Uint(_), sym::simd_sub) => fx.bcx.ins().isub(x_lane, y_lane),
-                    (ty::Uint(_), sym::simd_mul) => fx.bcx.ins().imul(x_lane, y_lane),
-                    (ty::Uint(_), sym::simd_div) => fx.bcx.ins().udiv(x_lane, y_lane),
-                    (ty::Uint(_), sym::simd_rem) => fx.bcx.ins().urem(x_lane, y_lane),
+                codegen_f16_f128::maybe_with_f16_to_f32_pair(
+                    fx,
+                    x_lane,
+                    y_lane,
+                    |fx, x_lane, y_lane| match (lane_ty.kind(), intrinsic) {
+                        (ty::Uint(_), sym::simd_add) => fx.bcx.ins().iadd(x_lane, y_lane),
+                        (ty::Uint(_), sym::simd_sub) => fx.bcx.ins().isub(x_lane, y_lane),
+                        (ty::Uint(_), sym::simd_mul) => fx.bcx.ins().imul(x_lane, y_lane),
+                        (ty::Uint(_), sym::simd_div) => fx.bcx.ins().udiv(x_lane, y_lane),
+                        (ty::Uint(_), sym::simd_rem) => fx.bcx.ins().urem(x_lane, y_lane),
 
-                    (ty::Int(_), sym::simd_add) => fx.bcx.ins().iadd(x_lane, y_lane),
-                    (ty::Int(_), sym::simd_sub) => fx.bcx.ins().isub(x_lane, y_lane),
-                    (ty::Int(_), sym::simd_mul) => fx.bcx.ins().imul(x_lane, y_lane),
-                    (ty::Int(_), sym::simd_div) => fx.bcx.ins().sdiv(x_lane, y_lane),
-                    (ty::Int(_), sym::simd_rem) => fx.bcx.ins().srem(x_lane, y_lane),
+                        (ty::Int(_), sym::simd_add) => fx.bcx.ins().iadd(x_lane, y_lane),
+                        (ty::Int(_), sym::simd_sub) => fx.bcx.ins().isub(x_lane, y_lane),
+                        (ty::Int(_), sym::simd_mul) => fx.bcx.ins().imul(x_lane, y_lane),
+                        (ty::Int(_), sym::simd_div) => fx.bcx.ins().sdiv(x_lane, y_lane),
+                        (ty::Int(_), sym::simd_rem) => fx.bcx.ins().srem(x_lane, y_lane),
 
-                    (ty::Float(_), sym::simd_add) => fx.bcx.ins().fadd(x_lane, y_lane),
-                    (ty::Float(_), sym::simd_sub) => fx.bcx.ins().fsub(x_lane, y_lane),
-                    (ty::Float(_), sym::simd_mul) => fx.bcx.ins().fmul(x_lane, y_lane),
-                    (ty::Float(_), sym::simd_div) => fx.bcx.ins().fdiv(x_lane, y_lane),
-                    (ty::Float(FloatTy::F32), sym::simd_rem) => fx.lib_call(
-                        "fmodf",
-                        vec![AbiParam::new(types::F32), AbiParam::new(types::F32)],
-                        vec![AbiParam::new(types::F32)],
-                        &[x_lane, y_lane],
-                    )[0],
-                    (ty::Float(FloatTy::F64), sym::simd_rem) => fx.lib_call(
-                        "fmod",
-                        vec![AbiParam::new(types::F64), AbiParam::new(types::F64)],
-                        vec![AbiParam::new(types::F64)],
-                        &[x_lane, y_lane],
-                    )[0],
+                        (ty::Float(_), sym::simd_add) => fx.bcx.ins().fadd(x_lane, y_lane),
+                        (ty::Float(_), sym::simd_sub) => fx.bcx.ins().fsub(x_lane, y_lane),
+                        (ty::Float(_), sym::simd_mul) => fx.bcx.ins().fmul(x_lane, y_lane),
+                        (ty::Float(_), sym::simd_div) => fx.bcx.ins().fdiv(x_lane, y_lane),
+                        (ty::Float(FloatTy::F16), sym::simd_rem) => fx.lib_call(
+                            "fmodf",
+                            vec![AbiParam::new(types::F32), AbiParam::new(types::F32)],
+                            vec![AbiParam::new(types::F32)],
+                            // FIXME(bytecodealliance/wasmtime#8312): Already converted
+                            // by the FIXME above.
+                            // fx.bcx.ins().fpromote(types::F32, lhs),
+                            // fx.bcx.ins().fpromote(types::F32, rhs),
+                            &[x_lane, y_lane],
+                        )[0],
+                        (ty::Float(FloatTy::F32), sym::simd_rem) => fx.lib_call(
+                            "fmodf",
+                            vec![AbiParam::new(types::F32), AbiParam::new(types::F32)],
+                            vec![AbiParam::new(types::F32)],
+                            &[x_lane, y_lane],
+                        )[0],
+                        (ty::Float(FloatTy::F64), sym::simd_rem) => fx.lib_call(
+                            "fmod",
+                            vec![AbiParam::new(types::F64), AbiParam::new(types::F64)],
+                            vec![AbiParam::new(types::F64)],
+                            &[x_lane, y_lane],
+                        )[0],
 
-                    (ty::Uint(_), sym::simd_shl) => fx.bcx.ins().ishl(x_lane, y_lane),
-                    (ty::Uint(_), sym::simd_shr) => fx.bcx.ins().ushr(x_lane, y_lane),
-                    (ty::Uint(_), sym::simd_and) => fx.bcx.ins().band(x_lane, y_lane),
-                    (ty::Uint(_), sym::simd_or) => fx.bcx.ins().bor(x_lane, y_lane),
-                    (ty::Uint(_), sym::simd_xor) => fx.bcx.ins().bxor(x_lane, y_lane),
+                        (ty::Uint(_), sym::simd_shl) => fx.bcx.ins().ishl(x_lane, y_lane),
+                        (ty::Uint(_), sym::simd_shr) => fx.bcx.ins().ushr(x_lane, y_lane),
+                        (ty::Uint(_), sym::simd_and) => fx.bcx.ins().band(x_lane, y_lane),
+                        (ty::Uint(_), sym::simd_or) => fx.bcx.ins().bor(x_lane, y_lane),
+                        (ty::Uint(_), sym::simd_xor) => fx.bcx.ins().bxor(x_lane, y_lane),
 
-                    (ty::Int(_), sym::simd_shl) => fx.bcx.ins().ishl(x_lane, y_lane),
-                    (ty::Int(_), sym::simd_shr) => fx.bcx.ins().sshr(x_lane, y_lane),
-                    (ty::Int(_), sym::simd_and) => fx.bcx.ins().band(x_lane, y_lane),
-                    (ty::Int(_), sym::simd_or) => fx.bcx.ins().bor(x_lane, y_lane),
-                    (ty::Int(_), sym::simd_xor) => fx.bcx.ins().bxor(x_lane, y_lane),
+                        (ty::Int(_), sym::simd_shl) => fx.bcx.ins().ishl(x_lane, y_lane),
+                        (ty::Int(_), sym::simd_shr) => fx.bcx.ins().sshr(x_lane, y_lane),
+                        (ty::Int(_), sym::simd_and) => fx.bcx.ins().band(x_lane, y_lane),
+                        (ty::Int(_), sym::simd_or) => fx.bcx.ins().bor(x_lane, y_lane),
+                        (ty::Int(_), sym::simd_xor) => fx.bcx.ins().bxor(x_lane, y_lane),
 
-                    _ => unreachable!(),
-                }
+                        _ => unreachable!(),
+                    },
+                )
             });
         }
 
@@ -461,14 +505,18 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                 let b_lane = b.value_lane(fx, lane).load_scalar(fx);
                 let c_lane = c.value_lane(fx, lane).load_scalar(fx);
 
-                let res_lane = fx.bcx.ins().fma(a_lane, b_lane, c_lane);
+                let res_lane = if *lane_ty.kind() == ty::Float(FloatTy::F16) {
+                    codegen_f16_f128::fma_f16(fx, a_lane, b_lane, c_lane)
+                } else {
+                    fx.bcx.ins().fma(a_lane, b_lane, c_lane)
+                };
                 let res_lane = CValue::by_val(res_lane, res_lane_layout);
 
                 ret.place_lane(fx, lane).write_cvalue(fx, res_lane);
             }
         }
 
-        sym::simd_fmin | sym::simd_fmax => {
+        sym::simd_minimum_number_nsz | sym::simd_maximum_number_nsz => {
             intrinsic_args!(fx, args => (x, y); intrinsic);
 
             if !x.layout().ty.is_simd() {
@@ -483,8 +531,12 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                     _ => unreachable!("{:?}", lane_ty),
                 }
                 match intrinsic {
-                    sym::simd_fmin => crate::num::codegen_float_min(fx, x_lane, y_lane),
-                    sym::simd_fmax => crate::num::codegen_float_max(fx, x_lane, y_lane),
+                    sym::simd_minimum_number_nsz => {
+                        crate::num::codegen_float_min(fx, x_lane, y_lane)
+                    }
+                    sym::simd_maximum_number_nsz => {
+                        crate::num::codegen_float_max(fx, x_lane, y_lane)
+                    }
                     _ => unreachable!(),
                 }
             });
@@ -555,14 +607,15 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
                     ty::Float(_) => {}
                     _ => unreachable!("{:?}", lane_ty),
                 }
-                match intrinsic {
+
+                codegen_f16_f128::maybe_with_f16_to_f32(fx, lane, |fx, lane| match intrinsic {
                     sym::simd_fabs => fx.bcx.ins().fabs(lane),
                     sym::simd_fsqrt => fx.bcx.ins().sqrt(lane),
                     sym::simd_ceil => fx.bcx.ins().ceil(lane),
                     sym::simd_floor => fx.bcx.ins().floor(lane),
                     sym::simd_trunc => fx.bcx.ins().trunc(lane),
                     _ => unreachable!(),
-                }
+                })
             });
         }
 
@@ -578,7 +631,9 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
 
             simd_reduce(fx, v, Some(acc), ret, &|fx, lane_ty, a, b| {
                 if lane_ty.is_floating_point() {
-                    fx.bcx.ins().fadd(a, b)
+                    codegen_f16_f128::maybe_with_f16_to_f32_pair(fx, a, b, |fx, a, b| {
+                        fx.bcx.ins().fadd(a, b)
+                    })
                 } else {
                     fx.bcx.ins().iadd(a, b)
                 }
@@ -596,7 +651,9 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
 
             simd_reduce(fx, v, None, ret, &|fx, lane_ty, a, b| {
                 if lane_ty.is_floating_point() {
-                    fx.bcx.ins().fadd(a, b)
+                    codegen_f16_f128::maybe_with_f16_to_f32_pair(fx, a, b, |fx, a, b| {
+                        fx.bcx.ins().fadd(a, b)
+                    })
                 } else {
                     fx.bcx.ins().iadd(a, b)
                 }
@@ -615,7 +672,9 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
 
             simd_reduce(fx, v, Some(acc), ret, &|fx, lane_ty, a, b| {
                 if lane_ty.is_floating_point() {
-                    fx.bcx.ins().fmul(a, b)
+                    codegen_f16_f128::maybe_with_f16_to_f32_pair(fx, a, b, |fx, a, b| {
+                        fx.bcx.ins().fmul(a, b)
+                    })
                 } else {
                     fx.bcx.ins().imul(a, b)
                 }
@@ -633,7 +692,9 @@ pub(super) fn codegen_simd_intrinsic_call<'tcx>(
 
             simd_reduce(fx, v, None, ret, &|fx, lane_ty, a, b| {
                 if lane_ty.is_floating_point() {
-                    fx.bcx.ins().fmul(a, b)
+                    codegen_f16_f128::maybe_with_f16_to_f32_pair(fx, a, b, |fx, a, b| {
+                        fx.bcx.ins().fmul(a, b)
+                    })
                 } else {
                     fx.bcx.ins().imul(a, b)
                 }

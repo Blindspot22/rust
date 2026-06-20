@@ -8,7 +8,7 @@ use crate::{ops, range};
 
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_const_unstable(feature = "const_index", issue = "143775")]
-impl<T, I> const ops::Index<I> for [T]
+const impl<T, I> ops::Index<I> for [T]
 where
     I: [const] SliceIndex<[T]>,
 {
@@ -22,11 +22,12 @@ where
 
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_const_unstable(feature = "const_index", issue = "143775")]
-impl<T, I> const ops::IndexMut<I> for [T]
+const impl<T, I> ops::IndexMut<I> for [T]
 where
     I: [const] SliceIndex<[T]>,
 {
     #[inline(always)]
+    #[rustc_no_writable]
     fn index_mut(&mut self, index: I) -> &mut I::Output {
         index.index_mut(self)
     }
@@ -102,46 +103,6 @@ const unsafe fn get_offset_len_mut_noubcheck<T>(
     crate::intrinsics::aggregate_raw_ptr(ptr, len)
 }
 
-mod private_slice_index {
-    use super::{ops, range};
-
-    #[stable(feature = "slice_get_slice", since = "1.28.0")]
-    pub trait Sealed {}
-
-    #[stable(feature = "slice_get_slice", since = "1.28.0")]
-    impl Sealed for usize {}
-    #[stable(feature = "slice_get_slice", since = "1.28.0")]
-    impl Sealed for ops::Range<usize> {}
-    #[stable(feature = "slice_get_slice", since = "1.28.0")]
-    impl Sealed for ops::RangeTo<usize> {}
-    #[stable(feature = "slice_get_slice", since = "1.28.0")]
-    impl Sealed for ops::RangeFrom<usize> {}
-    #[stable(feature = "slice_get_slice", since = "1.28.0")]
-    impl Sealed for ops::RangeFull {}
-    #[stable(feature = "slice_get_slice", since = "1.28.0")]
-    impl Sealed for ops::RangeInclusive<usize> {}
-    #[stable(feature = "slice_get_slice", since = "1.28.0")]
-    impl Sealed for ops::RangeToInclusive<usize> {}
-    #[stable(feature = "slice_index_with_ops_bound_pair", since = "1.53.0")]
-    impl Sealed for (ops::Bound<usize>, ops::Bound<usize>) {}
-
-    #[unstable(feature = "new_range_api", issue = "125687")]
-    impl Sealed for range::Range<usize> {}
-    #[unstable(feature = "new_range_api", issue = "125687")]
-    impl Sealed for range::RangeInclusive<usize> {}
-    #[unstable(feature = "new_range_api", issue = "125687")]
-    impl Sealed for range::RangeToInclusive<usize> {}
-    #[unstable(feature = "new_range_api", issue = "125687")]
-    impl Sealed for range::RangeFrom<usize> {}
-
-    impl Sealed for ops::IndexRange {}
-
-    #[unstable(feature = "sliceindex_wrappers", issue = "146179")]
-    impl Sealed for crate::index::Last {}
-    #[unstable(feature = "sliceindex_wrappers", issue = "146179")]
-    impl<T> Sealed for crate::index::Clamp<T> where T: Sealed {}
-}
-
 /// A helper trait used for indexing operations.
 ///
 /// Implementations of this trait have to promise that if the argument
@@ -160,7 +121,7 @@ mod private_slice_index {
     label = "slice indices are of type `usize` or ranges of `usize`"
 )]
 #[rustc_const_unstable(feature = "const_index", issue = "143775")]
-pub const unsafe trait SliceIndex<T: ?Sized>: private_slice_index::Sealed {
+pub impl(crate) const unsafe trait SliceIndex<T: ?Sized> {
     /// The output type returned by methods.
     #[stable(feature = "slice_get_slice", since = "1.28.0")]
     type Output: ?Sized;
@@ -211,7 +172,7 @@ pub const unsafe trait SliceIndex<T: ?Sized>: private_slice_index::Sealed {
 /// The methods `index` and `index_mut` panic if the index is out of bounds.
 #[stable(feature = "slice_get_slice_impls", since = "1.15.0")]
 #[rustc_const_unstable(feature = "const_index", issue = "143775")]
-unsafe impl<T> const SliceIndex<[T]> for usize {
+const unsafe impl<T> SliceIndex<[T]> for usize {
     type Output = T;
 
     #[inline]
@@ -225,6 +186,7 @@ unsafe impl<T> const SliceIndex<[T]> for usize {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn get_mut(self, slice: &mut [T]) -> Option<&mut T> {
         if self < slice.len() {
             // SAFETY: `self` is checked to be in bounds.
@@ -273,6 +235,7 @@ unsafe impl<T> const SliceIndex<[T]> for usize {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn index_mut(self, slice: &mut [T]) -> &mut T {
         // N.B., use intrinsic indexing
         &mut (*slice)[self]
@@ -282,7 +245,7 @@ unsafe impl<T> const SliceIndex<[T]> for usize {
 /// Because `IndexRange` guarantees `start <= end`, fewer checks are needed here
 /// than there are for a general `Range<usize>` (which might be `100..3`).
 #[rustc_const_unstable(feature = "const_index", issue = "143775")]
-unsafe impl<T> const SliceIndex<[T]> for ops::IndexRange {
+const unsafe impl<T> SliceIndex<[T]> for ops::IndexRange {
     type Output = [T];
 
     #[inline]
@@ -296,6 +259,7 @@ unsafe impl<T> const SliceIndex<[T]> for ops::IndexRange {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn get_mut(self, slice: &mut [T]) -> Option<&mut [T]> {
         if self.end() <= slice.len() {
             // SAFETY: `self` is checked to be valid and in bounds above.
@@ -344,6 +308,7 @@ unsafe impl<T> const SliceIndex<[T]> for ops::IndexRange {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn index_mut(self, slice: &mut [T]) -> &mut [T] {
         if self.end() <= slice.len() {
             // SAFETY: `self` is checked to be valid and in bounds above.
@@ -359,7 +324,7 @@ unsafe impl<T> const SliceIndex<[T]> for ops::IndexRange {
 /// - the end of the range is out of bounds.
 #[stable(feature = "slice_get_slice_impls", since = "1.15.0")]
 #[rustc_const_unstable(feature = "const_index", issue = "143775")]
-unsafe impl<T> const SliceIndex<[T]> for ops::Range<usize> {
+const unsafe impl<T> SliceIndex<[T]> for ops::Range<usize> {
     type Output = [T];
 
     #[inline]
@@ -376,6 +341,7 @@ unsafe impl<T> const SliceIndex<[T]> for ops::Range<usize> {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn get_mut(self, slice: &mut [T]) -> Option<&mut [T]> {
         if let Some(new_len) = usize::checked_sub(self.end, self.start)
             && self.end <= slice.len()
@@ -445,6 +411,7 @@ unsafe impl<T> const SliceIndex<[T]> for ops::Range<usize> {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn index_mut(self, slice: &mut [T]) -> &mut [T] {
         // Using checked_sub is a safe way to get `SubUnchecked` in MIR
         if let Some(new_len) = usize::checked_sub(self.end, self.start)
@@ -458,9 +425,9 @@ unsafe impl<T> const SliceIndex<[T]> for ops::Range<usize> {
     }
 }
 
-#[unstable(feature = "new_range_api", issue = "125687")]
+#[stable(feature = "new_range_api", since = "1.96.0")]
 #[rustc_const_unstable(feature = "const_index", issue = "143775")]
-unsafe impl<T> const SliceIndex<[T]> for range::Range<usize> {
+const unsafe impl<T> SliceIndex<[T]> for range::Range<usize> {
     type Output = [T];
 
     #[inline]
@@ -469,6 +436,7 @@ unsafe impl<T> const SliceIndex<[T]> for range::Range<usize> {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn get_mut(self, slice: &mut [T]) -> Option<&mut [T]> {
         ops::Range::from(self).get_mut(slice)
     }
@@ -491,6 +459,7 @@ unsafe impl<T> const SliceIndex<[T]> for range::Range<usize> {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn index_mut(self, slice: &mut [T]) -> &mut [T] {
         ops::Range::from(self).index_mut(slice)
     }
@@ -499,7 +468,7 @@ unsafe impl<T> const SliceIndex<[T]> for range::Range<usize> {
 /// The methods `index` and `index_mut` panic if the end of the range is out of bounds.
 #[stable(feature = "slice_get_slice_impls", since = "1.15.0")]
 #[rustc_const_unstable(feature = "const_index", issue = "143775")]
-unsafe impl<T> const SliceIndex<[T]> for ops::RangeTo<usize> {
+const unsafe impl<T> SliceIndex<[T]> for ops::RangeTo<usize> {
     type Output = [T];
 
     #[inline]
@@ -508,6 +477,7 @@ unsafe impl<T> const SliceIndex<[T]> for ops::RangeTo<usize> {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn get_mut(self, slice: &mut [T]) -> Option<&mut [T]> {
         (0..self.end).get_mut(slice)
     }
@@ -530,6 +500,7 @@ unsafe impl<T> const SliceIndex<[T]> for ops::RangeTo<usize> {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn index_mut(self, slice: &mut [T]) -> &mut [T] {
         (0..self.end).index_mut(slice)
     }
@@ -538,7 +509,7 @@ unsafe impl<T> const SliceIndex<[T]> for ops::RangeTo<usize> {
 /// The methods `index` and `index_mut` panic if the start of the range is out of bounds.
 #[stable(feature = "slice_get_slice_impls", since = "1.15.0")]
 #[rustc_const_unstable(feature = "const_index", issue = "143775")]
-unsafe impl<T> const SliceIndex<[T]> for ops::RangeFrom<usize> {
+const unsafe impl<T> SliceIndex<[T]> for ops::RangeFrom<usize> {
     type Output = [T];
 
     #[inline]
@@ -547,6 +518,7 @@ unsafe impl<T> const SliceIndex<[T]> for ops::RangeFrom<usize> {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn get_mut(self, slice: &mut [T]) -> Option<&mut [T]> {
         (self.start..slice.len()).get_mut(slice)
     }
@@ -576,6 +548,7 @@ unsafe impl<T> const SliceIndex<[T]> for ops::RangeFrom<usize> {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn index_mut(self, slice: &mut [T]) -> &mut [T] {
         if self.start > slice.len() {
             slice_index_fail(self.start, slice.len(), slice.len())
@@ -588,9 +561,9 @@ unsafe impl<T> const SliceIndex<[T]> for ops::RangeFrom<usize> {
     }
 }
 
-#[unstable(feature = "new_range_api", issue = "125687")]
+#[stable(feature = "new_range_from_api", since = "1.96.0")]
 #[rustc_const_unstable(feature = "const_index", issue = "143775")]
-unsafe impl<T> const SliceIndex<[T]> for range::RangeFrom<usize> {
+const unsafe impl<T> SliceIndex<[T]> for range::RangeFrom<usize> {
     type Output = [T];
 
     #[inline]
@@ -599,6 +572,7 @@ unsafe impl<T> const SliceIndex<[T]> for range::RangeFrom<usize> {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn get_mut(self, slice: &mut [T]) -> Option<&mut [T]> {
         ops::RangeFrom::from(self).get_mut(slice)
     }
@@ -621,6 +595,7 @@ unsafe impl<T> const SliceIndex<[T]> for range::RangeFrom<usize> {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn index_mut(self, slice: &mut [T]) -> &mut [T] {
         ops::RangeFrom::from(self).index_mut(slice)
     }
@@ -628,7 +603,7 @@ unsafe impl<T> const SliceIndex<[T]> for range::RangeFrom<usize> {
 
 #[stable(feature = "slice_get_slice_impls", since = "1.15.0")]
 #[rustc_const_unstable(feature = "const_index", issue = "143775")]
-unsafe impl<T> const SliceIndex<[T]> for ops::RangeFull {
+const unsafe impl<T> SliceIndex<[T]> for ops::RangeFull {
     type Output = [T];
 
     #[inline]
@@ -637,6 +612,7 @@ unsafe impl<T> const SliceIndex<[T]> for ops::RangeFull {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn get_mut(self, slice: &mut [T]) -> Option<&mut [T]> {
         Some(slice)
     }
@@ -657,28 +633,29 @@ unsafe impl<T> const SliceIndex<[T]> for ops::RangeFull {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn index_mut(self, slice: &mut [T]) -> &mut [T] {
         slice
     }
 }
 
 /// The methods `index` and `index_mut` panic if:
-/// - the end of the range is `usize::MAX` or
 /// - the start of the range is greater than the end of the range or
 /// - the end of the range is out of bounds.
 #[stable(feature = "inclusive_range", since = "1.26.0")]
 #[rustc_const_unstable(feature = "const_index", issue = "143775")]
-unsafe impl<T> const SliceIndex<[T]> for ops::RangeInclusive<usize> {
+const unsafe impl<T> SliceIndex<[T]> for ops::RangeInclusive<usize> {
     type Output = [T];
 
     #[inline]
     fn get(self, slice: &[T]) -> Option<&[T]> {
-        if *self.end() == usize::MAX { None } else { self.into_slice_range().get(slice) }
+        if *self.end() >= slice.len() { None } else { self.into_slice_range().get(slice) }
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn get_mut(self, slice: &mut [T]) -> Option<&mut [T]> {
-        if *self.end() == usize::MAX { None } else { self.into_slice_range().get_mut(slice) }
+        if *self.end() >= slice.len() { None } else { self.into_slice_range().get_mut(slice) }
     }
 
     #[inline]
@@ -709,6 +686,7 @@ unsafe impl<T> const SliceIndex<[T]> for ops::RangeInclusive<usize> {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn index_mut(self, slice: &mut [T]) -> &mut [T] {
         let Self { mut start, mut end, exhausted } = self;
         let len = slice.len();
@@ -724,9 +702,9 @@ unsafe impl<T> const SliceIndex<[T]> for ops::RangeInclusive<usize> {
     }
 }
 
-#[unstable(feature = "new_range_api", issue = "125687")]
+#[stable(feature = "new_range_inclusive_api", since = "1.95.0")]
 #[rustc_const_unstable(feature = "const_index", issue = "143775")]
-unsafe impl<T> const SliceIndex<[T]> for range::RangeInclusive<usize> {
+const unsafe impl<T> SliceIndex<[T]> for range::RangeInclusive<usize> {
     type Output = [T];
 
     #[inline]
@@ -735,6 +713,7 @@ unsafe impl<T> const SliceIndex<[T]> for range::RangeInclusive<usize> {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn get_mut(self, slice: &mut [T]) -> Option<&mut [T]> {
         ops::RangeInclusive::from(self).get_mut(slice)
     }
@@ -757,6 +736,7 @@ unsafe impl<T> const SliceIndex<[T]> for range::RangeInclusive<usize> {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn index_mut(self, slice: &mut [T]) -> &mut [T] {
         ops::RangeInclusive::from(self).index_mut(slice)
     }
@@ -765,7 +745,7 @@ unsafe impl<T> const SliceIndex<[T]> for range::RangeInclusive<usize> {
 /// The methods `index` and `index_mut` panic if the end of the range is out of bounds.
 #[stable(feature = "inclusive_range", since = "1.26.0")]
 #[rustc_const_unstable(feature = "const_index", issue = "143775")]
-unsafe impl<T> const SliceIndex<[T]> for ops::RangeToInclusive<usize> {
+const unsafe impl<T> SliceIndex<[T]> for ops::RangeToInclusive<usize> {
     type Output = [T];
 
     #[inline]
@@ -774,6 +754,7 @@ unsafe impl<T> const SliceIndex<[T]> for ops::RangeToInclusive<usize> {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn get_mut(self, slice: &mut [T]) -> Option<&mut [T]> {
         (0..=self.end).get_mut(slice)
     }
@@ -796,15 +777,16 @@ unsafe impl<T> const SliceIndex<[T]> for ops::RangeToInclusive<usize> {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn index_mut(self, slice: &mut [T]) -> &mut [T] {
         (0..=self.end).index_mut(slice)
     }
 }
 
 /// The methods `index` and `index_mut` panic if the end of the range is out of bounds.
-#[stable(feature = "inclusive_range", since = "1.26.0")]
+#[stable(feature = "new_range_to_inclusive_api", since = "1.96.0")]
 #[rustc_const_unstable(feature = "const_index", issue = "143775")]
-unsafe impl<T> const SliceIndex<[T]> for range::RangeToInclusive<usize> {
+const unsafe impl<T> SliceIndex<[T]> for range::RangeToInclusive<usize> {
     type Output = [T];
 
     #[inline]
@@ -813,6 +795,7 @@ unsafe impl<T> const SliceIndex<[T]> for range::RangeToInclusive<usize> {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn get_mut(self, slice: &mut [T]) -> Option<&mut [T]> {
         (0..=self.last).get_mut(slice)
     }
@@ -835,6 +818,7 @@ unsafe impl<T> const SliceIndex<[T]> for range::RangeToInclusive<usize> {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn index_mut(self, slice: &mut [T]) -> &mut [T] {
         (0..=self.last).index_mut(slice)
     }
@@ -910,29 +894,7 @@ where
     R: [const] ops::RangeBounds<usize> + [const] Destruct,
 {
     let len = bounds.end;
-
-    let end = match range.end_bound() {
-        ops::Bound::Included(&end) if end >= len => slice_index_fail(0, end, len),
-        // Cannot overflow because `end < len` implies `end < usize::MAX`.
-        ops::Bound::Included(&end) => end + 1,
-
-        ops::Bound::Excluded(&end) if end > len => slice_index_fail(0, end, len),
-        ops::Bound::Excluded(&end) => end,
-        ops::Bound::Unbounded => len,
-    };
-
-    let start = match range.start_bound() {
-        ops::Bound::Excluded(&start) if start >= end => slice_index_fail(start, end, len),
-        // Cannot overflow because `start < end` implies `start < usize::MAX`.
-        ops::Bound::Excluded(&start) => start + 1,
-
-        ops::Bound::Included(&start) if start > end => slice_index_fail(start, end, len),
-        ops::Bound::Included(&start) => start,
-
-        ops::Bound::Unbounded => 0,
-    };
-
-    ops::Range { start, end }
+    into_slice_range(len, (range.start_bound().copied(), range.end_bound().copied()))
 }
 
 /// Performs bounds checking of a range without panicking.
@@ -972,20 +934,7 @@ where
     R: ops::RangeBounds<usize>,
 {
     let len = bounds.end;
-
-    let start = match range.start_bound() {
-        ops::Bound::Included(&start) => start,
-        ops::Bound::Excluded(start) => start.checked_add(1)?,
-        ops::Bound::Unbounded => 0,
-    };
-
-    let end = match range.end_bound() {
-        ops::Bound::Included(end) => end.checked_add(1)?,
-        ops::Bound::Excluded(&end) => end,
-        ops::Bound::Unbounded => len,
-    };
-
-    if start > end || end > len { None } else { Some(ops::Range { start, end }) }
+    try_into_slice_range(len, (range.start_bound().copied(), range.end_bound().copied()))
 }
 
 /// Converts a pair of `ops::Bound`s into `ops::Range` without performing any
@@ -1011,32 +960,40 @@ pub(crate) const fn into_range_unchecked(
 /// Converts pair of `ops::Bound`s into `ops::Range`.
 /// Returns `None` on overflowing indices.
 #[rustc_const_unstable(feature = "const_range", issue = "none")]
-pub(crate) const fn into_range(
+#[inline]
+pub(crate) const fn try_into_slice_range(
     len: usize,
     (start, end): (ops::Bound<usize>, ops::Bound<usize>),
 ) -> Option<ops::Range<usize>> {
-    use ops::Bound;
-    let start = match start {
-        Bound::Included(start) => start,
-        Bound::Excluded(start) => start.checked_add(1)?,
-        Bound::Unbounded => 0,
-    };
-
     let end = match end {
-        Bound::Included(end) => end.checked_add(1)?,
-        Bound::Excluded(end) => end,
-        Bound::Unbounded => len,
+        ops::Bound::Included(end) if end >= len => return None,
+        // Cannot overflow because `end < len` implies `end < usize::MAX`.
+        ops::Bound::Included(end) => end + 1,
+
+        ops::Bound::Excluded(end) if end > len => return None,
+        ops::Bound::Excluded(end) => end,
+
+        ops::Bound::Unbounded => len,
     };
 
-    // Don't bother with checking `start < end` and `end <= len`
-    // since these checks are handled by `Range` impls
+    let start = match start {
+        ops::Bound::Excluded(start) if start >= end => return None,
+        // Cannot overflow because `start < end` implies `start < usize::MAX`.
+        ops::Bound::Excluded(start) => start + 1,
+
+        ops::Bound::Included(start) if start > end => return None,
+        ops::Bound::Included(start) => start,
+
+        ops::Bound::Unbounded => 0,
+    };
 
     Some(start..end)
 }
 
 /// Converts pair of `ops::Bound`s into `ops::Range`.
 /// Panics on overflowing indices.
-pub(crate) fn into_slice_range(
+#[inline]
+pub(crate) const fn into_slice_range(
     len: usize,
     (start, end): (ops::Bound<usize>, ops::Bound<usize>),
 ) -> ops::Range<usize> {
@@ -1071,12 +1028,13 @@ unsafe impl<T> SliceIndex<[T]> for (ops::Bound<usize>, ops::Bound<usize>) {
 
     #[inline]
     fn get(self, slice: &[T]) -> Option<&Self::Output> {
-        into_range(slice.len(), self)?.get(slice)
+        try_into_slice_range(slice.len(), self)?.get(slice)
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn get_mut(self, slice: &mut [T]) -> Option<&mut Self::Output> {
-        into_range(slice.len(), self)?.get_mut(slice)
+        try_into_slice_range(slice.len(), self)?.get_mut(slice)
     }
 
     #[inline]
@@ -1097,6 +1055,7 @@ unsafe impl<T> SliceIndex<[T]> for (ops::Bound<usize>, ops::Bound<usize>) {
     }
 
     #[inline]
+    #[rustc_no_writable]
     fn index_mut(self, slice: &mut [T]) -> &mut Self::Output {
         into_slice_range(slice.len(), self).index_mut(slice)
     }

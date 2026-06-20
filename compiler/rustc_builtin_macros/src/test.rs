@@ -1,10 +1,9 @@
 //! The expansion from a test function to the appropriate test struct for libtest
 //! Ideally, this code would be in libtest but for efficiency and error messages it lives here.
 
-use std::assert_matches::assert_matches;
-use std::iter;
+use std::{assert_matches, iter};
 
-use rustc_ast::{self as ast, GenericParamKind, HasNodeId, attr, join_path_idents};
+use rustc_ast::{self as ast, GenericParamKind, attr, join_path_idents};
 use rustc_ast_pretty::pprust;
 use rustc_attr_parsing::AttributeParser;
 use rustc_errors::{Applicability, Diag, Level};
@@ -15,7 +14,7 @@ use rustc_span::{ErrorGuaranteed, Ident, RemapPathScopeComponents, Span, Symbol,
 use thin_vec::{ThinVec, thin_vec};
 use tracing::debug;
 
-use crate::errors;
+use crate::diagnostics;
 use crate::util::{check_builtin_macro_attribute, warn_on_duplicate_attribute};
 
 /// #[test_case] is used by custom test authors to mark tests
@@ -45,7 +44,7 @@ pub(crate) fn expand_test_case(
             }
         }
         _ => {
-            ecx.dcx().emit_err(errors::TestCaseNonItem { span: anno_item.span() });
+            ecx.dcx().emit_err(diagnostics::TestCaseNonItem { span: anno_item.span() });
             return vec![];
         }
     };
@@ -57,9 +56,9 @@ pub(crate) fn expand_test_case(
     // `#[test_case]` is valid on functions, consts, and statics. Only modify
     // the item in those cases.
     match &mut item.kind {
-        ast::ItemKind::Fn(box ast::Fn { ident, .. })
-        | ast::ItemKind::Const(box ast::ConstItem { ident, .. })
-        | ast::ItemKind::Static(box ast::StaticItem { ident, .. }) => {
+        ast::ItemKind::Fn(ast::Fn { ident, .. })
+        | ast::ItemKind::Const(ast::ConstItem { ident, .. })
+        | ast::ItemKind::Static(ast::StaticItem { ident, .. }) => {
             ident.span = ident.span.with_ctxt(sp.ctxt());
             let test_path_symbol = Symbol::intern(&item_path(
                 // skip the name of the root module
@@ -115,7 +114,7 @@ pub(crate) fn expand_test_or_bench(
 ) -> Vec<Annotatable> {
     let (item, is_stmt) = match item {
         Annotatable::Item(i) => (i, false),
-        Annotatable::Stmt(box ast::Stmt { kind: ast::StmtKind::Item(i), .. }) => (i, true),
+        Annotatable::Stmt(ast::Stmt { kind: ast::StmtKind::Item(i), .. }) => (i, true),
         other => {
             not_testable_error(cx, is_bench, attr_sp, None);
             return vec![other];
@@ -137,7 +136,7 @@ pub(crate) fn expand_test_or_bench(
     }
 
     if let Some(attr) = attr::find_by_name(&item.attrs, sym::naked) {
-        cx.dcx().emit_err(errors::NakedFunctionTestingAttribute {
+        cx.dcx().emit_err(diagnostics::NakedFunctionTestingAttribute {
             testing_span: attr_sp,
             naked_span: attr.span,
         });
@@ -283,13 +282,13 @@ pub(crate) fn expand_test_or_bench(
             // const $ident: test::TestDescAndFn =
             ast::ItemKind::Const(
                 ast::ConstItem {
-                    defaultness: ast::Defaultness::Final,
+                    defaultness: ast::Defaultness::Implicit,
                     ident: Ident::new(fn_.ident.name, sp),
                     generics: ast::Generics::default(),
                     ty: cx.ty(sp, ast::TyKind::Path(None, test_path("TestDescAndFn"))),
                     define_opaque: None,
                     // test::TestDescAndFn {
-                    rhs: Some(ast::ConstItemRhs::Body(
+                    rhs_kind: ast::ConstItemRhsKind::new_body(
                         cx.expr_struct(
                             sp,
                             test_path("TestDescAndFn"),
@@ -371,7 +370,7 @@ pub(crate) fn expand_test_or_bench(
                         field("testfn", test_fn), // }
                     ],
                         ), // }
-                    )),
+                    ),
                 }
                 .into(),
             ),
@@ -481,14 +480,7 @@ fn should_ignore_message(i: &ast::Item) -> Option<Symbol> {
 
 fn should_panic(cx: &ExtCtxt<'_>, i: &ast::Item) -> ShouldPanic {
     if let Some(Attribute::Parsed(AttributeKind::ShouldPanic { reason, .. })) =
-        AttributeParser::parse_limited(
-            cx.sess,
-            &i.attrs,
-            sym::should_panic,
-            i.span,
-            i.node_id(),
-            None,
-        )
+        AttributeParser::parse_limited(cx.sess, &i.attrs, &[sym::should_panic])
     {
         ShouldPanic::Yes(reason)
     } else {
@@ -533,27 +525,31 @@ fn check_test_signature(
     let dcx = cx.dcx();
 
     if let ast::Safety::Unsafe(span) = f.sig.header.safety {
-        return Err(dcx.emit_err(errors::TestBadFn { span: i.span, cause: span, kind: "unsafe" }));
+        return Err(dcx.emit_err(diagnostics::TestBadFn {
+            span: i.span,
+            cause: span,
+            kind: "unsafe",
+        }));
     }
 
     if let Some(coroutine_kind) = f.sig.header.coroutine_kind {
         match coroutine_kind {
             ast::CoroutineKind::Async { span, .. } => {
-                return Err(dcx.emit_err(errors::TestBadFn {
+                return Err(dcx.emit_err(diagnostics::TestBadFn {
                     span: i.span,
                     cause: span,
                     kind: "async",
                 }));
             }
             ast::CoroutineKind::Gen { span, .. } => {
-                return Err(dcx.emit_err(errors::TestBadFn {
+                return Err(dcx.emit_err(diagnostics::TestBadFn {
                     span: i.span,
                     cause: span,
                     kind: "gen",
                 }));
             }
             ast::CoroutineKind::AsyncGen { span, .. } => {
-                return Err(dcx.emit_err(errors::TestBadFn {
+                return Err(dcx.emit_err(diagnostics::TestBadFn {
                     span: i.span,
                     cause: span,
                     kind: "async gen",
@@ -596,7 +592,7 @@ fn check_bench_signature(
     // N.B., inadequate check, but we're running
     // well before resolve, can't get too deep.
     if f.sig.decl.inputs.len() != 1 {
-        return Err(cx.dcx().emit_err(errors::BenchSig { span: i.span }));
+        return Err(cx.dcx().emit_err(diagnostics::BenchSig { span: i.span }));
     }
     Ok(())
 }

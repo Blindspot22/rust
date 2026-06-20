@@ -8,7 +8,6 @@ macro_rules! suite {
         )*
     }
 }
-
 suite! {
     len;
     is_empty;

@@ -6,7 +6,7 @@ use rustc_target::callconv::FnAbi;
 
 use super::{
     FloatBinOp, ShiftOp, bin_op_simd_float_all, bin_op_simd_float_first, convert_float_to_int,
-    packssdw, packsswb, packuswb, psadbw, shift_simd_by_scalar,
+    packssdw, packsswb, packuswb, pmaddwd, psadbw, shift_simd_by_scalar,
 };
 use crate::*;
 
@@ -26,14 +26,14 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         // These intrinsics operate on 128-bit (f32x4, f64x2, i8x16, i16x8, i32x4, i64x2) SIMD
         // vectors unless stated otherwise.
-        // Many intrinsic names are sufixed with "ps" (packed single), "ss" (scalar signle),
+        // Many intrinsic names are suffixed with "ps" (packed single), "ss" (scalar single),
         // "pd" (packed double) or "sd" (scalar double), where single means single precision
         // floating point (f32) and double means double precision floating point (f64). "ps"
-        // and "pd" means thet the operation is performed on each element of the vector, while
+        // and "pd" means that the operation is performed on each element of the vector, while
         // "ss" and "sd" means that the operation is performed only on the first element, copying
         // the remaining elements from the input vector (for binary operations, from the left-hand
         // side).
-        // Intrinsincs sufixed with "epiX" or "epuX" operate with X-bit signed or unsigned
+        // Intrinsics suffixed with "epiX" or "epuX" operate with X-bit signed or unsigned
         // vectors.
         match unprefixed_name {
             // Used to implement the _mm_sad_epu8 function.
@@ -286,33 +286,7 @@ pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let [left, right] =
                     this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
-                let (left, left_len) = this.project_to_simd(left)?;
-                let (right, right_len) = this.project_to_simd(right)?;
-                let (dest, dest_len) = this.project_to_simd(dest)?;
-
-                assert_eq!(left_len, right_len);
-                assert_eq!(dest_len.strict_mul(2), left_len);
-
-                for i in 0..dest_len {
-                    let j1 = i.strict_mul(2);
-                    let left1 = this.read_scalar(&this.project_index(&left, j1)?)?.to_i16()?;
-                    let right1 = this.read_scalar(&this.project_index(&right, j1)?)?.to_i16()?;
-
-                    let j2 = j1.strict_add(1);
-                    let left2 = this.read_scalar(&this.project_index(&left, j2)?)?.to_i16()?;
-                    let right2 = this.read_scalar(&this.project_index(&right, j2)?)?.to_i16()?;
-
-                    let dest = this.project_index(&dest, i)?;
-
-                    // Multiplications are i16*i16->i32, which will not overflow.
-                    let mul1 = i32::from(left1).strict_mul(right1.into());
-                    let mul2 = i32::from(left2).strict_mul(right2.into());
-                    // However, this addition can overflow in the most extreme case
-                    // (-0x8000)*(-0x8000)+(-0x8000)*(-0x8000) = 0x80000000
-                    let res = mul1.wrapping_add(mul2);
-
-                    this.write_scalar(Scalar::from_i32(res), &dest)?;
-                }
+                pmaddwd(this, left, right, dest)?;
             }
             _ => return interp_ok(EmulateItemResult::NotSupported),
         }

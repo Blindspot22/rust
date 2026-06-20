@@ -1,17 +1,16 @@
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
-use rustc_middle::mir::interpret::LitToConstInput;
 use rustc_middle::query::Providers;
 use rustc_middle::thir::visit;
 use rustc_middle::thir::visit::Visitor;
 use rustc_middle::ty::abstract_const::CastKind;
-use rustc_middle::ty::{self, Expr, TyCtxt, TypeVisitableExt};
+use rustc_middle::ty::{self, Expr, LitToConstInput, TyCtxt, TypeVisitableExt};
 use rustc_middle::{mir, thir};
 use rustc_span::Span;
 use tracing::instrument;
 
-use crate::errors::{GenericConstantTooComplex, GenericConstantTooComplexSub};
+use crate::diagnostics::{GenericConstantTooComplex, GenericConstantTooComplexSub};
 
 /// We do not allow all binary operations in abstract consts, so filter disallowed ones.
 fn check_binop(op: mir::BinOp) -> bool {
@@ -59,7 +58,11 @@ fn recurse_build<'tcx>(
         }
         &ExprKind::Literal { lit, neg } => {
             let sp = node.span;
-            tcx.at(sp).lit_to_const(LitToConstInput { lit: lit.node, ty: node.ty, neg })
+            match tcx.at(sp).lit_to_const(LitToConstInput { lit: lit.node, ty: Some(node.ty), neg })
+            {
+                Some(value) => ty::Const::new_value(tcx, value.valtree, value.ty),
+                None => ty::Const::new_misc_error(tcx),
+            }
         }
         &ExprKind::NonHirLiteral { lit, user_ty: _ } => {
             let val = ty::ValTree::from_scalar_int(tcx, lit);
@@ -67,7 +70,11 @@ fn recurse_build<'tcx>(
         }
         &ExprKind::ZstLiteral { user_ty: _ } => ty::Const::zero_sized(tcx, node.ty),
         &ExprKind::NamedConst { def_id, args, user_ty: _ } => {
-            let uneval = ty::UnevaluatedConst::new(def_id, args);
+            let uneval = ty::UnevaluatedConst::new(
+                tcx,
+                ty::UnevaluatedConstKind::new_from_def_id(tcx, def_id),
+                args,
+            );
             ty::Const::new_unevaluated(tcx, uneval)
         }
         ExprKind::ConstParam { param, .. } => ty::Const::new_param(tcx, *param),
@@ -102,7 +109,7 @@ fn recurse_build<'tcx>(
         // }
         // ```
         ExprKind::Block { block } => {
-            if let thir::Block { stmts: box [], expr: Some(e), .. } = &body.blocks[*block] {
+            if let thir::Block { stmts: [], expr: Some(e), .. } = &body.blocks[*block] {
                 recurse_build(tcx, body, *e, root_span)?
             } else {
                 maybe_supported_error(GenericConstantTooComplexSub::BlockNotSupported(node.span))?
@@ -172,7 +179,6 @@ fn recurse_build<'tcx>(
         | ExprKind::LoopMatch { .. } => {
             error(GenericConstantTooComplexSub::LoopNotSupported(node.span))?
         }
-        ExprKind::Box { .. } => error(GenericConstantTooComplexSub::BoxNotSupported(node.span))?,
         ExprKind::ByUse { .. } => {
             error(GenericConstantTooComplexSub::ByUseNotSupported(node.span))?
         }
@@ -205,6 +211,9 @@ fn recurse_build<'tcx>(
         | ExprKind::StaticRef { .. }
         | ExprKind::ThreadLocalRef(_) => {
             error(GenericConstantTooComplexSub::OperationNotSupported(node.span))?
+        }
+        ExprKind::Reborrow { .. } => {
+            todo!();
         }
     })
 }
@@ -258,7 +267,6 @@ impl<'a, 'tcx> IsThirPolymorphic<'a, 'tcx> {
                 count.has_non_region_param()
             }
             thir::ExprKind::Scope { .. }
-            | thir::ExprKind::Box { .. }
             | thir::ExprKind::If { .. }
             | thir::ExprKind::Call { .. }
             | thir::ExprKind::ByUse { .. }
@@ -304,6 +312,9 @@ impl<'a, 'tcx> IsThirPolymorphic<'a, 'tcx> {
             | thir::ExprKind::InlineAsm(_)
             | thir::ExprKind::ThreadLocalRef(_)
             | thir::ExprKind::Yield { .. } => false,
+            thir::ExprKind::Reborrow { .. } => {
+                todo!();
+            }
         }
     }
     fn pat_is_poly(&mut self, pat: &thir::Pat<'tcx>) -> bool {

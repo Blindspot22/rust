@@ -1,7 +1,6 @@
 use std::iter;
 
 use rustc_abi::ExternAbi;
-use rustc_hir::attrs::AttributeKind;
 use rustc_hir::{self as hir, find_attr};
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeFoldable, TypeFolder, TypeSuperFoldable};
 use rustc_session::{declare_lint, declare_lint_pass};
@@ -116,7 +115,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for CheckGpuKernelTypes<'tcx> {
             }
 
             ty::Adt(_, _)
-            | ty::Alias(_, _)
+            | ty::Alias(_)
             | ty::Array(_, _)
             | ty::Bound(_, _)
             | ty::Closure(_, _)
@@ -167,7 +166,7 @@ impl<'tcx> LateLintPass<'tcx> for ImproperGpuKernelLint {
             return;
         }
 
-        let sig = cx.tcx.fn_sig(id).instantiate_identity();
+        let sig = cx.tcx.fn_sig(id).instantiate_identity().skip_norm_wip();
         let sig = cx.tcx.instantiate_bound_regions_with_erased(sig);
 
         for (input_ty, input_hir) in iter::zip(sig.inputs(), decl.inputs) {
@@ -184,10 +183,7 @@ impl<'tcx> LateLintPass<'tcx> for ImproperGpuKernelLint {
         }
 
         // Check for no_mangle/export_name, so the kernel can be found when querying the compiled object for the kernel function by name
-        if !find_attr!(
-            cx.tcx.get_all_attrs(id),
-            AttributeKind::NoMangle(..) | AttributeKind::ExportName { .. }
-        ) {
+        if !find_attr!(cx.tcx, id, NoMangle(..) | ExportName { .. }) {
             cx.emit_span_lint(MISSING_GPU_KERNEL_EXPORT_NAME, span, MissingGpuKernelExportName);
         }
     }

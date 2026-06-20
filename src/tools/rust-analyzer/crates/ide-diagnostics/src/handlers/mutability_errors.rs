@@ -8,7 +8,7 @@ use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, fix};
 // Diagnostic: need-mut
 //
 // This diagnostic is triggered on mutating an immutable variable.
-pub(crate) fn need_mut(ctx: &DiagnosticsContext<'_>, d: &hir::NeedMut) -> Option<Diagnostic> {
+pub(crate) fn need_mut(ctx: &DiagnosticsContext<'_, '_>, d: &hir::NeedMut) -> Option<Diagnostic> {
     let root = ctx.sema.db.parse_or_expand(d.span.file_id);
     let node = d.span.value.to_node(&root);
     let mut span = d.span;
@@ -63,7 +63,10 @@ pub(crate) fn need_mut(ctx: &DiagnosticsContext<'_>, d: &hir::NeedMut) -> Option
 // Diagnostic: unused-mut
 //
 // This diagnostic is triggered when a mutable variable isn't actually mutated.
-pub(crate) fn unused_mut(ctx: &DiagnosticsContext<'_>, d: &hir::UnusedMut) -> Option<Diagnostic> {
+pub(crate) fn unused_mut(
+    ctx: &DiagnosticsContext<'_, '_>,
+    d: &hir::UnusedMut,
+) -> Option<Diagnostic> {
     let ast = d.local.primary_source(ctx.sema.db).syntax_ptr();
     let fixes = (|| {
         let file_id = ast.file_id.file_id()?;
@@ -87,7 +90,6 @@ pub(crate) fn unused_mut(ctx: &DiagnosticsContext<'_>, d: &hir::UnusedMut) -> Op
             use_range,
         )])
     })();
-    let ast = d.local.primary_source(ctx.sema.db).syntax_ptr();
     Some(
         Diagnostic::new_with_syntax_node_ptr(
             ctx,
@@ -995,10 +997,6 @@ fn fn_once(mut x: impl FnOnce(u8) -> u8) -> u8 {
         }
                     "#,
         );
-        // FIXME: There should be no "unused variable" here, and there should be a mutability error,
-        // but our MIR infra is horribly broken and due to the order in which expressions are lowered
-        // there is no `StorageLive` for `x` in the closure (in fact, `x` should not even be a variable
-        // of the closure, the environment should be, but as I said, our MIR infra is horribly broken).
         check_diagnostics(
             r#"
 //- minicore: copy, fn
@@ -1007,8 +1005,8 @@ fn f() {
         || {
             || {
                 let x = 2;
-                 // ^ 💡 warn: unused variable
                 || { || { x = 5; } }
+                        //^^^^^ 💡 error: cannot mutate immutable variable `x`
             }
         }
     };
@@ -1315,7 +1313,7 @@ fn main() {
     fn regression_20662() {
         check_diagnostics(
             r#"
-//- minicore: index
+//- minicore: index, slice
 pub trait A: core::ops::IndexMut<usize> {
     type T: A;
 }

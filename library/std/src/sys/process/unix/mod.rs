@@ -21,7 +21,14 @@ cfg_select! {
     }
 }
 
-pub use imp::{ExitStatus, ExitStatusError, Process};
+#[cfg(target_os = "linux")]
+mod pidfd;
 
-pub use self::common::{ChildPipe, Command, CommandArgs, ExitCode, Stdio, read_output};
+pub use imp::{ExitStatus, ExitStatusError, Process};
+#[cfg(target_os = "linux")]
+pub use pidfd::PidFd;
+
+pub use self::common::{
+    ChildPipe, Command, CommandArgs, ExitCode, Stdio, getpid, getppid, read_output,
+};
 pub use crate::ffi::OsString as EnvKey;

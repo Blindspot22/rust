@@ -11,7 +11,7 @@ use base_db::target::TargetData;
 use base_db::{
     Crate, CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CrateWorkspaceData,
     DependencyBuilder, Env, FileChange, FileSet, FxIndexMap, LangCrateOrigin, SourceDatabase,
-    SourceRoot, Version, VfsPath,
+    SourceRoot, Version, VfsPath, all_crates,
 };
 use cfg::CfgOptions;
 use hir_expand::{
@@ -37,7 +37,110 @@ use triomphe::Arc;
 
 pub const WORKSPACE: base_db::SourceRootId = base_db::SourceRootId(0);
 
+/// A trait for setting up test databases from fixture strings.
+///
+/// Fixtures are strings containing Rust source code with optional metadata that describe
+/// a project setup. This is the primary way to write tests for rust-analyzer without
+/// having to depend on the entire sysroot.
+///
+/// # Fixture Syntax
+///
+/// ## Basic Structure
+///
+/// A fixture without metadata is parsed into a single source file (`/main.rs`).
+/// Metadata is added after a `//-` comment prefix.
+///
+/// ```text
+/// //- /main.rs
+/// fn main() {
+///     println!("Hello");
+/// }
+/// ```
+///
+/// Note that the fixture syntax is optional and can be omitted if the test only requires
+/// a simple single file.
+///
+/// ## File Metadata
+///
+/// Each file can have the following metadata after `//-`:
+///
+/// - **Path** (required): Must start with `/`, e.g., `/main.rs`, `/lib.rs`, `/foo/bar.rs`
+/// - **`crate:<name>`**: Defines a new crate with this file as its root
+///   - Optional version: `crate:foo@0.1.0,https://example.com/repo.git`
+/// - **`deps:<crate1>,<crate2>`**: Dependencies (requires `crate:`)
+/// - **`extern-prelude:<crate1>,<crate2>`**: Limits extern prelude to specified crates
+/// - **`edition:<year>`**: Rust edition (2015, 2018, 2021, 2024). Defaults to current.
+/// - **`cfg:<key>=<value>,<flag>`**: Configuration options, e.g., `cfg:test,feature="foo"`
+/// - **`env:<KEY>=<value>`**: Environment variables
+/// - **`crate-attr:<attr>`**: Crate-level attributes, e.g., `crate-attr:no_std`
+/// - **`new_source_root:local|library`**: Starts a new source root
+/// - **`library`**: Marks crate as external library (not workspace member)
+///
+/// ## Global Meta (must appear at the top, in order)
+///
+/// - **`//- toolchain: nightly|stable`**: Sets the Rust toolchain (default: stable)
+/// - **`//- target_data_layout: <layout>`**: LLVM data layout string
+/// - **`//- target_arch: <arch>`**: Target architecture (default: x86_64)
+/// - **`//- proc_macros: <name1>,<name2>`**: Enables predefined test proc macros
+/// - **`//- minicore: <flag1>, <flag2>`**: Includes subset of libcore
+///
+/// ## Cursor Markers
+///
+/// Use `$0` to mark cursor position(s) in the fixture:
+/// - Single `$0`: marks a position (use with [`with_position`](Self::with_position))
+/// - Two `$0` markers: marks a range (use with [`with_range`](Self::with_range))
+/// - Escape as `\$0` if you need a literal `$0`
+///
+/// # Examples
+///
+/// ## Single file with cursor position
+/// ```text
+/// r#"
+/// fn main() {
+///     let x$0 = 42;
+/// }
+/// "#
+/// ```
+///
+/// ## Multiple crates with dependencies
+/// ```text
+/// r#"
+/// //- /main.rs crate:main deps:helper
+/// use helper::greet;
+/// fn main() { greet(); }
+///
+/// //- /lib.rs crate:helper
+/// pub fn greet() {}
+/// "#
+/// ```
+///
+/// ## Using minicore for lang items
+/// ```text
+/// r#"
+/// //- minicore: option, result, iterator
+/// //- /main.rs
+/// fn foo() -> Option<i32> { Some(42) }
+/// "#
+/// ```
+///
+/// The available minicore flags are listed at the top of crates\test-utils\src\minicore.rs.
+///
+/// ## Using test proc macros
+/// ```text
+/// r#"
+/// //- proc_macros: identity, mirror
+/// //- /main.rs crate:main deps:proc_macros
+/// use proc_macros::identity;
+///
+/// #[identity]
+/// fn foo() {}
+/// "#
+/// ```
+///
+/// Available proc macros: `identity` (attr), `DeriveIdentity` (derive), `input_replace` (attr),
+/// `mirror` (bang), `shorten` (bang)
 pub trait WithFixture: Default + ExpandDatabase + SourceDatabase + 'static {
+    /// See the trait documentation for more information on fixtures.
     #[track_caller]
     fn with_single_file(
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
@@ -46,10 +149,11 @@ pub trait WithFixture: Default + ExpandDatabase + SourceDatabase + 'static {
         let fixture = ChangeFixture::parse(ra_fixture);
         fixture.change.apply(&mut db);
         assert_eq!(fixture.files.len(), 1, "Multiple file found in the fixture");
-        let file = EditionedFileId::from_span_guess_origin(&db, fixture.files[0]);
-        (db, file)
+        let file_id = EditionedFileId::from_span_file_id(&db, fixture.files[0]);
+        (db, file_id)
     }
 
+    /// See the trait documentation for more information on fixtures.
     #[track_caller]
     fn with_many_files(
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
@@ -61,11 +165,12 @@ pub trait WithFixture: Default + ExpandDatabase + SourceDatabase + 'static {
         let files = fixture
             .files
             .into_iter()
-            .map(|file| EditionedFileId::from_span_guess_origin(&db, file))
+            .map(|file| EditionedFileId::from_span_file_id(&db, file))
             .collect();
         (db, files)
     }
 
+    /// See the trait documentation for more information on fixtures.
     #[track_caller]
     fn with_files(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> Self {
         let mut db = Self::default();
@@ -75,6 +180,7 @@ pub trait WithFixture: Default + ExpandDatabase + SourceDatabase + 'static {
         db
     }
 
+    /// See the trait documentation for more information on fixtures.
     #[track_caller]
     fn with_files_extra_proc_macros(
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
@@ -88,6 +194,7 @@ pub trait WithFixture: Default + ExpandDatabase + SourceDatabase + 'static {
         db
     }
 
+    /// See the trait documentation for more information on fixtures.
     #[track_caller]
     fn with_position(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> (Self, FilePosition) {
         let (db, file_id, range_or_offset) = Self::with_range_or_offset(ra_fixture);
@@ -95,6 +202,7 @@ pub trait WithFixture: Default + ExpandDatabase + SourceDatabase + 'static {
         (db, FilePosition { file_id, offset })
     }
 
+    /// See the trait documentation for more information on fixtures.
     #[track_caller]
     fn with_range(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> (Self, FileRange) {
         let (db, file_id, range_or_offset) = Self::with_range_or_offset(ra_fixture);
@@ -102,6 +210,7 @@ pub trait WithFixture: Default + ExpandDatabase + SourceDatabase + 'static {
         (db, FileRange { file_id, range })
     }
 
+    /// See the trait documentation for more information on fixtures.
     #[track_caller]
     fn with_range_or_offset(
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
@@ -113,12 +222,12 @@ pub trait WithFixture: Default + ExpandDatabase + SourceDatabase + 'static {
         let (file_id, range_or_offset) = fixture
             .file_position
             .expect("Could not find file position in fixture. Did you forget to add an `$0`?");
-        let file_id = EditionedFileId::from_span_guess_origin(&db, file_id);
+        let file_id = EditionedFileId::from_span_file_id(&db, file_id);
         (db, file_id, range_or_offset)
     }
 
     fn test_crate(&self) -> Crate {
-        self.all_crates().iter().copied().find(|&krate| !krate.data(self).origin.is_lang()).unwrap()
+        all_crates(self).iter().copied().find(|&krate| !krate.data(self).origin.is_lang()).unwrap()
     }
 }
 

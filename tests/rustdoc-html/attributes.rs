@@ -1,4 +1,5 @@
 //@ edition: 2024
+//@ only-linux
 #![crate_name = "foo"]
 
 //@ has foo/fn.f.html '//*[@class="code-attribute"]' '#[unsafe(no_mangle)]'
@@ -59,7 +60,7 @@ pub enum Enum {
 pub trait Trait {
     //@ has 'foo/trait.Trait.html'
     //@ has - '//*[@id="associatedconstant.BAR"]/*[@class="code-header"]/*[@class="code-attribute"]' '#[unsafe(link_section = "bar")]'
-    //@ has - '//*[@id="associatedconstant.BAR"]/*[@class="code-header"]' 'const BAR: u32 = 0u32'
+    //@ has - '//*[@id="associatedconstant.BAR"]/*[@class="code-header"]' 'const BAR: u32 = 0'
     #[unsafe(link_section = "bar")]
     const BAR: u32 = 0;
 

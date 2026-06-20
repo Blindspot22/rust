@@ -1,15 +1,14 @@
 //! The `Visitor` responsible for actually checking a `mir::Body` for invalid operations.
 
-use std::assert_matches::assert_matches;
 use std::borrow::Cow;
-use std::mem;
 use std::num::NonZero;
 use std::ops::Deref;
+use std::{assert_matches, mem};
 
 use rustc_errors::{Diag, ErrorGuaranteed};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
-use rustc_hir::{self as hir, LangItem};
+use rustc_hir::{self as hir, LangItem, find_attr};
 use rustc_index::bit_set::DenseBitSet;
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_middle::mir::visit::Visitor;
@@ -215,7 +214,7 @@ impl<'mir, 'tcx> Checker<'mir, 'tcx> {
             return;
         }
 
-        if !tcx.has_attr(def_id, sym::rustc_do_not_const_check) {
+        if !find_attr!(tcx, def_id, RustcDoNotConstCheck) {
             self.visit_body(body);
         }
 
@@ -334,7 +333,7 @@ impl<'mir, 'tcx> Checker<'mir, 'tcx> {
             self.tcx.dcx().span_bug(span, "tls access is checked in `Rvalue::ThreadLocalRef`");
         }
         if let Some(def_id) = def_id.as_local()
-            && let Err(guar) = self.tcx.ensure_ok().check_well_formed(hir::OwnerId { def_id })
+            && let Err(guar) = self.tcx.ensure_result().check_well_formed(hir::OwnerId { def_id })
         {
             self.error_emitted = Some(guar);
         }
@@ -400,8 +399,9 @@ impl<'mir, 'tcx> Checker<'mir, 'tcx> {
                 ty::BoundConstness::Const
             }
         };
-        let const_conditions =
-            ocx.normalize(&ObligationCause::misc(call_span, body_id), param_env, const_conditions);
+        let const_conditions = const_conditions.into_iter().map(|(c, s)| {
+            (ocx.normalize(&ObligationCause::misc(call_span, body_id), param_env, c), s)
+        });
         ocx.register_obligations(const_conditions.into_iter().map(|(trait_ref, span)| {
             Obligation::new(
                 tcx,
@@ -570,14 +570,14 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
         match rvalue {
             Rvalue::ThreadLocalRef(_) => self.check_op(ops::ThreadLocalAccess),
 
-            Rvalue::Use(_)
+            Rvalue::Use(..)
             | Rvalue::CopyForDeref(..)
             | Rvalue::Repeat(..)
             | Rvalue::Discriminant(..) => {}
 
             Rvalue::Aggregate(kind, ..) => {
                 if let AggregateKind::Coroutine(def_id, ..) = kind.as_ref()
-                    && let Some(coroutine_kind) = self.tcx.coroutine_kind(def_id)
+                    && let Some(coroutine_kind) = self.tcx.coroutine_kind(*def_id)
                 {
                     self.check_op(ops::Coroutine(coroutine_kind));
                 }
@@ -608,6 +608,10 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                 if borrowed_place_has_mut_interior && self.place_may_escape(place) {
                     self.check_op(ops::EscapingCellBorrow);
                 }
+            }
+
+            Rvalue::Reborrow(..) => {
+                // FIXME(reborrow): figure out if this is relevant at all.
             }
 
             Rvalue::RawPtr(RawPtrKind::FakeForPtrMetadata, place) => {
@@ -645,8 +649,6 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
 
             Rvalue::Cast(_, _, _) => {}
 
-            Rvalue::ShallowInitBox(_, _) => {}
-
             Rvalue::UnaryOp(op, operand) => {
                 let ty = operand.ty(self.body, self.tcx);
                 match op {
@@ -667,7 +669,7 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                 }
             }
 
-            Rvalue::BinaryOp(op, box (lhs, rhs)) => {
+            Rvalue::BinaryOp(op, (lhs, rhs)) => {
                 let lhs_ty = lhs.ty(self.body, self.tcx);
                 let rhs_ty = rhs.ty(self.body, self.tcx);
 
@@ -727,7 +729,6 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
             | StatementKind::FakeRead(..)
             | StatementKind::StorageLive(_)
             | StatementKind::StorageDead(_)
-            | StatementKind::Retag { .. }
             | StatementKind::PlaceMention(..)
             | StatementKind::AscribeUserType(..)
             | StatementKind::Coverage(..)
@@ -774,16 +775,17 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
 
                 // Attempting to call a trait method?
                 if let Some(trait_did) = tcx.trait_of_assoc(callee) {
-                    // We can't determine the actual callee here, so we have to do different checks
-                    // than usual.
+                    // We can't determine the actual callee (the underlying impl of the trait) here, so we have
+                    // to do different checks than usual.
 
                     trace!("attempting to call a trait method");
-                    let trait_is_const = tcx.is_const_trait(trait_did);
+                    let is_const =
+                        matches!(tcx.constness(callee), hir::Constness::Const { always: false });
 
                     // Only consider a trait to be const if the const conditions hold.
                     // Otherwise, it's really misleading to call something "conditionally"
                     // const when it's very obviously not conditionally const.
-                    if trait_is_const && has_const_conditions == Some(ConstConditionsHold::Yes) {
+                    if is_const && has_const_conditions == Some(ConstConditionsHold::Yes) {
                         // Trait calls are always conditionally-const.
                         self.check_op(ops::ConditionallyConstCall {
                             callee,
@@ -815,6 +817,10 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                     });
                 }
 
+                if self.tcx.fn_sig(callee).skip_binder().c_variadic() {
+                    self.check_op(ops::FnCallCVariadic)
+                }
+
                 // At this point, we are calling a function, `callee`, whose `DefId` is known...
 
                 // `begin_panic` and `panic_display` functions accept generic
@@ -841,13 +847,6 @@ impl<'tcx> Visitor<'tcx> for Checker<'_, 'tcx> {
                     } else {
                         self.check_op(ops::PanicNonStr);
                     }
-                    // Allow this call, skip all the checks below.
-                    return;
-                }
-
-                // This can be called on stable via the `vec!` macro.
-                if tcx.is_lang_item(callee, LangItem::ExchangeMalloc) {
-                    self.check_op(ops::HeapAllocation);
                     // Allow this call, skip all the checks below.
                     return;
                 }

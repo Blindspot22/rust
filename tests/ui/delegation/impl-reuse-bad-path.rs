@@ -1,10 +1,9 @@
-#![allow(incomplete_features)]
 #![feature(fn_delegation)]
 
 mod unresolved {
     struct S;
     reuse impl unresolved for S { self.0 }
-    //~^ ERROR failed to resolve: use of unresolved module or unlinked crate `unresolved`
+    //~^ ERROR cannot find module or crate `unresolved` in this scope
     //~| ERROR cannot find trait `unresolved` in this scope
 
     trait T {}

@@ -60,7 +60,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
     ) -> Diag<'a> {
         fn with_short_path<'tcx, T>(tcx: TyCtxt<'tcx>, value: T) -> String
         where
-            T: fmt::Display + Print<'tcx, FmtPrinter<'tcx, 'tcx>>,
+            T: fmt::Display + for<'b> Print<FmtPrinter<'b, 'tcx>>,
         {
             let s = value.to_string();
             if s.len() > 50 {
@@ -78,7 +78,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         let mut err = match cause {
             OverflowCause::DeeplyNormalize(alias_term) => {
                 let alias_term = self.resolve_vars_if_possible(alias_term);
-                let kind = alias_term.kind(self.tcx).descr();
+                let kind = alias_term.kind.descr();
                 let alias_str = with_short_path(self.tcx, alias_term);
                 struct_span_code_err!(
                     self.dcx(),
@@ -97,6 +97,15 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                             span,
                             E0275,
                             "overflow assigning `{a}` to `{b}`",
+                        )
+                    }
+                    ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(term)) => {
+                        let term = with_short_path(self.tcx, term);
+                        struct_span_code_err!(
+                            self.dcx(),
+                            span,
+                            E0275,
+                            "overflow evaluating whether `{term}` is well-formed",
                         )
                     }
                     _ => {

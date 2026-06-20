@@ -40,7 +40,7 @@ case ${TARGET} in
 	export RUSTFLAGS="${RUSTFLAGS} -C llvm-args=-fast-isel=false"
 	;;
     armv7-*eabihf | thumbv7-*eabihf)
-        export RUSTFLAGS="${RUSTFLAGS} -Ctarget-feature=+neon"
+        export RUSTFLAGS="${RUSTFLAGS} -Ctarget-feature=+neon,+fp16"
         ;;
     amdgcn-*)
         export RUSTFLAGS="${RUSTFLAGS} -Ctarget-cpu=gfx1200"
@@ -49,6 +49,9 @@ case ${TARGET} in
     # doesn't detect RISC-V compilers automatically, so do it manually here.
     riscv*)
         export RUSTFLAGS="${RUSTFLAGS} -Ctarget-feature=+zk,+zks,+zbb,+zbc"
+        ;;
+    hexagon*)
+        export RUSTFLAGS="${RUSTFLAGS} -Ctarget-feature=+hvxv60,+hvx-length128b"
         ;;
 esac
 

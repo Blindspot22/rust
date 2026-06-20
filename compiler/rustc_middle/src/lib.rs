@@ -26,27 +26,23 @@
 
 // tidy-alphabetical-start
 #![allow(internal_features)]
-#![allow(rustc::diagnostic_outside_of_impl)]
 #![allow(rustc::direct_use_of_rustc_type_ir)]
-#![allow(rustc::untranslatable_diagnostic)]
-#![cfg_attr(bootstrap, feature(array_windows))]
+#![cfg_attr(bootstrap, feature(box_as_ptr))]
+#![cfg_attr(doc, feature(intra_doc_pointers))]
 #![feature(allocator_api)]
-#![feature(assert_matches)]
 #![feature(associated_type_defaults)]
-#![feature(box_as_ptr)]
-#![feature(box_patterns)]
 #![feature(closure_track_caller)]
 #![feature(const_default)]
 #![feature(const_trait_impl)]
 #![feature(core_intrinsics)]
 #![feature(debug_closure_helpers)]
 #![feature(decl_macro)]
+#![feature(default_field_values)]
+#![feature(deref_patterns)]
 #![feature(discriminant_kind)]
 #![feature(extern_types)]
 #![feature(file_buffered)]
 #![feature(gen_blocks)]
-#![feature(if_let_guard)]
-#![feature(intra_doc_pointers)]
 #![feature(min_specialization)]
 #![feature(negative_impls)]
 #![feature(never_type)]
@@ -54,12 +50,12 @@
 #![feature(range_bounds_is_empty)]
 #![feature(rustc_attrs)]
 #![feature(sized_hierarchy)]
+#![feature(trait_alias)]
 #![feature(try_blocks)]
 #![feature(try_trait_v2)]
 #![feature(try_trait_v2_residual)]
 #![feature(try_trait_v2_yeet)]
 #![feature(type_alias_impl_trait)]
-#![feature(unwrap_infallible)]
 #![feature(yeet_expr)]
 #![recursion_limit = "256"]
 // tidy-alphabetical-end
@@ -72,26 +68,25 @@ mod macros;
 
 #[macro_use]
 pub mod arena;
+
+pub mod dep_graph;
 pub mod error;
 pub mod hir;
 pub mod hooks;
+pub mod ich;
 pub mod infer;
 pub mod lint;
 pub mod metadata;
 pub mod middle;
 pub mod mir;
+pub mod mono;
+pub mod queries;
+pub mod query;
 pub mod thir;
 pub mod traits;
 pub mod ty;
 pub mod util;
-mod values;
-
-#[macro_use]
-pub mod query;
-#[macro_use]
-pub mod dep_graph;
+pub mod verify_ich;
 
 // Allows macros to refer to this crate as `::rustc_middle`
 extern crate self as rustc_middle;
-
-rustc_fluent_macro::fluent_messages! { "../messages.ftl" }

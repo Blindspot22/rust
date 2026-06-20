@@ -183,6 +183,7 @@ impl<T: PointeeSized> *const T {
     /// [`with_exposed_provenance`]: with_exposed_provenance
     #[inline(always)]
     #[stable(feature = "exposed_provenance", since = "1.84.0")]
+    #[expect(lossy_provenance_casts, reason = "this *is* the replacement")]
     pub fn expose_provenance(self) -> usize {
         self.cast::<()>() as usize
     }
@@ -239,7 +240,7 @@ impl<T: PointeeSized> *const T {
     /// let ptr: *const u8 = &10u8 as *const u8;
     ///
     /// unsafe {
-    ///     let val_back = &*ptr;
+    ///     let val_back = ptr.as_ref_unchecked();
     ///     assert_eq!(val_back, &10);
     /// }
     /// ```
@@ -259,6 +260,7 @@ impl<T: PointeeSized> *const T {
     ///
     /// [`is_null`]: #method.is_null
     /// [`as_uninit_ref`]: #method.as_uninit_ref
+    /// [`as_ref_unchecked`]: #method.as_ref_unchecked
     #[stable(feature = "ptr_as_ref", since = "1.9.0")]
     #[rustc_const_stable(feature = "const_ptr_is_null", since = "1.84.0")]
     #[inline]
@@ -283,15 +285,14 @@ impl<T: PointeeSized> *const T {
     /// # Examples
     ///
     /// ```
-    /// #![feature(ptr_as_ref_unchecked)]
     /// let ptr: *const u8 = &10u8 as *const u8;
     ///
     /// unsafe {
     ///     assert_eq!(ptr.as_ref_unchecked(), &10);
     /// }
     /// ```
-    // FIXME: mention it in the docs for `as_ref` and `as_uninit_ref` once stabilized.
-    #[unstable(feature = "ptr_as_ref_unchecked", issue = "122034")]
+    #[stable(feature = "ptr_as_ref_unchecked", since = "1.95.0")]
+    #[rustc_const_stable(feature = "ptr_as_ref_unchecked", since = "1.95.0")]
     #[inline]
     #[must_use]
     pub const unsafe fn as_ref_unchecked<'a>(self) -> &'a T {
@@ -329,6 +330,10 @@ impl<T: PointeeSized> *const T {
     }
 
     #[doc = include_str!("./docs/offset.md")]
+    ///
+    /// Consider using [`wrapping_offset`](#method.wrapping_offset) instead if these constraints are
+    /// difficult to satisfy. The only advantage of this method is that it
+    /// enables more aggressive compiler optimizations.
     ///
     /// # Examples
     ///
@@ -810,6 +815,10 @@ impl<T: PointeeSized> *const T {
 
     #[doc = include_str!("./docs/add.md")]
     ///
+    /// Consider using [`wrapping_add`](#method.wrapping_add) instead if these constraints are
+    /// difficult to satisfy. The only advantage of this method is that it
+    /// enables more aggressive compiler optimizations.
+    ///
     /// # Examples
     ///
     /// ```
@@ -883,38 +892,11 @@ impl<T: PointeeSized> *const T {
         unsafe { self.cast::<u8>().add(count).with_metadata_of(self) }
     }
 
-    /// Subtracts an unsigned offset from a pointer.
+    #[doc = include_str!("./docs/sub.md")]
     ///
-    /// This can only move the pointer backward (or not move it). If you need to move forward or
-    /// backward depending on the value, then you might want [`offset`](#method.offset) instead
-    /// which takes a signed offset.
-    ///
-    /// `count` is in units of T; e.g., a `count` of 3 represents a pointer
-    /// offset of `3 * size_of::<T>()` bytes.
-    ///
-    /// # Safety
-    ///
-    /// If any of the following conditions are violated, the result is Undefined Behavior:
-    ///
-    /// * The offset in bytes, `count * size_of::<T>()`, computed on mathematical integers (without
-    ///   "wrapping around"), must fit in an `isize`.
-    ///
-    /// * If the computed offset is non-zero, then `self` must be [derived from][crate::ptr#provenance] a pointer to some
-    ///   [allocation], and the entire memory range between `self` and the result must be in
-    ///   bounds of that allocation. In particular, this range must not "wrap around" the edge
-    ///   of the address space.
-    ///
-    /// Allocations can never be larger than `isize::MAX` bytes, so if the computed offset
-    /// stays in bounds of the allocation, it is guaranteed to satisfy the first requirement.
-    /// This implies, for instance, that `vec.as_ptr().add(vec.len())` (for `vec: Vec<T>`) is always
-    /// safe.
-    ///
-    /// Consider using [`wrapping_sub`] instead if these constraints are
+    /// Consider using [`wrapping_sub`](#method.wrapping_sub) instead if these constraints are
     /// difficult to satisfy. The only advantage of this method is that it
     /// enables more aggressive compiler optimizations.
-    ///
-    /// [`wrapping_sub`]: #method.wrapping_sub
-    /// [allocation]: crate::ptr#allocation
     ///
     /// # Examples
     ///
@@ -1385,6 +1367,43 @@ impl<T> *const T {
     #[unstable(feature = "cast_maybe_uninit", issue = "145036")]
     pub const fn cast_uninit(self) -> *const MaybeUninit<T> {
         self as _
+    }
+
+    /// Forms a raw slice from a pointer and a length.
+    ///
+    /// The `len` argument is the number of **elements**, not the number of bytes.
+    ///
+    /// This function is safe, but actually using the return value is unsafe.
+    /// See the documentation of [`slice::from_raw_parts`] for slice safety requirements.
+    ///
+    /// [`slice::from_raw_parts`]: crate::slice::from_raw_parts
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// #![feature(ptr_cast_slice)]
+    ///
+    /// // create a slice pointer when starting out with a pointer to the first element
+    /// let x = [5, 6, 7];
+    /// let raw_slice = x.as_ptr().cast_slice(3);
+    /// assert_eq!(unsafe { &*raw_slice }[2], 7);
+    /// ```
+    ///
+    /// You must ensure that the pointer is valid and not null before dereferencing
+    /// the raw slice. A slice reference must never have a null pointer, even if it's empty.
+    ///
+    /// ```rust,should_panic
+    /// #![feature(ptr_cast_slice)]
+    /// use std::ptr;
+    /// let danger: *const [u8] = ptr::null::<u8>().cast_slice(0);
+    /// unsafe {
+    ///     danger.as_ref().expect("references must not be null");
+    /// }
+    /// ```
+    #[inline]
+    #[unstable(feature = "ptr_cast_slice", issue = "149103")]
+    pub const fn cast_slice(self, len: usize) -> *const [T] {
+        slice_from_raw_parts(self, len)
     }
 }
 impl<T> *const MaybeUninit<T> {

@@ -1,6 +1,6 @@
 #![allow(invalid_from_utf8)]
 
-use std::assert_matches::assert_matches;
+use std::assert_matches;
 use std::borrow::Cow;
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::str::{from_utf8, from_utf8_unchecked};
@@ -164,7 +164,7 @@ fn test_join_for_different_lengths_with_long_separator() {
 }
 
 #[test]
-fn test_join_issue_80335() {
+fn test_join_inconsistent_borrow_shrink() {
     use core::borrow::Borrow;
     use core::cell::Cell;
 
@@ -191,7 +191,26 @@ fn test_join_issue_80335() {
     }
 
     let arr: [WeirdBorrow; 3] = Default::default();
-    test_join!("0-0-0", arr, "-");
+    test_join!("123456-0-0", arr, "-");
+}
+
+#[test]
+#[should_panic(expected = "mid > len")]
+fn test_join_inconsistent_borrow_grow() {
+    use std::borrow::Borrow;
+    use std::cell::Cell;
+
+    struct E(Cell<u32>);
+
+    impl Borrow<str> for E {
+        fn borrow(&self) -> &str {
+            let count = self.0.get();
+            self.0.set(count + 1);
+            if count == 0 { "" } else { "longer string" }
+        }
+    }
+
+    let _s = [E(Cell::new(0)), E(Cell::new(0))].join("");
 }
 
 #[test]
@@ -612,14 +631,14 @@ mod slice_index {
             data: "abcdef";
             good: data[4..4] == "";
             bad: data[4..3];
-            message: "begin <= end (4 <= 3)";
+            message: "byte range starts at 4 but ends at 3";
         }
 
         in mod rangeinclusive_neg_width {
             data: "abcdef";
             good: data[4..=3] == "";
             bad: data[4..=2];
-            message: "begin <= end (4 <= 3)";
+            message: "byte range starts at 4 but ends at 3";
         }
     }
 
@@ -630,13 +649,13 @@ mod slice_index {
                 // note: using 0 specifically ensures that the result of overflowing is 0..0,
                 //       so that `get` doesn't simply return None for the wrong reason.
                 bad: data[0..=usize::MAX];
-                message: "maximum usize";
+                message: "out of bounds";
             }
 
             in mod rangetoinclusive {
                 data: "hello";
                 bad: data[..=usize::MAX];
-                message: "maximum usize";
+                message: "out of bounds";
             }
         }
     }
@@ -659,49 +678,49 @@ mod slice_index {
                 data: super::DATA;
                 bad: data[super::BAD_START..super::GOOD_END];
                 message:
-                    "byte index 4 is not a char boundary; it is inside 'α' (bytes 3..5) of";
+                    "start byte index 4 is not a char boundary; it is inside 'α' (bytes 3..5 of string)";
             }
 
             in mod range_2 {
                 data: super::DATA;
                 bad: data[super::GOOD_START..super::BAD_END];
                 message:
-                    "byte index 6 is not a char boundary; it is inside 'β' (bytes 5..7) of";
+                    "end byte index 6 is not a char boundary; it is inside 'β' (bytes 5..7 of string)";
             }
 
             in mod rangefrom {
                 data: super::DATA;
                 bad: data[super::BAD_START..];
                 message:
-                    "byte index 4 is not a char boundary; it is inside 'α' (bytes 3..5) of";
+                    "start byte index 4 is not a char boundary; it is inside 'α' (bytes 3..5 of string)";
             }
 
             in mod rangeto {
                 data: super::DATA;
                 bad: data[..super::BAD_END];
                 message:
-                    "byte index 6 is not a char boundary; it is inside 'β' (bytes 5..7) of";
+                    "end byte index 6 is not a char boundary; it is inside 'β' (bytes 5..7 of string)";
             }
 
             in mod rangeinclusive_1 {
                 data: super::DATA;
                 bad: data[super::BAD_START..=super::GOOD_END_INCL];
                 message:
-                    "byte index 4 is not a char boundary; it is inside 'α' (bytes 3..5) of";
+                    "start byte index 4 is not a char boundary; it is inside 'α' (bytes 3..5 of string)";
             }
 
             in mod rangeinclusive_2 {
                 data: super::DATA;
                 bad: data[super::GOOD_START..=super::BAD_END_INCL];
                 message:
-                    "byte index 6 is not a char boundary; it is inside 'β' (bytes 5..7) of";
+                    "end byte index 6 is not a char boundary; it is inside 'β' (bytes 5..7 of string)";
             }
 
             in mod rangetoinclusive {
                 data: super::DATA;
                 bad: data[..=super::BAD_END_INCL];
                 message:
-                    "byte index 6 is not a char boundary; it is inside 'β' (bytes 5..7) of";
+                    "end byte index 6 is not a char boundary; it is inside 'β' (bytes 5..7 of string)";
             }
         }
     }
@@ -716,14 +735,8 @@ mod slice_index {
 
     // check the panic includes the prefix of the sliced string
     #[test]
-    #[should_panic(expected = "byte index 1024 is out of bounds of `Lorem ipsum dolor sit amet")]
+    #[should_panic(expected = "end byte index 1024 is out of bounds for string of length 416")]
     fn test_slice_fail_truncated_1() {
-        let _ = &LOREM_PARAGRAPH[..1024];
-    }
-    // check the truncation in the panic message
-    #[test]
-    #[should_panic(expected = "luctus, im`[...]")]
-    fn test_slice_fail_truncated_2() {
         let _ = &LOREM_PARAGRAPH[..1024];
     }
 }
@@ -1873,7 +1886,13 @@ fn to_lowercase() {
 #[test]
 fn to_uppercase() {
     assert_eq!("".to_uppercase(), "");
-    assert_eq!("aéǅßﬁᾀ".to_uppercase(), "AÉǄSSFIἈΙ");
+    assert_eq!("aéǅßẞﬁᾀ".to_uppercase(), "AÉǄSSẞFIἈΙ");
+}
+
+#[test]
+fn to_casefold_unnormalized() {
+    assert_eq!("".to_casefold_unnormalized(), "");
+    assert_eq!("ꮿﬁῲὼ\u{0345}ßẞΣς".to_casefold_unnormalized(), "Ꮿfiὼιὼιssssσσ");
 }
 
 #[test]
@@ -2335,6 +2354,7 @@ fn utf8_char_counts() {
         .flat_map(|n| n - spread..=n + spread)
         .collect::<Vec<usize>>();
     if cfg!(not(miri)) {
+        // Miri is too slow
         reps.extend([1024, 1 << 16].iter().copied().flat_map(|n| n - spread..=n + spread));
     }
     let counts = if cfg!(miri) { 0..1 } else { 0..8 };
@@ -2411,6 +2431,16 @@ fn floor_char_boundary() {
     check_many("🇯🇵", 0..4, 0);
     check_many("🇯🇵", 4..8, 4);
     check_many("🇯🇵", 8..10, 8);
+
+    // anticipate length- and index-based specializations
+    let s = "jpĵƥ日本🇯🇵jpĵƥ日本🇯🇵";
+    let expected = [
+        0, 1, 2, 2, 4, 4, 6, 6, 6, 9, 9, 9, 12, 12, 12, 12, 16, 16, 16, 16, 20, 21, 22, 22, 24, 24,
+        26, 26, 26, 29, 29, 29, 32, 32, 32, 32, 36, 36, 36, 36, 40, 40, 40, 40,
+    ];
+    for (idx, &ret) in expected.iter().enumerate() {
+        check_many(s, [idx], ret);
+    }
 }
 
 #[test]
@@ -2457,4 +2487,14 @@ fn ceil_char_boundary() {
 
     // above len
     check_many("hello", 5..=10, 5);
+
+    // anticipate length- and index-based specializations
+    let s = "jpĵƥ日本🇯🇵jpĵƥ日本🇯🇵";
+    let expected = [
+        0, 1, 2, 4, 4, 6, 6, 9, 9, 9, 12, 12, 12, 16, 16, 16, 16, 20, 20, 20, 20, 21, 22, 24, 24,
+        26, 26, 29, 29, 29, 32, 32, 32, 36, 36, 36, 36, 40, 40, 40, 40, 40, 40, 40,
+    ];
+    for (idx, &ret) in expected.iter().enumerate() {
+        check_many(s, [idx], ret);
+    }
 }

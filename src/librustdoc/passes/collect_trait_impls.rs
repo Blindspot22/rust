@@ -3,9 +3,9 @@
 //! struct implements that trait.
 
 use rustc_data_structures::fx::FxHashSet;
-use rustc_hir::Attribute;
 use rustc_hir::attrs::{AttributeKind, DocAttribute};
 use rustc_hir::def_id::{DefId, DefIdMap, DefIdSet, LOCAL_CRATE};
+use rustc_hir::{Attribute, find_attr};
 use rustc_middle::ty;
 use tracing::debug;
 
@@ -66,16 +66,10 @@ pub(crate) fn collect_trait_impls(mut krate: Crate, cx: &mut DocContext<'_>) -> 
         for &impl_def_id in tcx.trait_impls_in_crate(LOCAL_CRATE) {
             let mut parent = Some(tcx.parent(impl_def_id));
             while let Some(did) = parent {
-                attr_buf.extend(tcx.get_all_attrs(did).iter().filter_map(|attr| match attr {
-                    Attribute::Parsed(AttributeKind::Doc(d)) if !d.cfg.is_empty() => {
-                        // The only doc attributes we're interested into for trait impls are the
-                        // `cfg`s for the `doc_cfg` feature. So we create a new empty `DocAttribute`
-                        // and then only clone the actual `DocAttribute::cfg` field.
-                        let mut new_attr = DocAttribute::default();
-                        new_attr.cfg = d.cfg.clone();
-                        Some(Attribute::Parsed(AttributeKind::Doc(Box::new(new_attr))))
-                    }
-                    _ => None,
+                attr_buf.extend(find_attr!(tcx, did, Doc(d) if !d.cfg.is_empty() => {
+                    let mut new_attr = DocAttribute::default();
+                    new_attr.cfg = d.cfg.clone();
+                    Attribute::Parsed(AttributeKind::Doc(Box::new(new_attr)))
                 }));
                 parent = tcx.opt_parent(did);
             }
@@ -100,7 +94,7 @@ pub(crate) fn collect_trait_impls(mut krate: Crate, cx: &mut DocContext<'_>) -> 
             // While the `impl` blocks themselves are only in `libcore`, the module with `doc`
             // attached is directly included in `libstd` as well.
             if did.is_local() {
-                for def_id in prim.impls(tcx).filter(|def_id| {
+                for def_id in prim.impls(tcx).filter(|&def_id| {
                     // Avoid including impl blocks with filled-in generics.
                     // https://github.com/rust-lang/rust/issues/94937
                     //
@@ -116,7 +110,7 @@ pub(crate) fn collect_trait_impls(mut krate: Crate, cx: &mut DocContext<'_>) -> 
                     // `Generics`. To avoid relying on the `impl` block, these
                     // things would need to be created from wholecloth, in a
                     // form that is valid for use in type inference.
-                    let ty = tcx.type_of(def_id).instantiate_identity();
+                    let ty = tcx.type_of(def_id).instantiate_identity().skip_norm_wip();
                     match ty.kind() {
                         ty::Slice(ty) | ty::Ref(_, ty, _) | ty::RawPtr(ty, _) => {
                             matches!(ty.kind(), ty::Param(..))
@@ -161,8 +155,9 @@ pub(crate) fn collect_trait_impls(mut krate: Crate, cx: &mut DocContext<'_>) -> 
 
     // scan through included items ahead of time to splice in Deref targets to the "valid" sets
     for it in new_items_external.iter().chain(new_items_local.iter()) {
-        if let ImplItem(box Impl { ref for_, ref trait_, ref items, .. }) = it.kind
+        if let ImplItem(Impl { ref for_, ref trait_, ref items, polarity, .. }) = it.kind
             && trait_.as_ref().map(|t| t.def_id()) == tcx.lang_items().deref_trait()
+            && polarity != ty::ImplPolarity::Negative
             && cleaner.keep_impl(for_, true)
         {
             let target = items
@@ -200,7 +195,7 @@ pub(crate) fn collect_trait_impls(mut krate: Crate, cx: &mut DocContext<'_>) -> 
 
     // Filter out external items that are not needed
     new_items_external.retain(|it| {
-        if let ImplItem(box Impl { ref for_, ref trait_, ref kind, .. }) = it.kind {
+        if let ImplItem(Impl { ref for_, ref trait_, ref kind, .. }) = it.kind {
             cleaner.keep_impl(
                 for_,
                 trait_.as_ref().map(|t| t.def_id()) == tcx.lang_items().deref_trait(),

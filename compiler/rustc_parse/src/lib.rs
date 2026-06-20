@@ -1,15 +1,11 @@
 //! The main parser interface.
 
 // tidy-alphabetical-start
-#![allow(rustc::diagnostic_outside_of_impl)]
-#![allow(rustc::untranslatable_diagnostic)]
-#![feature(assert_matches)]
-#![feature(box_patterns)]
+#![cfg_attr(test, feature(iter_order_by))]
 #![feature(debug_closure_helpers)]
 #![feature(default_field_values)]
-#![feature(if_let_guard)]
+#![feature(deref_patterns)]
 #![feature(iter_intersperse)]
-#![feature(iter_order_by)]
 #![recursion_limit = "256"]
 // tidy-alphabetical-end
 
@@ -77,8 +73,6 @@ const _: () = {
     }
 };
 
-rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
-
 // Unwrap the result if `Ok`, otherwise emit the diagnostics and abort.
 pub fn unwrap_or_emit_fatal<T>(expr: Result<T, Vec<Diag<'_>>>) -> T {
     match expr {
@@ -122,21 +116,14 @@ pub fn new_parser_from_file<'a>(
         let msg = format!("couldn't read `{}`: {}", path.display(), e);
         let mut err = psess.dcx().struct_fatal(msg);
         if let Ok(contents) = std::fs::read(path)
-            && let Err(utf8err) = String::from_utf8(contents.clone())
+            && let Err(utf8err) = std::str::from_utf8(&contents)
         {
-            utf8_error(
-                sm,
-                &path.display().to_string(),
-                sp,
-                &mut err,
-                utf8err.utf8_error(),
-                &contents,
-            );
+            utf8_error(sm, &path.display().to_string(), sp, &mut err, utf8err, &contents);
         }
         if let Some(sp) = sp {
             err.span(sp);
         }
-        err.emit();
+        err.emit()
     });
     new_parser_from_source_file(psess, source_file, strip_tokens)
 }
@@ -266,6 +253,15 @@ pub fn parse_in<'a, T>(
 
 pub fn fake_token_stream_for_item(psess: &ParseSess, item: &ast::Item) -> TokenStream {
     let source = pprust::item_to_string(item);
+    let filename = FileName::macro_expansion_source_code(&source);
+    unwrap_or_emit_fatal(source_str_to_stream(psess, filename, source, Some(item.span)))
+}
+
+pub fn fake_token_stream_for_foreign_item(
+    psess: &ParseSess,
+    item: &ast::ForeignItem,
+) -> TokenStream {
+    let source = pprust::foreign_item_to_string(item);
     let filename = FileName::macro_expansion_source_code(&source);
     unwrap_or_emit_fatal(source_str_to_stream(psess, filename, source, Some(item.span)))
 }

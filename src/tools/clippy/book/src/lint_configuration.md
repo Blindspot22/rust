@@ -214,6 +214,23 @@ Whether `unwrap` should be allowed in test functions or `#[cfg(test)]`
 * [`unwrap_used`](https://rust-lang.github.io/rust-clippy/master/index.html#unwrap_used)
 
 
+## `allow-unwrap-types`
+List of types to allow `unwrap()` and `expect()` on.
+
+#### Example
+
+```toml
+allow-unwrap-types = [ "std::sync::LockResult" ]
+```
+
+**Default Value:** `[]`
+
+---
+**Affected lints:**
+* [`expect_used`](https://rust-lang.github.io/rust-clippy/master/index.html#expect_used)
+* [`unwrap_used`](https://rust-lang.github.io/rust-clippy/master/index.html#unwrap_used)
+
+
 ## `allow-useless-vec-in-tests`
 Whether `useless_vec` should ignore test functions or `#[cfg(test)]`
 
@@ -246,7 +263,7 @@ A list of crate names to allow duplicates of
 
 ## `allowed-idents-below-min-chars`
 Allowed names below the minimum allowed characters. The value `".."` can be used as part of
-the list to indicate, that the configured values should be appended to the default
+the list to indicate that the configured values should be appended to the default
 configuration of Clippy. By default, any configuration will replace the default value.
 
 **Default Value:** `["i", "j", "x", "y", "z", "w", "n"]`
@@ -505,6 +522,23 @@ The minimum digits a const float literal must have to supress the `excessive_pre
 * [`excessive_precision`](https://rust-lang.github.io/rust-clippy/master/index.html#excessive_precision)
 
 
+## `disallowed-fields`
+The list of disallowed fields, written as fully qualified paths.
+
+**Fields:**
+- `path` (required): the fully qualified path to the field that should be disallowed
+- `reason` (optional): explanation why this field is disallowed
+- `replacement` (optional): suggested alternative method
+- `allow-invalid` (optional, `false` by default): when set to `true`, it will ignore this entry
+  if the path doesn't exist, instead of emitting an error
+
+**Default Value:** `[]`
+
+---
+**Affected lints:**
+* [`disallowed_fields`](https://rust-lang.github.io/rust-clippy/master/index.html#disallowed_fields)
+
+
 ## `disallowed-macros`
 The list of disallowed macros, written as fully qualified paths.
 
@@ -570,12 +604,12 @@ The list of disallowed types, written as fully qualified paths.
 
 ## `doc-valid-idents`
 The list of words this lint should not consider as identifiers needing ticks. The value
-`".."` can be used as part of the list to indicate, that the configured values should be appended to the
+`".."` can be used as part of the list to indicate that the configured values should be appended to the
 default configuration of Clippy. By default, any configuration will replace the default value. For example:
 * `doc-valid-idents = ["ClipPy"]` would replace the default list with `["ClipPy"]`.
 * `doc-valid-idents = ["ClipPy", ".."]` would append `ClipPy` to the default list.
 
-**Default Value:** `["KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "MHz", "GHz", "THz", "AccessKit", "CoAP", "CoreFoundation", "CoreGraphics", "CoreText", "DevOps", "Direct2D", "Direct3D", "DirectWrite", "DirectX", "ECMAScript", "GPLv2", "GPLv3", "GitHub", "GitLab", "IPv4", "IPv6", "InfiniBand", "RoCE", "ClojureScript", "CoffeeScript", "JavaScript", "PostScript", "PureScript", "TypeScript", "PowerPC", "WebAssembly", "NaN", "NaNs", "OAuth", "GraphQL", "OCaml", "OpenAL", "OpenDNS", "OpenGL", "OpenMP", "OpenSSH", "OpenSSL", "OpenStreetMap", "OpenTelemetry", "OpenType", "WebGL", "WebGL2", "WebGPU", "WebRTC", "WebSocket", "WebTransport", "WebP", "OpenExr", "YCbCr", "sRGB", "TensorFlow", "TrueType", "iOS", "macOS", "FreeBSD", "NetBSD", "OpenBSD", "NixOS", "TeX", "LaTeX", "BibTeX", "BibLaTeX", "MinGW", "CamelCase"]`
+**Default Value:** `["KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "MHz", "GHz", "THz", "AccessKit", "CoAP", "CoreFoundation", "CoreGraphics", "CoreText", "DevOps", "Direct2D", "Direct3D", "DirectWrite", "DirectX", "ECMAScript", "GPLv2", "GPLv3", "GitHub", "GitLab", "IPv4", "IPv6", "InfiniBand", "RoCE", "ClojureScript", "CoffeeScript", "JavaScript", "PostScript", "PureScript", "TypeScript", "PowerPC", "PowerShell", "WebAssembly", "NaN", "NaNs", "OAuth", "GraphQL", "SQLite", "MySQL", "PostgreSQL", "MariaDB", "MongoDB", "OCaml", "OpenAL", "OpenDNS", "OpenGL", "OpenMP", "OpenSSH", "OpenSSL", "OpenStreetMap", "OpenTelemetry", "OpenType", "WebGL", "WebGL2", "WebGPU", "WebRTC", "WebSocket", "WebTransport", "WebP", "OpenExr", "YCbCr", "sRGB", "TensorFlow", "TrueType", "iOS", "macOS", "FreeBSD", "NetBSD", "OpenBSD", "NixOS", "TeX", "LaTeX", "BibTeX", "BibLaTeX", "MinGW", "CamelCase"]`
 
 ---
 **Affected lints:**
@@ -746,7 +780,8 @@ be filtering for common types.
 
 
 ## `max-fn-params-bools`
-The maximum number of bool parameters a function can have
+The maximum number of bool parameters a function can have.
+Use `0` to lint on any function with a bool parameter.
 
 **Default Value:** `3`
 
@@ -891,9 +926,11 @@ The minimum rust version that the project supports. Defaults to the `rust-versio
 * [`manual_hash_one`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_hash_one)
 * [`manual_is_ascii_check`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_is_ascii_check)
 * [`manual_is_power_of_two`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_is_power_of_two)
+* [`manual_isolate_lowest_one`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_isolate_lowest_one)
 * [`manual_let_else`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_let_else)
 * [`manual_midpoint`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_midpoint)
 * [`manual_non_exhaustive`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_non_exhaustive)
+* [`manual_noop_waker`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_noop_waker)
 * [`manual_option_as_slice`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_option_as_slice)
 * [`manual_pattern_char_comparison`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_pattern_char_comparison)
 * [`manual_range_contains`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_range_contains)
@@ -905,6 +942,7 @@ The minimum rust version that the project supports. Defaults to the `rust-versio
 * [`manual_split_once`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_split_once)
 * [`manual_str_repeat`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_str_repeat)
 * [`manual_strip`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_strip)
+* [`manual_take`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_take)
 * [`manual_try_fold`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_try_fold)
 * [`map_clone`](https://rust-lang.github.io/rust-clippy/master/index.html#map_clone)
 * [`map_unwrap_or`](https://rust-lang.github.io/rust-clippy/master/index.html#map_unwrap_or)
@@ -946,6 +984,28 @@ The minimum size (in bytes) to consider a type for passing by reference instead 
 ---
 **Affected lints:**
 * [`large_types_passed_by_value`](https://rust-lang.github.io/rust-clippy/master/index.html#large_types_passed_by_value)
+
+
+## `profiles`
+Named profiles of disallowed items (unrelated to Cargo build profiles).
+
+#### Example
+
+```toml
+[profiles.persistent]
+disallowed-methods = [{ path = "std::env::temp_dir" }]
+disallowed-types = [{ path = "std::time::Instant", reason = "use our custom time API" }]
+
+[profiles.single_threaded]
+disallowed-methods = [{ path = "std::thread::spawn" }]
+```
+
+**Default Value:** `{}`
+
+---
+**Affected lints:**
+* [`disallowed_methods`](https://rust-lang.github.io/rust-clippy/master/index.html#disallowed_methods)
+* [`disallowed_types`](https://rust-lang.github.io/rust-clippy/master/index.html#disallowed_types)
 
 
 ## `pub-underscore-fields-behavior`

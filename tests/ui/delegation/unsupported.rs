@@ -1,15 +1,15 @@
+//@ compile-flags: -Z deduplicate-diagnostics=yes
 //@ revisions: current next
 //@ ignore-compare-mode-next-solver (explicit revisions)
 //@[next] compile-flags: -Znext-solver
 //@ check-fail
-
+//@ ignore-parallel-frontend query cycle
 // Next solver revision included because of trait-system-refactor-initiative#234.
 // If we end up in a query cycle, it should be okay as long as results are the same.
 
 #![feature(const_trait_impl)]
 #![feature(c_variadic)]
 #![feature(fn_delegation)]
-#![allow(incomplete_features)]
 
 mod opaque {
     trait Trait {}
@@ -52,7 +52,7 @@ mod effects {
     }
 
     reuse Trait::foo;
-    //~^ ERROR type annotations needed
+    //~^ ERROR: delegation self type is not specified
 }
 
 fn main() {}

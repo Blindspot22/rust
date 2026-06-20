@@ -1,7 +1,7 @@
 //! Completion tests for type position.
 use expect_test::expect;
 
-use crate::tests::{check, check_with_base_items};
+use crate::tests::{check, check_edit, check_with_base_items};
 
 #[test]
 fn record_field_ty() {
@@ -14,9 +14,9 @@ struct Foo<'lt, T, const C: usize> {
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
-            sp Self   Foo<'_, {unknown}, _>
-            st Foo<…> Foo<'_, {unknown}, _>
+            md module::
+            sp Self          Foo<'lt, T, C>
+            st Foo<…>        Foo<'lt, T, C>
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -43,9 +43,9 @@ struct Foo<'lt, T, const C: usize>(f$0);
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
-            sp Self   Foo<'_, {unknown}, _>
-            st Foo<…> Foo<'_, {unknown}, _>
+            md module::
+            sp Self          Foo<'lt, T, C>
+            st Foo<…>        Foo<'lt, T, C>
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -75,7 +75,7 @@ fn x<'lt, T, const C: usize>() -> $0
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -94,6 +94,250 @@ fn x<'lt, T, const C: usize>() -> $0
 }
 
 #[test]
+fn fn_return_type_missing_thin_arrow() {
+    check_with_base_items(
+        r#"
+fn x() u$0
+"#,
+        expect![[r#"
+            en Enum (adds ->)          Enum
+            ma makro!(…) macro_rules! makro
+            md module:: (adds ->)
+            st Record (adds ->)      Record
+            st Tuple (adds ->)        Tuple
+            st Unit (adds ->)          Unit
+            tt Trait (adds ->)
+            un Union (adds ->)        Union
+            bt u32 (adds ->)            u32
+            kw crate:: (adds ->)
+            kw dyn (adds ->)
+            kw fn (adds ->)
+            kw for (adds ->)
+            kw impl (adds ->)
+            kw self:: (adds ->)
+            kw where
+        "#]],
+    );
+
+    check_with_base_items(
+        r#"
+fn x() $0
+"#,
+        expect![[r#"
+            en Enum (adds ->)          Enum
+            ma makro!(…) macro_rules! makro
+            md module:: (adds ->)
+            st Record (adds ->)      Record
+            st Tuple (adds ->)        Tuple
+            st Unit (adds ->)          Unit
+            tt Trait (adds ->)
+            un Union (adds ->)        Union
+            bt u32 (adds ->)            u32
+            kw crate:: (adds ->)
+            kw dyn (adds ->)
+            kw fn (adds ->)
+            kw for (adds ->)
+            kw impl (adds ->)
+            kw self:: (adds ->)
+            kw where
+        "#]],
+    );
+
+    check_with_base_items(
+        r#"
+mod foo { pub struct Bar; }
+fn x() foo::$0
+"#,
+        expect![[r#"
+            st Bar (adds ->) Bar
+        "#]],
+    );
+
+    check_with_base_items(
+        r#"
+mod foo { pub struct Bar; }
+fn x() foo::b$0
+"#,
+        expect![[r#"
+            st Bar (adds ->) Bar
+        "#]],
+    );
+}
+
+#[test]
+fn fn_return_type_missing_thin_arrow_path_completion() {
+    check_edit(
+        "u32",
+        r#"
+fn foo() u$0
+"#,
+        r#"
+fn foo() -> u32
+"#,
+    );
+
+    check_edit(
+        "u32",
+        r#"
+fn foo() $0
+"#,
+        r#"
+fn foo() -> u32
+"#,
+    );
+
+    check_edit(
+        "Num",
+        r#"
+type Num = u32;
+fn foo() $0
+"#,
+        r#"
+type Num = u32;
+fn foo() -> Num
+"#,
+    );
+
+    check_edit(
+        "impl",
+        r#"
+fn foo() $0
+"#,
+        r#"
+fn foo() -> impl $0
+"#,
+    );
+
+    check_edit(
+        "foo",
+        r#"
+mod foo { pub type Num = u32; }
+fn foo() $0
+"#,
+        r#"
+mod foo { pub type Num = u32; }
+fn foo() -> foo::
+"#,
+    );
+
+    check_edit(
+        "crate::",
+        r#"
+mod foo { pub type Num = u32; }
+fn foo() $0
+"#,
+        r#"
+mod foo { pub type Num = u32; }
+fn foo() -> crate::
+"#,
+    );
+
+    check_edit(
+        "Num",
+        r#"
+mod foo { pub type Num = u32; }
+fn foo() foo::$0
+"#,
+        r#"
+mod foo { pub type Num = u32; }
+fn foo() -> foo::Num
+"#,
+    );
+
+    // no spaces, test edit order
+    check_edit(
+        "foo",
+        r#"
+mod foo { pub type Num = u32; }
+fn foo()$0
+"#,
+        r#"
+mod foo { pub type Num = u32; }
+fn foo() ->foo::
+"#,
+    );
+}
+
+#[test]
+fn fn_return_type_missing_thin_arrow_path_completion_with_generic_args() {
+    check_edit(
+        "Foo",
+        r#"
+struct Foo<T>(T);
+fn foo() F$0
+"#,
+        r#"
+struct Foo<T>(T);
+fn foo() -> Foo<$0>
+"#,
+    );
+
+    check_edit(
+        "Foo",
+        r#"
+struct Foo<T>(T);
+fn foo() $0
+"#,
+        r#"
+struct Foo<T>(T);
+fn foo() -> Foo<$0>
+"#,
+    );
+
+    check_edit(
+        "Foo",
+        r#"
+type Foo<T> = T;
+fn foo() $0
+"#,
+        r#"
+type Foo<T> = T;
+fn foo() -> Foo<$0>
+"#,
+    );
+}
+
+#[test]
+fn fn_return_type_missing_thin_arrow_infer_ref_type() {
+    check_with_base_items(
+        r#"
+fn x() u$0 {&2u32}
+"#,
+        expect![[r#"
+            en Enum (adds ->)          Enum
+            ma makro!(…) macro_rules! makro
+            md module:: (adds ->)
+            st Record (adds ->)      Record
+            st Tuple (adds ->)        Tuple
+            st Unit (adds ->)          Unit
+            tt Trait (adds ->)
+            un Union (adds ->)        Union
+            bt u32 (adds ->)            u32
+            it &u32 (adds ->)
+            kw crate:: (adds ->)
+            kw dyn (adds ->)
+            kw fn (adds ->)
+            kw for (adds ->)
+            kw impl (adds ->)
+            kw self:: (adds ->)
+            kw where
+        "#]],
+    );
+
+    check_edit(
+        "&u32",
+        r#"
+struct Foo<T>(T);
+fn x() u$0 {&2u32}
+"#,
+        r#"
+struct Foo<T>(T);
+fn x() -> &u32 {&2u32}
+"#,
+    );
+}
+
+#[test]
 fn fn_return_type_after_reference() {
     check_with_base_items(
         r#"
@@ -102,7 +346,7 @@ fn x<'lt, T, const C: usize>(_: &()) -> &$0
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -136,7 +380,7 @@ fn foo() -> B$0 {
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -164,8 +408,37 @@ const FOO: $0 = Foo(2);
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
-            st Foo<…>        Foo<{unknown}>
+            md module::
+            st Foo<…>                Foo<T>
+            st Record                Record
+            st Tuple                  Tuple
+            st Unit                    Unit
+            tt Trait
+            un Union                  Union
+            bt u32                      u32
+            it Foo<i32>
+            kw crate::
+            kw dyn
+            kw fn
+            kw for
+            kw impl
+            kw self::
+        "#]],
+    );
+}
+
+#[test]
+fn inferred_type_static() {
+    check_with_base_items(
+        r#"
+struct Foo<T>(T);
+static FOO: $0 = Foo(2);
+"#,
+        expect![[r#"
+            en Enum                    Enum
+            ma makro!(…) macro_rules! makro
+            md module::
+            st Foo<…>                Foo<T>
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -195,7 +468,7 @@ fn f2() {
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -227,7 +500,7 @@ fn f2() {
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -256,7 +529,7 @@ fn f2(x: u64) -> $0 {
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -286,7 +559,7 @@ fn f2(x: $0) {
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -322,8 +595,8 @@ fn foo<'lt, T, const C: usize>() {
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md a
-            md module
+            md a::
+            md module::
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -355,8 +628,8 @@ fn foo<'lt, T, const C: usize>() {
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
-            st Foo<…>        Foo<{unknown}>
+            md module::
+            st Foo<…>                Foo<T>
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -387,7 +660,7 @@ fn foo<'lt, T, const C: usize>() {
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -413,7 +686,7 @@ fn foo<'lt, T, const C: usize>() {
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -456,7 +729,7 @@ fn foo<'lt, T: Trait2<$0>, const CONST_PARAM: usize>(_: T) {}
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -485,7 +758,7 @@ fn foo<'lt, T: Trait2<self::$0>, const CONST_PARAM: usize>(_: T) {}
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -510,7 +783,7 @@ impl Tr<$0
         expect![[r#"
             en Enum                        Enum
             ma makro!(…)     macro_rules! makro
-            md module
+            md module::
             sp Self dyn Tr<{unknown}> + 'static
             st Record                    Record
             st S                              S
@@ -561,7 +834,7 @@ fn f(t: impl MyTrait<u$0
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -590,7 +863,7 @@ fn f(t: impl MyTrait<u8, u$0
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -637,7 +910,7 @@ fn f(t: impl MyTrait<u$0
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -666,7 +939,7 @@ fn f(t: impl MyTrait<u8, u$0
         expect![[r#"
             en Enum                        Enum
             ma makro!(…)     macro_rules! makro
-            md module
+            md module::
             st Record                    Record
             st Tuple                      Tuple
             st Unit                        Unit
@@ -715,7 +988,7 @@ fn f(t: impl MyTrait<Item1 = $0
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -744,7 +1017,7 @@ fn f(t: impl MyTrait<Item1 = u8, Item2 = $0
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             st Record                Record
             st Tuple                  Tuple
             st Unit                    Unit
@@ -796,7 +1069,7 @@ struct Foo {
 pub struct S;
 "#,
         expect![[r#"
-            md std
+            md std::
             sp Self Foo
             st Foo  Foo
             bt u32  u32
@@ -825,7 +1098,7 @@ struct Foo {
 pub struct S;
 "#,
         expect![[r#"
-            md std
+            md std::
             sp Self Foo
             st Foo  Foo
             st S      S
@@ -855,7 +1128,7 @@ fn completes_const_and_type_generics_separately() {
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             st Foo                      Foo
             st Record                Record
             st Tuple                  Tuple
@@ -909,7 +1182,7 @@ fn completes_const_and_type_generics_separately() {
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             st Foo                      Foo
             st Record                Record
             st Tuple                  Tuple
@@ -960,7 +1233,7 @@ fn completes_const_and_type_generics_separately() {
         expect![[r#"
             en Enum                    Enum
             ma makro!(…) macro_rules! makro
-            md module
+            md module::
             st Foo                      Foo
             st Record                Record
             st Tuple                  Tuple
@@ -1171,7 +1444,7 @@ struct Bar;
 impl $0 for Bar { }
 "#,
         expect![[r#"
-            md module
+            md module::
             tt Foo
             tt Trait
             kw crate::
@@ -1194,7 +1467,7 @@ mod outer {
 impl outer::$0 for Bar { }
 "#,
         expect![[r#"
-            md inner
+            md inner::
             tt Foo
         "#]],
     );

@@ -53,14 +53,14 @@ Directives can generally be found by browsing the
 
 See [Building auxiliary crates](compiletest.html#building-auxiliary-crates)
 
-| Directive             | Explanation                                                                                           | Supported test suites                  | Possible values                               |
-|-----------------------|-------------------------------------------------------------------------------------------------------|----------------------------------------|-----------------------------------------------|
-| `aux-bin`             | Build a aux binary, made available in `auxiliary/bin` relative to test directory                      | All except `run-make`/`run-make-cargo` | Path to auxiliary `.rs` file                  |
-| `aux-build`           | Build a separate crate from the named source file                                                     | All except `run-make`/`run-make-cargo` | Path to auxiliary `.rs` file                  |
-| `aux-crate`           | Like `aux-build` but makes available as extern prelude                                                | All except `run-make`/`run-make-cargo` | `<extern_prelude_name>=<path/to/aux/file.rs>` |
-| `aux-codegen-backend` | Similar to `aux-build` but pass the compiled dylib to `-Zcodegen-backend` when building the main file | `ui-fulldeps`                          | Path to codegen backend file                  |
-| `proc-macro`          | Similar to `aux-build`, but for aux forces host and don't use `-Cprefer-dynamic`[^pm].                | All except `run-make`/`run-make-cargo` | Path to auxiliary proc-macro `.rs` file       |
-| `build-aux-docs`      | Build docs for auxiliaries as well.  Note that this only works with `aux-build`, not `aux-crate`.     | All except `run-make`/`run-make-cargo` | N/A                                           |
+| Directive             | Explanation                                                                                           | Supported test suites                  | Possible values                                                    |
+|-----------------------|-------------------------------------------------------------------------------------------------------|----------------------------------------|--------------------------------------------------------------------|
+| `aux-bin`             | Build a aux binary, made available in `auxiliary/bin` relative to test directory                      | All except `run-make`/`run-make-cargo` | Path to auxiliary `.rs` file                                       |
+| `aux-build`           | Build a separate crate from the named source file                                                     | All except `run-make`/`run-make-cargo` | Path to auxiliary `.rs` file                                       |
+| `aux-crate`           | Like `aux-build` but makes available as extern prelude                                                | All except `run-make`/`run-make-cargo` | `[<extern_modifiers>:]<extern_prelude_name>=<path/to/aux/file.rs>` |
+| `aux-codegen-backend` | Similar to `aux-build` but pass the compiled dylib to `-Zcodegen-backend` when building the main file | `ui-fulldeps`                          | Path to codegen backend file                                       |
+| `proc-macro`          | Similar to `aux-build`, but for aux forces host and don't use `-Cprefer-dynamic`[^pm].                | All except `run-make`/`run-make-cargo` | Path to auxiliary proc-macro `.rs` file                            |
+| `build-aux-docs`      | Build docs for auxiliaries as well.  Note that this only works with `aux-build`, not `aux-crate`.     | All except `run-make`/`run-make-cargo` | N/A                                                                |
 
 [^pm]: please see the [Auxiliary proc-macro section](compiletest.html#auxiliary-proc-macro) in the compiletest chapter for specifics.
 
@@ -70,18 +70,17 @@ See [Controlling pass/fail expectations](ui.md#controlling-passfail-expectations
 
 | Directive                   | Explanation                                 | Supported test suites                     | Possible values |
 |-----------------------------|---------------------------------------------|-------------------------------------------|-----------------|
-| `check-pass`                | Building (no codegen) should pass           | `ui`, `crashes`, `incremental`            | N/A             |
-| `check-fail`                | Building (no codegen) should fail           | `ui`, `crashes`                           | N/A             |
-| `build-pass`                | Building should pass                        | `ui`, `crashes`, `codegen`, `incremental` | N/A             |
-| `build-fail`                | Building should fail                        | `ui`, `crashes`                           | N/A             |
-| `run-pass`                  | Program must exit with code `0`             | `ui`, `crashes`, `incremental`            | N/A             |
-| `run-fail`                  | Program must exit with code `1..=127`       | `ui`, `crashes`                           | N/A             |
+| `check-pass`                | Building (no codegen) should pass           | `ui`                                      | N/A             |
+| `check-fail`                | Building (no codegen) should fail           | `ui`                                      | N/A             |
+| `build-pass`                | Building should pass                        | `ui`                                      | N/A             |
+| `build-fail`                | Building should fail                        | `ui`                                      | N/A             |
+| `run-pass`                  | Program must exit with code `0`             | `ui`                                      | N/A             |
+| `run-fail`                  | Program must exit with code `1..=127`       | `ui`                                      | N/A             |
 | `run-crash`                 | Program must crash                          | `ui`                                      | N/A             |
 | `run-fail-or-crash`         | Program must `run-fail` or `run-crash`      | `ui`                                      | N/A             |
-| `ignore-pass`               | Ignore `--pass` flag                        | `ui`, `crashes`, `codegen`, `incremental` | N/A             |
+| `no-pass-override`          | Ignore `--pass` flag                        | `ui`                                      | N/A             |
 | `dont-check-failure-status` | Don't check exact failure status (i.e. `1`) | `ui`, `incremental`                       | N/A             |
-| `failure-status`            | Check                                       | `ui`, `crashes`                           | Any `u16`       |
-| `should-ice`                | Check failure status is `101`               | `coverage`, `incremental`                 | N/A             |
+| `failure-status`            | On failure, the compiler must exit with this status code. To expect an ICE, use `//@ failure-status: 101`. | `ui`, `incremental` | Any `u16` |
 | `should-fail`               | Compiletest self-test                       | All                                       | N/A             |
 
 ### Controlling output snapshots and normalizations
@@ -91,9 +90,9 @@ comparison](ui.md#output-comparison) and [Rustfix tests](ui.md#rustfix-tests) fo
 
 | Directive                         | Explanation                                                                                                              | Supported test suites                        | Possible values                                                                         |
 |-----------------------------------|--------------------------------------------------------------------------------------------------------------------------|----------------------------------------------|-----------------------------------------------------------------------------------------|
-| `check-run-results`               | Check run test binary `run-{pass,fail}` output snapshot                                                                  | `ui`, `crashes`, `incremental` if `run-pass` | N/A                                                                                     |
-| `error-pattern`                   | Check that output contains a specific string                                                                             | `ui`, `crashes`, `incremental` if `run-pass` | String                                                                                  |
-| `regex-error-pattern`             | Check that output contains a regex pattern                                                                               | `ui`, `crashes`, `incremental` if `run-pass` | Regex                                                                                   |
+| `check-run-results`               | Check run test binary `run-{pass,fail}` output snapshot                                                                  | `ui`, `crashes`, `incremental`               | N/A                                                                                     |
+| `error-pattern`                   | Check that output contains a specific string                                                                             | `ui`, `crashes`, `incremental`               | String                                                                                  |
+| `regex-error-pattern`             | Check that output contains a regex pattern                                                                               | `ui`, `crashes`, `incremental`               | Regex                                                                                   |
 | `check-stdout`                    | Check `stdout` against `error-pattern`s from running test binary[^check_stdout]                                          | `ui`, `crashes`, `incremental`               | N/A                                                                                     |
 | `normalize-stderr-32bit`          | Normalize actual stderr (for 32-bit platforms) with a rule `"<raw>" -> "<normalized>"` before comparing against snapshot | `ui`, `incremental`                          | `"<RAW>" -> "<NORMALIZED>"`, `<RAW>`/`<NORMALIZED>` is regex capture and replace syntax |
 | `normalize-stderr-64bit`          | Normalize actual stderr (for 64-bit platforms) with a rule `"<raw>" -> "<normalized>"` before comparing against snapshot | `ui`, `incremental`                          | `"<RAW>" -> "<NORMALIZED>"`, `<RAW>`/`<NORMALIZED>` is regex capture and replace syntax |
@@ -107,7 +106,7 @@ comparison](ui.md#output-comparison) and [Rustfix tests](ui.md#rustfix-tests) fo
 | `exec-env`                        | Env var to set when executing a test                                                                                     | `ui`, `crashes`                              | `<KEY>=<VALUE>`                                                                         |
 | `unset-exec-env`                  | Env var to unset when executing a test                                                                                   | `ui`, `crashes`                              | Any env var name                                                                        |
 | `stderr-per-bitwidth`             | Generate a stderr snapshot for each bitwidth                                                                             | `ui`                                         | N/A                                                                                     |
-| `forbid-output`                   | A pattern which must not appear in stderr/`cfail` output                                                                 | `ui`, `incremental`                          | Regex pattern                                                                           |
+| `forbid-output`                   | Check that compile/run output does not contain a specific string                                                         | `ui`, `incremental`                          | String                                                                                  |
 | `run-flags`                       | Flags passed to the test executable                                                                                      | `ui`                                         | Arbitrary flags                                                                         |
 | `known-bug`                       | No error annotation needed due to known bug                                                                              | `ui`, `crashes`, `incremental`               | Issue number `#123456`                                                                  |
 | `compare-output-by-lines`         | Compare the output by lines, rather than as a single string                                                              | All                                          | N/A                                                                                     |
@@ -134,7 +133,7 @@ means the test won't be compiled or run.
 Some examples of `X` in `ignore-X` or `only-X`:
 
 - A full target triple: `aarch64-apple-ios`
-- Architecture: `aarch64`, `arm`, `mips`, `wasm32`, `x86_64`, `x86`,
+- Architecture: `aarch64`, `arm`, `csky`, `mips`, `mips64`, `wasm32`, `x86_64`, `x86`,
   ...
 - OS: `android`, `emscripten`, `freebsd`, `ios`, `linux`, `macos`, `windows`,
   ...
@@ -148,7 +147,9 @@ Some examples of `X` in `ignore-X` or `only-X`:
 - When [remote testing] is used: `remote`
 - When particular debuggers are being tested: `cdb`, `gdb`, `lldb`
 - When particular debugger versions are matched: `ignore-gdb-version`
-- Specific [compare modes]: `compare-mode-polonius`, `compare-mode-chalk`,
+- When the [parallel frontend] is enabled: `ignore-parallel-frontend`
+- Specific [compare modes]: `compare-mode-polonius`,
+  `compare-mode-next-solver`, `compare-mode-next-solver-coherence`,
   `compare-mode-split-dwarf`, `compare-mode-split-dwarf-single`
 - The two different test modes used by coverage tests:
   `ignore-coverage-map`, `ignore-coverage-run`
@@ -163,10 +164,14 @@ The following directives will check rustc build settings and target settings:
   For tests that cross-compile to explicit targets
   via `--target`, use `needs-llvm-components` instead to ensure the appropriate
   backend is available.
+- `needs-asm-ret` - ignores if the target does not have a `ret` instruction
+  in its assembly syntax. Most target architectures have this instruction,
+  making it handy for portable inline-assembly tests, but some architectures
+  (e.g. 32-bit ARM) do not have it.
 - `needs-profiler-runtime` — ignores the test if the profiler runtime was not
-  enabled for the target (`build.profiler = true` in rustc's `bootstrap.toml`)
+  enabled for the target (`build.profiler = true` in `bootstrap.toml`)
 - `needs-sanitizer-support` — ignores if the sanitizer support was not enabled
-  for the target (`sanitizers = true` in rustc's `bootstrap.toml`)
+  for the target (`build.sanitizers = true` in `bootstrap.toml`)
 - `needs-sanitizer-{address,hwaddress,leak,memory,thread}` — ignores if the
   corresponding sanitizer is not enabled for the target (AddressSanitizer,
   hardware-assisted AddressSanitizer, LeakSanitizer, MemorySanitizer or
@@ -180,8 +185,7 @@ The following directives will check rustc build settings and target settings:
 - `needs-threads` — ignores if the target does not have threading support
 - `needs-subprocess`  — ignores if the target does not have subprocess support
 - `needs-symlink` — ignores if the target does not support symlinks.
-  This can be the case on Windows if the developer did not enable privileged symlink
-  permissions.
+  This can be the case on Windows if the developer did not enable privileged symlink permissions.
 - `ignore-std-debug-assertions` — ignores if std was built with debug assertions.
 - `needs-std-debug-assertions` — ignores if std was not built with debug assertions.
 - `ignore-std-remap-debuginfo` — ignores if std was built with remapping of it's sources.
@@ -200,6 +204,8 @@ The following directives will check rustc build settings and target settings:
   on `wasm32-unknown-unknown` target because the target does not support the
   `proc-macro` crate type.
 - `needs-target-std` — ignores if target platform does not have std support.
+  - See also [`#![no_std]`/`#![no_core]` and implied `needs-target-std` for
+    codegen tests](./compiletest.md#codegen-tests).
 - `ignore-backends` — ignores the listed backends, separated by whitespace characters.
   Please note
   that this directive can be overriden with the `--bypass-ignore-backends=[BACKEND]` command line
@@ -231,6 +237,7 @@ The following directives will check LLVM support:
 See also [Debuginfo tests](compiletest.md#debuginfo-tests) for directives for ignoring debuggers.
 
 [remote testing]: running.md#running-tests-on-a-remote-machine
+[parallel frontend]: compiletest.md#parallel-frontend
 [compare modes]: ui.md#compare-modes
 [`x86_64-gnu-debug`]: https://github.com/rust-lang/rust/blob/ab3dba92db355b8d97db915a2dca161a117e959c/src/ci/docker/host-x86_64/x86_64-gnu-debug/Dockerfile#L32
 [`aarch64-gnu-debug`]: https://github.com/rust-lang/rust/blob/20c909ff9cdd88d33768a4ddb8952927a675b0ad/src/ci/docker/host-aarch64/aarch64-gnu-debug/Dockerfile#L32
@@ -312,9 +319,7 @@ See [Pretty-printer](compiletest.md#pretty-printer-tests).
 
 - `no-auto-check-cfg` — disable auto check-cfg (only for `--check-cfg` tests)
 - [`revisions`](compiletest.md#revisions) — compile multiple times
--[`forbid-output`](compiletest.md#incremental-tests) — incremental cfail rejects
-      output pattern
-- [`should-ice`](compiletest.md#incremental-tests) — incremental cfail should ICE
+- [`forbid-output`](compiletest.md#incremental-tests) — check that output does not contain a specified string
 - [`reference`] — an annotation linking to a rule in the reference
 - `disable-gdb-pretty-printers` — disable gdb pretty printers for debuginfo tests
 
@@ -325,6 +330,8 @@ See [Pretty-printer](compiletest.md#pretty-printer-tests).
 The following directives affect how certain command-line tools are invoked, in
 test suites that use those tools:
 
+- `skip-filecheck` avoids running LLVM's `FileCheck` tool in tests that would normally run it to check output.
+  - Used by codegen tests, assembly tests, and mir-opt tests.
 - `filecheck-flags` adds extra flags when running LLVM's `FileCheck` tool.
   - Used by [codegen tests](compiletest.md#codegen-tests),
   [assembly tests](compiletest.md#assembly-tests), and

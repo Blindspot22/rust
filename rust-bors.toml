@@ -23,7 +23,18 @@ labels_blocking_approval = [
     "S-waiting-on-t-opsem",
     "S-waiting-on-t-rustdoc",
     "S-waiting-on-t-rustdoc-frontend",
-    "S-waiting-on-t-clippy"
+    "S-waiting-on-t-clippy",
+    # PR manually set to blocked
+    "S-blocked",
+    # Needs a Crater run before being approved
+    "needs-crater",
+    # Needs a formal decision to be made
+    "needs-rfc",
+    "needs-fcp",
+    "needs-acp",
+    "needs-mcp",
+    # A PR in the Rust reference must be done first
+    "needs-reference-pr"
 ]
 
 # If CI runs quicker than this duration, consider it to be a failure
@@ -39,7 +50,7 @@ approved = [
     "-S-waiting-on-author",
     "-S-waiting-on-crater",
     "-S-waiting-on-review",
-    "-S-waiting-on-team"
+    "-S-waiting-on-team",
 ]
 unapproved = [
     "+S-waiting-on-author",
@@ -47,16 +58,16 @@ unapproved = [
     "-S-waiting-on-bors",
     "-S-waiting-on-crater",
     "-S-waiting-on-review",
-    "-S-waiting-on-team"
+    "-S-waiting-on-team",
 ]
 try_failed = [
     "+S-waiting-on-author",
     "-S-waiting-on-review",
-    "-S-waiting-on-crater"
+    "-S-waiting-on-crater",
 ]
 auto_build_succeeded = [
     "+merged-by-bors",
-    "-S-waiting-on-bors"
+    "-S-waiting-on-bors",
 ]
 auto_build_failed = [
     "+S-waiting-on-review",
@@ -64,5 +75,5 @@ auto_build_failed = [
     "-S-waiting-on-bors",
     "-S-waiting-on-author",
     "-S-waiting-on-crater",
-    "-S-waiting-on-team"
+    "-S-waiting-on-team",
 ]

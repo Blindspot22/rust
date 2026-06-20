@@ -15,8 +15,7 @@
 
 pub use rustc_ast_ir::visit::VisitorResult;
 pub use rustc_ast_ir::{try_visit, visit_opt, walk_list, walk_visitable_list};
-use rustc_span::source_map::Spanned;
-use rustc_span::{Ident, Span, Symbol};
+use rustc_span::{Ident, Span, Spanned, Symbol};
 use thin_vec::ThinVec;
 
 use crate::ast::*;
@@ -425,11 +424,13 @@ macro_rules! common_visitor_and_walkers {
             ByRef,
             Closure,
             Const,
+            ConstBlockItem,
             ConstItem,
-            ConstItemRhs,
+            ConstItemRhsKind,
             Defaultness,
             Delegation,
             DelegationMac,
+            DelegationSuffixes,
             DelimArgs,
             DelimSpan,
             EnumDef,
@@ -442,6 +443,7 @@ macro_rules! common_visitor_and_walkers {
             FormatArguments,
             FormatPlaceholder,
             GenericParamKind,
+            Guard,
             Impl,
             ImplPolarity,
             Inline,
@@ -466,6 +468,7 @@ macro_rules! common_visitor_and_walkers {
             RangeEnd,
             RangeSyntax,
             Recovered,
+            RestrictionKind,
             Safety,
             StaticItem,
             StrLit,
@@ -579,12 +582,14 @@ macro_rules! common_visitor_and_walkers {
                 fn visit_generics(Generics);
                 fn visit_inline_asm(InlineAsm);
                 fn visit_inline_asm_sym(InlineAsmSym);
+                fn visit_impl_restriction(ImplRestriction);
                 //fn visit_item(Item);
                 fn visit_label(Label);
                 fn visit_lifetime(Lifetime, _ctxt: LifetimeCtxt);
                 fn visit_local(Local);
                 fn visit_mac_call(MacCall);
                 fn visit_macro_def(MacroDef);
+                fn visit_mut_restriction(MutRestriction);
                 fn visit_param_bound(GenericBound, _ctxt: BoundKind);
                 fn visit_param(Param);
                 fn visit_pat_field(PatField);
@@ -756,9 +761,10 @@ macro_rules! common_visitor_and_walkers {
             ) -> V::Result;
         }
 
-        // this is only used by the MutVisitor. We include this symmetry here to make writing other functions easier
+        // This is only used by the MutVisitor. We include this symmetry here to make writing other
+        // functions easier.
         $(${ignore($lt)}
-            #[expect(unused, rustc::pass_by_value)]
+            #[expect(unused, rustc::disallowed_pass_by_ref)]
             #[inline]
         )?
         fn visit_span<$($lt,)? V: $Visitor$(<$lt>)?>(vis: &mut V, span: &$($lt)? $($mut)? Span) -> V::Result {
@@ -825,6 +831,8 @@ macro_rules! common_visitor_and_walkers {
                         visit_visitable!($($mut)? vis, use_tree),
                     ItemKind::Static(item) =>
                         visit_visitable!($($mut)? vis, item),
+                    ItemKind::ConstBlock(item) =>
+                        visit_visitable!($($mut)? vis, item),
                     ItemKind::Const(item) =>
                         visit_visitable!($($mut)? vis, item),
                     ItemKind::Mod(safety, ident, mod_kind) =>
@@ -844,7 +852,7 @@ macro_rules! common_visitor_and_walkers {
                         visit_visitable!($($mut)? vis, impl_),
                     ItemKind::Trait(trait_) =>
                         visit_visitable!($($mut)? vis, trait_),
-                    ItemKind::TraitAlias(box TraitAlias { constness, ident, generics, bounds}) => {
+                    ItemKind::TraitAlias(TraitAlias { constness, ident, generics, bounds}) => {
                         visit_visitable!($($mut)? vis, constness, ident, generics);
                         visit_visitable_with!($($mut)? vis, bounds, BoundKind::Bound)
                     }
@@ -942,7 +950,7 @@ macro_rules! common_visitor_and_walkers {
         impl_walkable!(|&$($mut)? $($lt)? self: Impl, vis: &mut V| {
             let Impl { generics, of_trait, self_ty, items, constness: _ } = self;
             try_visit!(vis.visit_generics(generics));
-            if let Some(box of_trait) = of_trait {
+            if let Some(of_trait) = of_trait {
                 let TraitImplHeader { defaultness, safety, polarity, trait_ref } = of_trait;
                 visit_visitable!($($mut)? vis, defaultness, safety, polarity, trait_ref);
             }
@@ -997,7 +1005,7 @@ macro_rules! common_visitor_and_walkers {
                     visit_visitable!($($mut)? vis, block, opt_label, span),
                 ExprKind::Match(subexpression, arms, kind) =>
                     visit_visitable!($($mut)? vis, subexpression, arms, kind),
-                ExprKind::Closure(box Closure {
+                ExprKind::Closure(Closure {
                     binder,
                     capture_clause,
                     coroutine_kind,
@@ -1017,7 +1025,9 @@ macro_rules! common_visitor_and_walkers {
                     visit_visitable!($($mut)? vis, block, opt_label),
                 ExprKind::Gen(capt, body, kind, decl_span) =>
                     visit_visitable!($($mut)? vis, capt, body, kind, decl_span),
-                ExprKind::Await(expr, span) | ExprKind::Use(expr, span) =>
+                ExprKind::Await(expr, span)
+                | ExprKind::Move(expr, span)
+                | ExprKind::Use(expr, span) =>
                     visit_visitable!($($mut)? vis, expr, span),
                 ExprKind::Assign(lhs, rhs, span) =>
                     visit_visitable!($($mut)? vis, lhs, rhs, span),
@@ -1097,12 +1107,14 @@ macro_rules! common_visitor_and_walkers {
             pub fn walk_generics(Generics);
             pub fn walk_inline_asm(InlineAsm);
             pub fn walk_inline_asm_sym(InlineAsmSym);
+            pub fn walk_impl_restriction(ImplRestriction);
             //pub fn walk_item(Item);
             pub fn walk_label(Label);
             pub fn walk_lifetime(Lifetime);
             pub fn walk_local(Local);
             pub fn walk_mac(MacCall);
             pub fn walk_macro_def(MacroDef);
+            pub fn walk_mut_restriction(MutRestriction);
             pub fn walk_param_bound(GenericBound);
             pub fn walk_param(Param);
             pub fn walk_pat_field(PatField);

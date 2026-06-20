@@ -7,7 +7,6 @@
 //@ edition: 2021
 
 #![feature(rustc_private)]
-#![feature(assert_matches)]
 
 extern crate rustc_hir;
 extern crate rustc_middle;
@@ -21,7 +20,7 @@ use rustc_public::ItemKind;
 use rustc_public::crate_def::CrateDef;
 use rustc_public::mir::{ProjectionElem, Rvalue, StatementKind};
 use rustc_public::ty::{RigidTy, TyKind, UintTy};
-use std::assert_matches::assert_matches;
+use std::assert_matches;
 use std::io::Write;
 use std::ops::ControlFlow;
 
@@ -74,7 +73,7 @@ fn test_place_projections() -> ControlFlow<()> {
             Rvalue::Use(rustc_public::mir::Operand::Copy(rustc_public::mir::Place {
                 local: _,
                 projection: r_proj,
-            })),
+            }), _),
         ) => {
             // We can't match on vecs, only on slices. Comparing for equality wouldn't be any easier
             // since we'd then have to add in the expected local values instead of matching on

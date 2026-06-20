@@ -14,13 +14,10 @@
 
 // tidy-alphabetical-start
 #![allow(rustc::direct_use_of_rustc_type_ir)]
-#![feature(assert_matches)]
 #![feature(extend_one)]
 #![recursion_limit = "512"] // For rustdoc
 // tidy-alphabetical-end
 
-mod errors;
+mod diagnostics;
 pub mod infer;
 pub mod traits;
-
-rustc_fluent_macro::fluent_messages! { "../messages.ftl" }

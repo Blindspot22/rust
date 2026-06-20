@@ -1,5 +1,5 @@
-#![feature(cfg_select)]
 #![crate_type = "lib"]
+#![warn(unreachable_cfg_select_predicates)] // Unused warnings are disabled by default in UI tests.
 
 fn print() {
     println!(cfg_select! {
@@ -23,45 +23,46 @@ fn arm_rhs_expr_1() -> i32 {
 
 fn arm_rhs_expr_2() -> i32 {
     cfg_select! {
-        true => 1,
-        false => 2
+        false => 2,
+        true => 1
     }
 }
 
 fn arm_rhs_expr_3() -> i32 {
     cfg_select! {
-        true => 1,
-        false => 2,
-        true => { 42 }
-        false => -1 as i32,
-        true => 2 + 2,
-        false => "",
-        true => if true { 42 } else { 84 }
-        false => if true { 42 } else { 84 },
-        true => return 42,
-        false => loop {}
-        true => (1, 2),
-        false => (1, 2,),
-        true => todo!(),
-        false => println!("hello"),
+        any(true) => 1,
+        any(false) => 2,
+        any(true) => { 42 }
+        any(true) => { 42 },
+        any(false) => -1 as i32,
+        any(true) => 2 + 2,
+        any(false) => "",
+        any(true) => if true { 42 } else { 84 }
+        any(false) => if true { 42 } else { 84 },
+        any(true) => return 42,
+        any(false) => loop {}
+        any(true) => (1, 2),
+        any(false) => (1, 2,),
+        any(true) => todo!(),
+        any(false) => println!("hello"),
     }
 }
 
 fn expand_to_statements() -> i32 {
     cfg_select! {
-        true => {
-            let a = 1;
-            a + 1
-        }
         false => {
             let b = 2;
             b + 1
+        }
+        true => {
+            let a = 1;
+            a + 1
         }
     }
 }
 
 type ExpandToType = cfg_select! {
-    unix => u32,
+    unix => { u32 },
     _ => i32,
 };
 
@@ -76,7 +77,7 @@ fn expand_to_pattern(x: Option<i32>) -> bool {
 }
 
 cfg_select! {
-    true => {
+    false => {
         fn foo() {}
     }
     _ => {
@@ -88,7 +89,7 @@ struct S;
 
 impl S {
     cfg_select! {
-        true => {
+        false => {
             fn foo() {}
         }
         _ => {
@@ -99,7 +100,7 @@ impl S {
 
 trait T {
     cfg_select! {
-        true => {
+        false => {
             fn a();
         }
         _ => {
@@ -110,9 +111,9 @@ trait T {
 
 impl T for S {
     cfg_select! {
-        true => {
+        false => {
             fn a() {}
-        }
+        },
         _ => {
             fn b() {}
         }
@@ -121,7 +122,7 @@ impl T for S {
 
 extern "C" {
     cfg_select! {
-        true => {
+        false => {
             fn puts(s: *const i8) -> i32;
         }
         _ => {
@@ -133,7 +134,28 @@ extern "C" {
 cfg_select! {
     _ => {}
     true => {}
-    //~^ WARN unreachable predicate
+    //~^ WARN unreachable configuration predicate
+}
+
+cfg_select! {
+    true => {}
+    _ => {}
+    //~^ WARN unreachable configuration predicate
+}
+
+cfg_select! {
+    unix => {}
+    not(unix) => {},
+    _ => {}
+    //~^ WARN unreachable configuration predicate
+}
+
+cfg_select! {
+    test => {}
+    test => {}
+    //~^ WARN unreachable configuration predicate
+    _ => {}
+    //~^ WARN unreachable configuration predicate
 }
 
 cfg_select! {
@@ -156,17 +178,17 @@ cfg_select! {
 
 cfg_select! {
     "str" => {}
-    //~^ ERROR malformed `cfg_select` macro input [E0539]
+    //~^ ERROR malformed `cfg_select` macro input [E0565]
 }
 
 cfg_select! {
     a::b => {}
-    //~^ ERROR malformed `cfg_select` macro input [E0539]
+    //~^ ERROR malformed `cfg_select` macro input [E0565]
 }
 
 cfg_select! {
     a() => {}
-    //~^ ERROR invalid predicate `a` [E0537]
+    //~^ ERROR malformed `cfg_select` macro input [E0539]
 }
 
 cfg_select! {
@@ -179,4 +201,53 @@ cfg_select! {
     cfg!() => {}
     //~^ ERROR expected one of `(`, `::`, `=>`, or `=`, found `!`
     //~| WARN unexpected `cfg` condition name
+}
+
+// Regression test for https://github.com/rust-lang/rust/issues/155701.
+cfg_select! {
+    /// doc comment
+    //~^ ERROR doc comments are not allowed on `cfg_select` branches
+    debug_assertions => {}
+    /// doc comment
+    //~^ ERROR doc comments are not allowed on `cfg_select` branches
+    _ => {}
+}
+
+cfg_select! {
+    #[cfg(false)]
+    //~^ ERROR attributes are not allowed on `cfg_select` branches
+    debug_assertions => {}
+    _ => {}
+}
+
+cfg_select! {
+    #![cfg(false)]
+    //~^ ERROR an inner attribute is not permitted in this context
+    debug_assertions => {}
+    _ => {}
+}
+
+cfg_select! {
+    //! inner doc comment
+    //~^ ERROR expected outer doc comment
+    debug_assertions => {}
+    _ => {}
+}
+
+cfg_select! {
+    debug_assertions => {}
+    /// line1
+    //~^ ERROR doc comments are not allowed on `cfg_select` branches
+    // line2
+    /// line3
+    _ => {}
+}
+
+cfg_select! {
+    /// outer doc comment
+    //~^ ERROR doc comments are not allowed on `cfg_select` branches
+    //! inner doc comment
+    //~^ ERROR expected outer doc comment
+    debug_assertions => {}
+    _ => {}
 }

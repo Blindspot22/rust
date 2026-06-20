@@ -19,7 +19,12 @@ LL | use e as b;
    |     -^^^^^
    |     |
    |     no `e` in the root
-   |     help: a similar name exists in the module: `a`
+   |
+help: a similar name exists in the module
+   |
+LL - use e as b;
+LL + use a as b;
+   |
 
 error: aborting due to 3 previous errors
 

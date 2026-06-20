@@ -54,7 +54,7 @@ fn main() -> Result<(), String> {
                     vv.into_iter().flatten().collect_vec()
                 })?;
 
-            if filepath.ends_with("sve.spec.yml") || filepath.ends_with("sve2.spec.yml") {
+            if input.ctx.generate_load_store_tests {
                 let loads = intrinsics.iter()
                     .filter_map(|i| {
                         if matches!(i.test, Test::Load(..)) {
@@ -139,6 +139,7 @@ fn parse_args() -> Vec<(PathBuf, Option<PathBuf>)> {
         .into_iter()
         .filter_map(Result::ok)
         .filter(|f| f.file_type().is_file())
+        .filter(|f| f.file_name().to_string_lossy().ends_with(".yml"))
         .map(|f| (f.into_path(), out_dir.clone()))
         .collect()
 }
@@ -165,7 +166,7 @@ use super::*;{uses_neon}
 
 "#,
         uses_neon = if generated_input.ctx.uses_neon_types {
-            "\nuse crate::core_arch::arch::aarch64::*;"
+            "\nuse crate::core_arch::arch::aarch64::*;\nuse super::{AsSigned, AsUnsigned};"
         } else {
             ""
         },

@@ -101,11 +101,11 @@ impl CargoTestHandle {
         ws_target_dir: Option<&Utf8Path>,
         test_target: TestTarget,
         sender: Sender<CargoTestMessage>,
-    ) -> std::io::Result<Self> {
+    ) -> anyhow::Result<Self> {
         let mut cmd = toolchain::command(Tool::Cargo.path(), root, &options.extra_env);
         cmd.env("RUSTC_BOOTSTRAP", "1");
         cmd.arg("--color=always");
-        cmd.arg("test");
+        cmd.arg(&options.subcommand); // test, usually
 
         cmd.arg("--package");
         cmd.arg(&test_target.package);
@@ -124,7 +124,7 @@ impl CargoTestHandle {
         cmd.arg("--no-fail-fast");
         cmd.arg("--manifest-path");
         cmd.arg(root.join("Cargo.toml"));
-        options.apply_on_command(&mut cmd, ws_target_dir);
+        options.apply_on_command(&mut cmd, ws_target_dir, Some(&test_target.package));
         cmd.arg("--");
         if let Some(path) = path {
             cmd.arg(path);

@@ -964,6 +964,52 @@ fn psadbw<'tcx>(
     interp_ok(())
 }
 
+/// Multiply packed signed 16-bit integers in `left` and `right`, producing intermediate signed 32-bit integers.
+/// Horizontally add adjacent pairs of intermediate 32-bit integers, and pack the results in `dest`.
+///
+/// <https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=_mm_madd_epi16>
+/// <https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=_mm256_madd_epi16>
+/// <https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=_mm512_madd_epi16>
+fn pmaddwd<'tcx>(
+    ecx: &mut crate::MiriInterpCx<'tcx>,
+    left: &OpTy<'tcx>,
+    right: &OpTy<'tcx>,
+    dest: &MPlaceTy<'tcx>,
+) -> InterpResult<'tcx, ()> {
+    let (left, left_len) = ecx.project_to_simd(left)?;
+    let (right, right_len) = ecx.project_to_simd(right)?;
+    let (dest, dest_len) = ecx.project_to_simd(dest)?;
+
+    // fn  pmaddwd(a: i16x8,  b: i16x8)  -> i32x4;
+    // fn  pmaddwd(a: i16x16, b: i16x16) -> i32x8;
+    // fn vpmaddwd(a: i16x32, b: i16x32) -> i32x16;
+    assert_eq!(left_len, right_len);
+    assert_eq!(dest_len.strict_mul(2), left_len);
+
+    for i in 0..dest_len {
+        let j1 = i.strict_mul(2);
+        let left1 = ecx.read_scalar(&ecx.project_index(&left, j1)?)?.to_i16()?;
+        let right1 = ecx.read_scalar(&ecx.project_index(&right, j1)?)?.to_i16()?;
+
+        let j2 = j1.strict_add(1);
+        let left2 = ecx.read_scalar(&ecx.project_index(&left, j2)?)?.to_i16()?;
+        let right2 = ecx.read_scalar(&ecx.project_index(&right, j2)?)?.to_i16()?;
+
+        let dest = ecx.project_index(&dest, i)?;
+
+        // Multiplications are i16*i16->i32, which will not overflow.
+        let mul1 = i32::from(left1).strict_mul(right1.into());
+        let mul2 = i32::from(left2).strict_mul(right2.into());
+        // However, this addition can overflow in the most extreme case
+        // (-0x8000)*(-0x8000)+(-0x8000)*(-0x8000) = 0x80000000
+        let res = mul1.wrapping_add(mul2);
+
+        ecx.write_scalar(Scalar::from_i32(res), &dest)?;
+    }
+
+    interp_ok(())
+}
+
 /// Multiplies packed 8-bit unsigned integers from `left` and packed
 /// signed 8-bit integers from `right` into 16-bit signed integers. Then,
 /// the saturating sum of the products with indices `2*i` and `2*i+1`
@@ -1010,12 +1056,22 @@ fn pmaddbw<'tcx>(
     interp_ok(())
 }
 
-/// Shuffle 32-bit integers in `values` across lanes using the corresponding
-/// index in `indices`, and store the results in dst.
+/// Shuffle elements in `values` across lanes using the corresponding index in
+/// `indices`, and store the results in `dest`.
+///
+/// This helper is shared by both the 32-bit-lane and 64-bit-lane AVX
+/// permute-by-index intrinsics. The element type is taken from `values` and
+/// `dest`, while the index lanes are interpreted at their full width (`i32` or
+/// `i64`, depending on the intrinsic).
+///
+/// For a vector with `N` lanes, only the low `log2(N)` bits of each index are
+/// used. Equivalently, lane `i` of the result is copied from
+/// `values[indices[i] & (N - 1)]`.
 ///
 /// <https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=_mm256_permutevar8x32_epi32>
 /// <https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=_mm256_permutevar8x32_ps>
 /// <https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=_mm512_permutexvar_epi32>
+/// <https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=_mm512_permutexvar_epi64>
 fn permute<'tcx>(
     ecx: &mut crate::MiriInterpCx<'tcx>,
     values: &OpTy<'tcx>,
@@ -1029,18 +1085,70 @@ fn permute<'tcx>(
     // fn permd(a: u32x8, b: u32x8) -> u32x8;
     // fn permps(a: __m256, b: i32x8) -> __m256;
     // fn vpermd(a: i32x16, idx: i32x16) -> i32x16;
+    // fn vpermq(a: i64x8, b: i64x8) -> i64x8;
     assert_eq!(dest_len, values_len);
     assert_eq!(dest_len, indices_len);
 
     // Only use the lower 3 bits to index into a vector with 8 lanes,
     // or the lower 4 bits when indexing into a 16-lane vector.
     assert!(dest_len.is_power_of_two());
-    let mask = u32::try_from(dest_len).unwrap().strict_sub(1);
+    let mask = u128::from(dest_len).strict_sub(1);
 
     for i in 0..dest_len {
         let dest = ecx.project_index(&dest, i)?;
-        let index = ecx.read_scalar(&ecx.project_index(&indices, i)?)?.to_u32()?;
-        let element = ecx.project_index(&values, (index & mask).into())?;
+        let index_place = ecx.project_index(&indices, i)?;
+        let index = ecx.read_scalar(&index_place)?.to_uint(index_place.layout.size)?;
+        // `mask` is at most `dest_len - 1` which fits in a `u64`, so this cannot fail.
+        let element = ecx.project_index(&values, u64::try_from(index & mask).unwrap())?;
+
+        ecx.copy_op(&element, &dest)?;
+    }
+
+    interp_ok(())
+}
+
+/// Shuffle elements from *two* source registers (`left` and `right`) using
+/// the corresponding index in `indices`, and store the results in `dest`.
+///
+/// For a vector with `N` lanes, the low `log2(N)` bits of each index select a
+/// lane within a source vector. Bit `log2(N)` selects the source vector (`0` =>
+/// `left`, `1` => `right`), and all higher bits are ignored.
+/// Equivalently, lane `i` of the result is copied from
+/// `src[indices[i] & (N - 1)]` where
+/// `src = if indices[i] & N == 0 { left } else { right }`.
+///
+/// <https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=_mm512_permutex2var_epi64>
+/// <https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=_mm512_permutex2var_epi8>
+fn permute2<'tcx>(
+    ecx: &mut crate::MiriInterpCx<'tcx>,
+    left: &OpTy<'tcx>,
+    indices: &OpTy<'tcx>,
+    right: &OpTy<'tcx>,
+    dest: &MPlaceTy<'tcx>,
+) -> InterpResult<'tcx, ()> {
+    let (left, left_len) = ecx.project_to_simd(left)?;
+    let (indices, indices_len) = ecx.project_to_simd(indices)?;
+    let (right, right_len) = ecx.project_to_simd(right)?;
+    let (dest, dest_len) = ecx.project_to_simd(dest)?;
+
+    assert_eq!(dest_len, left_len);
+    assert_eq!(dest_len, indices_len);
+    assert_eq!(dest_len, right_len);
+
+    // Use the low bits to select a lane within either input vector, and the next bit to
+    // choose between the two vectors.
+    assert!(dest_len.is_power_of_two());
+    let lane_mask = u128::from(dest_len).strict_sub(1);
+    let vector_select_bit = u128::from(dest_len);
+
+    for i in 0..dest_len {
+        let dest = ecx.project_index(&dest, i)?;
+        let index_place = ecx.project_index(&indices, i)?;
+        let index = ecx.read_scalar(&index_place)?.to_uint(index_place.layout.size)?;
+        // `lane_mask` is at most `dest_len - 1` which fits in a `u64`, so this cannot fail.
+        let lane = u64::try_from(index & lane_mask).unwrap();
+        let src = if index & vector_select_bit == 0 { &left } else { &right };
+        let element = ecx.project_index(src, lane)?;
 
         ecx.copy_op(&element, &dest)?;
     }
@@ -1132,21 +1240,7 @@ fn pclmulqdq<'tcx>(
         let index = if (imm8 & 0x10) == 0 { lo } else { hi };
         let right = ecx.read_scalar(&ecx.project_index(&right, index)?)?.to_u64()?;
 
-        // Perform carry-less multiplication.
-        //
-        // This operation is like long multiplication, but ignores all carries.
-        // That idea corresponds to the xor operator, which is used in the implementation.
-        //
-        // Wikipedia has an example https://en.wikipedia.org/wiki/Carry-less_product#Example
-        let mut result: u128 = 0;
-
-        for i in 0..64 {
-            // if the i-th bit in right is set
-            if (right & (1 << i)) != 0 {
-                // xor result with `left` shifted to the left by i positions
-                result ^= u128::from(left) << i;
-            }
-        }
+        let result = left.widening_carryless_mul(right);
 
         let dest = ecx.project_index(&dest, i)?;
         ecx.write_scalar(Scalar::from_u128(result), &dest)?;

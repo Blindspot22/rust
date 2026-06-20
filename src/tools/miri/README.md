@@ -1,5 +1,9 @@
 # Miri
 
+<img src="miri-sticker.png" align="right" width="200px"
+ alt="Corro, the Unsafe Rusturchin, drinking from a juice bottle labeled 'Miri - 100% safe'"
+ title="Art by Paige Losare-Lusby, Creative Commons Attribute-ShareAlike">
+
 Miri is an [Undefined Behavior][reference-ub] detection tool for Rust. It can run binaries and test
 suites of cargo projects and detect unsafe code that fails to uphold its safety requirements. For
 instance:
@@ -32,12 +36,13 @@ Miri has already discovered many [real-world bugs](#bugs-found-by-miri). If you
 found a bug with Miri, we'd appreciate if you tell us and we'll add it to the
 list!
 
-By default, Miri ensures a fully deterministic execution and isolates the
+By default, Miri ensures a fully deterministic execution by isolating the
 program from the host system. Some APIs that would usually access the host, such
 as gathering entropy for random number generators, environment variables, and
 clocks, are replaced by deterministic "fake" implementations. Set
 `MIRIFLAGS="-Zmiri-disable-isolation"` to access the real system APIs instead.
-(In particular, the "fake" system RNG APIs make Miri **not suited for
+(Note that this isolation is *not* a proper sandbox, and gaps in the isolation are considered
+normal bugs, not security bugs. Also, the "fake" system RNG APIs make Miri **not suited for
 cryptographic use**! Do not generate keys using Miri.)
 
 All that said, be aware that Miri does **not catch every violation of the Rust specification** in
@@ -154,6 +159,18 @@ platform. For example `cargo miri test --target s390x-unknown-linux-gnu`
 will run your test suite on a big-endian target, which is useful for testing
 endian-sensitive code.
 
+### Controlling target features
+
+Controlling target features works similar to regular rustc invocations:
+`RUSTFLAGS="-Ctarget-features=+avx512f" cargo miri test` runs the tests with AVX512 enabled. (Miri
+only supports very few AVX512 intrinsics at the moment.) `-Ctarget-cpu` also works. If target
+features are also relevant for doctests, you have to also set `RUSTDOCFLAGS`.
+
+Unlike regular rustc, this flag has *two* effects: it builds the code with that target feature
+available (which affects `cfg(target_feature)`), and it tells Miri to consider the "virtual CPU"
+that the interpreted program runs on as having the feature available (meaning the code is allowed to
+invoke the corresponding intrinsics).
+
 ### Testing multiple different executions
 
 Certain parts of the execution are picked randomly by Miri, such as the exact base address
@@ -228,7 +245,8 @@ and macOS targets are usually on par. Windows is supported less well.
 
 ### Running tests in parallel
 
-Though it implements Rust threading, Miri itself is a single-threaded interpreter.
+Though it implements Rust threading, Miri itself is a single-threaded interpreter
+(it works like a multi-threaded OS on a single-core CPU).
 This means that when running `cargo miri test`, you will probably see a dramatic
 increase in the amount of time it takes to run your whole test suite due to the
 inherent interpreter slowdown and a loss of parallelism.
@@ -419,13 +437,13 @@ to Miri failing to detect cases of undefined behavior in a program.
   be detected. Using this flag is **unsound** (but the affected soundness rules
   are experimental). Later flags take precedence: borrow tracking can be reactivated
   by `-Zmiri-tree-borrows`.
-* `-Zmiri-disable-validation` disables enforcing validity invariants, which are
-  enforced by default.  This is mostly useful to focus on other failures (such
-  as out-of-bounds accesses) first.  Setting this flag means Miri can miss bugs
-  in your program.  However, this can also help to make Miri run faster.  Using
+* `-Zmiri-disable-validation` disables enforcing validity invariants, which are enforced by default.
+  This only disables these checks for typed copies; using invalid values in any other operation will
+  still cause an error. This also disables the aliasing model (Stacked/Tree Borrows). This is mostly
+  useful to focus on other failures (such as out-of-bounds accesses) first. Setting this flag means
+  Miri can miss bugs in your program. However, this can also help to make Miri run faster. Using
   this flag is **unsound**.
-* `-Zmiri-disable-weak-memory-emulation` disables the emulation of some C++11 weak
-  memory effects.
+* `-Zmiri-disable-weak-memory-emulation` disables the emulation of some C++11 weak memory effects.
 * `-Zmiri-fixed-schedule` disables preemption (like `-Zmiri-preemption-rate=0.0`) and furthermore
   disables the randomization of the next thread to be picked, instead fixing a round-robin schedule.
   Note however that other aspects of Miri's concurrency behavior are still randomize; use
@@ -462,8 +480,9 @@ to Miri failing to detect cases of undefined behavior in a program.
   but reports to the program that it did actually write. This is useful when you
   are not interested in the actual program's output, but only want to see Miri's
   errors and warnings.
-* `-Zmiri-recursive-validation` is a *highly experimental* flag that makes validity checking
-  recurse below references.
+* `-Zmiri-recursive-validation` is a *highly experimental* flag that makes validity checking recurse
+  *one level* below references. The in-memory value is treated as-if it was inside a
+  `MaybeDangling`, i.e., nested references do not even have to be dereferenceable.
 * `-Zmiri-preemption-rate` configures the probability that at the end of a basic block, the active
   thread will be preempted. The default is `0.01` (i.e., 1%). Setting this to `0` disables
   preemption. Note that even without preemption, the schedule is still non-deterministic:
@@ -496,25 +515,20 @@ to Miri failing to detect cases of undefined behavior in a program.
   of Rust will be stricter than Tree Borrows. In other words, if you use Tree Borrows,
   even if your code is accepted today, it might be declared UB in the future.
   This is much less likely with Stacked Borrows.
+* `-Zmiri-tree-borrows-implicit-writes` enables implicit writes for all `&mut` function arguments.
+  This makes Tree Borrows less permissive.
 * `-Zmiri-tree-borrows-no-precise-interior-mut` makes Tree Borrows
   track interior mutable data on the level of references instead of on the
   byte-level as is done by default.  Therefore, with this flag, Tree
   Borrows will be more permissive.
+* `-Zmiri-tree-borrows-relax-custom-allocator-uniqueness` disables uniqueness assumptions for
+  `Box<T, A>` where `A` is not `Global`. The exact aliasing rules for such custom allocators are
+  still up in the air, and by default Miri is conservative and rejects some allocator
+  implementations that incur relevant aliasing between the allocation and the allocator.
 * `-Zmiri-force-page-size=<num>` overrides the default page size for an architecture, in multiples of 1k.
   `4` is default for most targets. This value should always be a power of 2 and nonzero.
 
 [function ABI]: https://doc.rust-lang.org/reference/items/functions.html#extern-function-qualifier
-
-Some native rustc `-Z` flags are also very relevant for Miri:
-
-* `-Zmir-opt-level` controls how many MIR optimizations are performed.  Miri
-  overrides the default to be `0`; be advised that using any higher level can
-  make Miri miss bugs in your program because they got optimized away.
-* `-Zalways-encode-mir` makes rustc dump MIR even for completely monomorphic
-  functions.  This is needed so that Miri can execute such functions, so Miri
-  sets this flag per default.
-* `-Zmir-emit-retag` controls whether `Retag` statements are emitted. Miri
-  enables this per default because it is needed for [Stacked Borrows] and [Tree Borrows].
 
 Moreover, Miri recognizes some environment variables:
 
@@ -625,6 +639,9 @@ Definite bugs found:
 * [`ReentrantLock` not correctly dealing with reuse of addresses for TLS storage of different threads](https://github.com/rust-lang/rust/pull/141248)
 * [Rare Deadlock in the thread (un)parking example code](https://github.com/rust-lang/rust/issues/145816)
 * [`winit` registering a global constructor with the wrong ABI on Windows](https://github.com/rust-windowing/winit/issues/4435)
+* [`VecDeque::splice` confusing physical and logical indices](https://github.com/rust-lang/rust/issues/151758)
+* [Data race in `oneshot` channel](https://github.com/faern/oneshot/issues/69)
+* [Memory leak in serde-yaml-bw](https://github.com/bourumir-wyngs/serde-yaml-bw/issues/197)
 
 Violations of [Stacked Borrows] found that are likely bugs (but Stacked Borrows is currently just an experiment):
 

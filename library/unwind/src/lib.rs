@@ -1,15 +1,13 @@
 #![no_std]
 #![unstable(feature = "panic_unwind", issue = "32837")]
-#![feature(cfg_emscripten_wasm_eh)]
-#![feature(cfg_select)]
 #![feature(link_cfg)]
 #![feature(staged_api)]
-#![cfg_attr(not(target_env = "msvc"), feature(libc))]
 #![cfg_attr(
-    all(target_family = "wasm", any(not(target_os = "emscripten"), emscripten_wasm_eh)),
-    feature(link_llvm_intrinsics, simd_wasm64)
+    target_family = "wasm",
+    feature(link_llvm_intrinsics, simd_wasm64, asm_experimental_arch)
 )]
 #![allow(internal_features)]
+#![allow(unused_features)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 // Force libc to be included even if unused. This is required by many platforms.
@@ -34,6 +32,7 @@ cfg_select! {
         target_os = "psp",
         target_os = "solid_asp3",
         all(target_vendor = "fortanix", target_env = "sgx"),
+        all(target_os = "wasi", panic = "unwind"),
     ) => {
         mod libunwind;
         pub use libunwind::*;

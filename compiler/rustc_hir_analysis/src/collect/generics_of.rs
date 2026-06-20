@@ -1,6 +1,7 @@
-use std::assert_matches::assert_matches;
+use std::assert_matches;
 use std::ops::ControlFlow;
 
+use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, Level};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
 use rustc_hir::intravisit::{self, Visitor, VisitorExt};
@@ -8,15 +9,25 @@ use rustc_hir::{self as hir, AmbigArg, GenericParamKind, HirId, Node};
 use rustc_middle::span_bug;
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_session::lint;
-use rustc_span::{Span, Symbol, kw};
+use rustc_span::{Span, kw, sym};
 use tracing::{debug, instrument};
 
-use crate::delegation::inherit_generics_for_delegation_item;
 use crate::middle::resolve_bound_vars as rbv;
 
 #[instrument(level = "debug", skip(tcx), ret)]
 pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
     use rustc_hir::*;
+
+    struct GenericParametersForbiddenHere {
+        msg: &'static str,
+    }
+
+    impl<'a> Diagnostic<'a, ()> for GenericParametersForbiddenHere {
+        fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, ()> {
+            let Self { msg } = self;
+            Diag::new(dcx, level, msg)
+        }
+    }
 
     // For an RPITIT, synthesize generics which are equal to the opaque's generics
     // and parent fn's generics compressed into one list.
@@ -56,13 +67,7 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
     }
 
     let hir_id = tcx.local_def_id_to_hir_id(def_id);
-
     let node = tcx.hir_node(hir_id);
-    if let Some(sig) = node.fn_sig()
-        && let Some(sig_id) = sig.decl.opt_delegation_sig_id()
-    {
-        return inherit_generics_for_delegation_item(tcx, def_id, sig_id);
-    }
 
     let parent_def_id = match node {
         Node::ImplItem(_)
@@ -71,12 +76,12 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
         | Node::Ctor(..)
         | Node::Field(_) => {
             let parent_id = tcx.hir_get_parent_item(hir_id);
-            Some(parent_id.to_def_id())
+            Some(parent_id.def_id)
         }
         // FIXME(#43408) always enable this once `lazy_normalization` is
         // stable enough and does not need a feature gate anymore.
         Node::AnonConst(_) => {
-            let parent_did = tcx.parent(def_id.to_def_id());
+            let parent_did = tcx.local_parent(def_id);
             debug!(?parent_did);
 
             let mut in_param_ty = false;
@@ -168,7 +173,7 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
         }
         Node::ConstBlock(_)
         | Node::Expr(&hir::Expr { kind: hir::ExprKind::Closure { .. }, .. }) => {
-            Some(tcx.typeck_root_def_id(def_id.to_def_id()))
+            Some(tcx.typeck_root_def_id_local(def_id))
         }
         Node::OpaqueTy(&hir::OpaqueTy {
             origin:
@@ -181,7 +186,7 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
             } else {
                 assert_matches!(tcx.def_kind(fn_def_id), DefKind::AssocFn | DefKind::Fn);
             }
-            Some(fn_def_id.to_def_id())
+            Some(fn_def_id)
         }
         Node::OpaqueTy(&hir::OpaqueTy {
             origin: hir::OpaqueTyOrigin::TyAlias { parent, in_assoc_ty },
@@ -195,7 +200,7 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
             debug!("generics_of: parent of opaque ty {:?} is {:?}", def_id, parent);
             // Opaque types are always nested within another item, and
             // inherit the generics of the item.
-            Some(parent.to_def_id())
+            Some(parent)
         }
 
         // All of these nodes have no parent from which to inherit generics.
@@ -214,7 +219,7 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
 
     // Add in the self type parameter.
     let opt_self = if let Node::Item(item) = node
-        && let ItemKind::Trait(..) | ItemKind::TraitAlias(..) = item.kind
+        && let ItemKind::Trait { .. } | ItemKind::TraitAlias(..) = item.kind
     {
         // Something of a hack: We reuse the node ID of the trait for the self type parameter.
         Some(ty::GenericParamDef {
@@ -274,13 +279,11 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
                     match param_default_policy.expect("no policy for generic param default") {
                         ParamDefaultPolicy::Allowed => {}
                         ParamDefaultPolicy::FutureCompatForbidden => {
-                            tcx.node_span_lint(
+                            tcx.emit_node_span_lint(
                                 lint::builtin::INVALID_TYPE_PARAM_DEFAULT,
                                 param.hir_id,
                                 param.span,
-                                |lint| {
-                                    lint.primary_message(MESSAGE);
-                                },
+                                GenericParametersForbiddenHere { msg: MESSAGE },
                             );
                         }
                         ParamDefaultPolicy::Forbidden => {
@@ -323,22 +326,18 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
     {
         // See `ClosureArgsParts`, `CoroutineArgsParts`, and `CoroutineClosureArgsParts`
         // for info on the usage of each of these fields.
-        let dummy_args = match kind {
-            ClosureKind::Closure => &["<closure_kind>", "<closure_signature>", "<upvars>"][..],
-            ClosureKind::Coroutine(_) => {
-                &["<coroutine_kind>", "<resume_ty>", "<yield_ty>", "<return_ty>", "<upvars>"][..]
-            }
-            ClosureKind::CoroutineClosure(_) => &[
-                "<closure_kind>",
-                "<closure_signature_parts>",
-                "<upvars>",
-                "<bound_captures_by_ref>",
-            ][..],
+        let len = match kind {
+            // The args are: closure_kind, closure_signature, upvars.
+            ClosureKind::Closure => 3,
+            // The args are: coroutine_kind, resume_ty, yield_ty, return_ty, upvars.
+            ClosureKind::Coroutine(_) => 5,
+            // The args are: closure_kind, closure_signature_parts, upvars, bound_captures_by_ref.
+            ClosureKind::CoroutineClosure(_) => 4,
         };
 
-        own_params.extend(dummy_args.iter().map(|&arg| ty::GenericParamDef {
+        own_params.extend((0..len).map(|_| ty::GenericParamDef {
             index: next_index(),
-            name: Symbol::intern(arg),
+            name: sym::empty, // dummy; exact value doesn't matter
             def_id: def_id.to_def_id(),
             pure_wrt_drop: false,
             kind: ty::GenericParamDefKind::Type { has_default: false, synthetic: false },
@@ -375,7 +374,7 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
         own_params.iter().map(|param| (param.def_id, param.index)).collect();
 
     ty::Generics {
-        parent: parent_def_id,
+        parent: parent_def_id.map(LocalDefId::to_def_id),
         parent_count,
         own_params,
         param_def_id_to_index,
@@ -397,7 +396,7 @@ fn param_default_policy(node: Node<'_>) -> Option<ParamDefaultPolicy> {
 
     Some(match node {
         Node::Item(item) => match item.kind {
-            ItemKind::Trait(..)
+            ItemKind::Trait { .. }
             | ItemKind::TraitAlias(..)
             | ItemKind::TyAlias(..)
             | ItemKind::Enum(..)

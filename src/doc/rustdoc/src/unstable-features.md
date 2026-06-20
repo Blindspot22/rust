@@ -653,6 +653,15 @@ add the `--scrape-tests` flag.
 This flag enables the generation of links in the source code pages which allow the reader
 to jump to a type definition.
 
+> [!WARNING]
+> In very specific scenarios, enabling this feature may lead to your program getting rejected if you
+> rely on rustdoc intentionally not running all semantic analysis passes on function bodies to aid
+> with documenting `cfg`-conditional items.
+>
+> More concretely, rustdoc may choose to type-check bodies if they contain type-dependent paths
+> including method calls. This may result in name resolution and type errors getting reported that
+> rustdoc would usually suppress.
+
 ### `--test-builder`: `rustc`-like program to build tests
 
  * Tracking issue: [#102981](https://github.com/rust-lang/rust/issues/102981)
@@ -750,6 +759,20 @@ pass `--doctest-build-arg ARG` for each argument `ARG`.
 ## `--generate-macro-expansion`: Generate macros expansion toggles in source code
 
 This flag enables the generation of toggles to expand macros in the HTML source code pages.
+
+## `--remap-path-scope`: Scopes to which the source remapping should be done
+
+This flag is the equivalent flag from `rustc` `--remap-path-scope`.
+
+Defines which scopes of paths should be remapped by --remap-path-prefix.
+
+### `documentation` scope
+
+`rustdoc` (and by extension `rustc`) have a special `documentation` remapping scope, it
+permits remapping source paths that ends up in the generated documentation.
+
+Currently the scope can only be specified from `rustc`, due to the lack of an equivalent
+`--remap-path-scope` flag in `rustc`.
 
 ## `#[doc(cfg)]` and `#[doc(auto_cfg)]`
 

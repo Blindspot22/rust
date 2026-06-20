@@ -1,19 +1,21 @@
 use std::fmt;
+use std::hash::Hash;
 use std::marker::PhantomData;
 use std::ops::{ControlFlow, Deref};
 
 use derive_where::derive_where;
 #[cfg(feature = "nightly")]
-use rustc_macros::{Decodable_NoContext, Encodable_NoContext, HashStable_NoContext};
-use rustc_type_ir_macros::{GenericTypeVisitable, TypeFoldable_Generic, TypeVisitable_Generic};
+use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash, StableHash_NoContext};
+use rustc_type_ir_macros::{
+    GenericTypeVisitable, Lift_Generic, TypeFoldable_Generic, TypeVisitable_Generic,
+};
 use tracing::instrument;
 
 use crate::data_structures::SsoHashSet;
 use crate::fold::{FallibleTypeFolder, TypeFoldable, TypeFolder, TypeSuperFoldable};
 use crate::inherent::*;
-use crate::lift::Lift;
 use crate::visit::{Flags, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor};
-use crate::{self as ty, DebruijnIndex, Interner, UniverseIndex};
+use crate::{self as ty, DebruijnIndex, Interner, UniverseIndex, Unnormalized};
 
 /// `Binder` is a binder for higher-ranked lifetimes or types. It is part of the
 /// compiler's representation for things like `for<'a> Fn(&'a isize)`
@@ -23,33 +25,15 @@ use crate::{self as ty, DebruijnIndex, Interner, UniverseIndex};
 /// for more details.
 ///
 /// `Decodable` and `Encodable` are implemented for `Binder<T>` using the `impl_binder_encode_decode!` macro.
-#[derive_where(Clone, Hash, PartialEq, Debug; I: Interner, T)]
-#[derive_where(Copy; I: Interner, T: Copy)]
-#[derive(GenericTypeVisitable)]
-#[cfg_attr(feature = "nightly", derive(HashStable_NoContext))]
+#[derive_where(Clone, Copy, Hash, PartialEq, Debug; I: Interner, T)]
+#[derive(GenericTypeVisitable, Lift_Generic)]
+#[cfg_attr(feature = "nightly", derive(StableHash_NoContext))]
 pub struct Binder<I: Interner, T> {
     value: T,
     bound_vars: I::BoundVarKinds,
 }
 
 impl<I: Interner, T: Eq> Eq for Binder<I, T> {}
-
-// FIXME: We manually derive `Lift` because the `derive(Lift_Generic)` doesn't
-// understand how to turn `T` to `T::Lifted` in the output `type Lifted`.
-impl<I: Interner, U: Interner, T> Lift<U> for Binder<I, T>
-where
-    T: Lift<U>,
-    I::BoundVarKinds: Lift<U, Lifted = U::BoundVarKinds>,
-{
-    type Lifted = Binder<U, T::Lifted>;
-
-    fn lift_to_interner(self, cx: U) -> Option<Self::Lifted> {
-        Some(Binder {
-            value: self.value.lift_to_interner(cx)?,
-            bound_vars: self.bound_vars.lift_to_interner(cx)?,
-        })
-    }
-}
 
 #[cfg(feature = "nightly")]
 macro_rules! impl_binder_encode_decode {
@@ -359,13 +343,11 @@ impl<I: Interner> TypeVisitor<I> for ValidateBoundVars<I> {
 /// `instantiate`.
 ///
 /// See <https://rustc-dev-guide.rust-lang.org/ty_module/early_binder.html> for more details.
-#[derive_where(Clone, PartialEq, Ord, Hash, Debug; I: Interner, T)]
-#[derive_where(PartialOrd; I: Interner, T: Ord)]
-#[derive_where(Copy; I: Interner, T: Copy)]
+#[derive_where(Clone, Copy, PartialOrd, Ord, PartialEq, Hash, Debug; I: Interner, T)]
 #[derive(GenericTypeVisitable)]
 #[cfg_attr(
     feature = "nightly",
-    derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
+    derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
 )]
 pub struct EarlyBinder<I: Interner, T> {
     value: T,
@@ -375,13 +357,17 @@ pub struct EarlyBinder<I: Interner, T> {
 
 impl<I: Interner, T: Eq> Eq for EarlyBinder<I, T> {}
 
-/// For early binders, you should first call `instantiate` before using any visitors.
+// FIXME(154045): Recommended as per https://github.com/rust-lang/rust/issues/154045, this is so sad :((
 #[cfg(feature = "nightly")]
-impl<I: Interner, T> !TypeFoldable<I> for ty::EarlyBinder<I, T> {}
+macro_rules! generate { ($( $tt:tt )*) => { $( $tt )* } }
 
-/// For early binders, you should first call `instantiate` before using any visitors.
 #[cfg(feature = "nightly")]
-impl<I: Interner, T> !TypeVisitable<I> for ty::EarlyBinder<I, T> {}
+generate!(
+    /// For early binders, you should first call `instantiate` before using any visitors.
+    impl<I: Interner, T> !TypeFoldable<I> for ty::EarlyBinder<I, T> {}
+    /// For early binders, you should first call `instantiate` before using any visitors.
+    impl<I: Interner, T> !TypeVisitable<I> for ty::EarlyBinder<I, T> {}
+);
 
 impl<I: Interner, T> EarlyBinder<I, T> {
     pub fn bind(value: T) -> EarlyBinder<I, T> {
@@ -459,8 +445,8 @@ where
 
     /// Similar to [`instantiate_identity`](EarlyBinder::instantiate_identity),
     /// but on an iterator of `TypeFoldable` values.
-    pub fn iter_identity(self) -> Iter::IntoIter {
-        self.value.into_iter()
+    pub fn iter_identity(self) -> impl Iterator<Item = Unnormalized<I, Iter::Item>> {
+        self.value.into_iter().map(Unnormalized::new)
     }
 }
 
@@ -475,7 +461,7 @@ where
     Iter::Item: TypeFoldable<I>,
     A: SliceLike<Item = I::GenericArg>,
 {
-    type Item = Iter::Item;
+    type Item = Unnormalized<I, Iter::Item>;
 
     fn next(&mut self) -> Option<Self::Item> {
         Some(
@@ -526,8 +512,8 @@ where
 
     /// Similar to [`instantiate_identity`](EarlyBinder::instantiate_identity),
     /// but on an iterator of values that deref to a `TypeFoldable`.
-    pub fn iter_identity_copied(self) -> IterIdentityCopied<Iter> {
-        IterIdentityCopied { it: self.value.into_iter() }
+    pub fn iter_identity_copied(self) -> IterIdentityCopied<I, Iter> {
+        IterIdentityCopied { it: self.value.into_iter(), _tcx: PhantomData }
     }
 }
 
@@ -542,7 +528,7 @@ where
     Iter::Item: Deref,
     <Iter::Item as Deref>::Target: Copy + TypeFoldable<I>,
 {
-    type Item = <Iter::Item as Deref>::Target;
+    type Item = Unnormalized<I, <Iter::Item as Deref>::Target>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.it.next().map(|value| {
@@ -576,19 +562,20 @@ where
 {
 }
 
-pub struct IterIdentityCopied<Iter: IntoIterator> {
+pub struct IterIdentityCopied<I: Interner, Iter: IntoIterator> {
     it: Iter::IntoIter,
+    _tcx: PhantomData<fn() -> I>,
 }
 
-impl<Iter: IntoIterator> Iterator for IterIdentityCopied<Iter>
+impl<I: Interner, Iter: IntoIterator> Iterator for IterIdentityCopied<I, Iter>
 where
     Iter::Item: Deref,
     <Iter::Item as Deref>::Target: Copy,
 {
-    type Item = <Iter::Item as Deref>::Target;
+    type Item = Unnormalized<I, <Iter::Item as Deref>::Target>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.it.next().map(|i| *i)
+        self.it.next().map(|i| Unnormalized::new(*i))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -596,18 +583,18 @@ where
     }
 }
 
-impl<Iter: IntoIterator> DoubleEndedIterator for IterIdentityCopied<Iter>
+impl<I: Interner, Iter: IntoIterator> DoubleEndedIterator for IterIdentityCopied<I, Iter>
 where
     Iter::IntoIter: DoubleEndedIterator,
     Iter::Item: Deref,
     <Iter::Item as Deref>::Target: Copy,
 {
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.it.next_back().map(|i| *i)
+        self.it.next_back().map(|i| Unnormalized::new(*i))
     }
 }
 
-impl<Iter: IntoIterator> ExactSizeIterator for IterIdentityCopied<Iter>
+impl<I: Interner, Iter: IntoIterator> ExactSizeIterator for IterIdentityCopied<I, Iter>
 where
     Iter::IntoIter: ExactSizeIterator,
     Iter::Item: Deref,
@@ -638,7 +625,7 @@ impl<I: Interner, T: Iterator> Iterator for EarlyBinderIter<I, T> {
 }
 
 impl<I: Interner, T: TypeFoldable<I>> ty::EarlyBinder<I, T> {
-    pub fn instantiate<A>(self, cx: I, args: A) -> T
+    pub fn instantiate<A>(self, cx: I, args: A) -> Unnormalized<I, T>
     where
         A: SliceLike<Item = I::GenericArg>,
     {
@@ -651,10 +638,10 @@ impl<I: Interner, T: TypeFoldable<I>> ty::EarlyBinder<I, T> {
                 "{:?} has parameters, but no args were provided in instantiate",
                 self.value,
             );
-            return self.value;
+            return Unnormalized::new(self.value);
         }
         let mut folder = ArgFolder { cx, args: args.as_slice(), binders_passed: 0 };
-        self.value.fold_with(&mut folder)
+        Unnormalized::new(self.value.fold_with(&mut folder))
     }
 
     /// Makes the identity replacement `T0 => T0, ..., TN => TN`.
@@ -665,8 +652,16 @@ impl<I: Interner, T: TypeFoldable<I>> ty::EarlyBinder<I, T> {
     /// - Outside of `foo`, `T` is bound (represented by the presence of `EarlyBinder`).
     /// - Inside of the body of `foo`, we treat `T` as a placeholder by calling
     /// `instantiate_identity` to discharge the `EarlyBinder`.
-    pub fn instantiate_identity(self) -> T {
-        self.value
+    pub fn instantiate_identity(self) -> Unnormalized<I, T> {
+        // FIXME(#155345): In case the bound value was already normalized, this
+        // is unnecessary. We may want to track explicitly whether `EarlyBinder`
+        // contains something that has been normalized already.
+        // Also do that for other types who have `instantiate_identity` method,
+        // e.g., `GenericPredicates` and `ConstConditions`.
+        //
+        // This is annoying, as e.g. `type_of` for opaque types is normalized,
+        // while `type_of` for free type aliases is not.
+        Unnormalized::new(self.value)
     }
 
     /// Returns the inner value, but only if it contains no bound vars.
@@ -942,10 +937,7 @@ impl<'a, I: Interner> ArgFolder<'a, I> {
 /// solver, canonicalization is hot and there are some pathological cases where
 /// this is needed (`post-mono-higher-ranked-hang`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    feature = "nightly",
-    derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
-)]
+#[cfg_attr(feature = "nightly", derive(Encodable_NoContext, Decodable_NoContext, StableHash))]
 #[derive(TypeVisitable_Generic, GenericTypeVisitable, TypeFoldable_Generic)]
 pub enum BoundVarIndexKind {
     Bound(DebruijnIndex),
@@ -955,28 +947,19 @@ pub enum BoundVarIndexKind {
 /// The "placeholder index" fully defines a placeholder region, type, or const. Placeholders are
 /// identified by both a universe, as well as a name residing within that universe. Distinct bound
 /// regions/types/consts within the same universe simply have an unknown relationship to one
-/// another.
-#[derive_where(Clone, PartialEq, Ord, Hash; I: Interner, T)]
-#[derive_where(PartialOrd; I: Interner, T: Ord)]
-#[derive_where(Copy; I: Interner, T: Copy, T)]
-#[derive_where(Eq; T)]
-#[derive(TypeVisitable_Generic, TypeFoldable_Generic)]
+#[derive_where(Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash; I: Interner, T)]
+#[derive(TypeVisitable_Generic, TypeFoldable_Generic, GenericTypeVisitable, Lift_Generic)]
 #[cfg_attr(
     feature = "nightly",
-    derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
+    derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
 )]
 pub struct Placeholder<I: Interner, T> {
+    #[lift(identity)]
     pub universe: UniverseIndex,
     pub bound: T,
     #[type_foldable(identity)]
     #[type_visitable(ignore)]
     _tcx: PhantomData<fn() -> I>,
-}
-
-impl<I: Interner, T> Placeholder<I, T> {
-    pub fn new(universe: UniverseIndex, bound: T) -> Self {
-        Placeholder { universe, bound, _tcx: PhantomData }
-    }
 }
 
 impl<I: Interner, T: fmt::Debug> fmt::Debug for ty::Placeholder<I, T> {
@@ -989,17 +972,312 @@ impl<I: Interner, T: fmt::Debug> fmt::Debug for ty::Placeholder<I, T> {
     }
 }
 
-impl<I: Interner, U: Interner, T> Lift<U> for Placeholder<I, T>
-where
-    T: Lift<U>,
-{
-    type Lifted = Placeholder<U, T::Lifted>;
+#[derive_where(Clone, Copy, PartialEq, Eq, Hash; I: Interner)]
+#[derive(Lift_Generic, GenericTypeVisitable)]
+#[cfg_attr(
+    feature = "nightly",
+    derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
+)]
+pub enum BoundRegionKind<I: Interner> {
+    /// An anonymous region parameter for a given fn (&T)
+    Anon,
 
-    fn lift_to_interner(self, cx: U) -> Option<Self::Lifted> {
-        Some(Placeholder {
-            universe: self.universe,
-            bound: self.bound.lift_to_interner(cx)?,
-            _tcx: PhantomData,
-        })
+    /// An anonymous region parameter with a `Symbol` name.
+    ///
+    /// Used to give late-bound regions names for things like pretty printing.
+    NamedForPrinting(I::Symbol),
+
+    /// Late-bound regions that appear in the AST.
+    Named(I::DefId),
+
+    /// Anonymous region for the implicit env pointer parameter
+    /// to a closure
+    ClosureEnv,
+}
+
+impl<I: Interner> fmt::Debug for ty::BoundRegionKind<I> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            ty::BoundRegionKind::Anon => write!(f, "BrAnon"),
+            ty::BoundRegionKind::NamedForPrinting(name) => {
+                write!(f, "BrNamedForPrinting({:?})", name)
+            }
+            ty::BoundRegionKind::Named(did) => {
+                write!(f, "BrNamed({did:?})")
+            }
+            ty::BoundRegionKind::ClosureEnv => write!(f, "BrEnv"),
+        }
+    }
+}
+
+impl<I: Interner> BoundRegionKind<I> {
+    pub fn is_named(&self, tcx: I) -> bool {
+        self.get_name(tcx).is_some()
+    }
+
+    pub fn get_name(&self, tcx: I) -> Option<I::Symbol> {
+        match *self {
+            ty::BoundRegionKind::Named(def_id) => {
+                let name = tcx.item_name(def_id);
+                if name.is_kw_underscore_lifetime() { None } else { Some(name) }
+            }
+            ty::BoundRegionKind::NamedForPrinting(name) => Some(name),
+            _ => None,
+        }
+    }
+
+    pub fn get_id(&self) -> Option<I::DefId> {
+        match *self {
+            ty::BoundRegionKind::Named(id) => Some(id),
+            _ => None,
+        }
+    }
+}
+
+#[derive_where(Clone, Copy, PartialEq, Eq, Debug, Hash; I: Interner)]
+#[derive(Lift_Generic, GenericTypeVisitable)]
+#[cfg_attr(
+    feature = "nightly",
+    derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
+)]
+pub enum BoundTyKind<I: Interner> {
+    Anon,
+    Param(I::DefId),
+}
+
+#[derive_where(Clone, Copy, PartialEq, Eq, Debug, Hash; I: Interner)]
+#[derive(Lift_Generic, GenericTypeVisitable)]
+#[cfg_attr(
+    feature = "nightly",
+    derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
+)]
+pub enum BoundVariableKind<I: Interner> {
+    Ty(BoundTyKind<I>),
+    Region(BoundRegionKind<I>),
+    Const,
+}
+
+impl<I: Interner> BoundVariableKind<I> {
+    pub fn expect_region(self) -> BoundRegionKind<I> {
+        match self {
+            BoundVariableKind::Region(lt) => lt,
+            _ => panic!("expected a region, but found another kind"),
+        }
+    }
+
+    pub fn expect_ty(self) -> BoundTyKind<I> {
+        match self {
+            BoundVariableKind::Ty(ty) => ty,
+            _ => panic!("expected a type, but found another kind"),
+        }
+    }
+
+    pub fn expect_const(self) {
+        match self {
+            BoundVariableKind::Const => (),
+            _ => panic!("expected a const, but found another kind"),
+        }
+    }
+}
+
+#[derive_where(Clone, Copy, PartialEq, Eq, Hash; I: Interner)]
+#[derive(GenericTypeVisitable)]
+#[cfg_attr(
+    feature = "nightly",
+    derive(Encodable_NoContext, StableHash_NoContext, Decodable_NoContext)
+)]
+pub struct BoundRegion<I: Interner> {
+    pub var: ty::BoundVar,
+    pub kind: BoundRegionKind<I>,
+}
+
+impl<I: Interner> core::fmt::Debug for BoundRegion<I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            BoundRegionKind::Anon => write!(f, "{:?}", self.var),
+            BoundRegionKind::ClosureEnv => write!(f, "{:?}.Env", self.var),
+            BoundRegionKind::Named(def) => {
+                write!(f, "{:?}.Named({:?})", self.var, def)
+            }
+            BoundRegionKind::NamedForPrinting(symbol) => {
+                write!(f, "{:?}.NamedAnon({:?})", self.var, symbol)
+            }
+        }
+    }
+}
+
+impl<I: Interner> BoundRegion<I> {
+    pub fn var(self) -> ty::BoundVar {
+        self.var
+    }
+
+    pub fn assert_eq(self, var: BoundVariableKind<I>) {
+        assert_eq!(self.kind, var.expect_region())
+    }
+}
+
+pub type PlaceholderRegion<I> = ty::Placeholder<I, BoundRegion<I>>;
+
+impl<I: Interner> PlaceholderRegion<I> {
+    pub fn universe(self) -> UniverseIndex {
+        self.universe
+    }
+
+    pub fn var(self) -> ty::BoundVar {
+        self.bound.var()
+    }
+
+    pub fn with_updated_universe(self, ui: UniverseIndex) -> Self {
+        Self { universe: ui, bound: self.bound, _tcx: PhantomData }
+    }
+
+    pub fn new(ui: UniverseIndex, bound: BoundRegion<I>) -> Self {
+        Self { universe: ui, bound, _tcx: PhantomData }
+    }
+
+    pub fn new_anon(ui: UniverseIndex, var: ty::BoundVar) -> Self {
+        let bound = BoundRegion { var, kind: BoundRegionKind::Anon };
+        Self { universe: ui, bound, _tcx: PhantomData }
+    }
+}
+
+#[derive_where(Clone, Copy, PartialEq, Eq, Hash; I: Interner)]
+#[derive(GenericTypeVisitable, Lift_Generic)]
+#[cfg_attr(
+    feature = "nightly",
+    derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
+)]
+pub struct BoundTy<I: Interner> {
+    #[lift(identity)]
+    pub var: ty::BoundVar,
+    pub kind: BoundTyKind<I>,
+}
+
+impl<I: Interner> fmt::Debug for ty::BoundTy<I> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            ty::BoundTyKind::Anon => write!(f, "{:?}", self.var),
+            ty::BoundTyKind::Param(def_id) => write!(f, "{def_id:?}"),
+        }
+    }
+}
+
+impl<I: Interner> BoundTy<I> {
+    pub fn var(self) -> ty::BoundVar {
+        self.var
+    }
+
+    pub fn assert_eq(self, var: BoundVariableKind<I>) {
+        assert_eq!(self.kind, var.expect_ty())
+    }
+}
+
+pub type PlaceholderType<I> = ty::Placeholder<I, BoundTy<I>>;
+
+impl<I: Interner> PlaceholderType<I> {
+    pub fn universe(self) -> UniverseIndex {
+        self.universe
+    }
+
+    pub fn var(self) -> ty::BoundVar {
+        self.bound.var
+    }
+
+    pub fn with_updated_universe(self, ui: UniverseIndex) -> Self {
+        Self { universe: ui, bound: self.bound, _tcx: PhantomData }
+    }
+
+    pub fn new(ui: UniverseIndex, bound: BoundTy<I>) -> Self {
+        Self { universe: ui, bound, _tcx: PhantomData }
+    }
+
+    pub fn new_anon(ui: UniverseIndex, var: ty::BoundVar) -> Self {
+        let bound = BoundTy { var, kind: BoundTyKind::Anon };
+        Self { universe: ui, bound, _tcx: PhantomData }
+    }
+}
+
+#[derive_where(Clone, Copy, PartialEq, Debug, Eq, Hash; I: Interner)]
+#[derive(GenericTypeVisitable)]
+#[cfg_attr(
+    feature = "nightly",
+    derive(Encodable_NoContext, Decodable_NoContext, StableHash_NoContext)
+)]
+pub struct BoundConst<I: Interner> {
+    pub var: ty::BoundVar,
+    #[derive_where(skip(Debug))]
+    pub _tcx: PhantomData<fn() -> I>,
+}
+
+impl<I: Interner> BoundConst<I> {
+    pub fn var(self) -> ty::BoundVar {
+        self.var
+    }
+
+    pub fn assert_eq(self, var: BoundVariableKind<I>) {
+        var.expect_const()
+    }
+
+    pub fn new(var: ty::BoundVar) -> Self {
+        Self { var, _tcx: PhantomData }
+    }
+}
+
+pub type PlaceholderConst<I> = ty::Placeholder<I, BoundConst<I>>;
+
+impl<I: Interner> PlaceholderConst<I> {
+    pub fn universe(self) -> UniverseIndex {
+        self.universe
+    }
+
+    pub fn var(self) -> ty::BoundVar {
+        self.bound.var
+    }
+
+    pub fn with_updated_universe(self, ui: UniverseIndex) -> Self {
+        Self { universe: ui, bound: self.bound, _tcx: PhantomData }
+    }
+
+    pub fn new(ui: UniverseIndex, bound: BoundConst<I>) -> Self {
+        Self { universe: ui, bound, _tcx: PhantomData }
+    }
+
+    pub fn new_anon(ui: UniverseIndex, var: ty::BoundVar) -> Self {
+        let bound = BoundConst::new(var);
+        Self { universe: ui, bound, _tcx: PhantomData }
+    }
+
+    pub fn find_const_ty_from_env(self, env: I::ParamEnv) -> I::Ty {
+        let mut candidates = env.caller_bounds().iter().filter_map(|clause| {
+            // `ConstArgHasType` are never desugared to be higher ranked.
+            match clause.kind().skip_binder() {
+                ty::ClauseKind::ConstArgHasType(placeholder_ct, ty) => {
+                    assert!(!(placeholder_ct, ty).has_escaping_bound_vars());
+
+                    match placeholder_ct.kind() {
+                        ty::ConstKind::Placeholder(placeholder_ct) if placeholder_ct == self => {
+                            Some(ty)
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        });
+
+        // N.B. it may be tempting to fix ICEs by making this function return
+        // `Option<Ty<'tcx>>` instead of `Ty<'tcx>`; however, this is generally
+        // considered to be a bandaid solution, since it hides more important
+        // underlying issues with how we construct generics and predicates of
+        // items. It's advised to fix the underlying issue rather than trying
+        // to modify this function.
+        let ty = candidates.next().unwrap_or_else(|| {
+            panic!("cannot find `{self:?}` in param-env: {env:#?}");
+        });
+        assert!(
+            candidates.next().is_none(),
+            "did not expect duplicate `ConstParamHasTy` for `{self:?}` in param-env: {env:#?}"
+        );
+        ty
     }
 }

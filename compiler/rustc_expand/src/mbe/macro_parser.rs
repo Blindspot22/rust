@@ -199,8 +199,8 @@ pub(super) fn compute_locs(matcher: &[TokenTree]) -> Vec<MatcherLoc> {
                     let idx_seq = idx_first - 1;
                     inner(&seq.tts, locs, next_metavar, seq_depth + 1);
 
-                    if let Some(separator) = &seq.separator {
-                        locs.push(MatcherLoc::SequenceSep { separator: separator.clone() });
+                    if let Some(separator) = seq.separator {
+                        locs.push(MatcherLoc::SequenceSep { separator });
                         locs.push(MatcherLoc::SequenceKleeneOpAfterSep { idx_first });
                     } else {
                         locs.push(MatcherLoc::SequenceKleeneOpNoSep { op, idx_first });
@@ -386,6 +386,15 @@ pub(super) fn count_metavar_decls(matcher: &[TokenTree]) -> usize {
 pub(crate) enum NamedMatch {
     MatchedSeq(Vec<NamedMatch>),
     MatchedSingle(ParseNtResult),
+}
+
+impl NamedMatch {
+    pub(super) fn is_repeatable(&self) -> bool {
+        match self {
+            NamedMatch::MatchedSeq(_) => true,
+            NamedMatch::MatchedSingle(_) => false,
+        }
+    }
 }
 
 /// Performs a token equality check, ignoring syntax context (that is, an unhygienic comparison)

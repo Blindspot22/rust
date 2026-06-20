@@ -1,7 +1,7 @@
 use rustc_hir::def::CtorOf;
 use rustc_index::Idx;
 
-use crate::rmeta::decoder::Metadata;
+use crate::rmeta::decoder::MetaBlob;
 use crate::rmeta::*;
 
 pub(super) trait IsDefault: Default {
@@ -41,16 +41,6 @@ impl IsDefault for u64 {
 impl<T> IsDefault for LazyArray<T> {
     fn is_default(&self) -> bool {
         self.num_elems == 0
-    }
-}
-
-impl IsDefault for UnusedGenericParams {
-    fn is_default(&self) -> bool {
-        // UnusedGenericParams encodes the *un*usedness as a bitset.
-        // This means that 0 corresponds to all bits used, which is indeed the default.
-        let is_default = self.bits() == 0;
-        debug_assert_eq!(is_default, self.all_used());
-        is_default
     }
 }
 
@@ -175,10 +165,12 @@ fixed_size_enum! {
         ( AssocTy                                  )
         ( TyParam                                  )
         ( Fn                                       )
-        ( Const                                    )
+        ( Const { is_type_const: true}             )
+        ( Const { is_type_const: false}            )
         ( ConstParam                               )
         ( AssocFn                                  )
-        ( AssocConst                               )
+        ( AssocConst { is_type_const:true }        )
+        ( AssocConst { is_type_const:false }       )
         ( ExternCrate                              )
         ( Use                                      )
         ( ForeignMod                               )
@@ -233,8 +225,9 @@ defaulted_enum! {
 
 defaulted_enum! {
     hir::Constness {
-        ( Const    )
+        ( Const { always: false } )
         ( NotConst )
+        ( Const { always: true } )
     }
 }
 
@@ -494,7 +487,7 @@ impl<I: Idx, const N: usize, T: FixedSizeEncoding<ByteArray = [u8; N]>> TableBui
         }
     }
 
-    pub(crate) fn encode(&self, buf: &mut FileEncoder) -> LazyTable<I, T> {
+    pub(crate) fn encode(&self, buf: &mut FileEncoder<'_>) -> LazyTable<I, T> {
         let pos = buf.position();
 
         let width = self.width;
@@ -523,7 +516,7 @@ where
     for<'tcx> T::Value<'tcx>: FixedSizeEncoding<ByteArray = [u8; N]>,
 {
     /// Given the metadata, extract out the value at a particular index (if any).
-    pub(super) fn get<'a, 'tcx, M: Metadata<'a>>(&self, metadata: M, i: I) -> T::Value<'tcx> {
+    pub(super) fn get<'a, 'tcx, M: MetaBlob<'a>>(&self, metadata: M, i: I) -> T::Value<'tcx> {
         // Access past the end of the table returns a Default
         if i.index() >= self.len {
             return Default::default();

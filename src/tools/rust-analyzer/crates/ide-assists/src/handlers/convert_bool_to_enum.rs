@@ -1,19 +1,22 @@
 use either::Either;
 use hir::ModuleDef;
+use ide_db::imports::insert_use::insert_use_with_editor;
 use ide_db::text_edit::TextRange;
 use ide_db::{
-    FxHashSet,
+    FileId, FxHashSet,
     assists::AssistId,
     defs::Definition,
-    helpers::mod_path_to_ast,
-    imports::insert_use::{ImportScope, insert_use},
+    helpers::mod_path_to_ast_with_factory,
+    imports::insert_use::ImportScope,
     search::{FileReference, UsageSearchResult},
     source_change::SourceChangeBuilder,
 };
 use itertools::Itertools;
+use syntax::ast::edit::AstNodeEdit;
+use syntax::ast::syntax_factory::SyntaxFactory;
 use syntax::{
     AstNode, NodeOrToken, SyntaxKind, SyntaxNode, T,
-    ast::{self, HasName, edit::IndentLevel, edit_in_place::Indent, make},
+    ast::{self, HasName, edit::IndentLevel},
 };
 
 use crate::{
@@ -50,7 +53,7 @@ use crate::{
 //     }
 // }
 // ```
-pub(crate) fn convert_bool_to_enum(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+pub(crate) fn convert_bool_to_enum(acc: &mut Assists, ctx: &AssistContext<'_, '_>) -> Option<()> {
     let BoolNodeData { target_node, name, ty_annotation, initializer, definition } =
         find_bool_node(ctx)?;
     let target_module = ctx.sema.scope(&target_node)?.module().nearest_non_block_module(ctx.db());
@@ -61,21 +64,32 @@ pub(crate) fn convert_bool_to_enum(acc: &mut Assists, ctx: &AssistContext<'_>) -
         "Convert boolean to enum",
         target,
         |edit| {
+            let make = SyntaxFactory::without_mappings();
             if let Some(ty) = &ty_annotation {
                 cov_mark::hit!(replaces_ty_annotation);
                 edit.replace(ty.syntax().text_range(), "Bool");
             }
 
             if let Some(initializer) = initializer {
-                replace_bool_expr(edit, initializer);
+                replace_bool_expr(edit, initializer, &make);
             }
 
             let usages = definition.usages(&ctx.sema).all();
-            add_enum_def(edit, ctx, &usages, target_node, &target_module);
+            add_enum_def(edit, ctx, &usages, target_node, &target_module, &make);
             let mut delayed_mutations = Vec::new();
-            replace_usages(edit, ctx, usages, definition, &target_module, &mut delayed_mutations);
-            for (scope, path) in delayed_mutations {
-                insert_use(&scope, path, &ctx.config.insert_use);
+            replace_usages(
+                edit,
+                ctx,
+                usages,
+                definition,
+                &target_module,
+                &mut delayed_mutations,
+                &make,
+            );
+            for (file_id, scope, path) in delayed_mutations {
+                let editor = edit.make_editor(scope.as_syntax_node());
+                insert_use_with_editor(&scope, path, &ctx.config.insert_use, &editor);
+                edit.add_file_edits(file_id, editor);
             }
         },
     )
@@ -90,7 +104,7 @@ struct BoolNodeData {
 }
 
 /// Attempts to find an appropriate node to apply the action to.
-fn find_bool_node(ctx: &AssistContext<'_>) -> Option<BoolNodeData> {
+fn find_bool_node(ctx: &AssistContext<'_, '_>) -> Option<BoolNodeData> {
     let name = ctx.find_node_at_offset::<ast::Name>()?;
 
     if let Some(ident_pat) = name.syntax().parent().and_then(ast::IdentPat::cast) {
@@ -167,16 +181,16 @@ fn find_bool_node(ctx: &AssistContext<'_>) -> Option<BoolNodeData> {
     }
 }
 
-fn replace_bool_expr(edit: &mut SourceChangeBuilder, expr: ast::Expr) {
+fn replace_bool_expr(edit: &mut SourceChangeBuilder, expr: ast::Expr, make: &SyntaxFactory) {
     let expr_range = expr.syntax().text_range();
-    let enum_expr = bool_expr_to_enum_expr(expr);
+    let enum_expr = bool_expr_to_enum_expr(expr, make);
     edit.replace(expr_range, enum_expr.syntax().text())
 }
 
 /// Converts an expression of type `bool` to one of the new enum type.
-fn bool_expr_to_enum_expr(expr: ast::Expr) -> ast::Expr {
-    let true_expr = make::expr_path(make::path_from_text("Bool::True"));
-    let false_expr = make::expr_path(make::path_from_text("Bool::False"));
+fn bool_expr_to_enum_expr(expr: ast::Expr, make: &SyntaxFactory) -> ast::Expr {
+    let true_expr = make.expr_path(make.path_from_text("Bool::True"));
+    let false_expr = make.expr_path(make.path_from_text("Bool::False"));
 
     if let ast::Expr::Literal(literal) = &expr {
         match literal.kind() {
@@ -185,10 +199,10 @@ fn bool_expr_to_enum_expr(expr: ast::Expr) -> ast::Expr {
             _ => expr,
         }
     } else {
-        make::expr_if(
+        make.expr_if(
             expr,
-            make::tail_only_block_expr(true_expr),
-            Some(ast::ElseBranch::Block(make::tail_only_block_expr(false_expr))),
+            make.tail_only_block_expr(true_expr),
+            Some(ast::ElseBranch::Block(make.tail_only_block_expr(false_expr))),
         )
         .into()
     }
@@ -197,16 +211,19 @@ fn bool_expr_to_enum_expr(expr: ast::Expr) -> ast::Expr {
 /// Replaces all usages of the target identifier, both when read and written to.
 fn replace_usages(
     edit: &mut SourceChangeBuilder,
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
     usages: UsageSearchResult,
     target_definition: Definition,
     target_module: &hir::Module,
-    delayed_mutations: &mut Vec<(ImportScope, ast::Path)>,
+    delayed_mutations: &mut Vec<(FileId, ImportScope, ast::Path)>,
+    make: &SyntaxFactory,
 ) {
     for (file_id, references) in usages {
-        edit.edit_file(file_id.file_id(ctx.db()));
+        let vfs_file_id = file_id.file_id(ctx.db());
+        edit.edit_file(vfs_file_id);
 
-        let refs_with_imports = augment_references_with_imports(ctx, references, target_module);
+        let refs_with_imports =
+            augment_references_with_imports(ctx, references, target_module, make);
 
         refs_with_imports.into_iter().rev().for_each(
             |FileReferenceWithImport { range, name, import_data }| {
@@ -223,12 +240,13 @@ fn replace_usages(
                             target_definition,
                             target_module,
                             delayed_mutations,
+                            make,
                         )
                     }
                 } else if let Some(initializer) = find_assignment_usage(&name) {
                     cov_mark::hit!(replaces_assignment);
 
-                    replace_bool_expr(edit, initializer);
+                    replace_bool_expr(edit, initializer, make);
                 } else if let Some((prefix_expr, inner_expr)) = find_negated_usage(&name) {
                     cov_mark::hit!(replaces_negation);
 
@@ -246,7 +264,7 @@ fn replace_usages(
                 {
                     cov_mark::hit!(replaces_record_expr);
 
-                    let enum_expr = bool_expr_to_enum_expr(initializer);
+                    let enum_expr = bool_expr_to_enum_expr(initializer, make);
                     utils::replace_record_field_expr(ctx, edit, record_field, enum_expr);
                 } else if let Some(pat) = find_record_pat_field_usage(&name) {
                     match pat {
@@ -262,6 +280,7 @@ fn replace_usages(
                                     target_definition,
                                     target_module,
                                     delayed_mutations,
+                                    make,
                                 )
                             }
                         }
@@ -271,14 +290,14 @@ fn replace_usages(
                             if let Some(expr) = literal_pat.literal().and_then(|literal| {
                                 literal.syntax().ancestors().find_map(ast::Expr::cast)
                             }) {
-                                replace_bool_expr(edit, expr);
+                                replace_bool_expr(edit, expr, make);
                             }
                         }
                         _ => (),
                     }
                 } else if let Some((ty_annotation, initializer)) = find_assoc_const_usage(&name) {
                     edit.replace(ty_annotation.syntax().text_range(), "Bool");
-                    replace_bool_expr(edit, initializer);
+                    replace_bool_expr(edit, initializer, make);
                 } else if let Some(receiver) = find_method_call_expr_usage(&name) {
                     edit.replace(
                         receiver.syntax().text_range(),
@@ -295,10 +314,10 @@ fn replace_usages(
                             ctx,
                             edit,
                             record_field,
-                            make::expr_bin_op(
+                            make.expr_bin_op(
                                 expr,
                                 ast::BinaryOp::CmpOp(ast::CmpOp::Eq { negated: false }),
-                                make::expr_path(make::path_from_text("Bool::True")),
+                                make.expr_path(make.path_from_text("Bool::True")),
                             ),
                         );
                     } else {
@@ -308,8 +327,7 @@ fn replace_usages(
 
                 // add imports across modules where needed
                 if let Some((scope, path)) = import_data {
-                    let scope = edit.make_import_scope_mut(scope);
-                    delayed_mutations.push((scope, path));
+                    delayed_mutations.push((vfs_file_id, scope, path));
                 }
             },
         )
@@ -323,9 +341,10 @@ struct FileReferenceWithImport {
 }
 
 fn augment_references_with_imports(
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
     references: Vec<FileReference>,
     target_module: &hir::Module,
+    make: &SyntaxFactory,
 ) -> Vec<FileReferenceWithImport> {
     let mut visited_modules = FxHashSet::default();
 
@@ -356,9 +375,9 @@ fn augment_references_with_imports(
                                 cfg,
                             )
                             .map(|mod_path| {
-                                make::path_concat(
-                                    mod_path_to_ast(&mod_path, edition),
-                                    make::path_from_text("Bool"),
+                                make.path_concat(
+                                    mod_path_to_ast_with_factory(make, &mod_path, edition),
+                                    make.path_from_text("Bool"),
                                 )
                             })?;
 
@@ -453,10 +472,11 @@ fn find_method_call_expr_usage(name: &ast::NameLike) -> Option<ast::Expr> {
 /// Adds the definition of the new enum before the target node.
 fn add_enum_def(
     edit: &mut SourceChangeBuilder,
-    ctx: &AssistContext<'_>,
+    ctx: &AssistContext<'_, '_>,
     usages: &UsageSearchResult,
     target_node: SyntaxNode,
     target_module: &hir::Module,
+    make: &SyntaxFactory,
 ) -> Option<()> {
     let insert_before = node_to_insert_before(target_node);
 
@@ -479,10 +499,9 @@ fn add_enum_def(
             ctx.sema.scope(name.syntax()).map(|scope| scope.module())
         })
         .any(|module| module.nearest_non_block_module(ctx.db()) != *target_module);
-    let enum_def = make_bool_enum(make_enum_pub);
 
     let indent = IndentLevel::from_node(&insert_before);
-    enum_def.reindent_to(indent);
+    let enum_def = make_bool_enum(make_enum_pub, make).reset_indent().indent(indent);
 
     edit.insert(
         insert_before.text_range().start(),
@@ -504,31 +523,30 @@ fn node_to_insert_before(target_node: SyntaxNode) -> SyntaxNode {
         .unwrap_or(target_node)
 }
 
-fn make_bool_enum(make_pub: bool) -> ast::Enum {
-    let derive_eq = make::attr_outer(make::meta_token_tree(
-        make::ext::ident_path("derive"),
-        make::token_tree(
+fn make_bool_enum(make_pub: bool, make: &SyntaxFactory) -> ast::Enum {
+    let derive_eq = make.attr_outer(make.meta_token_tree(
+        make.ident_path("derive"),
+        make.token_tree(
             T!['('],
             vec![
-                NodeOrToken::Token(make::tokens::ident("PartialEq")),
-                NodeOrToken::Token(make::token(T![,])),
-                NodeOrToken::Token(make::tokens::single_space()),
-                NodeOrToken::Token(make::tokens::ident("Eq")),
+                NodeOrToken::Token(make.ident("PartialEq")),
+                NodeOrToken::Token(make.token(T![,])),
+                NodeOrToken::Token(make.whitespace(" ")),
+                NodeOrToken::Token(make.ident("Eq")),
             ],
         ),
     ));
-    make::enum_(
+    make.item_enum(
         [derive_eq],
-        if make_pub { Some(make::visibility_pub()) } else { None },
-        make::name("Bool"),
+        if make_pub { Some(make.visibility_pub()) } else { None },
+        make.name("Bool"),
         None,
         None,
-        make::variant_list(vec![
-            make::variant(None, make::name("True"), None, None),
-            make::variant(None, make::name("False"), None, None),
+        make.variant_list(vec![
+            make.variant(None, make.name("True"), None, None),
+            make.variant(None, make.name("False"), None, None),
         ]),
     )
-    .clone_for_update()
 }
 
 #[cfg(test)]

@@ -61,13 +61,14 @@ mod tests;
 use std::ops::{Deref, DerefMut, Index, IndexMut};
 
 use base_db::Crate;
+use either::Either;
 use hir_expand::{
     EditionedFileId, ErasedAstId, HirFileId, InFile, MacroCallId, mod_path::ModPath, name::Name,
     proc_macro::ProcMacroKind,
 };
-use intern::Symbol;
+use intern::{Symbol, sym};
 use itertools::Itertools;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use span::{Edition, FileAstId, FileId, ROOT_ERASED_FILE_AST_ID};
 use stdx::format_to;
 use syntax::{AstNode, SmolStr, SyntaxNode, ToSmolStr, ast};
@@ -75,13 +76,14 @@ use triomphe::Arc;
 use tt::TextRange;
 
 use crate::{
-    AstId, BlockId, BlockLoc, ExternCrateId, FunctionId, FxIndexMap, Lookup, MacroCallStyles,
-    MacroExpander, MacroId, ModuleId, ModuleIdLt, ProcMacroId, UseId,
+    AstId, BlockId, BlockLoc, BuiltinDeriveImplId, ExternCrateId, FunctionId, FxIndexMap, Lookup,
+    MacroCallStyles, MacroExpander, MacroId, ModuleId, ModuleIdLt, ProcMacroId, UseId,
     db::DefDatabase,
     item_scope::{BuiltinShadowMode, ItemScope},
     item_tree::TreeId,
     nameres::{diagnostics::DefDiagnostic, path_resolution::ResolveMode},
     per_ns::PerNs,
+    unstable_features::UnstableFeatures,
     visibility::{Visibility, VisibilityExplicitness},
 };
 
@@ -192,7 +194,8 @@ pub struct DefMap {
     /// Tracks which custom derives are in scope for an item, to allow resolution of derive helper
     /// attributes.
     // FIXME: Figure out a better way for the IDE layer to resolve these?
-    derive_helpers_in_scope: FxHashMap<AstId<ast::Item>, Vec<(Name, MacroId, MacroCallId)>>,
+    derive_helpers_in_scope:
+        FxHashMap<AstId<ast::Item>, Vec<(Name, MacroId, Either<MacroCallId, BuiltinDeriveImplId>)>>,
     /// A mapping from [`hir_expand::MacroDefId`] to [`crate::MacroId`].
     pub macro_def_to_macro_id: FxHashMap<ErasedAstId, MacroId>,
 
@@ -209,12 +212,13 @@ struct DefMapCrateData {
     /// Side table for resolving derive helpers.
     exported_derives: FxHashMap<MacroId, Box<[Name]>>,
     fn_proc_macro_mapping: FxHashMap<FunctionId, ProcMacroId>,
+    fn_proc_macro_mapping_back: FxHashMap<ProcMacroId, FunctionId>,
 
     /// Custom tool modules registered with `#![register_tool]`.
     registered_tools: Vec<Symbol>,
     /// Unstable features of Rust enabled with `#![feature(A, B)]`.
-    unstable_features: FxHashSet<Symbol>,
-    /// #[rustc_coherence_is_core]
+    unstable_features: UnstableFeatures,
+    /// `#[rustc_coherence_is_core]`
     rustc_coherence_is_core: bool,
     no_core: bool,
     no_std: bool,
@@ -228,8 +232,9 @@ impl DefMapCrateData {
         Self {
             exported_derives: FxHashMap::default(),
             fn_proc_macro_mapping: FxHashMap::default(),
+            fn_proc_macro_mapping_back: FxHashMap::default(),
             registered_tools: PREDEFINED_TOOLS.iter().map(|it| Symbol::intern(it)).collect(),
-            unstable_features: FxHashSet::default(),
+            unstable_features: UnstableFeatures::default(),
             rustc_coherence_is_core: false,
             no_core: false,
             no_std: false,
@@ -242,6 +247,7 @@ impl DefMapCrateData {
         let Self {
             exported_derives,
             fn_proc_macro_mapping,
+            fn_proc_macro_mapping_back,
             registered_tools,
             unstable_features,
             rustc_coherence_is_core: _,
@@ -252,6 +258,7 @@ impl DefMapCrateData {
         } = self;
         exported_derives.shrink_to_fit();
         fn_proc_macro_mapping.shrink_to_fit();
+        fn_proc_macro_mapping_back.shrink_to_fit();
         registered_tools.shrink_to_fit();
         unstable_features.shrink_to_fit();
     }
@@ -340,7 +347,7 @@ impl ModuleOrigin {
         match self {
             &ModuleOrigin::File { definition: editioned_file_id, .. }
             | &ModuleOrigin::CrateRoot { definition: editioned_file_id } => {
-                let sf = db.parse(editioned_file_id).tree();
+                let sf = editioned_file_id.parse(db).tree();
                 InFile::new(editioned_file_id.into(), ModuleSource::SourceFile(sf))
             }
             &ModuleOrigin::Inline { definition, definition_tree_id } => InFile::new(
@@ -420,7 +427,7 @@ pub(crate) fn crate_local_def_map(db: &dyn DefDatabase, crate_id: Crate) -> DefM
 
 #[salsa_macros::tracked(returns(ref))]
 pub fn block_def_map(db: &dyn DefDatabase, block_id: BlockId) -> DefMap {
-    let BlockLoc { ast_id, module } = block_id.lookup(db);
+    let BlockLoc { ast_id, module } = *block_id.lookup(db);
 
     let visibility = Visibility::Module(module, VisibilityExplicitness::Implicit);
     let module_data =
@@ -458,7 +465,16 @@ impl DefMap {
         block: Option<BlockInfo>,
     ) -> DefMap {
         let mut modules = ModulesMap::new();
-        let root = unsafe { ModuleIdLt::new(db, krate, block.map(|it| it.block)).to_static() };
+        let root = unsafe {
+            ModuleIdLt::new(
+                db,
+                krate,
+                block.map(|it| it.block),
+                None,
+                Name::new_symbol_root(sym::__empty),
+            )
+            .to_static()
+        };
         modules.insert(root, module_data);
 
         DefMap {
@@ -540,7 +556,7 @@ impl DefMap {
     pub fn derive_helpers_in_scope(
         &self,
         id: AstId<ast::Adt>,
-    ) -> Option<&[(Name, MacroId, MacroCallId)]> {
+    ) -> Option<&[(Name, MacroId, Either<MacroCallId, BuiltinDeriveImplId>)]> {
         self.derive_helpers_in_scope.get(&id.map(|it| it.upcast())).map(Deref::deref)
     }
 
@@ -548,8 +564,9 @@ impl DefMap {
         &self.data.registered_tools
     }
 
-    pub fn is_unstable_feature_enabled(&self, feature: &Symbol) -> bool {
-        self.data.unstable_features.contains(feature)
+    #[inline]
+    pub fn features(&self) -> &UnstableFeatures {
+        &self.data.unstable_features
     }
 
     pub fn is_rustc_coherence_is_core(&self) -> bool {
@@ -566,6 +583,10 @@ impl DefMap {
 
     pub fn fn_as_proc_macro(&self, id: FunctionId) -> Option<ProcMacroId> {
         self.data.fn_proc_macro_mapping.get(&id).copied()
+    }
+
+    pub fn proc_macro_as_fn(&self, id: ProcMacroId) -> Option<FunctionId> {
+        self.data.fn_proc_macro_mapping_back.get(&id).copied()
     }
 
     pub fn krate(&self) -> Crate {
@@ -829,6 +850,7 @@ pub(crate) fn macro_styles_from_id(db: &dyn DefDatabase, macro_id: MacroId) -> M
         MacroExpander::BuiltIn(_) | MacroExpander::BuiltInEager(_) => MacroCallStyles::FN_LIKE,
         MacroExpander::BuiltInAttr(_) => MacroCallStyles::ATTR,
         MacroExpander::BuiltInDerive(_) => MacroCallStyles::DERIVE,
+        MacroExpander::UnimplementedBuiltIn => MacroCallStyles::all(), // Unknown.
     }
 }
 

@@ -25,7 +25,9 @@ use load_cargo::{ProjectFolders, load_proc_macro};
 use lsp_types::FileSystemWatcher;
 use paths::Utf8Path;
 use proc_macro_api::ProcMacroClient;
-use project_model::{ManifestPath, ProjectWorkspace, ProjectWorkspaceKind, WorkspaceBuildScripts};
+use project_model::{
+    ManifestPath, ProjectWorkspace, ProjectWorkspaceKind, WorkspaceBuildScripts, project_json,
+};
 use stdx::{format_to, thread::ThreadIntent};
 use triomphe::Arc;
 use vfs::{AbsPath, AbsPathBuf, ChangeKind};
@@ -388,7 +390,7 @@ impl GlobalState {
         info!(%cause, "will fetch build data");
         let workspaces = Arc::clone(&self.workspaces);
         let config = self.config.cargo(None);
-        let root_path = self.config.root_path().clone();
+        let root_path = self.config.default_root_path().clone();
 
         self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, move |sender| {
             sender.send(Task::FetchBuildData(BuildDataProgress::Begin)).unwrap();
@@ -438,7 +440,7 @@ impl GlobalState {
                     let expansion_res = match client {
                         Some(Ok(client)) => match res {
                             Ok((crate_name, path)) => {
-                                progress(format!("loading proc-macros: {path}"));
+                                progress(path.to_string());
                                 let ignored_proc_macros = ignored_proc_macros
                                     .iter()
                                     .find_map(|(name, macros)| {
@@ -580,7 +582,8 @@ impl GlobalState {
                                 [
                                     (base.clone(), "**/*.rs"),
                                     (base.clone(), "**/Cargo.{lock,toml}"),
-                                    (base, "**/rust-analyzer.toml"),
+                                    (base.clone(), "**/rust-analyzer.toml"),
+                                    (base, "**/*.md"),
                                 ]
                             })
                         })
@@ -605,6 +608,7 @@ impl GlobalState {
                                     format!("{base}/**/*.rs"),
                                     format!("{base}/**/Cargo.{{toml,lock}}"),
                                     format!("{base}/**/rust-analyzer.toml"),
+                                    format!("{base}/**/*.md"),
                                 ]
                             })
                         })
@@ -699,15 +703,19 @@ impl GlobalState {
                     _ => Default::default(),
                 };
                 info!("Using proc-macro server at {path}");
+                let num_process = self.config.proc_macro_num_processes();
 
-                Some(ProcMacroClient::spawn(&path, &env, ws.toolchain.as_ref()).map_err(|err| {
-                    tracing::error!(
-                        "Failed to run proc-macro server from path {path}, error: {err:?}",
-                    );
-                    anyhow::format_err!(
-                        "Failed to run proc-macro server from path {path}, error: {err:?}",
-                    )
-                }))
+                Some(
+                    ProcMacroClient::spawn(&path, &env, ws.toolchain.as_ref(), num_process)
+                        .map_err(|err| {
+                            tracing::error!(
+                                "Failed to run proc-macro server from path {path}, error: {err:?}",
+                            );
+                            anyhow::format_err!(
+                                "Failed to run proc-macro server from path {path}, error: {err:?}",
+                            )
+                        }),
+                )
             }))
         }
 
@@ -875,8 +883,9 @@ impl GlobalState {
                     generation.clone(),
                     sender.clone(),
                     config,
+                    crate::flycheck::FlycheckConfigJson::default(),
                     None,
-                    self.config.root_path().clone(),
+                    self.config.default_root_path().clone(),
                     None,
                     None,
                 )]
@@ -894,16 +903,25 @@ impl GlobalState {
                                     cargo: Some((cargo, _, _)),
                                     ..
                                 } => (
+                                    crate::flycheck::FlycheckConfigJson::default(),
                                     cargo.workspace_root(),
                                     Some(cargo.manifest_path()),
                                     Some(cargo.target_directory()),
                                 ),
                                 ProjectWorkspaceKind::Json(project) => {
+                                    let config_json = crate::flycheck::FlycheckConfigJson {
+                                        single_template: project
+                                            .runnable_template(project_json::RunnableKind::Flycheck)
+                                            .cloned(),
+                                    };
                                     // Enable flychecks for json projects if a custom flycheck command was supplied
                                     // in the workspace configuration.
                                     match config {
+                                        _ if config_json.any_configured() => {
+                                            (config_json, project.path(), None, None)
+                                        }
                                         FlycheckConfig::CustomCommand { .. } => {
-                                            (project.path(), None, None)
+                                            (config_json, project.path(), None, None)
                                         }
                                         _ => return None,
                                     }
@@ -913,12 +931,13 @@ impl GlobalState {
                             ws.sysroot.root().map(ToOwned::to_owned),
                         ))
                     })
-                    .map(|(id, (root, manifest_path, target_dir), sysroot_root)| {
+                    .map(|(id, (config_json, root, manifest_path, target_dir), sysroot_root)| {
                         FlycheckHandle::spawn(
                             id,
                             generation.clone(),
                             sender.clone(),
                             config.clone(),
+                            config_json,
                             sysroot_root,
                             root.to_path_buf(),
                             manifest_path.map(|it| it.to_path_buf()),
@@ -929,6 +948,7 @@ impl GlobalState {
             }
         }
         .into();
+        self.flycheck_formatted_commands = vec![];
     }
 }
 
@@ -957,6 +977,7 @@ pub(crate) fn should_refresh_for_change(
     change_kind: ChangeKind,
     additional_paths: &[&str],
 ) -> bool {
+    // Note: build scripts are retriggered on file save, no refresh is necessary
     const IMPLICIT_TARGET_FILES: &[&str] = &["build.rs", "src/main.rs", "src/lib.rs"];
     const IMPLICIT_TARGET_DIRS: &[&str] = &["src/bin", "examples", "tests", "benches"];
 
@@ -973,15 +994,20 @@ pub(crate) fn should_refresh_for_change(
         return true;
     }
 
+    // .cargo/config{.toml}
+    if matches!(file_name, "config.toml" | "config")
+        && path.parent().map(|parent| parent.as_str().ends_with(".cargo")).unwrap_or(false)
+    {
+        return true;
+    }
+
+    // Everything below only matters when files are created or deleted
     if change_kind == ChangeKind::Modify {
         return false;
     }
 
-    // .cargo/config{.toml}
     if path.extension().unwrap_or_default() != "rs" {
-        let is_cargo_config = matches!(file_name, "config.toml" | "config")
-            && path.parent().map(|parent| parent.as_str().ends_with(".cargo")).unwrap_or(false);
-        return is_cargo_config;
+        return false;
     }
 
     if IMPLICIT_TARGET_FILES.iter().any(|it| path.as_str().ends_with(it)) {

@@ -3,15 +3,13 @@
 //! [`rustc`] module.
 
 // tidy-alphabetical-start
-#![allow(rustc::diagnostic_outside_of_impl)]
-#![allow(rustc::untranslatable_diagnostic)]
 #![allow(unused_crate_dependencies)]
 // tidy-alphabetical-end
 
 pub(crate) mod checks;
 pub mod constructor;
 #[cfg(feature = "rustc")]
-pub mod errors;
+pub mod diagnostics;
 #[cfg(feature = "rustc")]
 pub(crate) mod lints;
 pub mod pat;
@@ -20,18 +18,12 @@ pub mod pat_column;
 pub mod rustc;
 pub mod usefulness;
 
-#[cfg(feature = "rustc")]
-rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
-
 use std::fmt;
 
 pub use rustc_index::{Idx, IndexVec}; // re-exported to avoid rustc_index version issues
 
 use crate::constructor::{Constructor, ConstructorSet, IntRange};
 use crate::pat::DeconstructedPat;
-
-pub trait Captures<'a> {}
-impl<'a, T: ?Sized> Captures<'a> for T {}
 
 /// `bool` newtype that indicates whether this is a privately uninhabited field that we should skip
 /// during analysis.

@@ -3,20 +3,22 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::str;
 
-use rustc_abi::{FIRST_VARIANT, ReprOptions, VariantIdx};
+use rustc_abi::{FIRST_VARIANT, FieldIdx, ReprOptions, VariantIdx};
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::intern::Interned;
-use rustc_data_structures::stable_hasher::{HashStable, HashingControls, StableHasher};
+use rustc_data_structures::stable_hash::{
+    StableHash, StableHashControls, StableHashCtxt, StableHasher,
+};
 use rustc_errors::ErrorGuaranteed;
-use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def::{CtorKind, DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::{self as hir, LangItem, find_attr};
 use rustc_index::{IndexSlice, IndexVec};
-use rustc_macros::{HashStable, TyDecodable, TyEncodable};
-use rustc_query_system::ich::StableHashingContext;
+use rustc_macros::{StableHash, TyDecodable, TyEncodable};
 use rustc_session::DataTypeKind;
+use rustc_span::sym;
+use rustc_type_ir::FieldInfo;
 use rustc_type_ir::solve::AdtDestructorKind;
 use tracing::{debug, info, trace};
 
@@ -24,10 +26,10 @@ use super::{
     AsyncDestructor, Destructor, FieldDef, GenericPredicates, Ty, TyCtxt, VariantDef, VariantDiscr,
 };
 use crate::mir::interpret::ErrorHandled;
-use crate::ty;
 use crate::ty::util::{Discr, IntTypeExt};
+use crate::ty::{self, ConstKind};
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, HashStable, TyEncodable, TyDecodable)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, StableHash, TyEncodable, TyDecodable)]
 pub struct AdtFlags(u16);
 bitflags::bitflags! {
     impl AdtFlags: u16 {
@@ -59,6 +61,10 @@ bitflags::bitflags! {
         const IS_PIN                        = 1 << 11;
         /// Indicates whether the type is `#[pin_project]`.
         const IS_PIN_PROJECT                = 1 << 12;
+        /// Indicates whether the type is `FieldRepresentingType`.
+        const IS_FIELD_REPRESENTING_TYPE    = 1 << 13;
+        /// Indicates whether the type is `MaybeDangling<_>`.
+        const IS_MAYBE_DANGLING             = 1 << 14;
     }
 }
 rustc_data_structures::external_bitflags_debug! { AdtFlags }
@@ -146,33 +152,33 @@ impl Hash for AdtDefData {
     }
 }
 
-impl<'a> HashStable<StableHashingContext<'a>> for AdtDefData {
-    fn hash_stable(&self, hcx: &mut StableHashingContext<'a>, hasher: &mut StableHasher) {
+impl StableHash for AdtDefData {
+    fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
         thread_local! {
-            static CACHE: RefCell<FxHashMap<(usize, HashingControls), Fingerprint>> = Default::default();
+            static CACHE: RefCell<FxHashMap<(usize, StableHashControls), Fingerprint>> = Default::default();
         }
 
         let hash: Fingerprint = CACHE.with(|cache| {
             let addr = self as *const AdtDefData as usize;
-            let hashing_controls = hcx.hashing_controls();
-            *cache.borrow_mut().entry((addr, hashing_controls)).or_insert_with(|| {
+            let stable_hash_controls = hcx.stable_hash_controls();
+            *cache.borrow_mut().entry((addr, stable_hash_controls)).or_insert_with(|| {
                 let ty::AdtDefData { did, ref variants, ref flags, ref repr } = *self;
 
                 let mut hasher = StableHasher::new();
-                did.hash_stable(hcx, &mut hasher);
-                variants.hash_stable(hcx, &mut hasher);
-                flags.hash_stable(hcx, &mut hasher);
-                repr.hash_stable(hcx, &mut hasher);
+                did.stable_hash(hcx, &mut hasher);
+                variants.stable_hash(hcx, &mut hasher);
+                flags.stable_hash(hcx, &mut hasher);
+                repr.stable_hash(hcx, &mut hasher);
 
                 hasher.finish()
             })
         });
 
-        hash.hash_stable(hcx, hasher);
+        hash.stable_hash(hcx, hasher);
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash, HashStable)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, StableHash)]
 #[rustc_pass_by_value]
 pub struct AdtDef<'tcx>(pub Interned<'tcx, AdtDefData>);
 
@@ -201,6 +207,52 @@ impl<'tcx> AdtDef<'tcx> {
     pub fn repr(self) -> ReprOptions {
         self.0.0.repr
     }
+
+    pub fn field_representing_type_info(
+        self,
+        tcx: TyCtxt<'tcx>,
+        args: ty::GenericArgsRef<'tcx>,
+    ) -> Option<FieldInfo<TyCtxt<'tcx>>> {
+        if !self.is_field_representing_type() {
+            return None;
+        }
+        let base = args.type_at(0);
+        let variant_idx = match args.const_at(1).kind() {
+            ConstKind::Value(v) => VariantIdx::from_u32(v.to_leaf().to_u32()),
+            _ => return None,
+        };
+        let field_idx = match args.const_at(2).kind() {
+            ConstKind::Value(v) => FieldIdx::from_u32(v.to_leaf().to_u32()),
+            _ => return None,
+        };
+        let (ty, variant, name) = match base.kind() {
+            ty::Adt(base_def, base_args) => {
+                let variant = base_def.variant(variant_idx);
+                let field = &variant.fields[field_idx];
+                let ty = field.ty(tcx, base_args).skip_norm_wip();
+                (ty, base_def.is_enum().then_some(variant.name), field.name)
+            }
+            ty::Tuple(tys) => {
+                if variant_idx != FIRST_VARIANT {
+                    bug!("expected variant of tuple to be FIRST_VARIANT, but found {variant_idx:?}")
+                }
+                (
+                    if let Some(ty) = tys.get(field_idx.index()) {
+                        *ty
+                    } else {
+                        bug!(
+                            "expected valid tuple index, but got {field_idx:?}, tuple length: {}",
+                            tys.len()
+                        )
+                    },
+                    None,
+                    sym::integer(field_idx.index()),
+                )
+            }
+            _ => panic!(),
+        };
+        Some(FieldInfo { base, ty, variant, variant_idx, name, field_idx })
+    }
 }
 
 impl<'tcx> rustc_type_ir::inherent::AdtDef<TyCtxt<'tcx>> for AdtDef<'tcx> {
@@ -210,6 +262,10 @@ impl<'tcx> rustc_type_ir::inherent::AdtDef<TyCtxt<'tcx>> for AdtDef<'tcx> {
 
     fn is_struct(self) -> bool {
         self.is_struct()
+    }
+
+    fn is_packed(self) -> bool {
+        self.repr().packed()
     }
 
     fn struct_tail_ty(self, interner: TyCtxt<'tcx>) -> Option<ty::EarlyBinder<'tcx, Ty<'tcx>>> {
@@ -222,6 +278,14 @@ impl<'tcx> rustc_type_ir::inherent::AdtDef<TyCtxt<'tcx>> for AdtDef<'tcx> {
 
     fn is_manually_drop(self) -> bool {
         self.is_manually_drop()
+    }
+
+    fn field_representing_type_info(
+        self,
+        tcx: TyCtxt<'tcx>,
+        args: ty::GenericArgsRef<'tcx>,
+    ) -> Option<FieldInfo<TyCtxt<'tcx>>> {
+        self.field_representing_type_info(tcx, args)
     }
 
     fn all_field_tys(
@@ -247,13 +311,14 @@ impl<'tcx> rustc_type_ir::inherent::AdtDef<TyCtxt<'tcx>> for AdtDef<'tcx> {
 
     fn destructor(self, tcx: TyCtxt<'tcx>) -> Option<AdtDestructorKind> {
         Some(match tcx.constness(self.destructor(tcx)?.did) {
-            hir::Constness::Const => AdtDestructorKind::Const,
+            hir::Constness::Const { always: true } => todo!("FIXME(comptime)"),
+            hir::Constness::Const { always: false } => AdtDestructorKind::Const,
             hir::Constness::NotConst => AdtDestructorKind::NotConst,
         })
     }
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, HashStable, TyEncodable, TyDecodable)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, StableHash, TyEncodable, TyDecodable)]
 pub enum AdtKind {
     Struct,
     Union,
@@ -282,13 +347,11 @@ impl AdtDefData {
         debug!("AdtDef::new({:?}, {:?}, {:?}, {:?})", did, kind, variants, repr);
         let mut flags = AdtFlags::NO_ADT_FLAGS;
 
-        if kind == AdtKind::Enum
-            && find_attr!(tcx.get_all_attrs(did), AttributeKind::NonExhaustive(..))
-        {
+        if kind == AdtKind::Enum && find_attr!(tcx, did, NonExhaustive(..)) {
             debug!("found non-exhaustive variant list for {:?}", did);
             flags = flags | AdtFlags::IS_VARIANT_LIST_NON_EXHAUSTIVE;
         }
-        if find_attr!(tcx.get_all_attrs(did), AttributeKind::PinV2(..)) {
+        if find_attr!(tcx, did, PinV2(..)) {
             debug!("found pin-project type {:?}", did);
             flags |= AdtFlags::IS_PIN_PROJECT;
         }
@@ -303,7 +366,7 @@ impl AdtDefData {
             flags |= AdtFlags::HAS_CTOR;
         }
 
-        if find_attr!(tcx.get_all_attrs(did), AttributeKind::Fundamental) {
+        if find_attr!(tcx, did, Fundamental) {
             flags |= AdtFlags::IS_FUNDAMENTAL;
         }
         if tcx.is_lang_item(did, LangItem::PhantomData) {
@@ -315,6 +378,9 @@ impl AdtDefData {
         if tcx.is_lang_item(did, LangItem::ManuallyDrop) {
             flags |= AdtFlags::IS_MANUALLY_DROP;
         }
+        if tcx.is_lang_item(did, LangItem::MaybeDangling) {
+            flags |= AdtFlags::IS_MAYBE_DANGLING;
+        }
         if tcx.is_lang_item(did, LangItem::UnsafeCell) {
             flags |= AdtFlags::IS_UNSAFE_CELL;
         }
@@ -323,6 +389,9 @@ impl AdtDefData {
         }
         if tcx.is_lang_item(did, LangItem::Pin) {
             flags |= AdtFlags::IS_PIN;
+        }
+        if tcx.is_lang_item(did, LangItem::FieldRepresentingType) {
+            flags |= AdtFlags::IS_FIELD_REPRESENTING_TYPE;
         }
 
         AdtDefData { did, variants, flags, repr }
@@ -439,6 +508,12 @@ impl<'tcx> AdtDef<'tcx> {
         self.flags().contains(AdtFlags::IS_MANUALLY_DROP)
     }
 
+    /// Returns `true` if this is `MaybeDangling<T>`.
+    #[inline]
+    pub fn is_maybe_dangling(self) -> bool {
+        self.flags().contains(AdtFlags::IS_MAYBE_DANGLING)
+    }
+
     /// Returns `true` if this is `Pin<T>`.
     #[inline]
     pub fn is_pin(self) -> bool {
@@ -450,6 +525,10 @@ impl<'tcx> AdtDef<'tcx> {
     #[inline]
     pub fn is_pin_project(self) -> bool {
         self.flags().contains(AdtFlags::IS_PIN_PROJECT)
+    }
+
+    pub fn is_field_representing_type(self) -> bool {
+        self.flags().contains(AdtFlags::IS_FIELD_REPRESENTING_TYPE)
     }
 
     /// Returns `true` if this type has a destructor.
@@ -674,10 +753,4 @@ impl<'tcx> AdtDef<'tcx> {
     ) -> Option<ty::EarlyBinder<'tcx, Ty<'tcx>>> {
         if self.is_struct() { tcx.adt_sizedness_constraint((self.did(), sizedness)) } else { None }
     }
-}
-
-#[derive(Clone, Copy, Debug, HashStable)]
-pub enum Representability {
-    Representable,
-    Infinite(ErrorGuaranteed),
 }

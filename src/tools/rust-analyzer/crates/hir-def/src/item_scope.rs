@@ -4,6 +4,7 @@
 use std::{fmt, sync::LazyLock};
 
 use base_db::Crate;
+use either::Either;
 use hir_expand::{AstId, MacroCallId, attrs::AttrId, name::Name};
 use indexmap::map::Entry;
 use itertools::Itertools;
@@ -199,7 +200,7 @@ struct DeriveMacroInvocation {
     attr_id: AttrId,
     /// The `#[derive]` call
     attr_call_id: MacroCallId,
-    derive_call_ids: SmallVec<[Option<MacroCallId>; 4]>,
+    derive_call_ids: SmallVec<[Option<Either<MacroCallId, BuiltinDeriveImplId>>; 4]>,
 }
 
 pub(crate) static BUILTIN_SCOPE: LazyLock<FxIndexMap<Name, PerNs>> = LazyLock::new(|| {
@@ -345,7 +346,9 @@ impl ItemScope {
     pub fn all_macro_calls(&self) -> impl Iterator<Item = MacroCallId> + '_ {
         self.macro_invocations.values().copied().chain(self.attr_macros.values().copied()).chain(
             self.derive_macros.values().flat_map(|it| {
-                it.iter().flat_map(|it| it.derive_call_ids.iter().copied().flatten())
+                it.iter().flat_map(|it| {
+                    it.derive_call_ids.iter().copied().flatten().flat_map(|it| it.left())
+                })
             }),
         )
     }
@@ -377,6 +380,10 @@ impl ItemScope {
 
     pub(crate) fn type_(&self, name: &Name) -> Option<(ModuleDefId, Visibility)> {
         self.types.get(name).map(|item| (item.def, item.vis))
+    }
+
+    pub(crate) fn makro(&self, name: &Name) -> Option<MacroId> {
+        self.macros.get(name).map(|item| item.def)
     }
 
     /// XXX: this is O(N) rather than O(1), try to not introduce new usages.
@@ -476,6 +483,11 @@ impl ItemScope {
         self.declarations.push(def)
     }
 
+    pub(crate) fn remove_from_value_ns(&mut self, name: &Name, def: ModuleDefId) {
+        let entry = self.values.shift_remove(name);
+        assert!(entry.is_some_and(|entry| entry.def == def))
+    }
+
     pub(crate) fn get_legacy_macro(&self, name: &Name) -> Option<&[MacroId]> {
         self.legacy_macros.get(name).map(|it| &**it)
     }
@@ -519,7 +531,7 @@ impl ItemScope {
     pub(crate) fn set_derive_macro_invoc(
         &mut self,
         adt: AstId<ast::Adt>,
-        call: MacroCallId,
+        call: Either<MacroCallId, BuiltinDeriveImplId>,
         id: AttrId,
         idx: usize,
     ) {
@@ -539,7 +551,7 @@ impl ItemScope {
         adt: AstId<ast::Adt>,
         attr_id: AttrId,
         attr_call_id: MacroCallId,
-        mut derive_call_ids: SmallVec<[Option<MacroCallId>; 4]>,
+        mut derive_call_ids: SmallVec<[Option<Either<MacroCallId, BuiltinDeriveImplId>>; 4]>,
     ) {
         derive_call_ids.shrink_to_fit();
         self.derive_macros.entry(adt).or_default().push(DeriveMacroInvocation {
@@ -554,7 +566,9 @@ impl ItemScope {
     ) -> impl Iterator<
         Item = (
             AstId<ast::Adt>,
-            impl Iterator<Item = (AttrId, MacroCallId, &[Option<MacroCallId>])>,
+            impl Iterator<
+                Item = (AttrId, MacroCallId, &[Option<Either<MacroCallId, BuiltinDeriveImplId>>]),
+            >,
         ),
     > + '_ {
         self.derive_macros.iter().map(|(k, v)| {
@@ -666,20 +680,19 @@ impl ItemScope {
                     changed = true;
                 }
                 Entry::Occupied(mut entry)
-                    if !matches!(import, Some(ImportOrExternCrate::Glob(..))) =>
+                    if !matches!(import, Some(ImportOrExternCrate::Glob(..)))
+                        && glob_imports.values.remove(&lookup) =>
                 {
-                    if glob_imports.values.remove(&lookup) {
-                        cov_mark::hit!(import_shadowed);
+                    cov_mark::hit!(import_shadowed);
 
-                        let import = import.and_then(ImportOrExternCrate::import_or_glob);
-                        let prev = std::mem::replace(&mut fld.import, import);
-                        if let Some(import) = import {
-                            self.use_imports_values
-                                .insert(import, prev.map_or(ImportOrDef::Def(fld.def), Into::into));
-                        }
-                        entry.insert(fld);
-                        changed = true;
+                    let import = import.and_then(ImportOrExternCrate::import_or_glob);
+                    let prev = std::mem::replace(&mut fld.import, import);
+                    if let Some(import) = import {
+                        self.use_imports_values
+                            .insert(import, prev.map_or(ImportOrDef::Def(fld.def), Into::into));
                     }
+                    entry.insert(fld);
+                    changed = true;
                 }
                 _ => {}
             }
@@ -706,20 +719,19 @@ impl ItemScope {
                     changed = true;
                 }
                 Entry::Occupied(mut entry)
-                    if !matches!(import, Some(ImportOrExternCrate::Glob(..))) =>
+                    if !matches!(import, Some(ImportOrExternCrate::Glob(..)))
+                        && glob_imports.macros.remove(&lookup) =>
                 {
-                    if glob_imports.macros.remove(&lookup) {
-                        cov_mark::hit!(import_shadowed);
-                        let prev = std::mem::replace(&mut fld.import, import);
-                        if let Some(import) = import {
-                            self.use_imports_macros.insert(
-                                import,
-                                prev.map_or_else(|| ImportOrDef::Def(fld.def.into()), Into::into),
-                            );
-                        }
-                        entry.insert(fld);
-                        changed = true;
+                    cov_mark::hit!(import_shadowed);
+                    let prev = std::mem::replace(&mut fld.import, import);
+                    if let Some(import) = import {
+                        self.use_imports_macros.insert(
+                            import,
+                            prev.map_or_else(|| ImportOrDef::Def(fld.def.into()), Into::into),
+                        );
                     }
+                    entry.insert(fld);
+                    changed = true;
                 }
                 _ => {}
             }
@@ -882,6 +894,24 @@ impl ItemScope {
     pub(crate) fn update_visibility_macros(&mut self, name: &Name, vis: Visibility) {
         let res =
             self.macros.get_mut(name).expect("tried to update visibility of non-existent macro");
+        res.vis = vis;
+    }
+
+    pub(crate) fn update_def_types(&mut self, name: &Name, def: ModuleDefId, vis: Visibility) {
+        let res = self.types.get_mut(name).expect("tried to update def of non-existent type");
+        res.def = def;
+        res.vis = vis;
+    }
+
+    pub(crate) fn update_def_values(&mut self, name: &Name, def: ModuleDefId, vis: Visibility) {
+        let res = self.values.get_mut(name).expect("tried to update def of non-existent value");
+        res.def = def;
+        res.vis = vis;
+    }
+
+    pub(crate) fn update_def_macros(&mut self, name: &Name, def: MacroId, vis: Visibility) {
+        let res = self.macros.get_mut(name).expect("tried to update def of non-existent macro");
+        res.def = def;
         res.vis = vis;
     }
 }

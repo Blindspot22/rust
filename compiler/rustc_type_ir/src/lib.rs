@@ -5,10 +5,7 @@
 #![allow(rustc::usage_of_type_ir_inherent)]
 #![allow(rustc::usage_of_type_ir_traits)]
 #![cfg_attr(feature = "nightly", allow(internal_features))]
-#![cfg_attr(
-    feature = "nightly",
-    feature(associated_type_defaults, never_type, rustc_attrs, negative_impls)
-)]
+#![cfg_attr(feature = "nightly", feature(associated_type_defaults, rustc_attrs, negative_impls))]
 // tidy-alphabetical-end
 
 extern crate self as rustc_type_ir;
@@ -16,8 +13,9 @@ extern crate self as rustc_type_ir;
 use std::fmt;
 use std::hash::Hash;
 
+use rustc_abi::{FieldIdx, VariantIdx};
 #[cfg(feature = "nightly")]
-use rustc_macros::{Decodable, Encodable, HashStable_NoContext};
+use rustc_macros::{Decodable, Encodable, StableHash};
 
 // These modules are `pub` since they are not glob-imported.
 pub mod data_structures;
@@ -30,6 +28,7 @@ pub mod ir_print;
 pub mod lang_items;
 pub mod lift;
 pub mod outlives;
+pub mod region_constraint;
 pub mod relate;
 pub mod search_graph;
 pub mod solve;
@@ -53,8 +52,10 @@ mod pattern;
 mod predicate;
 mod predicate_kind;
 mod region_kind;
+mod ty;
 mod ty_info;
 mod ty_kind;
+mod unnormalized;
 mod upcast;
 mod visit;
 
@@ -80,8 +81,10 @@ pub use predicate_kind::*;
 pub use region_kind::*;
 pub use rustc_ast_ir::{FloatTy, IntTy, Movability, Mutability, Pinnedness, UintTy};
 use rustc_type_ir_macros::GenericTypeVisitable;
+pub use ty::{Alias, AliasTerm, AliasTy, UnevaluatedConst};
 pub use ty_info::*;
 pub use ty_kind::*;
+pub use unnormalized::Unnormalized;
 pub use upcast::*;
 pub use visit::*;
 
@@ -125,7 +128,7 @@ rustc_index::newtype_index! {
     /// is the outer fn.
     ///
     /// [dbi]: https://en.wikipedia.org/wiki/De_Bruijn_index
-    #[cfg_attr(feature = "nightly", derive(HashStable_NoContext))]
+    #[stable_hash]
     #[encodable]
     #[orderable]
     #[debug_format = "DebruijnIndex({})"]
@@ -219,7 +222,7 @@ pub fn debug_bound_var<T: std::fmt::Write>(
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, GenericTypeVisitable)]
-#[cfg_attr(feature = "nightly", derive(Decodable, Encodable, HashStable_NoContext))]
+#[cfg_attr(feature = "nightly", derive(Decodable, Encodable, StableHash))]
 #[cfg_attr(feature = "nightly", rustc_pass_by_value)]
 pub enum Variance {
     Covariant,     // T<A> <: T<B> iff A <: B -- e.g., function return type
@@ -335,7 +338,7 @@ rustc_index::newtype_index! {
     /// declared, but a type name in a non-zero universe is a placeholder
     /// type -- an idealized representative of "types in general" that we
     /// use for checking generic functions.
-    #[cfg_attr(feature = "nightly", derive(HashStable_NoContext))]
+    #[stable_hash]
     #[encodable]
     #[orderable]
     #[debug_format = "U{}"]
@@ -390,7 +393,7 @@ impl Default for UniverseIndex {
 }
 
 rustc_index::newtype_index! {
-    #[cfg_attr(feature = "nightly", derive(HashStable_NoContext))]
+    #[stable_hash]
     #[encodable]
     #[orderable]
     #[debug_format = "{}"]
@@ -405,7 +408,7 @@ rustc_index::newtype_index! {
 /// You can get the environment type of a closure using
 /// `tcx.closure_env_ty()`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[cfg_attr(feature = "nightly", derive(Encodable, Decodable, HashStable_NoContext))]
+#[cfg_attr(feature = "nightly", derive(Encodable, Decodable, StableHash))]
 pub enum ClosureKind {
     Fn,
     FnMut,
@@ -442,4 +445,13 @@ impl fmt::Display for ClosureKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.as_str().fmt(f)
     }
+}
+
+pub struct FieldInfo<I: Interner> {
+    pub base: I::Ty,
+    pub ty: I::Ty,
+    pub variant: Option<I::Symbol>,
+    pub variant_idx: VariantIdx,
+    pub name: I::Symbol,
+    pub field_idx: FieldIdx,
 }

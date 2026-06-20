@@ -3,8 +3,8 @@ use rustc_errors::Diag;
 use rustc_middle::bug;
 use rustc_middle::ty::{self, RePlaceholder, Region};
 
+use crate::diagnostics::PlaceholderRelationLfNotSatisfied;
 use crate::error_reporting::infer::nice_region_error::NiceRegionError;
-use crate::errors::PlaceholderRelationLfNotSatisfied;
 use crate::infer::{RegionResolutionError, SubregionOrigin};
 
 impl<'tcx> NiceRegionError<'_, 'tcx> {
@@ -34,14 +34,18 @@ impl<'tcx> NiceRegionError<'_, 'tcx> {
                         (Some(self.tcx().def_span(def_id)), Some(self.tcx().item_name(def_id)))
                     }
                     ty::BoundRegionKind::Anon | ty::BoundRegionKind::ClosureEnv => (None, None),
-                    ty::BoundRegionKind::NamedAnon(_) => bug!("only used for pretty printing"),
+                    ty::BoundRegionKind::NamedForPrinting(_) => {
+                        bug!("only used for pretty printing")
+                    }
                 };
                 let (sup_span, sup_symbol) = match *sup_name {
                     ty::BoundRegionKind::Named(def_id) => {
                         (Some(self.tcx().def_span(def_id)), Some(self.tcx().item_name(def_id)))
                     }
                     ty::BoundRegionKind::Anon | ty::BoundRegionKind::ClosureEnv => (None, None),
-                    ty::BoundRegionKind::NamedAnon(_) => bug!("only used for pretty printing"),
+                    ty::BoundRegionKind::NamedForPrinting(_) => {
+                        bug!("only used for pretty printing")
+                    }
                 };
                 let diag = match (sub_span, sup_span, sub_symbol, sup_symbol) {
                     (Some(sub_span), Some(sup_span), Some(sub_symbol), Some(sup_symbol)) => {

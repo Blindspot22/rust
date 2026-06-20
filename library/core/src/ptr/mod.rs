@@ -15,22 +15,19 @@
 //! The precise rules for validity are not determined yet. The guarantees that are
 //! provided at this point are very minimal:
 //!
-//! * For memory accesses of [size zero][zst], *every* pointer is valid, including the [null]
-//!   pointer. The following points are only concerned with non-zero-sized accesses.
-//! * A [null] pointer is *never* valid.
-//! * For a pointer to be valid, it is necessary, but not always sufficient, that the pointer be
-//!   *dereferenceable*. The [provenance] of the pointer is used to determine which [allocation]
-//!   it is derived from; a pointer is dereferenceable if the memory range of the given size
-//!   starting at the pointer is entirely contained within the bounds of that allocation. Note
+//! * A [null] pointer is *never* valid for reads/writes.
+//! * For memory accesses of [size zero][zst], *every* non-null pointer is valid for reads/writes.
+//!   The following points are only concerned with non-zero-sized accesses.
+//! * For a pointer to be valid for reads/writes, it is necessary, but not always sufficient, that
+//!   the pointer be *dereferenceable*. The [provenance] of the pointer is used to determine which
+//!   [allocation] it is derived from; a pointer is dereferenceable if the memory range of the given
+//!   size starting at the pointer is entirely contained within the bounds of that allocation. Note
 //!   that in Rust, every (stack-allocated) variable is considered a separate allocation.
 //! * All accesses performed by functions in this module are *non-atomic* in the sense
 //!   of [atomic operations] used to synchronize between threads. This means it is
 //!   undefined behavior to perform two concurrent accesses to the same location from different
-//!   threads unless both accesses only read from memory. Notice that this explicitly
-//!   includes [`read_volatile`] and [`write_volatile`]: Volatile accesses cannot
-//!   be used for inter-thread synchronization, regardless of whether they are acting on
-//!   Rust memory or not.
-//! * The result of casting a reference to a pointer is valid for as long as the
+//!   threads unless both accesses only read from memory.
+//! * The result of casting a reference to a pointer is valid for reads/writes for as long as the
 //!   underlying allocation is live and no reference (just raw pointers) is used to
 //!   access the same memory. That is, reference and pointer accesses cannot be
 //!   interleaved.
@@ -40,6 +37,13 @@
 //! will be provided eventually, as the [aliasing] rules are being determined. For more
 //! information, see the [book] as well as the section in the reference devoted
 //! to [undefined behavior][ub].
+//!
+//! Note that some operations such as [`read`] and [`write`][`write()`] do allow null pointers if
+//! the total size of the access is zero. However, other operations internally convert pointers into
+//! references. Therefore, the general notion of "valid for reads/writes" excludes null pointers,
+//! and the specific operations that permit null pointers mention that as an exception. Furthermore,
+//! [`read_volatile`] and [`write_volatile`] can be used in even more situations; see their
+//! documentation for details.
 //!
 //! We say that a pointer is "dangling" if it is not valid for any non-zero-sized accesses. This
 //! means out-of-bounds pointers, pointers to freed memory, null pointers, and pointers created with
@@ -258,16 +262,15 @@
 //! [`with_addr`] method:
 //!
 //! ```text
-//!     /// Creates a new pointer with the given address.
-//!     ///
-//!     /// This performs the same operation as an `addr as ptr` cast, but copies
-//!     /// the *provenance* of `self` to the new pointer.
-//!     /// This allows us to dynamically preserve and propagate this important
-//!     /// information in a way that is otherwise impossible with a unary cast.
-//!     ///
-//!     /// This is equivalent to using `wrapping_offset` to offset `self` to the
-//!     /// given address, and therefore has all the same capabilities and restrictions.
-//!     pub fn with_addr(self, addr: usize) -> Self;
+//! /// Creates a new pointer with the given address and the provenance  of `self`.
+//! ///
+//! /// This is similar to a `addr as *const T` cast,
+//! /// but copies the provenance of `self` to the new pointer.
+//! /// This avoids the inherent ambiguity of the unary cast.
+//! ///
+//! /// This is equivalent to using `wrapping_offset` to offset `self` to the given address,
+//! /// and therefore has all the same capabilities and restrictions.
+//! pub fn with_addr(self, addr: usize) -> Self;
 //! ```
 //!
 //! So you're still able to drop down to the address representation and do whatever
@@ -408,9 +411,10 @@ use crate::mem::{self, MaybeUninit, SizedTypeProperties};
 use crate::num::NonZero;
 use crate::{fmt, hash, intrinsics, ub_checks};
 
-mod alignment;
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
-pub use alignment::Alignment;
+#[deprecated(since = "1.96.0", note = "moved from `ptr` to `mem`")]
+/// Deprecated re-export of [mem::Alignment].
+pub type Alignment = mem::Alignment;
 
 mod metadata;
 #[unstable(feature = "ptr_metadata", issue = "81513")]
@@ -450,9 +454,9 @@ mod mut_ptr;
 ///
 /// Behavior is undefined if any of the following conditions are violated:
 ///
-/// * `src` must be [valid] for reads of `count * size_of::<T>()` bytes.
+/// * `src` must be [valid] for reads of `count * size_of::<T>()` bytes or that number must be 0.
 ///
-/// * `dst` must be [valid] for writes of `count * size_of::<T>()` bytes.
+/// * `dst` must be [valid] for writes of `count * size_of::<T>()` bytes or that number must be 0.
 ///
 /// * Both `src` and `dst` must be properly aligned.
 ///
@@ -568,11 +572,11 @@ pub const unsafe fn copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: us
 ///
 /// Behavior is undefined if any of the following conditions are violated:
 ///
-/// * `src` must be [valid] for reads of `count * size_of::<T>()` bytes.
+/// * `src` must be [valid] for reads of `count * size_of::<T>()` bytes or that number must be 0.
 ///
-/// * `dst` must be [valid] for writes of `count * size_of::<T>()` bytes, and must remain valid even
-///   when `src` is read for `count * size_of::<T>()` bytes. (This means if the memory ranges
-///   overlap, the `dst` pointer must not be invalidated by `src` reads.)
+/// * `dst` must be [valid] for writes of `count * size_of::<T>()` bytes or that number must be 0,
+///   and `dst` must remain valid even when `src` is read for `count * size_of::<T>()` bytes. (This
+///   means if the memory ranges overlap, the `dst` pointer must not be invalidated by `src` reads.)
 ///
 /// * Both `src` and `dst` must be properly aligned.
 ///
@@ -797,20 +801,33 @@ pub const unsafe fn write_bytes<T>(dst: *mut T, val: u8, count: usize) {
 /// // Ensure that the last item was dropped.
 /// assert!(weak.upgrade().is_none());
 /// ```
+#[inline(always)]
 #[stable(feature = "drop_in_place", since = "1.8.0")]
-#[lang = "drop_in_place"]
-#[allow(unconditional_recursion)]
 #[rustc_diagnostic_item = "ptr_drop_in_place"]
 #[rustc_const_unstable(feature = "const_drop_in_place", issue = "109342")]
 pub const unsafe fn drop_in_place<T: PointeeSized>(to_drop: *mut T)
 where
     T: [const] Destruct,
 {
+    // Due to historic reasons, `drop_in_place` takes a pointer rather than a reference,
+    // which results in worse codegen since we don't apply noalias/dereferenceable llvm
+    // attributes to pointer arguments. To workaround this without breaking public
+    // interface, `drop_in_place` calls the lang item, rather than being one directly.
+
+    // SAFETY:
+    // - compiler glue has the same safety requirements as this function
+    // - the pointer must be valid as per the safety requirement of this function
+    unsafe { drop_glue(&mut *to_drop) }
+}
+
+/// Helper function for `drop_in_place`. The compiler replaces this by the actual drop glue.
+#[lang = "drop_glue"]
+pub(crate) const unsafe fn drop_glue<T: PointeeSized>(_: &mut T)
+where
+    T: [const] Destruct,
+{
     // Code here does not matter - this is replaced by the
     // real drop glue by the compiler.
-
-    // SAFETY: see comment above
-    unsafe { drop_in_place(to_drop) }
 }
 
 /// Creates a null raw pointer.
@@ -1508,7 +1525,7 @@ unsafe fn swap_nonoverlapping_bytes(x: *mut u8, y: *mut u8, bytes: NonZero<usize
 ///
 /// Behavior is undefined if any of the following conditions are violated:
 ///
-/// * `dst` must be [valid] for both reads and writes.
+/// * `dst` must be [valid] for both reads and writes or `T` must be a ZST.
 ///
 /// * `dst` must be properly aligned.
 ///
@@ -1543,7 +1560,7 @@ pub const unsafe fn replace<T>(dst: *mut T, src: T) -> T {
     // SAFETY: the caller must guarantee that `dst` is valid to be
     // cast to a mutable reference (valid for writes, aligned, initialized),
     // and cannot overlap `src` since `dst` must point to a distinct
-    // allocation.
+    // allocation. We are excluding null (with a ZST check) before creating a reference.
     unsafe {
         ub_checks::assert_unsafe_precondition!(
             check_language_ub,
@@ -1554,6 +1571,12 @@ pub const unsafe fn replace<T>(dst: *mut T, src: T) -> T {
                 is_zst: bool = T::IS_ZST,
             ) => ub_checks::maybe_is_aligned_and_not_null(addr, align, is_zst)
         );
+        if T::IS_ZST {
+            // If `T` is a ZST, `dst` is allowed to be null. However, we also don't have to actually
+            // do anything since there isn't actually any data to be copied anyway. All values of
+            // type `T` are bit-identical, so we can just return `src` here.
+            return src;
+        }
         mem::replace(&mut *dst, src)
     }
 }
@@ -1565,7 +1588,7 @@ pub const unsafe fn replace<T>(dst: *mut T, src: T) -> T {
 ///
 /// Behavior is undefined if any of the following conditions are violated:
 ///
-/// * `src` must be [valid] for reads.
+/// * `src` must be [valid] for reads or `T` must be a ZST.
 ///
 /// * `src` must be properly aligned. Use [`read_unaligned`] if this is not the
 ///   case.
@@ -1817,7 +1840,7 @@ pub const unsafe fn read_unaligned<T>(src: *const T) -> T {
 ///
 /// Behavior is undefined if any of the following conditions are violated:
 ///
-/// * `dst` must be [valid] for writes.
+/// * `dst` must be [valid] for writes or `T` must be a ZST.
 ///
 /// * `dst` must be properly aligned. Use [`write_unaligned`] if this is not the
 ///   case.
@@ -2031,6 +2054,21 @@ pub const unsafe fn write_unaligned<T>(dst: *mut T, src: T) {
 /// [allocation]: crate::ptr#allocated-object
 /// [atomic]: crate::sync::atomic#memory-model-for-atomic-accesses
 ///
+/// # Load splitting
+///
+/// Exactly which hardware loads are performed by this function is, in general, highly target-dependent.
+///
+/// For a simple scalar, such as when `T` is a thin pointer, this will typically be one load assuming
+/// your target supports a load of exactly that size and alignment.
+///
+/// For anything else, it will be split into multiple loads in some unspecified way.
+/// This can happen even for scalars: notably, on many targets loading a `u128` will still need to be split,
+/// despite being "one" scalar.  On many targets loading anything larger than a pointer will need to be split.
+/// On all current targets a load larger than 64 bytes will need to be split.
+/// Any load whose size is not a power of two will also almost certainly need to be split.
+///
+/// There is no stability guarantee on how that splitting happens.  It may change at any point.
+///
 /// # Safety
 ///
 /// Like [`read`], `read_volatile` creates a bitwise copy of `T`, regardless of whether `T` is
@@ -2040,8 +2078,8 @@ pub const unsafe fn write_unaligned<T>(dst: *mut T, src: T) {
 ///
 /// Behavior is undefined if any of the following conditions are violated:
 ///
-/// * `src` must be either [valid] for reads, or it must point to memory outside of all Rust
-///   allocations and reading from that memory must:
+/// * `src` must be either [valid] for reads, or `T` must be a ZST, or `src` must point to memory
+///   outside of all Rust allocations and reading from that memory must:
 ///   - not trap, and
 ///   - not cause any memory inside a Rust allocation to be modified.
 ///
@@ -2124,12 +2162,27 @@ pub unsafe fn read_volatile<T>(src: *const T) -> T {
 /// [allocation]: crate::ptr#allocated-object
 /// [atomic]: crate::sync::atomic#memory-model-for-atomic-accesses
 ///
+/// # Store splitting
+///
+/// Exactly which hardware stores are performed by this function is, in general, highly target-dependent.
+///
+/// For a simple scalar, such as when `T` is a thin pointer, this will typically be one store assuming
+/// your target supports a store of exactly that size and alignment.
+///
+/// For anything else, it will be split into multiple stores in some unspecified way.
+/// This can happen even for scalars: notably, on many targets storing a `u128` will still need to be split,
+/// despite being "one" scalar.  On many targets storing anything larger than a pointer will need to be split.
+/// On all current targets a store larger than 64 bytes will need to be split.
+/// Any store whose size is not a power of two will also almost certainly need to be split.
+///
+/// There is no stability guarantee on how that splitting happens.  It may change at any point.
+///
 /// # Safety
 ///
 /// Behavior is undefined if any of the following conditions are violated:
 ///
-/// * `dst` must be either [valid] for writes, or it must point to memory outside of all Rust
-///   allocations and writing to that memory must:
+/// * `dst` must be either [valid] for writes, or `T` must be a ZST, or `dst` must point to memory
+///   outside of all Rust allocations and writing to that memory must:
 ///   - not trap, and
 ///   - not cause any memory inside a Rust allocation to be modified.
 ///
@@ -2565,21 +2618,21 @@ impl<F: FnPtr> Ord for F {
 #[stable(feature = "fnptr_impls", since = "1.4.0")]
 impl<F: FnPtr> hash::Hash for F {
     fn hash<HH: hash::Hasher>(&self, state: &mut HH) {
-        state.write_usize(self.addr() as _)
+        state.write_usize(self.addr().addr())
     }
 }
 
 #[stable(feature = "fnptr_impls", since = "1.4.0")]
 impl<F: FnPtr> fmt::Pointer for F {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::pointer_fmt_inner(self.addr() as _, f)
+        fmt::pointer_fmt_inner(self.addr().addr(), f)
     }
 }
 
 #[stable(feature = "fnptr_impls", since = "1.4.0")]
 impl<F: FnPtr> fmt::Debug for F {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::pointer_fmt_inner(self.addr() as _, f)
+        fmt::pointer_fmt_inner(self.addr().addr(), f)
     }
 }
 

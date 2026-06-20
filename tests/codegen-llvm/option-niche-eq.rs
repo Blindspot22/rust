@@ -1,6 +1,4 @@
-//@ revisions: REGULAR LLVM21
 //@ compile-flags: -Copt-level=3 -Zmerge-functions=disabled
-//@ [LLVM21] min-llvm-version: 21
 #![crate_type = "lib"]
 
 extern crate core;
@@ -76,11 +74,22 @@ pub fn niche_eq(l: Option<EnumWithNiche>, r: Option<EnumWithNiche>) -> bool {
     l == r
 }
 
-// LLVM21-LABEL: @bool_eq
+// CHECK-LABEL: @bool_eq
 #[no_mangle]
 pub fn bool_eq(l: Option<bool>, r: Option<bool>) -> bool {
-    // LLVM21: start:
-    // LLVM21-NEXT: icmp eq i8
-    // LLVM21-NEXT: ret i1
+    // CHECK: start:
+    // CHECK-NEXT: icmp eq i8
+    // CHECK-NEXT: ret i1
+    l == r
+}
+
+// CHECK-LABEL: @bool_ref_eq
+#[no_mangle]
+pub fn bool_ref_eq(l: &Option<bool>, r: &Option<bool>) -> bool {
+    // CHECK: start:
+    // CHECK-NEXT: load i8
+    // CHECK-NEXT: load i8
+    // CHECK-NEXT: icmp eq i8
+    // CHECK-NEXT: ret i1
     l == r
 }

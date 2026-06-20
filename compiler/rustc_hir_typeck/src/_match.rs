@@ -1,10 +1,11 @@
+use rustc_errors::codes::*;
 use rustc_errors::{Applicability, Diag};
 use rustc_hir::def::{CtorOf, DefKind, Res};
 use rustc_hir::def_id::LocalDefId;
 use rustc_hir::{self as hir, ExprKind, HirId, PatKind};
 use rustc_hir_pretty::ty_to_string;
 use rustc_middle::ty::{self, Ty};
-use rustc_span::Span;
+use rustc_span::{Span, sym};
 use rustc_trait_selection::traits::{
     MatchExpressionArmCause, ObligationCause, ObligationCauseCode,
 };
@@ -59,8 +60,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // type in that case)
         let mut all_arms_diverge = Diverges::WarnedAlways;
 
-        let expected =
-            orig_expected.try_structurally_resolve_and_adjust_for_branches(self, expr.span);
+        let expected = orig_expected.try_structurally_resolve_and_adjust_for_branches(self);
         debug!(?expected);
 
         let mut coercion = {
@@ -245,7 +245,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 self.may_coerce(arm_ty, ret_ty)
                     && prior_arm.is_none_or(|(_, ty, _)| self.may_coerce(ty, ret_ty))
                     // The match arms need to unify for the case of `impl Trait`.
-                    && !matches!(ret_ty.kind(), ty::Alias(ty::Opaque, ..))
+                    && !matches!(ret_ty.kind(), ty::Alias(ty::AliasTy { kind: ty::Opaque { .. }, .. }))
             }
             _ => false,
         };
@@ -254,7 +254,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
 
         let semi = expr.span.shrink_to_hi().with_hi(semi_span.hi());
-        let sugg = crate::errors::RemoveSemiForCoerce { expr: expr.span, ret, semi };
+        let sugg = crate::diagnostics::RemoveSemiForCoerce { expr: expr.span, ret, semi };
         diag.subdiagnostic(sugg);
     }
 
@@ -291,6 +291,23 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         error
     }
 
+    /// Check if the span comes from an assert-like macro expansion.
+    fn is_from_assert_macro(&self, span: Span) -> bool {
+        span.ctxt().outer_expn_data().macro_def_id.is_some_and(|def_id| {
+            matches!(
+                self.tcx.get_diagnostic_name(def_id),
+                Some(
+                    sym::assert_macro
+                        | sym::debug_assert_macro
+                        | sym::assert_eq_macro
+                        | sym::assert_ne_macro
+                        | sym::debug_assert_eq_macro
+                        | sym::debug_assert_ne_macro
+                )
+            )
+        })
+    }
+
     /// Explain why `if` expressions without `else` evaluate to `()` and detect likely irrefutable
     /// `if let PAT = EXPR {}` expressions that could be turned into `let PAT = EXPR;`.
     fn explain_if_expr(
@@ -302,6 +319,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         then_expr: &'tcx hir::Expr<'tcx>,
         error: &mut bool,
     ) {
+        let is_assert_macro = self.is_from_assert_macro(if_span);
+
         if let Some((if_span, msg)) = ret_reason {
             err.span_label(if_span, msg);
         } else if let ExprKind::Block(block, _) = then_expr.kind
@@ -309,8 +328,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         {
             err.span_label(expr.span, "found here");
         }
-        err.note("`if` expressions without `else` evaluate to `()`");
-        err.help("consider adding an `else` block that evaluates to the expected type");
+
+        if is_assert_macro {
+            err.code(E0308);
+            err.primary_message("mismatched types");
+        } else {
+            err.note("`if` expressions without `else` evaluate to `()`");
+            err.help("consider adding an `else` block that evaluates to the expected type");
+        }
         *error = true;
         if let ExprKind::Let(hir::LetExpr { span, pat, init, .. }) = cond_expr.kind
             && let ExprKind::Block(block, _) = then_expr.kind
@@ -507,7 +532,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let expected_ty = expectation.to_option(self)?;
         let (def_id, args) = match *expected_ty.kind() {
             // FIXME: Could also check that the RPIT is not defined
-            ty::Alias(ty::Opaque, alias_ty) => (alias_ty.def_id.as_local()?, alias_ty.args),
+            ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) => {
+                (def_id.as_local()?, args)
+            }
             // FIXME(-Znext-solver=no): Remove this branch once `replace_opaque_types_with_infer` is gone.
             ty::Infer(ty::TyVar(_)) => self
                 .inner

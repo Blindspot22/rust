@@ -2,13 +2,14 @@
 //! consts.
 use std::ops;
 
+use arrayvec::ArrayVec;
 use hir_expand::{InFile, Lookup};
 use span::Edition;
 use syntax::ast;
 use triomphe::Arc;
 
 use crate::{
-    DefWithBodyId, HasModule,
+    DefWithBodyId, ExpressionStoreOwnerId, HasModule,
     db::DefDatabase,
     expr_store::{
         ExpressionStore, ExpressionStoreSourceMap, SelfParamPtr, lower::lower_body, pretty,
@@ -28,9 +29,12 @@ pub struct Body {
     /// If this `Body` is for the body of a constant, this will just be
     /// empty.
     pub params: Box<[PatId]>,
-    pub self_param: Option<BindingId>,
-    /// The `ExprId` of the actual body expression.
-    pub body_expr: ExprId,
+    /// The first element, if it exists, is the real `self` binding.
+    ///
+    /// The second element is used for `async fn` (or `gen fn` etc.). These functions
+    /// have to put a `let self = self` inside the returned coroutine, and the second element
+    /// points at it.
+    pub self_params: ArrayVec<BindingId, 2>,
 }
 
 impl ops::Deref for Body {
@@ -68,15 +72,15 @@ impl ops::Deref for BodySourceMap {
     }
 }
 
+#[salsa::tracked]
 impl Body {
-    pub(crate) fn body_with_source_map_query(
-        db: &dyn DefDatabase,
-        def: DefWithBodyId,
-    ) -> (Arc<Body>, Arc<BodySourceMap>) {
+    #[salsa::tracked(lru = 512, returns(ref))]
+    pub fn with_source_map(db: &dyn DefDatabase, def: DefWithBodyId) -> (Arc<Body>, BodySourceMap) {
         let _p = tracing::info_span!("body_with_source_map_query").entered();
         let mut params = None;
 
         let mut is_async_fn = false;
+        let mut is_gen_fn = false;
         let InFile { file_id, value: body } = {
             match def {
                 DefWithBodyId::FunctionId(f) => {
@@ -84,6 +88,7 @@ impl Body {
                     let src = f.source(db);
                     params = src.value.param_list();
                     is_async_fn = src.value.async_token().is_some();
+                    is_gen_fn = src.value.gen_token().is_some();
                     src.map(|it| it.body().map(ast::Expr::from))
                 }
                 DefWithBodyId::ConstId(c) => {
@@ -99,18 +104,38 @@ impl Body {
                 DefWithBodyId::VariantId(v) => {
                     let s = v.lookup(db);
                     let src = s.source(db);
-                    src.map(|it| it.expr())
+                    src.map(|it| it.const_arg()?.expr())
                 }
             }
         };
         let module = def.module(db);
-        let (body, source_map) = lower_body(db, def, file_id, module, params, body, is_async_fn);
+        let (body, source_map) =
+            lower_body(db, def, file_id, module, params, body, is_async_fn, is_gen_fn);
 
-        (Arc::new(body), Arc::new(source_map))
+        (Arc::new(body), source_map)
     }
 
-    pub(crate) fn body_query(db: &dyn DefDatabase, def: DefWithBodyId) -> Arc<Body> {
-        db.body_with_source_map(def).0
+    #[salsa::tracked(returns(deref))]
+    pub fn of(db: &dyn DefDatabase, def: DefWithBodyId) -> Arc<Body> {
+        Self::with_source_map(db, def).0.clone()
+    }
+}
+
+impl Body {
+    pub fn root_expr(&self) -> ExprId {
+        // A `Body` can also contain root expressions that aren't the body (in the param patterns),
+        // but the body always come last.
+        self.store.expr_roots().next_back().unwrap()
+    }
+
+    pub fn self_param(&self) -> Option<BindingId> {
+        self.self_params.first().copied()
+    }
+
+    /// `async fn` (or `gen fn` etc.), have to put a `let self = self` inside the returned coroutine.
+    /// This function returns it.
+    pub fn coroutine_self_binding(&self) -> Option<BindingId> {
+        self.self_params.get(1).copied()
     }
 
     pub fn pretty_print(
@@ -129,13 +154,13 @@ impl Body {
         expr: ExprId,
         edition: Edition,
     ) -> String {
-        pretty::print_expr_hir(db, self, owner, expr, edition)
+        pretty::print_expr_hir(db, self, owner.into(), expr, edition)
     }
 
     pub fn pretty_print_pat(
         &self,
         db: &dyn DefDatabase,
-        owner: DefWithBodyId,
+        owner: ExpressionStoreOwnerId,
         pat: PatId,
         oneline: bool,
         edition: Edition,

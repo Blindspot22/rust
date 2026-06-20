@@ -6,15 +6,16 @@ use rustc_ast::{self as ast, NodeId};
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def::{DefKind, MacroKinds, Namespace, NonMacroAttrKind, PartialRes, PerNS};
 use rustc_middle::{bug, span_bug};
+use rustc_session::errors::feature_err;
 use rustc_session::lint::builtin::PROC_MACRO_DERIVE_RESOLUTION_FALLBACK;
-use rustc_session::parse::feature_err;
 use rustc_span::edition::Edition;
 use rustc_span::hygiene::{ExpnId, ExpnKind, LocalExpnId, MacroKind, SyntaxContext};
-use rustc_span::{Ident, Macros20NormalizedIdent, Span, kw, sym};
+use rustc_span::{Ident, Span, kw, sym};
 use smallvec::SmallVec;
 use tracing::{debug, instrument};
 
-use crate::errors::{ParamKindInEnumDiscriminant, ParamKindInNonTrivialAnonConst};
+use crate::diagnostics::{ParamKindInEnumDiscriminant, ParamKindInNonTrivialAnonConst};
+use crate::hygiene::Macros20NormalizedSyntaxContext;
 use crate::imports::{Import, NameResolution};
 use crate::late::{
     ConstantHasGenerics, DiagMetadata, NoConstantGenericsReason, PathSource, Rib, RibKind,
@@ -22,9 +23,9 @@ use crate::late::{
 use crate::macros::{MacroRulesScope, sub_namespace_match};
 use crate::{
     AmbiguityError, AmbiguityKind, AmbiguityWarning, BindingKey, CmResolver, Decl, DeclKind,
-    Determinacy, Finalize, ImportKind, LateDecl, Module, ModuleKind, ModuleOrUniformRoot,
-    ParentScope, PathResult, PrivacyError, Res, ResolutionError, Resolver, Scope, ScopeSet,
-    Segment, Stage, Used, errors,
+    Determinacy, Finalize, IdentKey, ImportKind, ImportSummary, LateDecl, LocalModule, Module,
+    ModuleKind, ModuleOrUniformRoot, ParentScope, PathResult, PrivacyError, Res, ResolutionError,
+    Resolver, Scope, ScopeSet, Segment, Stage, Symbol, Used, diagnostics,
 };
 
 #[derive(Copy, Clone)]
@@ -53,13 +54,14 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         mut self: CmResolver<'r, 'ra, 'tcx>,
         scope_set: ScopeSet<'ra>,
         parent_scope: &ParentScope<'ra>,
-        orig_ctxt: SyntaxContext,
+        mut ctxt: Macros20NormalizedSyntaxContext,
+        orig_ident_span: Span,
         derive_fallback_lint_id: Option<NodeId>,
         mut visitor: impl FnMut(
-            &mut CmResolver<'r, 'ra, 'tcx>,
+            CmResolver<'_, 'ra, 'tcx>,
             Scope<'ra>,
             UsePrelude,
-            SyntaxContext,
+            Macros20NormalizedSyntaxContext,
         ) -> ControlFlow<T>,
     ) -> Option<T> {
         // General principles:
@@ -125,7 +127,6 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             TypeNS | ValueNS => Scope::ModuleNonGlobs(module, None),
             MacroNS => Scope::DeriveHelpers(parent_scope.expansion),
         };
-        let mut ctxt = orig_ctxt.normalize_to_macros_2_0();
         let mut use_prelude = !module.no_implicit_prelude;
 
         loop {
@@ -150,7 +151,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                     true
                 }
                 Scope::ModuleNonGlobs(..) | Scope::ModuleGlobs(..) => true,
-                Scope::MacroUsePrelude => use_prelude || orig_ctxt.edition().is_rust_2015(),
+                Scope::MacroUsePrelude => use_prelude || orig_ident_span.is_rust_2015(),
                 Scope::BuiltinAttrs => true,
                 Scope::ExternPreludeItems | Scope::ExternPreludeFlags => {
                     use_prelude || module_and_extern_prelude || extern_prelude
@@ -163,7 +164,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             if visit {
                 let use_prelude = if use_prelude { UsePrelude::Yes } else { UsePrelude::No };
                 if let ControlFlow::Break(break_result) =
-                    visitor(&mut self, scope, use_prelude, ctxt)
+                    visitor(self.reborrow(), scope, use_prelude, ctxt)
                 {
                     return Some(break_result);
                 }
@@ -196,7 +197,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 Scope::ModuleGlobs(..) if module_only => break,
                 Scope::ModuleGlobs(..) if module_and_extern_prelude => match ns {
                     TypeNS => {
-                        ctxt.adjust(ExpnId::root());
+                        ctxt.update_unchecked(|ctxt| ctxt.adjust(ExpnId::root()));
                         Scope::ExternPreludeItems
                     }
                     ValueNS | MacroNS => break,
@@ -208,7 +209,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                             Scope::ModuleNonGlobs(parent_module, lint_id.or(prev_lint_id))
                         }
                         None => {
-                            ctxt.adjust(ExpnId::root());
+                            ctxt.update_unchecked(|ctxt| ctxt.adjust(ExpnId::root()));
                             match ns {
                                 TypeNS => Scope::ExternPreludeItems,
                                 ValueNS => Scope::StdLibPrelude,
@@ -238,11 +239,12 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
     fn hygienic_lexical_parent(
         &self,
         module: Module<'ra>,
-        ctxt: &mut SyntaxContext,
+        ctxt: &mut Macros20NormalizedSyntaxContext,
         derive_fallback_lint_id: Option<NodeId>,
     ) -> Option<(Module<'ra>, Option<NodeId>)> {
-        if !module.expansion.outer_expn_is_descendant_of(*ctxt) {
-            return Some((self.expn_def_scope(ctxt.remove_mark()), None));
+        if !module.expansion.outer_expn_is_descendant_of(**ctxt) {
+            let expn_id = ctxt.update_unchecked(|ctxt| ctxt.remove_mark());
+            return Some((self.expn_def_scope(expn_id), None));
         }
 
         if let ModuleKind::Block = module.kind {
@@ -269,10 +271,10 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             // The macro is a proc macro derive
             && let Some(def_id) = module.expansion.expn_data().macro_def_id
         {
-            let ext = &self.get_macro_by_def_id(def_id).ext;
+            let ext = self.get_macro_by_def_id(def_id);
             if ext.builtin_name.is_none()
                 && ext.macro_kinds() == MacroKinds::DERIVE
-                && parent.expansion.outer_expn_is_descendant_of(*ctxt)
+                && parent.expansion.outer_expn_is_descendant_of(**ctxt)
             {
                 return Some((parent, derive_fallback_lint_id));
             }
@@ -343,10 +345,9 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             } else if let RibKind::Block(Some(module)) = rib.kind
                 && let Ok(binding) = self.cm().resolve_ident_in_scope_set(
                     ident,
-                    ScopeSet::Module(ns, module),
+                    ScopeSet::Module(ns, module.to_module()),
                     parent_scope,
                     finalize.map(|finalize| Finalize { used: Used::Scope, ..finalize }),
-                    finalize.is_some(),
                     ignore_decl,
                     None,
                 )
@@ -355,7 +356,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 return Some(LateDecl::Decl(binding));
             } else if let RibKind::Module(module) = rib.kind {
                 // Encountered a module item, abandon ribs and look into that module and preludes.
-                let parent_scope = &ParentScope { module, ..*parent_scope };
+                let parent_scope = &ParentScope { module: module.to_module(), ..*parent_scope };
                 let finalize = finalize.map(|f| Finalize { stage: Stage::Late, ..f });
                 return self
                     .cm()
@@ -364,7 +365,6 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                         ScopeSet::All(ns),
                         parent_scope,
                         finalize,
-                        finalize.is_some(),
                         ignore_decl,
                         None,
                     )
@@ -385,21 +385,38 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
     }
 
     /// Resolve an identifier in the specified set of scopes.
-    #[instrument(level = "debug", skip(self))]
     pub(crate) fn resolve_ident_in_scope_set<'r>(
         self: CmResolver<'r, 'ra, 'tcx>,
         orig_ident: Ident,
         scope_set: ScopeSet<'ra>,
         parent_scope: &ParentScope<'ra>,
         finalize: Option<Finalize>,
-        force: bool,
         ignore_decl: Option<Decl<'ra>>,
         ignore_import: Option<Import<'ra>>,
     ) -> Result<Decl<'ra>, Determinacy> {
-        assert!(force || finalize.is_none()); // `finalize` implies `force`
+        self.resolve_ident_in_scope_set_inner(
+            IdentKey::new(orig_ident),
+            orig_ident.span,
+            scope_set,
+            parent_scope,
+            finalize,
+            ignore_decl,
+            ignore_import,
+        )
+    }
 
+    fn resolve_ident_in_scope_set_inner<'r>(
+        self: CmResolver<'r, 'ra, 'tcx>,
+        ident: IdentKey,
+        orig_ident_span: Span,
+        scope_set: ScopeSet<'ra>,
+        parent_scope: &ParentScope<'ra>,
+        finalize: Option<Finalize>,
+        ignore_decl: Option<Decl<'ra>>,
+        ignore_import: Option<Import<'ra>>,
+    ) -> Result<Decl<'ra>, Determinacy> {
         // Make sure `self`, `super` etc produce an error when passed to here.
-        if !matches!(scope_set, ScopeSet::Module(..)) && orig_ident.is_path_segment_keyword() {
+        if !matches!(scope_set, ScopeSet::Module(..)) && ident.name.is_path_segment_keyword() {
             return Err(Determinacy::Determined);
         }
 
@@ -433,14 +450,14 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         let break_result = self.visit_scopes(
             scope_set,
             parent_scope,
-            orig_ident.span.ctxt(),
+            ident.ctxt,
+            orig_ident_span,
             derive_fallback_lint_id,
-            |this, scope, use_prelude, ctxt| {
-                let ident = Ident::new(orig_ident.name, orig_ident.span.with_ctxt(ctxt));
-                // The passed `ctxt` is already normalized, so avoid expensive double normalization.
-                let ident = Macros20NormalizedIdent(ident);
+            |mut this, scope, use_prelude, ctxt| {
+                let ident = IdentKey { name: ident.name, ctxt };
                 let res = match this.reborrow().resolve_ident_in_scope(
                     ident,
+                    orig_ident_span,
                     ns,
                     scope,
                     use_prelude,
@@ -448,7 +465,6 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                     parent_scope,
                     // Shadowed decls don't need to be marked as used or non-speculatively loaded.
                     if innermost_results.is_empty() { finalize } else { None },
-                    force,
                     ignore_decl,
                     ignore_import,
                 ) {
@@ -468,20 +484,31 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                         // We do not need to report them if we are either in speculative resolution,
                         // or in late resolution when everything is already imported and expanded
                         // and no ambiguities exist.
-                        if matches!(finalize, None | Some(Finalize { stage: Stage::Late, .. })) {
-                            return ControlFlow::Break(Ok(decl));
-                        }
+                        let import = match finalize {
+                            None | Some(Finalize { stage: Stage::Late, .. }) => {
+                                return ControlFlow::Break(Ok(decl));
+                            }
+                            Some(Finalize { import, .. }) => import,
+                        };
+                        this.get_mut().maybe_push_glob_vs_glob_vis_ambiguity(
+                            ident,
+                            orig_ident_span,
+                            decl,
+                            import,
+                        );
 
                         if let Some(&(innermost_decl, _)) = innermost_results.first() {
                             // Found another solution, if the first one was "weak", report an error.
                             if this.get_mut().maybe_push_ambiguity(
-                                orig_ident,
+                                ident,
+                                orig_ident_span,
                                 ns,
                                 scope_set,
                                 parent_scope,
                                 decl,
                                 scope,
                                 &innermost_results,
+                                import,
                             ) {
                                 // No need to search for more potential ambiguities, one is enough.
                                 return ControlFlow::Break(Ok(innermost_decl));
@@ -506,20 +533,20 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         // Scope visiting walked all the scopes and maybe found something in one of them.
         match innermost_results.first() {
             Some(&(decl, ..)) => Ok(decl),
-            None => Err(Determinacy::determined(determinacy == Determinacy::Determined || force)),
+            None => Err(determinacy),
         }
     }
 
     fn resolve_ident_in_scope<'r>(
         mut self: CmResolver<'r, 'ra, 'tcx>,
-        ident: Macros20NormalizedIdent,
+        ident: IdentKey,
+        orig_ident_span: Span,
         ns: Namespace,
         scope: Scope<'ra>,
         use_prelude: UsePrelude,
         scope_set: ScopeSet<'ra>,
         parent_scope: &ParentScope<'ra>,
         finalize: Option<Finalize>,
-        force: bool,
         ignore_decl: Option<Decl<'ra>>,
         ignore_import: Option<Import<'ra>>,
     ) -> Result<Decl<'ra>, ControlFlow<Determinacy, Determinacy>> {
@@ -528,7 +555,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 if let Some(decl) = self
                     .helper_attrs
                     .get(&expn_id)
-                    .and_then(|attrs| attrs.iter().rfind(|(i, _)| ident == *i).map(|(_, d)| *d))
+                    .and_then(|attrs| attrs.iter().rfind(|(i, ..)| ident == *i).map(|(.., d)| *d))
                 {
                     Ok(decl)
                 } else {
@@ -542,7 +569,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                     match self.reborrow().resolve_derive_macro_path(
                         derive,
                         parent_scope,
-                        force,
+                        false,
                         ignore_import,
                     ) {
                         Ok((Some(ext), _)) => {
@@ -584,6 +611,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 let decl = self.reborrow().resolve_ident_in_module_non_globs_unadjusted(
                     module,
                     ident,
+                    orig_ident_span,
                     ns,
                     adjusted_parent_scope,
                     if matches!(scope_set, ScopeSet::Module(..)) {
@@ -601,23 +629,23 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                             self.get_mut().lint_buffer.buffer_lint(
                                 PROC_MACRO_DERIVE_RESOLUTION_FALLBACK,
                                 lint_id,
-                                ident.span,
-                                errors::ProcMacroDeriveResolutionFallback {
-                                    span: ident.span,
+                                orig_ident_span,
+                                diagnostics::ProcMacroDeriveResolutionFallback {
+                                    span: orig_ident_span,
                                     ns_descr: ns.descr(),
-                                    ident: ident.0,
+                                    ident: ident.name,
                                 },
                             );
                         }
                         Ok(decl)
                     }
                     Err(ControlFlow::Continue(determinacy)) => Err(determinacy),
-                    Err(ControlFlow::Break(determinacy)) => {
-                        return Err(ControlFlow::Break(Determinacy::determined(
-                            determinacy == Determinacy::Determined || force,
-                        )));
-                    }
+                    Err(ControlFlow::Break(..)) => return decl,
                 }
+            }
+            Scope::ModuleGlobs(module, _) if !module.is_local() => {
+                // Fast path: external module decoding only creates non-glob declarations.
+                Err(Determined)
             }
             Scope::ModuleGlobs(module, derive_fallback_lint_id) => {
                 let (adjusted_parent_scope, adjusted_finalize) = if matches!(
@@ -632,8 +660,9 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                     )
                 };
                 let binding = self.reborrow().resolve_ident_in_module_globs_unadjusted(
-                    module,
+                    module.expect_local(),
                     ident,
+                    orig_ident_span,
                     ns,
                     adjusted_parent_scope,
                     if matches!(scope_set, ScopeSet::Module(..)) {
@@ -651,44 +680,42 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                             self.get_mut().lint_buffer.buffer_lint(
                                 PROC_MACRO_DERIVE_RESOLUTION_FALLBACK,
                                 lint_id,
-                                ident.span,
-                                errors::ProcMacroDeriveResolutionFallback {
-                                    span: ident.span,
+                                orig_ident_span,
+                                diagnostics::ProcMacroDeriveResolutionFallback {
+                                    span: orig_ident_span,
                                     ns_descr: ns.descr(),
-                                    ident: ident.0,
+                                    ident: ident.name,
                                 },
                             );
                         }
                         Ok(binding)
                     }
                     Err(ControlFlow::Continue(determinacy)) => Err(determinacy),
-                    Err(ControlFlow::Break(determinacy)) => {
-                        return Err(ControlFlow::Break(Determinacy::determined(
-                            determinacy == Determinacy::Determined || force,
-                        )));
-                    }
+                    Err(ControlFlow::Break(..)) => return binding,
                 }
             }
             Scope::MacroUsePrelude => match self.macro_use_prelude.get(&ident.name).cloned() {
                 Some(decl) => Ok(decl),
-                None => Err(Determinacy::determined(
-                    self.graph_root.unexpanded_invocations.borrow().is_empty(),
-                )),
+                None => Err(Determinacy::determined(!self.graph_root.has_unexpanded_invocations())),
             },
             Scope::BuiltinAttrs => match self.builtin_attr_decls.get(&ident.name) {
                 Some(decl) => Ok(*decl),
                 None => Err(Determinacy::Determined),
             },
             Scope::ExternPreludeItems => {
-                match self.reborrow().extern_prelude_get_item(ident, finalize.is_some()) {
+                match self.reborrow().extern_prelude_get_item(
+                    ident,
+                    orig_ident_span,
+                    finalize.is_some(),
+                ) {
                     Some(decl) => Ok(decl),
-                    None => Err(Determinacy::determined(
-                        self.graph_root.unexpanded_invocations.borrow().is_empty(),
-                    )),
+                    None => {
+                        Err(Determinacy::determined(!self.graph_root.has_unexpanded_invocations()))
+                    }
                 }
             }
             Scope::ExternPreludeFlags => {
-                match self.extern_prelude_get_flag(ident, finalize.is_some()) {
+                match self.extern_prelude_get_flag(ident, orig_ident_span, finalize.is_some()) {
                     Some(decl) => Ok(decl),
                     None => Err(Determinacy::Determined),
                 }
@@ -700,12 +727,12 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             Scope::StdLibPrelude => {
                 let mut result = Err(Determinacy::Determined);
                 if let Some(prelude) = self.prelude
-                    && let Ok(decl) = self.reborrow().resolve_ident_in_scope_set(
-                        ident.0,
+                    && let Ok(decl) = self.reborrow().resolve_ident_in_scope_set_inner(
+                        ident,
+                        orig_ident_span,
                         ScopeSet::Module(ns, prelude),
                         parent_scope,
                         None,
-                        false,
                         ignore_decl,
                         ignore_import,
                     )
@@ -720,26 +747,26 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 Some(decl) => {
                     if matches!(ident.name, sym::f16)
                         && !self.tcx.features().f16()
-                        && !ident.span.allows_unstable(sym::f16)
+                        && !orig_ident_span.allows_unstable(sym::f16)
                         && finalize.is_some()
                     {
                         feature_err(
                             self.tcx.sess,
                             sym::f16,
-                            ident.span,
+                            orig_ident_span,
                             "the type `f16` is unstable",
                         )
                         .emit();
                     }
                     if matches!(ident.name, sym::f128)
                         && !self.tcx.features().f128()
-                        && !ident.span.allows_unstable(sym::f128)
+                        && !orig_ident_span.allows_unstable(sym::f128)
                         && finalize.is_some()
                     {
                         feature_err(
                             self.tcx.sess,
                             sym::f128,
-                            ident.span,
+                            orig_ident_span,
                             "the type `f128` is unstable",
                         )
                         .emit();
@@ -753,21 +780,55 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         ret.map_err(ControlFlow::Continue)
     }
 
+    fn maybe_push_glob_vs_glob_vis_ambiguity(
+        &mut self,
+        ident: IdentKey,
+        orig_ident_span: Span,
+        decl: Decl<'ra>,
+        import: Option<ImportSummary>,
+    ) {
+        let Some(import) = import else { return };
+        let vis1 = self.import_decl_vis(decl, import);
+        let vis2 = self.import_decl_vis_ext(decl, import, true);
+        if vis1 != vis2 {
+            self.ambiguity_errors.push(AmbiguityError {
+                kind: AmbiguityKind::GlobVsGlob,
+                ambig_vis: Some((vis1, vis2)),
+                ident: ident.orig(orig_ident_span),
+                b1: decl.ambiguity_vis_max.get().unwrap_or(decl),
+                b2: decl.ambiguity_vis_min.get().unwrap_or(decl),
+                scope1: Scope::ModuleGlobs(decl.parent_module.unwrap(), None),
+                scope2: Scope::ModuleGlobs(decl.parent_module.unwrap(), None),
+                warning: Some(AmbiguityWarning::GlobImport),
+            });
+        }
+    }
+
     fn maybe_push_ambiguity(
         &mut self,
-        orig_ident: Ident,
+        ident: IdentKey,
+        orig_ident_span: Span,
         ns: Namespace,
         scope_set: ScopeSet<'ra>,
         parent_scope: &ParentScope<'ra>,
         decl: Decl<'ra>,
         scope: Scope<'ra>,
         innermost_results: &[(Decl<'ra>, Scope<'ra>)],
+        import: Option<ImportSummary>,
     ) -> bool {
         let (innermost_decl, innermost_scope) = innermost_results[0];
         let (res, innermost_res) = (decl.res(), innermost_decl.res());
-        if res == innermost_res {
+        let ambig_vis = if res != innermost_res {
+            None
+        } else if let Some(import) = import
+            && let vis1 = self.import_decl_vis(decl, import)
+            && let vis2 = self.import_decl_vis(innermost_decl, import)
+            && vis1 != vis2
+        {
+            Some((vis1, vis2))
+        } else {
             return false;
-        }
+        };
 
         // FIXME: Use `scope` instead of `res` to detect built-in attrs and derive helpers,
         // it will exclude imports, make slightly more code legal, and will require lang approval.
@@ -781,7 +842,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         } else if innermost_res == derive_helper_compat {
             Some(AmbiguityKind::DeriveHelper)
         } else if res == derive_helper_compat && innermost_res != derive_helper {
-            span_bug!(orig_ident.span, "impossible inner resolution kind")
+            span_bug!(orig_ident_span, "impossible inner resolution kind")
         } else if matches!(innermost_scope, Scope::MacroRules(_))
             && matches!(scope, Scope::ModuleNonGlobs(..) | Scope::ModuleGlobs(..))
             && !self.disambiguate_macro_rules_vs_modularized(innermost_decl, decl)
@@ -796,7 +857,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             // we visit all macro_rules scopes (e.g. textual scope macros)
             // before we visit any modules (e.g. path-based scope macros)
             span_bug!(
-                orig_ident.span,
+                orig_ident_span,
                 "ambiguous scoped macro resolutions with path-based \
                                         scope resolution as first candidate"
             )
@@ -845,8 +906,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             } else {
                 // Turn ambiguity errors for core vs std panic into warnings.
                 // FIXME: Remove with lang team approval.
-                let is_issue_147319_hack = orig_ident.span.edition() <= Edition::Edition2024
-                    && matches!(orig_ident.name, sym::panic)
+                let is_issue_147319_hack = orig_ident_span.edition() <= Edition::Edition2024
+                    && matches!(ident.name, sym::panic)
                     && matches!(scope, Scope::StdLibPrelude)
                     && matches!(innermost_scope, Scope::ModuleGlobs(_, _))
                     && ((self.is_specific_builtin_macro(res, sym::std_panic)
@@ -854,11 +915,18 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                         || (self.is_specific_builtin_macro(res, sym::core_panic)
                             && self.is_specific_builtin_macro(innermost_res, sym::std_panic)));
 
-                let warning = is_issue_147319_hack.then_some(AmbiguityWarning::PanicImport);
+                let warning = if ambig_vis.is_some() {
+                    Some(AmbiguityWarning::GlobImport)
+                } else if is_issue_147319_hack {
+                    Some(AmbiguityWarning::PanicImport)
+                } else {
+                    None
+                };
 
                 self.ambiguity_errors.push(AmbiguityError {
                     kind,
-                    ident: orig_ident,
+                    ambig_vis,
+                    ident: ident.orig(orig_ident_span),
                     b1: innermost_decl,
                     b2: decl,
                     scope1: innermost_scope,
@@ -884,48 +952,25 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         self.resolve_ident_in_module(module, ident, ns, parent_scope, None, None, ignore_import)
     }
 
-    #[instrument(level = "debug", skip(self))]
-    pub(crate) fn resolve_ident_in_module<'r>(
-        self: CmResolver<'r, 'ra, 'tcx>,
-        module: ModuleOrUniformRoot<'ra>,
-        mut ident: Ident,
-        ns: Namespace,
+    fn resolve_super_in_module(
+        &self,
+        ident: Ident,
+        module: Option<Module<'ra>>,
         parent_scope: &ParentScope<'ra>,
-        finalize: Option<Finalize>,
-        ignore_decl: Option<Decl<'ra>>,
-        ignore_import: Option<Import<'ra>>,
-    ) -> Result<Decl<'ra>, Determinacy> {
-        let tmp_parent_scope;
-        let mut adjusted_parent_scope = parent_scope;
-        match module {
-            ModuleOrUniformRoot::Module(m) => {
-                if let Some(def) = ident.span.normalize_to_macros_2_0_and_adjust(m.expansion) {
-                    tmp_parent_scope =
-                        ParentScope { module: self.expn_def_scope(def), ..*parent_scope };
-                    adjusted_parent_scope = &tmp_parent_scope;
-                }
-            }
-            ModuleOrUniformRoot::ExternPrelude => {
-                ident.span.normalize_to_macros_2_0_and_adjust(ExpnId::root());
-            }
-            ModuleOrUniformRoot::ModuleAndExternPrelude(..) | ModuleOrUniformRoot::CurrentScope => {
-                // No adjustments
-            }
-        }
-        self.resolve_ident_in_virt_module_unadjusted(
-            module,
-            ident,
-            ns,
-            adjusted_parent_scope,
-            finalize,
-            ignore_decl,
-            ignore_import,
-        )
+    ) -> Option<Module<'ra>> {
+        let mut ctxt = ident.span.ctxt().normalize_to_macros_2_0();
+        module
+            .unwrap_or_else(|| self.resolve_self(&mut ctxt, parent_scope.module))
+            .parent
+            .map(|parent| self.resolve_self(&mut ctxt, parent))
     }
 
-    /// Attempts to resolve `ident` in namespace `ns` of `module`.
+    pub(crate) fn path_root_is_crate_root(&self, ident: Ident) -> bool {
+        ident.name == kw::PathRoot && ident.span.is_rust_2015() && self.tcx.sess.is_rust_2015()
+    }
+
     #[instrument(level = "debug", skip(self))]
-    fn resolve_ident_in_virt_module_unadjusted<'r>(
+    pub(crate) fn resolve_ident_in_module<'r>(
         self: CmResolver<'r, 'ra, 'tcx>,
         module: ModuleOrUniformRoot<'ra>,
         ident: Ident,
@@ -936,21 +981,47 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         ignore_import: Option<Import<'ra>>,
     ) -> Result<Decl<'ra>, Determinacy> {
         match module {
-            ModuleOrUniformRoot::Module(module) => self.resolve_ident_in_scope_set(
-                ident,
-                ScopeSet::Module(ns, module),
-                parent_scope,
-                finalize,
-                finalize.is_some(),
-                ignore_decl,
-                ignore_import,
-            ),
+            ModuleOrUniformRoot::Module(module) => {
+                if ns == TypeNS {
+                    if ident.name == kw::SelfLower {
+                        return Ok(module.self_decl.unwrap());
+                    }
+                    if ident.name == kw::Super
+                        && let Some(module) =
+                            self.resolve_super_in_module(ident, Some(module), parent_scope)
+                    {
+                        return Ok(module.self_decl.unwrap());
+                    }
+                }
+
+                let (ident_key, def) = IdentKey::new_adjusted(ident, module.expansion);
+                let adjusted_parent_scope = match def {
+                    Some(def) => ParentScope { module: self.expn_def_scope(def), ..*parent_scope },
+                    None => *parent_scope,
+                };
+                self.resolve_ident_in_scope_set_inner(
+                    ident_key,
+                    ident.span,
+                    ScopeSet::Module(ns, module),
+                    &adjusted_parent_scope,
+                    finalize,
+                    ignore_decl,
+                    ignore_import,
+                )
+            }
+            ModuleOrUniformRoot::OpenModule(sym) => {
+                let open_ns_name = format!("{}::{}", sym.as_str(), ident.name);
+                let ns_ident = IdentKey::with_root_ctxt(Symbol::intern(&open_ns_name));
+                match self.extern_prelude_get_flag(ns_ident, ident.span, finalize.is_some()) {
+                    Some(decl) => Ok(decl),
+                    None => Err(Determinacy::Determined),
+                }
+            }
             ModuleOrUniformRoot::ModuleAndExternPrelude(module) => self.resolve_ident_in_scope_set(
                 ident,
                 ScopeSet::ModuleAndExternPrelude(ns, module),
                 parent_scope,
                 finalize,
-                finalize.is_some(),
                 ignore_decl,
                 ignore_import,
             ),
@@ -958,12 +1029,12 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 if ns != TypeNS {
                     Err(Determined)
                 } else {
-                    self.resolve_ident_in_scope_set(
-                        ident,
+                    self.resolve_ident_in_scope_set_inner(
+                        IdentKey::new_adjusted(ident, ExpnId::root()).0,
+                        ident.span,
                         ScopeSet::ExternPrelude,
                         parent_scope,
                         finalize,
-                        finalize.is_some(),
                         ignore_decl,
                         ignore_import,
                     )
@@ -971,10 +1042,24 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             }
             ModuleOrUniformRoot::CurrentScope => {
                 if ns == TypeNS {
-                    if ident.name == kw::Crate || ident.name == kw::DollarCrate {
+                    if ident.name == kw::SelfLower {
+                        let mut ctxt = ident.span.ctxt().normalize_to_macros_2_0();
+                        let module = self.resolve_self(&mut ctxt, parent_scope.module);
+                        return Ok(module.self_decl.unwrap());
+                    }
+                    if ident.name == kw::Super
+                        && let Some(module) =
+                            self.resolve_super_in_module(ident, None, parent_scope)
+                    {
+                        return Ok(module.self_decl.unwrap());
+                    }
+                    if ident.name == kw::Crate
+                        || ident.name == kw::DollarCrate
+                        || self.path_root_is_crate_root(ident)
+                    {
                         let module = self.resolve_crate_root(ident);
                         return Ok(module.self_decl.unwrap());
-                    } else if ident.name == kw::Super || ident.name == kw::SelfLower {
+                    } else if ident.name == kw::Super {
                         // FIXME: Implement these with renaming requirements so that e.g.
                         // `use super;` doesn't work, but `use super as name;` does.
                         // Fall through here to get an error from `early_resolve_...`.
@@ -986,7 +1071,6 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                     ScopeSet::All(ns),
                     parent_scope,
                     finalize,
-                    finalize.is_some(),
                     ignore_decl,
                     ignore_import,
                 )
@@ -998,7 +1082,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
     fn resolve_ident_in_module_non_globs_unadjusted<'r>(
         mut self: CmResolver<'r, 'ra, 'tcx>,
         module: Module<'ra>,
-        ident: Macros20NormalizedIdent,
+        ident: IdentKey,
+        orig_ident_span: Span,
         ns: Namespace,
         parent_scope: &ParentScope<'ra>,
         shadowing: Shadowing,
@@ -1013,7 +1098,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         // doesn't need to be mutable. It will fail when there is a cycle of imports, and without
         // the exclusive access infinite recursion will crash the compiler with stack overflow.
         let resolution = &*self
-            .resolution_or_default(module, key)
+            .resolution_or_default(module, key, orig_ident_span)
             .try_borrow_mut_unchecked()
             .map_err(|_| ControlFlow::Continue(Determined))?;
 
@@ -1021,10 +1106,10 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
 
         if let Some(finalize) = finalize {
             return self.get_mut().finalize_module_binding(
-                ident.0,
+                ident,
+                orig_ident_span,
                 binding,
                 parent_scope,
-                module,
                 finalize,
                 shadowing,
             );
@@ -1035,6 +1120,11 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             let accessible = self.is_accessible_from(binding.vis(), parent_scope.module);
             return if accessible { Ok(binding) } else { Err(ControlFlow::Break(Determined)) };
         }
+
+        // In extern modules everything is determined from the start.
+        if !module.is_local() {
+            return Err(ControlFlow::Continue(Determined));
+        };
 
         // Check if one of single imports can still define the name, block if it can.
         if self.reborrow().single_import_can_define_name(
@@ -1049,7 +1139,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         }
 
         // Check if one of unexpanded macros can still define the name.
-        if !module.unexpanded_invocations.borrow().is_empty() {
+        if module.has_unexpanded_invocations() {
             return Err(ControlFlow::Continue(Undetermined));
         }
 
@@ -1060,8 +1150,9 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
     /// Attempts to resolve `ident` in namespace `ns` of glob bindings in `module`.
     fn resolve_ident_in_module_globs_unadjusted<'r>(
         mut self: CmResolver<'r, 'ra, 'tcx>,
-        module: Module<'ra>,
-        ident: Macros20NormalizedIdent,
+        module: LocalModule<'ra>,
+        ident: IdentKey,
+        orig_ident_span: Span,
         ns: Namespace,
         parent_scope: &ParentScope<'ra>,
         shadowing: Shadowing,
@@ -1074,7 +1165,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         // doesn't need to be mutable. It will fail when there is a cycle of imports, and without
         // the exclusive access infinite recursion will crash the compiler with stack overflow.
         let resolution = &*self
-            .resolution_or_default(module, key)
+            .resolution_or_default(module.to_module(), key, orig_ident_span)
             .try_borrow_mut_unchecked()
             .map_err(|_| ControlFlow::Continue(Determined))?;
 
@@ -1082,10 +1173,10 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
 
         if let Some(finalize) = finalize {
             return self.get_mut().finalize_module_binding(
-                ident.0,
+                ident,
+                orig_ident_span,
                 binding,
                 parent_scope,
-                module,
                 finalize,
                 shadowing,
             );
@@ -1132,7 +1223,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         // scopes we return `Undetermined` with `ControlFlow::Continue`.
         // Check if one of unexpanded macros can still define the name,
         // if it can then our "no resolution" result is not determined and can be invalidated.
-        if !module.unexpanded_invocations.borrow().is_empty() {
+        if module.has_unexpanded_invocations() {
             return Err(ControlFlow::Continue(Undetermined));
         }
 
@@ -1151,8 +1242,11 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 None => return Err(ControlFlow::Continue(Undetermined)),
             };
             let tmp_parent_scope;
-            let (mut adjusted_parent_scope, mut ident) = (parent_scope, ident);
-            match ident.0.span.glob_adjust(module.expansion, glob_import.span) {
+            let (mut adjusted_parent_scope, mut adjusted_ident) = (parent_scope, ident);
+            match adjusted_ident
+                .ctxt
+                .update_unchecked(|ctxt| ctxt.glob_adjust(module.expansion, glob_import.span))
+            {
                 Some(Some(def)) => {
                     tmp_parent_scope =
                         ParentScope { module: self.expn_def_scope(def), ..*parent_scope };
@@ -1161,12 +1255,12 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 Some(None) => {}
                 None => continue,
             };
-            let result = self.reborrow().resolve_ident_in_scope_set(
-                ident.0,
+            let result = self.reborrow().resolve_ident_in_scope_set_inner(
+                adjusted_ident,
+                orig_ident_span,
                 ScopeSet::Module(ns, module),
                 adjusted_parent_scope,
                 None,
-                false,
                 ignore_decl,
                 ignore_import,
             );
@@ -1188,10 +1282,10 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
 
     fn finalize_module_binding(
         &mut self,
-        ident: Ident,
+        ident: IdentKey,
+        orig_ident_span: Span,
         binding: Option<Decl<'ra>>,
         parent_scope: &ParentScope<'ra>,
-        module: Module<'ra>,
         finalize: Finalize,
         shadowing: Shadowing,
     ) -> Result<Decl<'ra>, ControlFlow<Determinacy, Determinacy>> {
@@ -1201,6 +1295,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             return Err(ControlFlow::Continue(Determined));
         };
 
+        let ident = ident.orig(orig_ident_span);
         if !self.is_accessible_from(binding.vis(), parent_scope.module) {
             if report_private {
                 self.privacy_errors.push(PrivacyError {
@@ -1223,37 +1318,6 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             && matches!(import.kind, ImportKind::MacroExport)
         {
             self.macro_expanded_macro_export_errors.insert((path_span, binding.span));
-        }
-
-        // If we encounter a re-export for a type with private fields, it will not be able to
-        // be constructed through this re-export. We track that case here to expand later
-        // privacy errors with appropriate information.
-        if let Res::Def(_, def_id) = binding.res() {
-            let struct_ctor = match def_id.as_local() {
-                Some(def_id) => self.struct_constructors.get(&def_id).cloned(),
-                None => {
-                    let ctor = self.cstore().ctor_untracked(self.tcx(), def_id);
-                    ctor.map(|(ctor_kind, ctor_def_id)| {
-                        let ctor_res = Res::Def(
-                            DefKind::Ctor(rustc_hir::def::CtorOf::Struct, ctor_kind),
-                            ctor_def_id,
-                        );
-                        let ctor_vis = self.tcx.visibility(ctor_def_id);
-                        let field_visibilities = self
-                            .tcx
-                            .associated_item_def_ids(def_id)
-                            .iter()
-                            .map(|field_id| self.tcx.visibility(field_id))
-                            .collect();
-                        (ctor_res, ctor_vis, field_visibilities)
-                    })
-                }
-            };
-            if let Some((_, _, fields)) = struct_ctor
-                && fields.iter().any(|vis| !self.is_accessible_from(*vis, module))
-            {
-                self.inaccessible_ctor_reexport.insert(path_span, binding.span);
-            }
         }
 
         self.record_use(ident, binding, used);
@@ -1314,7 +1378,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 &single_import.parent_scope,
                 None,
                 ignore_decl,
-                ignore_import,
+                None,
             ) {
                 Err(Determined) => continue,
                 Ok(binding)
@@ -1401,11 +1465,9 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                                         // `const name: Ty = expr;`. This is a heuristic, it will
                                         // break down in the presence of macros.
                                         let sm = self.tcx.sess.source_map();
-                                        let type_span = match sm.span_look_ahead(
-                                            original_rib_ident_def.span,
-                                            ":",
-                                            None,
-                                        ) {
+                                        let type_span = match sm
+                                            .span_followed_by(original_rib_ident_def.span, ":")
+                                        {
                                             None => {
                                                 Some(original_rib_ident_def.span.shrink_to_hi())
                                             }
@@ -1502,6 +1564,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                                         }
                                         NoConstantGenericsReason::NonTrivialConstArg => {
                                             ResolutionError::ParamInNonTrivialAnonConst {
+                                                is_gca: self.tcx.features().generic_const_args(),
                                                 name: rib_ident.name,
                                                 param_kind: ParamKindInNonTrivialAnonConst::Type,
                                             }
@@ -1526,12 +1589,12 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                         let item = if let Some(diag_metadata) = diag_metadata
                             && let Some(current_item) = diag_metadata.current_item
                         {
-                            let span = current_item
+                            let label_span = current_item
                                 .kind
                                 .ident()
                                 .map(|i| i.span)
                                 .unwrap_or(current_item.span);
-                            Some((span, current_item.kind.clone()))
+                            Some((label_span, current_item.span, current_item.kind.clone()))
                         } else {
                             None
                         };
@@ -1593,6 +1656,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                                         }
                                         NoConstantGenericsReason::NonTrivialConstArg => {
                                             ResolutionError::ParamInNonTrivialAnonConst {
+                                                is_gca: self.tcx.features().generic_const_args(),
                                                 name: rib_ident.name,
                                                 param_kind: ParamKindInNonTrivialAnonConst::Const {
                                                     name: rib_ident.name,
@@ -1619,12 +1683,12 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                         let item = if let Some(diag_metadata) = diag_metadata
                             && let Some(current_item) = diag_metadata.current_item
                         {
-                            let span = current_item
+                            let label_span = current_item
                                 .kind
                                 .ident()
                                 .map(|i| i.span)
                                 .unwrap_or(current_item.span);
-                            Some((span, current_item.kind.clone()))
+                            Some((label_span, current_item.span, current_item.kind.clone()))
                         } else {
                             None
                         };
@@ -1708,7 +1772,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         diag_metadata: Option<&DiagMetadata<'_>>,
     ) -> PathResult<'ra> {
         let mut module = None;
-        let mut module_had_parse_errors = false;
+        let mut module_had_parse_errors = !self.mods_with_parse_errors.is_empty()
+            && self.mods_with_parse_errors.contains(&parent_scope.module.nearest_parent_mod());
         let mut allow_super = true;
         let mut second_binding = None;
 
@@ -1740,19 +1805,15 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
 
             if ns == TypeNS {
                 if allow_super && name == kw::Super {
-                    let mut ctxt = ident.span.ctxt().normalize_to_macros_2_0();
-                    let self_module = match segment_idx {
-                        0 => Some(self.resolve_self(&mut ctxt, parent_scope.module)),
-                        _ => match module {
-                            Some(ModuleOrUniformRoot::Module(module)) => Some(module),
-                            _ => None,
-                        },
+                    let parent = if segment_idx == 0 {
+                        self.resolve_super_in_module(ident, None, parent_scope)
+                    } else if let Some(ModuleOrUniformRoot::Module(module)) = module {
+                        self.resolve_super_in_module(ident, Some(module), parent_scope)
+                    } else {
+                        None
                     };
-                    if let Some(self_module) = self_module
-                        && let Some(parent) = self_module.parent
-                    {
-                        module =
-                            Some(ModuleOrUniformRoot::Module(self.resolve_self(&mut ctxt, parent)));
+                    if let Some(parent) = parent {
+                        module = Some(ModuleOrUniformRoot::Module(parent));
                         continue;
                     }
                     return PathResult::failed(
@@ -1761,7 +1822,14 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                         finalize.is_some(),
                         module_had_parse_errors,
                         module,
-                        || ("there are too many leading `super` keywords".to_string(), None),
+                        || {
+                            (
+                                "too many leading `super` keywords".to_string(),
+                                "there are too many leading `super` keywords".to_string(),
+                                None,
+                                None,
+                            )
+                        },
                     );
                 }
                 if segment_idx == 0 {
@@ -1799,8 +1867,10 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 }
             }
 
+            let allow_trailing_self = is_last && name == kw::SelfLower;
+
             // Report special messages for path segment keywords in wrong positions.
-            if ident.is_path_segment_keyword() && segment_idx != 0 {
+            if ident.is_path_segment_keyword() && segment_idx != 0 && !allow_trailing_self {
                 return PathResult::failed(
                     ident,
                     false,
@@ -1809,16 +1879,32 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                     module,
                     || {
                         let name_str = if name == kw::PathRoot {
-                            "crate root".to_string()
+                            "the crate root".to_string()
                         } else {
                             format!("`{name}`")
                         };
-                        let label = if segment_idx == 1 && path[0].ident.name == kw::PathRoot {
-                            format!("global paths cannot start with {name_str}")
+                        let (message, label) = if segment_idx == 1
+                            && path[0].ident.name == kw::PathRoot
+                        {
+                            (
+                                format!("global paths cannot start with {name_str}"),
+                                "cannot start with this".to_string(),
+                            )
+                        } else if name == kw::SelfLower {
+                            (
+                                format!(
+                                    "`self` in paths can only be used in start position or last position"
+                                ),
+                                "can only be used in path start position or last position"
+                                    .to_string(),
+                            )
                         } else {
-                            format!("{name_str} in paths can only be used in start position")
+                            (
+                                format!("{name_str} in paths can only be used in start position"),
+                                "can only be used in path start position".to_string(),
+                            )
                         };
-                        (label, None)
+                        (message, label, None, None)
                     },
                 );
             }
@@ -1864,7 +1950,6 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                     ScopeSet::All(ns),
                     parent_scope,
                     finalize,
-                    finalize.is_some(),
                     ignore_decl,
                     ignore_import,
                 )
@@ -1892,7 +1977,10 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                     }
 
                     let maybe_assoc = opt_ns != Some(MacroNS) && PathSource::Type.is_expected(res);
-                    if let Some(def_id) = binding.res().module_like_def_id() {
+                    if let Res::OpenMod(sym) = binding.res() {
+                        module = Some(ModuleOrUniformRoot::OpenModule(sym));
+                        record_segment_res(self.reborrow(), finalize, res, id);
+                    } else if let Some(def_id) = binding.res().module_like_def_id() {
                         if self.mods_with_parse_errors.contains(&def_id) {
                             module_had_parse_errors = true;
                         }
@@ -1900,7 +1988,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                         record_segment_res(self.reborrow(), finalize, res, id);
                     } else if res == Res::ToolMod && !is_last && opt_ns.is_some() {
                         if binding.is_import() {
-                            self.dcx().emit_err(errors::ToolModuleImported {
+                            self.dcx().emit_err(diagnostics::ToolModuleImported {
                                 span: ident.span,
                                 import: binding.span,
                             });
@@ -1930,18 +2018,56 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                             module_had_parse_errors,
                             module,
                             || {
+                                let import_inherent_item_error_flag =
+                                    self.tcx.features().import_trait_associated_functions()
+                                        && matches!(
+                                            res,
+                                            Res::Def(
+                                                DefKind::Struct
+                                                    | DefKind::Enum
+                                                    | DefKind::Union
+                                                    | DefKind::ForeignTy,
+                                                _
+                                            )
+                                        );
+                                // Show a different error message for items that can have associated items.
                                 let label = format!(
-                                    "`{ident}` is {} {}, not a module",
+                                    "`{ident}` is {} {}, not a module{}",
                                     res.article(),
-                                    res.descr()
+                                    res.descr(),
+                                    if import_inherent_item_error_flag {
+                                        " or a trait"
+                                    } else {
+                                        ""
+                                    }
                                 );
-                                (label, None)
+                                let scope = match &path[..segment_idx] {
+                                    [.., prev] => {
+                                        if prev.ident.name == kw::PathRoot {
+                                            format!("the crate root")
+                                        } else {
+                                            format!("`{}`", prev.ident)
+                                        }
+                                    }
+                                    _ => format!("this scope"),
+                                };
+                                // FIXME: reword, as the reason we expected a module is because of
+                                // the following path segment.
+                                let message = format!("cannot find module `{ident}` in {scope}");
+                                let note = if import_inherent_item_error_flag {
+                                    Some(
+                                        "cannot import inherent associated items, only trait associated items".to_string(),
+                                    )
+                                } else {
+                                    None
+                                };
+                                (message, label, None, note)
                             },
                         );
                     }
                 }
-                Err(Undetermined) => return PathResult::Indeterminate,
-                Err(Determined) => {
+                Err(Undetermined) if finalize.is_none() => return PathResult::Indeterminate,
+                Err(Determined | Undetermined) => {
                     if let Some(ModuleOrUniformRoot::Module(module)) = module
                         && opt_ns.is_some()
                         && !module.is_normal()
@@ -1960,18 +2086,20 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                         module_had_parse_errors,
                         module,
                         || {
-                            this.get_mut().report_path_resolution_error(
-                                path,
-                                opt_ns,
-                                parent_scope,
-                                ribs,
-                                ignore_decl,
-                                ignore_import,
-                                module,
-                                segment_idx,
-                                ident,
-                                diag_metadata,
-                            )
+                            let (message, label, suggestion) =
+                                this.get_mut().report_path_resolution_error(
+                                    path,
+                                    opt_ns,
+                                    parent_scope,
+                                    ribs,
+                                    ignore_decl,
+                                    ignore_import,
+                                    module,
+                                    segment_idx,
+                                    ident,
+                                    diag_metadata,
+                                );
+                            (message, label, suggestion, None)
                         },
                     );
                 }

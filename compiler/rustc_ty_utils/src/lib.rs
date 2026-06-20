@@ -5,10 +5,8 @@
 //! This API is completely unstable and subject to change.
 
 // tidy-alphabetical-start
-#![feature(assert_matches)]
 #![feature(associated_type_defaults)]
-#![feature(box_patterns)]
-#![feature(if_let_guard)]
+#![feature(deref_patterns)]
 #![feature(iterator_try_collect)]
 #![feature(never_type)]
 // tidy-alphabetical-end
@@ -19,7 +17,7 @@ mod abi;
 mod assoc;
 mod common_traits;
 mod consts;
-mod errors;
+mod diagnostics;
 mod implied_bounds;
 mod instance;
 mod layout;
@@ -30,8 +28,6 @@ mod representability;
 pub mod sig_types;
 mod structural_match;
 mod ty;
-
-rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
 
 pub fn provide(providers: &mut Providers) {
     abi::provide(providers);

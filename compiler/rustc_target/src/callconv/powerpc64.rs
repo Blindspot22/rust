@@ -2,10 +2,10 @@
 // Alignment of 128 bit types is not currently handled, this will
 // need to be fixed when PowerPC vector support is added.
 
-use rustc_abi::{Endian, HasDataLayout, TyAbiInterface};
+use rustc_abi::{HasDataLayout, TyAbiInterface};
 
 use crate::callconv::{Align, ArgAbi, FnAbi, Reg, RegKind, Uniform};
-use crate::spec::{Env, HasTargetSpec, Os};
+use crate::spec::{HasTargetSpec, LlvmAbi, Os};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ABI {
@@ -36,7 +36,7 @@ where
         let valid_unit = match unit.kind {
             RegKind::Integer => false,
             RegKind::Float => true,
-            RegKind::Vector => arg.layout.size.bits() == 128,
+            RegKind::Vector { .. } => arg.layout.size.bits() == 128,
         };
 
         valid_unit.then_some(Uniform::consecutive(unit, arg.layout.size))
@@ -106,15 +106,13 @@ where
     Ty: TyAbiInterface<'a, C> + Copy,
     C: HasDataLayout + HasTargetSpec,
 {
-    let abi = if cx.target_spec().env == Env::Musl || cx.target_spec().os == Os::FreeBsd {
-        ELFv2
-    } else if cx.target_spec().os == Os::Aix {
-        AIX
-    } else {
-        match cx.data_layout().endian {
-            Endian::Big => ELFv1,
-            Endian::Little => ELFv2,
-        }
+    let abi = match cx.target_spec().options.llvm_abiname {
+        LlvmAbi::ElfV1 => ELFv1,
+        LlvmAbi::ElfV2 => ELFv2,
+        LlvmAbi::Unspecified if cx.target_spec().os == Os::Aix => AIX,
+        // Target::check_consistency enforces that every target except AIX
+        // sets llvm_abiname to either ElfV1 or ElfV2
+        _ => unreachable!(),
     };
 
     classify(cx, &mut fn_abi.ret, abi, true);

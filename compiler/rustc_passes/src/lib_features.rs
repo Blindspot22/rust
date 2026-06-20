@@ -13,7 +13,7 @@ use rustc_middle::query::{LocalCrate, Providers};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::{Span, Symbol, sym};
 
-use crate::errors::{FeaturePreviouslyDeclared, FeatureStableTwice};
+use crate::diagnostics::{FeaturePreviouslyDeclared, FeatureStableTwice};
 
 struct LibFeatureCollector<'tcx> {
     tcx: TyCtxt<'tcx>,
@@ -30,10 +30,10 @@ impl<'tcx> LibFeatureCollector<'tcx> {
             Attribute::Parsed(AttributeKind::Stability { stability, span }) => {
                 (stability.feature, stability.level, *span)
             }
-            Attribute::Parsed(AttributeKind::ConstStability { stability, span }) => {
+            Attribute::Parsed(AttributeKind::RustcConstStability { stability, span }) => {
                 (stability.feature, stability.level, *span)
             }
-            Attribute::Parsed(AttributeKind::BodyStability { stability, span }) => {
+            Attribute::Parsed(AttributeKind::RustcBodyStability { stability, span }) => {
                 (stability.feature, stability.level, *span)
             }
             _ => return None,

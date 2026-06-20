@@ -15,7 +15,7 @@ use super::Lift;
 
 pub type PrintError = std::fmt::Error;
 
-pub trait Print<'tcx, P> {
+pub trait Print<P> {
     fn print(&self, p: &mut P) -> Result<(), PrintError>;
 }
 
@@ -48,15 +48,17 @@ pub trait Printer<'tcx>: Sized {
         let impl_trait_ref = tcx.impl_opt_trait_ref(impl_def_id);
         let (self_ty, impl_trait_ref) = if tcx.generics_of(impl_def_id).count() <= args.len() {
             (
-                self_ty.instantiate(tcx, args),
-                impl_trait_ref.map(|impl_trait_ref| impl_trait_ref.instantiate(tcx, args)),
+                self_ty.instantiate(tcx, args).skip_norm_wip(),
+                impl_trait_ref
+                    .map(|impl_trait_ref| impl_trait_ref.instantiate(tcx, args).skip_norm_wip()),
             )
         } else {
             // We are probably printing a nested item inside of an impl.
             // Use the identity substitutions for the impl.
             (
-                self_ty.instantiate_identity(),
-                impl_trait_ref.map(|impl_trait_ref| impl_trait_ref.instantiate_identity()),
+                self_ty.instantiate_identity().skip_norm_wip(),
+                impl_trait_ref
+                    .map(|impl_trait_ref| impl_trait_ref.instantiate_identity().skip_norm_wip()),
             )
         };
 
@@ -133,8 +135,15 @@ pub trait Printer<'tcx>: Sized {
         self.print_path_with_generic_args(|p| p.print_def_path(def_id, parent_args), &[kind.into()])
     }
 
-    // Defaults (should not be overridden):
+    fn reset_path(&mut self) -> Result<(), PrintError> {
+        Ok(())
+    }
 
+    fn should_omit_parent_def_path(&self, _parent_def_id: DefId) -> bool {
+        false
+    }
+
+    // Defaults (should not be overridden):
     #[instrument(skip(self), level = "debug")]
     fn default_print_def_path(
         &mut self,
@@ -210,9 +219,15 @@ pub trait Printer<'tcx>: Sized {
                         && self.tcx().generics_of(parent_def_id).parent_count == 0;
                 }
 
+                let omit_parent = matches!(key.disambiguated_data.data, DefPathData::TypeNs(..))
+                    && self.should_omit_parent_def_path(parent_def_id);
+
                 self.print_path_with_simple(
                     |p: &mut Self| {
-                        if trait_qualify_parent {
+                        if omit_parent {
+                            p.reset_path()?;
+                            Ok(())
+                        } else if trait_qualify_parent {
                             let trait_ref = ty::TraitRef::new(
                                 p.tcx(),
                                 parent_def_id,
@@ -335,19 +350,19 @@ pub fn characteristic_def_id_of_type(ty: Ty<'_>) -> Option<DefId> {
     characteristic_def_id_of_type_cached(ty, &mut SsoHashSet::new())
 }
 
-impl<'tcx, P: Printer<'tcx>> Print<'tcx, P> for ty::Region<'tcx> {
+impl<'tcx, P: Printer<'tcx>> Print<P> for ty::Region<'tcx> {
     fn print(&self, p: &mut P) -> Result<(), PrintError> {
         p.print_region(*self)
     }
 }
 
-impl<'tcx, P: Printer<'tcx>> Print<'tcx, P> for Ty<'tcx> {
+impl<'tcx, P: Printer<'tcx>> Print<P> for Ty<'tcx> {
     fn print(&self, p: &mut P) -> Result<(), PrintError> {
         p.print_type(*self)
     }
 }
 
-impl<'tcx, P: Printer<'tcx> + std::fmt::Write> Print<'tcx, P> for ty::Instance<'tcx> {
+impl<'tcx, P: Printer<'tcx> + std::fmt::Write> Print<P> for ty::Instance<'tcx> {
     fn print(&self, cx: &mut P) -> Result<(), PrintError> {
         cx.print_def_path(self.def_id(), self.args)?;
         match self.def {
@@ -384,13 +399,13 @@ impl<'tcx, P: Printer<'tcx> + std::fmt::Write> Print<'tcx, P> for ty::Instance<'
     }
 }
 
-impl<'tcx, P: Printer<'tcx>> Print<'tcx, P> for &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>> {
+impl<'tcx, P: Printer<'tcx>> Print<P> for &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>> {
     fn print(&self, p: &mut P) -> Result<(), PrintError> {
         p.print_dyn_existential(self)
     }
 }
 
-impl<'tcx, P: Printer<'tcx>> Print<'tcx, P> for ty::Const<'tcx> {
+impl<'tcx, P: Printer<'tcx>> Print<P> for ty::Const<'tcx> {
     fn print(&self, p: &mut P) -> Result<(), PrintError> {
         p.print_const(*self)
     }
@@ -398,12 +413,12 @@ impl<'tcx, P: Printer<'tcx>> Print<'tcx, P> for ty::Const<'tcx> {
 
 impl<T> rustc_type_ir::ir_print::IrPrint<T> for TyCtxt<'_>
 where
-    T: Copy + for<'a, 'tcx> Lift<TyCtxt<'tcx>, Lifted: Print<'tcx, FmtPrinter<'a, 'tcx>>>,
+    T: Copy + for<'a, 'tcx> Lift<TyCtxt<'tcx>, Lifted: Print<FmtPrinter<'a, 'tcx>>>,
 {
     fn print(t: &T, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         ty::tls::with(|tcx| {
             let mut p = FmtPrinter::new(tcx, Namespace::TypeNS);
-            tcx.lift(*t).expect("could not lift for printing").print(&mut p)?;
+            tcx.lift(*t).print(&mut p)?;
             fmt.write_str(&p.into_buffer())?;
             Ok(())
         })

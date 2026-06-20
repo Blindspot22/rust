@@ -89,18 +89,17 @@ use rustc_hir::HirId;
 use rustc_index::{IndexSlice, IndexVec};
 use rustc_middle::middle::region;
 use rustc_middle::mir::{self, *};
-use rustc_middle::thir::{AdtExpr, AdtExprBase, ArmId, ExprId, ExprKind, LintLevel};
+use rustc_middle::thir::{AdtExpr, AdtExprBase, ArmId, ExprId, ExprKind};
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt, ValTree};
 use rustc_middle::{bug, span_bug};
 use rustc_pattern_analysis::rustc::RustcPatCtxt;
 use rustc_session::lint::Level;
-use rustc_span::source_map::Spanned;
-use rustc_span::{DUMMY_SP, Span};
+use rustc_span::{DUMMY_SP, Span, Spanned};
 use tracing::{debug, instrument};
 
 use super::matches::BuiltMatchTree;
 use crate::builder::{BlockAnd, BlockAndExtension, BlockFrame, Builder, CFG};
-use crate::errors::{
+use crate::diagnostics::{
     ConstContinueBadConst, ConstContinueNotMonomorphicConst, ConstContinueUnknownJumpTarget,
 };
 
@@ -428,7 +427,6 @@ impl DropTree {
                         place: drop_node.data.local.into(),
                         replace: false,
                         drop: None,
-                        async_fut: None,
                     };
                     cfg.terminate(block, drop_node.data.source_info, terminator);
                 }
@@ -520,6 +518,14 @@ impl<'tcx> Scopes<'tcx> {
     fn topmost(&self) -> region::Scope {
         self.scopes.last().expect("topmost_scope: no scopes present").region_scope
     }
+}
+
+/// Used by [`Builder::in_scope`] to create source scopes mapping from MIR back to HIR at points
+/// where lint levels change.
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum LintLevel {
+    Inherited,
+    Explicit(HirId),
 }
 
 impl<'a, 'tcx> Builder<'a, 'tcx> {
@@ -839,7 +845,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     ) -> Result<(ty::ValTree<'tcx>, Ty<'tcx>), interpret::ErrorHandled> {
         assert!(!constant.const_.ty().has_param());
         let (uv, ty) = match constant.const_ {
-            mir::Const::Unevaluated(uv, ty) => (uv.shrink(), ty),
+            mir::Const::Unevaluated(uv, ty) => (uv.shrink(self.tcx), ty),
             mir::Const::Ty(_, c) => match c.kind() {
                 // A constant that came from a const generic but was then used as an argument to
                 // old-style simd_shuffle (passing as argument instead of as a generic param).
@@ -885,7 +891,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
         let expr = &self.thir[value];
         let constant = match &expr.kind {
-            ExprKind::Adt(box AdtExpr { variant_index, fields, base, .. }) => {
+            ExprKind::Adt(AdtExpr { variant_index, fields, base, .. }) => {
                 assert!(matches!(base, AdtExprBase::None));
                 assert!(fields.is_empty());
                 ConstOperand {
@@ -918,7 +924,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | ExprKind::NamedConst { .. } => self.as_constant(&self.thir[value]),
 
             other => {
-                use crate::errors::ConstContinueNotMonomorphicConstReason as Reason;
+                use crate::diagnostics::ConstContinueNotMonomorphicConstReason as Reason;
 
                 let span = expr.span;
                 let reason = match other {
@@ -950,7 +956,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 (state_ty.discriminant_ty(self.tcx), Rvalue::Discriminant(scope.state_place))
             }
             ty::Uint(_) | ty::Int(_) | ty::Float(_) | ty::Bool | ty::Char => {
-                (state_ty, Rvalue::Use(Operand::Copy(scope.state_place)))
+                (state_ty, Rvalue::Use(Operand::Copy(scope.state_place), WithRetag::Yes))
             }
             _ => span_bug!(state_decl.source_info.span, "unsupported #[loop_match] state"),
         };
@@ -1163,7 +1169,6 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                                 unwind: UnwindAction::Continue,
                                 replace: false,
                                 drop: None,
-                                async_fut: None,
                             },
                         );
                         block = next;
@@ -1291,7 +1296,12 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 break;
             }
 
-            if self.tcx.hir_attrs(id).iter().any(|attr| Level::from_attr(attr).is_some()) {
+            if self
+                .tcx
+                .hir_attrs(id)
+                .iter()
+                .any(|attr| Level::from_opt_symbol(attr.name()).is_some())
+            {
                 // This is a rare case. It's for a node path that doesn't reach the root due to an
                 // intervening lint level attribute. This result doesn't get cached.
                 return id;
@@ -1733,7 +1743,6 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 unwind: UnwindAction::Cleanup(assign_unwind),
                 replace: true,
                 drop: None,
-                async_fut: None,
             },
         );
         self.diverge_from(block);
@@ -1904,7 +1913,6 @@ where
                         unwind: UnwindAction::Continue,
                         replace: false,
                         drop: None,
-                        async_fut: None,
                     },
                 );
                 block = next;

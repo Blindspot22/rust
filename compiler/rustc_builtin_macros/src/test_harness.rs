@@ -1,6 +1,7 @@
 // Code that generates a test runner to run all the tests in a crate
 
 use std::mem;
+use std::sync::atomic::Ordering;
 
 use rustc_ast as ast;
 use rustc_ast::attr::contains_name;
@@ -8,10 +9,11 @@ use rustc_ast::entry::EntryPointType;
 use rustc_ast::mut_visit::*;
 use rustc_ast::visit::Visitor;
 use rustc_ast::{ModKind, attr};
-use rustc_errors::DiagCtxtHandle;
+use rustc_attr_parsing::AttributeParser;
 use rustc_expand::base::{ExtCtxt, ResolverExpand};
 use rustc_expand::expand::{AstFragment, ExpansionConfig};
 use rustc_feature::Features;
+use rustc_hir::attrs::AttributeKind;
 use rustc_session::Session;
 use rustc_session::lint::builtin::UNNAMEABLE_TEST_ITEMS;
 use rustc_span::hygiene::{AstPass, SyntaxContext, Transparency};
@@ -21,7 +23,7 @@ use smallvec::smallvec;
 use thin_vec::{ThinVec, thin_vec};
 use tracing::debug;
 
-use crate::errors;
+use crate::diagnostics;
 
 #[derive(Clone)]
 struct Test {
@@ -60,7 +62,7 @@ pub fn inject(
 
     // Do this here so that the test_runner crate attribute gets marked as used
     // even in non-test builds
-    let test_runner = get_test_runner(dcx, krate);
+    let test_runner = get_test_runner(sess, krate);
 
     if sess.is_test_crate() {
         let panic_strategy = match (panic_strategy, sess.opts.unstable_opts.panic_abort_tests) {
@@ -70,7 +72,7 @@ pub fn inject(
                     // Silently allow compiling with panic=abort on these platforms,
                     // but with old behavior (abort if a test fails).
                 } else {
-                    dcx.emit_err(errors::TestsNotSupport {});
+                    dcx.emit_err(diagnostics::TestsNotSupport {});
                 }
                 PanicStrategy::Unwind
             }
@@ -165,7 +167,7 @@ impl<'a> Visitor<'a> for InnerItemLinter<'_> {
                 UNNAMEABLE_TEST_ITEMS,
                 attr.span,
                 i.id,
-                errors::UnnameableTestItems,
+                diagnostics::UnnameableTestItems,
             );
         }
     }
@@ -201,7 +203,7 @@ impl<'a> MutVisitor for EntryPointCleaner<'a> {
         // clash with the one we're going to add, but mark it as
         // #[allow(dead_code)] to avoid printing warnings.
         match entry_point_type(&item, self.depth == 0) {
-            EntryPointType::MainNamed | EntryPointType::RustcMainAttr => {
+            EntryPointType::RustcMainAttr => {
                 let allow_dead_code = attr::mk_attr_nested_word(
                     &self.sess.psess.attr_id_generator,
                     ast::AttrStyle::Outer,
@@ -212,8 +214,9 @@ impl<'a> MutVisitor for EntryPointCleaner<'a> {
                 );
                 item.attrs.retain(|attr| !attr.has_name(sym::rustc_main));
                 item.attrs.push(allow_dead_code);
+                self.sess.removed_rustc_main_attr.store(true, Ordering::Relaxed);
             }
-            EntryPointType::None | EntryPointType::OtherMain => {}
+            EntryPointType::None | EntryPointType::MainNamed | EntryPointType::OtherMain => {}
         };
     }
 }
@@ -329,7 +332,7 @@ fn mk_main(cx: &mut TestCtxt<'_>) -> Box<ast::Item> {
 
     let decl = ecx.fn_decl(ThinVec::new(), ast::FnRetTy::Ty(main_ret_ty));
     let sig = ast::FnSig { decl, header: ast::FnHeader::default(), span: sp };
-    let defaultness = ast::Defaultness::Final;
+    let defaultness = ast::Defaultness::Implicit;
 
     // Honor the reexport_test_harness_main attribute
     let main_ident = match cx.reexport_test_harness_main {
@@ -369,6 +372,8 @@ fn mk_tests_slice(cx: &TestCtxt<'_>, sp: Span) -> Box<ast::Expr> {
     let ecx = &cx.ext_cx;
 
     let mut tests = cx.test_cases.clone();
+    // Note that this sort is load-bearing: the libtest harness uses binary search to find tests by
+    // name.
     tests.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
 
     ecx.expr_array_ref(
@@ -386,20 +391,9 @@ fn get_test_name(i: &ast::Item) -> Option<Symbol> {
     attr::first_attr_value_str_by_name(&i.attrs, sym::rustc_test_marker)
 }
 
-fn get_test_runner(dcx: DiagCtxtHandle<'_>, krate: &ast::Crate) -> Option<ast::Path> {
-    let test_attr = attr::find_by_name(&krate.attrs, sym::test_runner)?;
-    let meta_list = test_attr.meta_item_list()?;
-    let span = test_attr.span;
-    match &*meta_list {
-        [single] => match single.meta_item() {
-            Some(meta_item) if meta_item.is_word() => return Some(meta_item.path.clone()),
-            _ => {
-                dcx.emit_err(errors::TestRunnerInvalid { span });
-            }
-        },
-        _ => {
-            dcx.emit_err(errors::TestRunnerNargs { span });
-        }
+fn get_test_runner(sess: &Session, krate: &ast::Crate) -> Option<ast::Path> {
+    match AttributeParser::parse_limited(sess, &krate.attrs, &[sym::test_runner]) {
+        Some(rustc_hir::Attribute::Parsed(AttributeKind::TestRunner(path))) => Some(path),
+        _ => None,
     }
-    None
 }

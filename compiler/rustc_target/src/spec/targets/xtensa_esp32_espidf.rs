@@ -7,9 +7,9 @@ pub(crate) fn target() -> Target {
     Target {
         llvm_target: "xtensa-none-elf".into(),
         pointer_width: 32,
-        data_layout: "e-m:e-p:32:32-v1:8:8-i64:64-i128:128-n32".into(),
+        data_layout: "e-m:e-p:32:32-i8:8:32-i16:16:32-i64:64-n32".into(),
         arch: Arch::Xtensa,
-        metadata: TargetMetadata { description: None, tier: None, host_tools: None, std: None },
+        metadata: TargetMetadata { description: None, tier: Some(3), host_tools: None, std: None },
 
         options: TargetOptions {
             endian: Endian::Little,

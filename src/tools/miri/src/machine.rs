@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::{fmt, process};
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rustc_abi::{Align, ExternAbi, Size};
 use rustc_apfloat::{Float, FloatConvert};
 use rustc_ast::expand::allocator::{self, SpecialAllocatorMethod};
@@ -17,7 +17,7 @@ use rustc_data_structures::either::Either;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 #[allow(unused)]
 use rustc_data_structures::static_assert_size;
-use rustc_hir::attrs::InlineAttr;
+use rustc_hir::attrs::{InlineAttr, Linkage};
 use rustc_log::tracing;
 use rustc_middle::middle::codegen_fn_attrs::TargetFeatureKind;
 use rustc_middle::mir;
@@ -40,6 +40,7 @@ use crate::concurrency::sync::SyncObj;
 use crate::concurrency::{
     AllocDataRaceHandler, GenmcCtx, GenmcEvalContextExt as _, GlobalDataRaceHandler, weak_memory,
 };
+use crate::helpers::is_no_core;
 use crate::*;
 
 /// First real-time signal.
@@ -202,8 +203,10 @@ pub enum MiriMemoryKind {
     /// Memory for thread-local statics.
     /// This memory may leak.
     Tls,
-    /// Memory mapped directly by the program
+    /// Memory mapped directly by the program.
     Mmap,
+    /// Memory allocated for `getaddrinfo` result.
+    SocketAddress,
 }
 
 impl From<MiriMemoryKind> for MemoryKind {
@@ -219,7 +222,7 @@ impl MayLeak for MiriMemoryKind {
         use self::MiriMemoryKind::*;
         match self {
             Rust | Miri | C | WinHeap | WinLocal | Runtime => false,
-            Machine | Global | ExternStatic | Tls | Mmap => true,
+            Machine | Global | ExternStatic | Tls | Mmap | SocketAddress => true,
         }
     }
 }
@@ -232,7 +235,7 @@ impl MiriMemoryKind {
             // Heap allocations are fine since the `Allocation` is created immediately.
             Rust | Miri | C | WinHeap | WinLocal | Mmap => true,
             // Everything else is unclear, let's not show potentially confusing spans.
-            Machine | Global | ExternStatic | Tls | Runtime => false,
+            Machine | Global | ExternStatic | Tls | Runtime | SocketAddress => false,
         }
     }
 }
@@ -252,6 +255,7 @@ impl fmt::Display for MiriMemoryKind {
             ExternStatic => write!(f, "extern static"),
             Tls => write!(f, "thread-local static"),
             Mmap => write!(f, "mmap"),
+            SocketAddress => write!(f, "socket address"),
         }
     }
 }
@@ -300,7 +304,8 @@ pub enum ProvenanceExtra {
 
 #[cfg(target_pointer_width = "64")]
 static_assert_size!(StrictPointer, 24);
-// FIXME: this would with in 24bytes but layout optimizations are not smart enough
+// Pointer does not fit as the layout algorithm isn't smart enough (but also, we tried using
+// pattern types to get a larger niche that makes this fit and it didn't improve performance).
 // #[cfg(target_pointer_width = "64")]
 //static_assert_size!(Pointer, 24);
 #[cfg(target_pointer_width = "64")]
@@ -536,10 +541,14 @@ pub struct MiriMachine<'tcx> {
     /// The set of threads.
     pub(crate) threads: ThreadManager<'tcx>,
 
+    /// Handles blocking I/O and polling for completion.
+    pub(crate) blocking_io: BlockingIoManager,
+
     /// Stores which thread is eligible to run on which CPUs.
     /// This has no effect at all, it is just tracked to produce the correct result
     /// in `sched_getaffinity`
-    pub(crate) thread_cpu_affinity: FxHashMap<ThreadId, CpuAffinityMask>,
+    /// This will be `None` when running `#![no_core]` crates.
+    pub(crate) thread_cpu_affinity: Option<FxHashMap<ThreadId, CpuAffinityMask>>,
 
     /// Precomputed `TyLayout`s for primitive data types that are commonly used inside Miri.
     pub(crate) layouts: PrimitiveLayouts<'tcx>,
@@ -565,7 +574,9 @@ pub struct MiriMachine<'tcx> {
     pub(crate) user_relevant_crates: Vec<CrateNum>,
 
     /// Mapping extern static names to their pointer.
-    extern_statics: FxHashMap<Symbol, StrictPointer>,
+    pub(crate) extern_statics: FxHashMap<Symbol, StrictPointer>,
+    /// A pointer to the allocation we provide for non-existent weak symbols.
+    pub(crate) missing_weak_symbol: Option<StrictPointer>,
 
     /// The random number generator used for resolving non-determinism.
     /// Needs to be queried by ptr_to_int, hence needs interior mutability.
@@ -595,12 +606,12 @@ pub struct MiriMachine<'tcx> {
     pub(crate) basic_block_count: u64,
 
     /// Handle of the optional shared object file for native functions.
-    #[cfg(all(unix, feature = "native-lib"))]
+    #[cfg(all(feature = "native-lib", unix))]
     pub native_lib: Vec<(libloading::Library, std::path::PathBuf)>,
-    #[cfg(not(all(unix, feature = "native-lib")))]
+    #[cfg(not(all(feature = "native-lib", unix)))]
     pub native_lib: Vec<!>,
     /// A memory location for exchanging the current `ecx` pointer with native code.
-    #[cfg(all(unix, feature = "native-lib"))]
+    #[cfg(all(feature = "native-lib", unix))]
     pub native_lib_ecx_interchange: &'static Cell<usize>,
 
     /// Run a garbage collector for BorTags every N basic blocks.
@@ -654,7 +665,7 @@ pub struct MiriMachine<'tcx> {
     /// Whether floating-point operations can have a non-deterministic rounding error.
     pub float_rounding_error: FloatRoundingErrorMode,
 
-    /// Whether Miri artifically introduces short reads/writes on file descriptors.
+    /// Whether Miri artificially introduces short reads/writes on file descriptors.
     pub short_fd_operations: bool,
 }
 
@@ -726,13 +737,24 @@ impl<'tcx> MiriMachine<'tcx> {
             config.num_cpus
         );
         let threads = ThreadManager::new(config);
-        let mut thread_cpu_affinity = FxHashMap::default();
-        if matches!(&tcx.sess.target.os, Os::Linux | Os::FreeBsd | Os::Android) {
-            thread_cpu_affinity
-                .insert(threads.active_thread(), CpuAffinityMask::new(&layout_cx, config.num_cpus));
-        }
+        let thread_cpu_affinity =
+            if matches!(&tcx.sess.target.os, Os::Linux | Os::FreeBsd | Os::Android)
+                && !is_no_core(tcx)
+            {
+                let mut affinity = FxHashMap::default();
+                affinity.insert(
+                    threads.active_thread(),
+                    CpuAffinityMask::new(&layout_cx, config.num_cpus),
+                );
+                Some(affinity)
+            } else {
+                None
+            };
+        let blocking_io = BlockingIoManager::new(config.isolated_op == IsolatedOp::Allow)
+            .expect("Couldn't create poll instance");
         let alloc_addresses =
             RefCell::new(alloc_addresses::GlobalStateInner::new(config, stack_addr, tcx));
+
         MiriMachine {
             tcx,
             borrow_tracker,
@@ -753,6 +775,7 @@ impl<'tcx> MiriMachine<'tcx> {
             layouts,
             threads,
             thread_cpu_affinity,
+            blocking_io,
             static_roots: Vec::new(),
             profiler,
             string_cache: Default::default(),
@@ -760,6 +783,7 @@ impl<'tcx> MiriMachine<'tcx> {
             backtrace_style: config.backtrace_style,
             user_relevant_crates,
             extern_statics: FxHashMap::default(),
+            missing_weak_symbol: None,
             rng: RefCell::new(rng),
             allocator: (!config.native_lib.is_empty())
                 .then(|| Rc::new(RefCell::new(crate::alloc::isolated_alloc::IsolatedAlloc::new()))),
@@ -771,7 +795,7 @@ impl<'tcx> MiriMachine<'tcx> {
             report_progress: config.report_progress,
             basic_block_count: 0,
             monotonic_clock: MonotonicClock::new(config.isolated_op == IsolatedOp::Allow),
-            #[cfg(all(unix, feature = "native-lib"))]
+            #[cfg(all(feature = "native-lib", unix))]
             native_lib: config.native_lib.iter().map(|lib_file_path| {
                 let host_triple = rustc_session::config::host_tuple();
                 let target_triple = tcx.sess.opts.target_triple.tuple();
@@ -793,9 +817,9 @@ impl<'tcx> MiriMachine<'tcx> {
                     lib_file_path.clone(),
                 )
             }).collect(),
-            #[cfg(all(unix, feature = "native-lib"))]
+            #[cfg(all(feature = "native-lib", unix))]
             native_lib_ecx_interchange: Box::leak(Box::new(Cell::new(0))),
-            #[cfg(not(all(unix, feature = "native-lib")))]
+            #[cfg(not(all(feature = "native-lib", unix)))]
             native_lib: config.native_lib.iter().map(|_| {
                 panic!("calling functions from native libraries via FFI is not supported in this build of Miri")
             }).collect(),
@@ -1004,11 +1028,13 @@ impl VisitProvenance for MiriMachine<'_> {
             argv,
             cmd_line,
             extern_statics,
+            missing_weak_symbol,
             dirs,
             borrow_tracker,
             data_race,
             alloc_addresses,
             fds,
+            blocking_io:_,
             epoll_interests:_,
             tcx: _,
             isolated_op: _,
@@ -1031,7 +1057,7 @@ impl VisitProvenance for MiriMachine<'_> {
             report_progress: _,
             basic_block_count: _,
             native_lib: _,
-            #[cfg(all(unix, feature = "native-lib"))]
+            #[cfg(all(feature = "native-lib", unix))]
             native_lib_ecx_interchange: _,
             gc_interval: _,
             since_gc: _,
@@ -1066,6 +1092,7 @@ impl VisitProvenance for MiriMachine<'_> {
         argc.visit_provenance(visit);
         argv.visit_provenance(visit);
         cmd_line.visit_provenance(visit);
+        missing_weak_symbol.visit_provenance(visit);
         for ptr in extern_statics.values() {
             ptr.visit_provenance(visit);
         }
@@ -1235,7 +1262,7 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
             // to run extra MIR), and Ok(Some(body)) if we found MIR to run for the
             // foreign function
             // Any needed call to `goto_block` will be performed by `emulate_foreign_item`.
-            let args = ecx.copy_fn_args(args); // FIXME: Should `InPlace` arguments be reset to uninit?
+            let args = MiriInterpCx::copy_fn_args(args); // FIXME: Should `InPlace` arguments be reset to uninit?
             let link_name = Symbol::intern(ecx.tcx.symbol_name(instance).name);
             return ecx.emulate_foreign_item(link_name, abi, &args, dest, ret, unwind);
         }
@@ -1262,7 +1289,7 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
         ret: Option<mir::BasicBlock>,
         unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx> {
-        let args = ecx.copy_fn_args(args); // FIXME: Should `InPlace` arguments be reset to uninit?
+        let args = MiriInterpCx::copy_fn_args(args); // FIXME: Should `InPlace` arguments be reset to uninit?
         ecx.emulate_dyn_sym(fn_val, abi, &args, dest, ret, unwind)
     }
 
@@ -1365,6 +1392,10 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
         def_id: DefId,
     ) -> InterpResult<'tcx, StrictPointer> {
         let link_name = Symbol::intern(ecx.tcx.symbol_name(Instance::mono(*ecx.tcx, def_id)).name);
+        let def_ty = ecx.tcx.type_of(def_id).instantiate_identity().skip_norm_wip();
+        let extern_decl_layout =
+            ecx.tcx.layout_of(ecx.typing_env().as_query_input(def_ty)).unwrap();
+
         if let Some(&ptr) = ecx.machine.extern_statics.get(&link_name) {
             // Various parts of the engine rely on `get_alloc_info` for size and alignment
             // information. That uses the type information of this static.
@@ -1373,9 +1404,6 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
                 panic!("extern_statics cannot contain wildcards")
             };
             let info = ecx.get_alloc_info(alloc_id);
-            let def_ty = ecx.tcx.type_of(def_id).instantiate_identity();
-            let extern_decl_layout =
-                ecx.tcx.layout_of(ecx.typing_env().as_query_input(def_ty)).unwrap();
             if extern_decl_layout.size != info.size || extern_decl_layout.align.abi != info.align {
                 throw_unsup_format!(
                     "extern static `{link_name}` has been declared as `{krate}::{name}` \
@@ -1391,8 +1419,26 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
                 )
             }
             interp_ok(ptr)
+        } else if ecx.tcx.codegen_fn_attrs(def_id).import_linkage == Some(Linkage::ExternalWeak) {
+            // Symbols with weak linkage default to null if they are not defined. However we can't
+            // create new allocations here. On the plus side we know rustc rejects non-ptr-sized
+            // weak statics so we can just use a single global "null" allocation for all of them.
+            // The memory we are assigning this address to is anyway somewhat "fake", it's an
+            // indirection introduced by how Rust represents external symbols with linkage (see
+            // <https://github.com/rust-lang/rust/issues/156468>). So we can just specify that such
+            // memory does not have unique addresses, despite being technically a `static`.
+            assert_eq!(
+                extern_decl_layout.size,
+                ecx.tcx.data_layout.pointer_size(),
+                "non-pointer-sized weak static"
+            );
+            interp_ok(
+                ecx.machine
+                    .missing_weak_symbol
+                    .expect("`missing_weak_symbol` should have been initialized"),
+            )
         } else {
-            throw_unsup_format!("extern static `{link_name}` is not supported by Miri",)
+            throw_unsup_format!("extern static `{link_name}` is not supported by Miri")
         }
     }
 
@@ -1648,26 +1694,23 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
     #[inline(always)]
     fn retag_ptr_value(
         ecx: &mut InterpCx<'tcx, Self>,
-        kind: mir::RetagKind,
         val: &ImmTy<'tcx>,
-    ) -> InterpResult<'tcx, ImmTy<'tcx>> {
+        ty: Ty<'tcx>,
+    ) -> InterpResult<'tcx, Option<ImmTy<'tcx>>> {
         if ecx.machine.borrow_tracker.is_some() {
-            ecx.retag_ptr_value(kind, val)
+            ecx.retag_ptr_value(val, ty)
         } else {
-            interp_ok(val.clone())
+            interp_ok(None)
         }
     }
 
     #[inline(always)]
-    fn retag_place_contents(
+    fn with_retag_mode<T>(
         ecx: &mut InterpCx<'tcx, Self>,
-        kind: mir::RetagKind,
-        place: &PlaceTy<'tcx>,
-    ) -> InterpResult<'tcx> {
-        if ecx.machine.borrow_tracker.is_some() {
-            ecx.retag_place_contents(kind, place)?;
-        }
-        interp_ok(())
+        mode: RetagMode,
+        f: impl FnOnce(&mut InterpCx<'tcx, Self>) -> InterpResult<'tcx, T>,
+    ) -> InterpResult<'tcx, T> {
+        if ecx.machine.borrow_tracker.is_some() { ecx.with_retag_mode(mode, f) } else { f(ecx) }
     }
 
     fn protect_in_place_function_argument(
@@ -1802,7 +1845,7 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
             // We have to skip the frame that is just being popped.
             ecx.active_thread_mut().recompute_top_user_relevant_frame(/* skip */ 1);
         }
-        // tracing-tree can autoamtically annotate scope changes, but it gets very confused by our
+        // tracing-tree can automatically annotate scope changes, but it gets very confused by our
         // concurrency and what it prints is just plain wrong. So we print our own information
         // instead. (Cc https://github.com/rust-lang/miri/issues/2266)
         info!("Leaving {}", ecx.frame().instance());

@@ -5,9 +5,9 @@
 //@ pp-exact:delegation-inherit-attributes.pp
 
 #![allow(incomplete_features)]
-#![feature(fn_delegation)]
+#![attr = Feature([fn_delegation#0])]
 extern crate std;
-#[prelude_import]
+#[attr = PreludeImport]
 use std::prelude::rust_2021::*;
 
 extern crate to_reuse_functions;
@@ -21,12 +21,12 @@ mod to_reuse {
     #[attr = Cold]
     fn foo_no_reason(x: usize) -> usize { x }
 
-    #[attr = Deprecation {deprecation: Deprecation {since: Unspecified}}]
     #[attr = Cold]
+    #[attr = Deprecated {deprecation: Deprecation {since: Unspecified}}]
     fn bar(x: usize) -> usize { x }
 }
 
-#[attr = Deprecation {deprecation: Deprecation {since: Unspecified}}]
+#[attr = Deprecated {deprecation: Deprecation {since: Unspecified}}]
 #[attr = MustUse {reason: "foo: some reason"}]
 #[attr = Inline(Hint)]
 fn foo1(arg0: _) -> _ { to_reuse::foo(self + 1) }
@@ -35,7 +35,7 @@ fn foo1(arg0: _) -> _ { to_reuse::foo(self + 1) }
 #[attr = Inline(Hint)]
 fn foo_no_reason(arg0: _) -> _ { to_reuse::foo_no_reason(self + 1) }
 
-#[attr = Deprecation {deprecation: Deprecation {since: Unspecified}}]
+#[attr = Deprecated {deprecation: Deprecation {since: Unspecified}}]
 #[attr = MustUse {reason: "some reason"}]
 #[attr = Inline(Hint)]
 fn foo2(arg0: _) -> _ { to_reuse::foo(self + 1) }
@@ -117,7 +117,7 @@ mod recursive {
         fn foo(self: _, arg1: _) -> _ { <X as T>::foo(self + 1, arg1) }
         #[attr = MustUse {reason: "some reason"}]
         #[attr = Inline(Hint)]
-        fn bar(self: _, arg1: _) -> _ { foo(self + 1, arg1) }
+        fn bar(arg0: _, arg1: _) -> _ { foo(self + 1, arg1) }
     }
 }
 

@@ -1,4 +1,4 @@
-use super::env::{CommandEnv, CommandEnvs};
+use super::env::{CommandEnv, CommandEnvs, CommandResolvedEnvs};
 pub use crate::ffi::OsString as EnvKey;
 use crate::ffi::{OsStr, OsString};
 use crate::num::NonZero;
@@ -87,6 +87,10 @@ impl Command {
 
     pub fn get_env_clear(&self) -> bool {
         self.env.does_clear()
+    }
+
+    pub fn get_resolved_envs(&self) -> CommandResolvedEnvs {
+        CommandResolvedEnvs::new(self.env.capture())
     }
 
     pub fn get_current_dir(&self) -> Option<&Path> {
@@ -326,4 +330,8 @@ pub fn read_output(
     _stderr: &mut Vec<u8>,
 ) -> io::Result<()> {
     match out.diverge() {}
+}
+
+pub fn getpid() -> u32 {
+    panic!("no pids on this platform")
 }

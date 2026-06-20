@@ -2,14 +2,14 @@ use std::ffi::CString;
 use std::path::Path;
 
 use rustc_data_structures::small_c_str::SmallCStr;
-use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, EmissionGuarantee, Level};
+use rustc_errors::{
+    Diag, DiagCtxtHandle, Diagnostic, EmissionGuarantee, Level, format_diag_message, msg,
+};
 use rustc_macros::Diagnostic;
 use rustc_span::Span;
 
-use crate::fluent_generated as fluent;
-
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_symbol_already_defined)]
+#[diag("symbol `{$symbol_name}` is already defined")]
 pub(crate) struct SymbolAlreadyDefined<'a> {
     #[primary_span]
     pub span: Span,
@@ -17,100 +17,109 @@ pub(crate) struct SymbolAlreadyDefined<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_sanitizer_memtag_requires_mte)]
+#[diag("`-Zsanitizer=memtag` requires `-Ctarget-feature=+mte`")]
 pub(crate) struct SanitizerMemtagRequiresMte;
 
 pub(crate) struct ParseTargetMachineConfig<'a>(pub LlvmError<'a>);
 
 impl<G: EmissionGuarantee> Diagnostic<'_, G> for ParseTargetMachineConfig<'_> {
     fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_, G> {
-        let diag: Diag<'_, G> = self.0.into_diag(dcx, level);
+        // Reuse the formatted primary message from `LlvmError` without emitting it.
+        let diag: Diag<'_, ()> = self.0.into_diag(dcx, level);
         let (message, _) = diag.messages.first().expect("`LlvmError` with no message");
-        let message = dcx.eagerly_translate_to_string(message.clone(), diag.args.iter());
-        Diag::new(dcx, level, fluent::codegen_llvm_parse_target_machine_config)
-            .with_arg("error", message)
+        let message = format_diag_message(message, &diag.args).into_owned();
+        diag.cancel();
+
+        Diag::new(
+            dcx,
+            level,
+            msg!("failed to parse target machine config to target machine: {$error}"),
+        )
+        .with_arg("error", message)
     }
 }
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_autodiff_component_unavailable)]
+#[diag("failed to load our autodiff backend: {$err}")]
 pub(crate) struct AutoDiffComponentUnavailable {
     pub err: String,
 }
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_autodiff_component_missing)]
-#[note]
+#[diag("autodiff backend not found in the sysroot: {$err}")]
+#[note("it will be distributed via rustup in the future")]
 pub(crate) struct AutoDiffComponentMissing {
     pub err: String,
 }
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_autodiff_without_lto)]
+#[diag("using the autodiff feature requires setting `lto=\"fat\"` in your Cargo.toml")]
 pub(crate) struct AutoDiffWithoutLto;
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_autodiff_without_enable)]
+#[diag("using the autodiff feature requires -Z autodiff=Enable")]
 pub(crate) struct AutoDiffWithoutEnable;
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_offload_without_enable)]
+#[diag(
+    "using the offload feature requires -Z offload=<Device or Host=/absolute/path/to/device.bin>"
+)]
 pub(crate) struct OffloadWithoutEnable;
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_offload_without_fat_lto)]
+#[diag("using the offload feature requires -C lto=fat")]
 pub(crate) struct OffloadWithoutFatLTO;
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_offload_no_abs_path)]
+#[diag("using the `-Z offload=Host=/absolute/path/to/device.bin` flag requires an absolute path")]
 pub(crate) struct OffloadWithoutAbsPath;
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_offload_no_host_out)]
+#[diag(
+    "using the `-Z offload=Host=/absolute/path/to/device.bin` flag must point to a `device.bin` file"
+)]
 pub(crate) struct OffloadWrongFileName;
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_offload_nonexisting)]
+#[diag(
+    "the given path/file to `device.bin` does not exist. Did you forget to run the device compilation first?"
+)]
 pub(crate) struct OffloadNonexistingPath;
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_offload_bundleimages_failed)]
+#[diag("call to BundleImages failed, `device.bin` was not created")]
 pub(crate) struct OffloadBundleImagesFailed;
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_offload_embed_failed)]
+#[diag("call to EmbedBufferInModule failed, `host.o` was not created")]
 pub(crate) struct OffloadEmbedFailed;
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_lto_bitcode_from_rlib)]
+#[diag("failed to get bitcode from object file for LTO ({$err})")]
 pub(crate) struct LtoBitcodeFromRlib {
     pub err: String,
 }
 
 #[derive(Diagnostic)]
-pub enum LlvmError<'a> {
-    #[diag(codegen_llvm_write_output)]
+pub(crate) enum LlvmError<'a> {
+    #[diag("could not write output to {$path}")]
     WriteOutput { path: &'a Path },
-    #[diag(codegen_llvm_target_machine)]
+    #[diag("could not create LLVM TargetMachine for triple: {$triple}")]
     CreateTargetMachine { triple: SmallCStr },
-    #[diag(codegen_llvm_run_passes)]
+    #[diag("failed to run LLVM passes")]
     RunLlvmPasses,
-    #[diag(codegen_llvm_serialize_module)]
-    SerializeModule { name: &'a str },
-    #[diag(codegen_llvm_write_ir)]
+    #[diag("failed to write LLVM IR to {$path}")]
     WriteIr { path: &'a Path },
-    #[diag(codegen_llvm_prepare_thin_lto_context)]
+    #[diag("failed to prepare thin LTO context")]
     PrepareThinLtoContext,
-    #[diag(codegen_llvm_load_bitcode)]
+    #[diag("failed to load bitcode of module \"{$name}\"")]
     LoadBitcode { name: CString },
-    #[diag(codegen_llvm_write_thinlto_key)]
+    #[diag("error while writing ThinLTO key data: {$err}")]
     WriteThinLtoKey { err: std::io::Error },
-    #[diag(codegen_llvm_prepare_thin_lto_module)]
+    #[diag("failed to prepare thin LTO module")]
     PrepareThinLtoModule,
-    #[diag(codegen_llvm_parse_bitcode)]
+    #[diag("failed to parse bitcode for LTO module")]
     ParseBitcode,
-    #[diag(codegen_llvm_prepare_autodiff)]
-    PrepareAutoDiff { src: String, target: String, error: String },
 }
 
 pub(crate) struct WithLlvmError<'a>(pub LlvmError<'a>, pub String);
@@ -119,17 +128,25 @@ impl<G: EmissionGuarantee> Diagnostic<'_, G> for WithLlvmError<'_> {
     fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_, G> {
         use LlvmError::*;
         let msg_with_llvm_err = match &self.0 {
-            WriteOutput { .. } => fluent::codegen_llvm_write_output_with_llvm_err,
-            CreateTargetMachine { .. } => fluent::codegen_llvm_target_machine_with_llvm_err,
-            RunLlvmPasses => fluent::codegen_llvm_run_passes_with_llvm_err,
-            SerializeModule { .. } => fluent::codegen_llvm_serialize_module_with_llvm_err,
-            WriteIr { .. } => fluent::codegen_llvm_write_ir_with_llvm_err,
-            PrepareThinLtoContext => fluent::codegen_llvm_prepare_thin_lto_context_with_llvm_err,
-            LoadBitcode { .. } => fluent::codegen_llvm_load_bitcode_with_llvm_err,
-            WriteThinLtoKey { .. } => fluent::codegen_llvm_write_thinlto_key_with_llvm_err,
-            PrepareThinLtoModule => fluent::codegen_llvm_prepare_thin_lto_module_with_llvm_err,
-            ParseBitcode => fluent::codegen_llvm_parse_bitcode_with_llvm_err,
-            PrepareAutoDiff { .. } => fluent::codegen_llvm_prepare_autodiff_with_llvm_err,
+            WriteOutput { .. } => msg!("could not write output to {$path}: {$llvm_err}"),
+            CreateTargetMachine { .. } => {
+                msg!("could not create LLVM TargetMachine for triple: {$triple}: {$llvm_err}")
+            }
+            RunLlvmPasses => msg!("failed to run LLVM passes: {$llvm_err}"),
+            WriteIr { .. } => msg!("failed to write LLVM IR to {$path}: {$llvm_err}"),
+            PrepareThinLtoContext => {
+                msg!("failed to prepare thin LTO context: {$llvm_err}")
+            }
+            LoadBitcode { .. } => {
+                msg!("failed to load bitcode of module \"{$name}\": {$llvm_err}")
+            }
+            WriteThinLtoKey { .. } => {
+                msg!("error while writing ThinLTO key data: {$err}: {$llvm_err}")
+            }
+            PrepareThinLtoModule => {
+                msg!("failed to prepare thin LTO module: {$llvm_err}")
+            }
+            ParseBitcode => msg!("failed to parse bitcode for LTO module: {$llvm_err}"),
         };
         self.0
             .into_diag(dcx, level)
@@ -139,7 +156,7 @@ impl<G: EmissionGuarantee> Diagnostic<'_, G> for WithLlvmError<'_> {
 }
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_from_llvm_optimization_diag)]
+#[diag("{$filename}:{$line}:{$column} {$pass_name} ({$kind}): {$message}")]
 pub(crate) struct FromLlvmOptimizationDiag<'a> {
     pub filename: &'a str,
     pub line: std::ffi::c_uint,
@@ -150,32 +167,36 @@ pub(crate) struct FromLlvmOptimizationDiag<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_from_llvm_diag)]
+#[diag("{$message}")]
 pub(crate) struct FromLlvmDiag {
     pub message: String,
 }
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_write_bytecode)]
+#[diag("failed to write bytecode to {$path}: {$err}")]
 pub(crate) struct WriteBytecode<'a> {
     pub path: &'a Path,
     pub err: std::io::Error,
 }
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_copy_bitcode)]
+#[diag("failed to copy bitcode to object file: {$err}")]
 pub(crate) struct CopyBitcode {
     pub err: std::io::Error,
 }
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_unknown_debuginfo_compression)]
-pub(crate) struct UnknownCompression {
+#[diag(
+    "unsupported debuginfo compression algorithm {$algorithm} - will fall back to uncompressed debuginfo"
+)]
+pub(crate) struct UnsupportedCompression {
     pub algorithm: &'static str,
 }
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_mismatch_data_layout)]
+#[diag(
+    "data-layout for target `{$rustc_target}`, `{$rustc_layout}`, differs from LLVM target's `{$llvm_target}` default layout, `{$llvm_layout}`"
+)]
 pub(crate) struct MismatchedDataLayout<'a> {
     pub rustc_target: &'a str,
     pub rustc_layout: &'a str,
@@ -184,11 +205,43 @@ pub(crate) struct MismatchedDataLayout<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_fixed_x18_invalid_arch)]
+#[diag("the `-Zfixed-x18` flag is not supported on the `{$arch}` architecture")]
 pub(crate) struct FixedX18InvalidArch<'a> {
     pub arch: &'a str,
 }
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_sanitizer_kcfi_arity_requires_llvm_21_0_0)]
-pub(crate) struct SanitizerKcfiArityRequiresLLVM2100;
+#[diag("`-Zpacked-stack` is incompatible with `backchain` target feature")]
+#[note(
+    "enabling both `-Zpacked-stack` and the `backchain` target feature is incompatible with the default s390x ABI. Switch to s390x-unknown-none-softfloat if you need both attributes"
+)]
+pub(crate) struct PackedStackBackchainNeedsSoftfloat;
+
+#[derive(Diagnostic)]
+#[diag(
+    "intrinsic signature mismatch for `{$name}`: expected signature `{$llvm_fn_ty}`, found `{$rust_fn_ty}`"
+)]
+pub(crate) struct IntrinsicSignatureMismatch<'a> {
+    pub name: &'a str,
+    pub llvm_fn_ty: &'a str,
+    pub rust_fn_ty: &'a str,
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("unknown LLVM intrinsic `{$name}`")]
+pub(crate) struct UnknownIntrinsic<'a> {
+    pub name: &'a str,
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("intrinsic `{$name}` cannot be used with target arch `{$target_arch}`")]
+pub(crate) struct IntrinsicWrongArch<'a> {
+    pub name: &'a str,
+    pub target_arch: &'a str,
+    #[primary_span]
+    pub span: Span,
+}

@@ -2,6 +2,7 @@
 
 use std::{
     io::{self, BufRead, Write},
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
 };
 
@@ -9,10 +10,10 @@ use paths::AbsPath;
 use span::Span;
 
 use crate::{
-    Codec, ProcMacro, ProcMacroKind, ServerError,
+    ProcMacro, ProcMacroKind, ServerError,
     bidirectional_protocol::msg::{
-        BidirectionalMessage, ExpandMacro, ExpandMacroData, ExpnGlobals, Request, Response,
-        SubRequest, SubResponse,
+        ApiVersionCheck, BidirectionalMessage, ExpandMacro, ExpandMacroData, ExpnGlobals,
+        ListMacros, Request, Response, SubRequest, SubResponse,
     },
     legacy_protocol::{
         SpanMode,
@@ -22,26 +23,25 @@ use crate::{
         },
     },
     process::ProcMacroServerProcess,
-    transport::codec::postcard::PostcardProtocol,
-    version,
+    transport::postcard,
 };
 
 pub mod msg;
 
-pub type SubCallback<'a> = &'a mut dyn FnMut(SubRequest) -> Result<SubResponse, ServerError>;
+pub type SubCallback<'a> = &'a dyn Fn(SubRequest) -> Result<SubResponse, ServerError>;
 
-pub fn run_conversation<C: Codec>(
+pub fn run_conversation(
     writer: &mut dyn Write,
     reader: &mut dyn BufRead,
-    buf: &mut C::Buf,
+    buf: &mut Vec<u8>,
     msg: BidirectionalMessage,
     callback: SubCallback<'_>,
 ) -> Result<BidirectionalMessage, ServerError> {
-    let encoded = C::encode(&msg).map_err(wrap_encode)?;
-    C::write(writer, &encoded).map_err(wrap_io("failed to write initial request"))?;
+    let encoded = postcard::encode(&msg).map_err(wrap_encode)?;
+    postcard::write(writer, &encoded).map_err(wrap_io("failed to write initial request"))?;
 
     loop {
-        let maybe_buf = C::read(reader, buf).map_err(wrap_io("failed to read message"))?;
+        let maybe_buf = postcard::read(reader, buf).map_err(wrap_io("failed to read message"))?;
         let Some(b) = maybe_buf else {
             return Err(ServerError {
                 message: "proc-macro server closed the stream".into(),
@@ -49,17 +49,28 @@ pub fn run_conversation<C: Codec>(
             });
         };
 
-        let msg: BidirectionalMessage = C::decode(b).map_err(wrap_decode)?;
+        let msg: BidirectionalMessage = postcard::decode(b).map_err(wrap_decode)?;
 
         match msg {
             BidirectionalMessage::Response(response) => {
                 return Ok(BidirectionalMessage::Response(response));
             }
             BidirectionalMessage::SubRequest(sr) => {
-                let resp = callback(sr)?;
-                let reply = BidirectionalMessage::SubResponse(resp);
-                let encoded = C::encode(&reply).map_err(wrap_encode)?;
-                C::write(writer, &encoded).map_err(wrap_io("failed to write sub-response"))?;
+                // TODO: Avoid `AssertUnwindSafe` by making the callback `UnwindSafe` once `ExpandDatabase`
+                // becomes unwind-safe (currently blocked by `parking_lot::RwLock` in the VFS).
+                let resp = match catch_unwind(AssertUnwindSafe(|| callback(sr))) {
+                    Ok(Ok(resp)) => BidirectionalMessage::SubResponse(resp),
+                    Ok(Err(err)) => BidirectionalMessage::SubResponse(SubResponse::Cancel {
+                        reason: err.to_string(),
+                    }),
+                    Err(_) => BidirectionalMessage::SubResponse(SubResponse::Cancel {
+                        reason: "callback panicked or was cancelled".into(),
+                    }),
+                };
+
+                let encoded = postcard::encode(&resp).map_err(wrap_encode)?;
+                postcard::write(writer, &encoded)
+                    .map_err(wrap_io("failed to write sub-response"))?;
             }
             _ => {
                 return Err(ServerError {
@@ -87,7 +98,7 @@ pub(crate) fn version_check(
     srv: &ProcMacroServerProcess,
     callback: SubCallback<'_>,
 ) -> Result<u32, ServerError> {
-    let request = BidirectionalMessage::Request(Request::ApiVersionCheck {});
+    let request = BidirectionalMessage::Request(Request::ApiVersionCheck(ApiVersionCheck {}));
 
     let response_payload = run_request(srv, request, callback)?;
 
@@ -124,9 +135,9 @@ pub(crate) fn find_proc_macros(
     dylib_path: &AbsPath,
     callback: SubCallback<'_>,
 ) -> Result<Result<Vec<(String, ProcMacroKind)>, String>, ServerError> {
-    let request = BidirectionalMessage::Request(Request::ListMacros {
+    let request = BidirectionalMessage::Request(Request::ListMacros(ListMacros {
         dylib_path: dylib_path.to_path_buf().into(),
-    });
+    }));
 
     let response_payload = run_request(srv, request, callback)?;
 
@@ -138,6 +149,7 @@ pub(crate) fn find_proc_macros(
 
 pub(crate) fn expand(
     proc_macro: &ProcMacro,
+    process: &ProcMacroServerProcess,
     subtree: tt::SubtreeView<'_>,
     attr: Option<tt::SubtreeView<'_>>,
     env: Vec<(String, String)>,
@@ -147,7 +159,7 @@ pub(crate) fn expand(
     current_dir: String,
     callback: SubCallback<'_>,
 ) -> Result<Result<tt::TopSubtree, String>, crate::ServerError> {
-    let version = proc_macro.process.version();
+    let version = process.version();
     let mut span_data_table = SpanDataIndexMap::default();
     let def_site = span_data_table.insert_full(def_site).0;
     let call_site = span_data_table.insert_full(call_site).0;
@@ -158,13 +170,8 @@ pub(crate) fn expand(
             macro_name: proc_macro.name.to_string(),
             attributes: attr
                 .map(|subtree| FlatTree::from_subtree(subtree, version, &mut span_data_table)),
-            has_global_spans: ExpnGlobals {
-                serialize: version >= version::HAS_GLOBAL_SPANS,
-                def_site,
-                call_site,
-                mixed_site,
-            },
-            span_data_table: if proc_macro.process.rust_analyzer_spans() {
+            has_global_spans: ExpnGlobals { def_site, call_site, mixed_site },
+            span_data_table: if process.rust_analyzer_spans() {
                 serialize_span_data_index_map(&span_data_table)
             } else {
                 Vec::new()
@@ -175,29 +182,16 @@ pub(crate) fn expand(
         current_dir: Some(current_dir),
     })));
 
-    let response_payload = run_request(&proc_macro.process, task, callback)?;
+    let response_payload = run_request(process, task, callback)?;
 
     match response_payload {
         BidirectionalMessage::Response(Response::ExpandMacro(it)) => Ok(it
-            .map(|tree| {
-                let mut expanded = FlatTree::to_subtree_resolved(tree, version, &span_data_table);
-                if proc_macro.needs_fixup_change() {
-                    proc_macro.change_fixup_to_match_old_server(&mut expanded);
-                }
-                expanded
-            })
-            .map_err(|msg| msg.0)),
-        BidirectionalMessage::Response(Response::ExpandMacroExtended(it)) => Ok(it
             .map(|resp| {
-                let mut expanded = FlatTree::to_subtree_resolved(
+                FlatTree::to_subtree_resolved(
                     resp.tree,
                     version,
                     &deserialize_span_data_index_map(&resp.span_data_table),
-                );
-                if proc_macro.needs_fixup_change() {
-                    proc_macro.change_fixup_to_match_old_server(&mut expanded);
-                }
-                expanded
+                )
             })
             .map_err(|msg| msg.0)),
         _ => Err(ServerError { message: "unexpected response".to_owned(), io: None }),
@@ -212,14 +206,7 @@ fn run_request(
     if let Some(err) = srv.exited() {
         return Err(err.clone());
     }
-
-    match srv.use_postcard() {
-        true => srv.run_bidirectional::<PostcardProtocol>(msg, callback),
-        false => Err(ServerError {
-            message: "bidirectional messaging does not support JSON".to_owned(),
-            io: None,
-        }),
-    }
+    srv.run_bidirectional(msg, callback)
 }
 
 pub fn reject_subrequests(req: SubRequest) -> Result<SubResponse, ServerError> {

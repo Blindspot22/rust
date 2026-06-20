@@ -2,7 +2,9 @@ error[E0432]: unresolved import `super::inner::doesnt_exist`
   --> $DIR/diagnostics-same-crate.rs:32:9
    |
 LL |     use super::inner::doesnt_exist;
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^ no `doesnt_exist` in `inner`
+   |         ^^^^^^^^^^^^^^------------
+   |                       |
+   |                       no `doesnt_exist` in `inner`
    |
 note: found an item that was configured out
   --> $DIR/diagnostics-same-crate.rs:11:13
@@ -28,7 +30,7 @@ LL |     #[cfg(false)]
 LL |     pub mod doesnt_exist {
    |             ^^^^^^^^^^^^
 
-error[E0433]: failed to resolve: could not find `doesnt_exist` in `inner`
+error[E0433]: cannot find `doesnt_exist` in `inner`
   --> $DIR/diagnostics-same-crate.rs:53:12
    |
 LL |     inner::doesnt_exist::hello();

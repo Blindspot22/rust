@@ -1,26 +1,22 @@
-//! This module implements some validity checks for attributes.
-//! In particular it verifies that `#[inline]` and `#[repr]` attributes are
-//! attached to items that actually support them and if there are
-//! conflicts between multiple such attributes attached to the same
-//! item.
+//! This module lists attribute targets, with conversions from other types.
 
 use std::fmt::{self, Display};
 
 use rustc_ast::visit::AssocCtxt;
 use rustc_ast::{AssocItemKind, ForeignItemKind, ast};
-use rustc_macros::HashStable_Generic;
+use rustc_macros::StableHash;
 
 use crate::def::DefKind;
 use crate::{Item, ItemKind, TraitItem, TraitItemKind, hir};
 
-#[derive(Copy, Clone, PartialEq, Debug, Eq, HashStable_Generic)]
+#[derive(Copy, Clone, PartialEq, Debug, Eq, StableHash)]
 pub enum GenericParamKind {
     Type,
     Lifetime,
     Const,
 }
 
-#[derive(Copy, Clone, PartialEq, Debug, Eq, HashStable_Generic)]
+#[derive(Copy, Clone, PartialEq, Debug, Eq, StableHash)]
 pub enum MethodKind {
     /// Method in a `trait Trait` block
     Trait {
@@ -33,7 +29,7 @@ pub enum MethodKind {
     Inherent,
 }
 
-#[derive(Copy, Clone, PartialEq, Debug, Eq, HashStable_Generic)]
+#[derive(Copy, Clone, PartialEq, Debug, Eq, StableHash)]
 pub enum Target {
     ExternCrate,
     Use,
@@ -71,6 +67,10 @@ pub enum Target {
     MacroCall,
     Crate,
     Delegation { mac: bool },
+    ForLoop,
+    While,
+    Loop,
+    Break,
 }
 
 impl Display for Target {
@@ -117,7 +117,11 @@ impl Target {
             | Target::MacroCall
             | Target::Crate
             | Target::WherePredicate
-            | Target::Delegation { .. } => false,
+            | Target::Delegation { .. }
+            | Target::Loop
+            | Target::While
+            | Target::ForLoop
+            | Target::Break => false,
         }
     }
 
@@ -136,7 +140,7 @@ impl Target {
             ItemKind::Enum(..) => Target::Enum,
             ItemKind::Struct(..) => Target::Struct,
             ItemKind::Union(..) => Target::Union,
-            ItemKind::Trait(..) => Target::Trait,
+            ItemKind::Trait { .. } => Target::Trait,
             ItemKind::TraitAlias(..) => Target::TraitAlias,
             ItemKind::Impl(imp_) => Target::Impl { of_trait: imp_.of_trait.is_some() },
         }
@@ -148,7 +152,7 @@ impl Target {
             DefKind::ExternCrate => Target::ExternCrate,
             DefKind::Use => Target::Use,
             DefKind::Static { .. } => Target::Static,
-            DefKind::Const => Target::Const,
+            DefKind::Const { .. } => Target::Const,
             DefKind::Fn => Target::Fn,
             DefKind::Macro(..) => Target::MacroDef,
             DefKind::Mod => Target::Mod,
@@ -171,6 +175,7 @@ impl Target {
             ast::ItemKind::Use(..) => Target::Use,
             ast::ItemKind::Static { .. } => Target::Static,
             ast::ItemKind::Const(..) => Target::Const,
+            ast::ItemKind::ConstBlock(..) => Target::Const,
             ast::ItemKind::Fn { .. } => Target::Fn,
             ast::ItemKind::Mod(..) => Target::Mod,
             ast::ItemKind::ForeignMod { .. } => Target::ForeignMod,
@@ -259,6 +264,10 @@ impl Target {
         match &expr.kind {
             ast::ExprKind::Closure(..) | ast::ExprKind::Gen(..) => Self::Closure,
             ast::ExprKind::Paren(e) => Self::from_expr(&e),
+            ast::ExprKind::ForLoop { .. } => Self::ForLoop,
+            ast::ExprKind::Loop(..) => Self::Loop,
+            ast::ExprKind::While(..) => Self::While,
+            ast::ExprKind::Break(..) => Self::Break,
             _ => Self::Expression,
         }
     }
@@ -310,6 +319,10 @@ impl Target {
             Target::MacroCall => "macro call",
             Target::Crate => "crate",
             Target::Delegation { .. } => "delegation",
+            Target::Loop => "loop",
+            Target::ForLoop => "for loop",
+            Target::While => "while loop",
+            Target::Break => "break expression",
         }
     }
 
@@ -361,6 +374,10 @@ impl Target {
             Target::MacroCall => "macro calls",
             Target::Crate => "crates",
             Target::Delegation { .. } => "delegations",
+            Target::ForLoop => "for loops",
+            Target::Loop => "loops",
+            Target::While => "while loops",
+            Target::Break => "break expressions",
         }
     }
 }

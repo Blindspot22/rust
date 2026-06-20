@@ -5,15 +5,16 @@
 extern crate other_crate_privacy2 as codegen;
 
 // has a span but in the other crate
-//~? ERROR `#[eii2]` required, but not found
-//~? ERROR `#[eii3]` required, but not found
+//~? ERROR `#[eii2]` function required, but not found
+//~? ERROR `#[eii3]` function required, but not found
+//~? ERROR `#[eii5]` static required, but not found
 
 #[codegen::eii1]
 fn eii1_impl(x: u64) {
     println!("{x:?}")
 }
 
-#[codegen::eii3] //~ ERROR failed to resolve: could not find `eii3` in `codegen`
+#[codegen::eii3] //~ ERROR cannot find `eii3` in `codegen`
 fn eii3_impl(x: u64) {
     println!("{x:?}")
 }

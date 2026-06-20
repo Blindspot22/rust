@@ -284,6 +284,10 @@ pub(crate) fn set_comdat(llmod: &Module, llglobal: &Value, name: &CStr) {
     }
 }
 
+pub(crate) fn count_params(llfn: &Value) -> c_uint {
+    LLVMCountParams(llfn)
+}
+
 /// Safe wrapper around `LLVMGetParam`, because segfaults are no fun.
 pub(crate) fn get_param(llfn: &Value, index: c_uint) -> &Value {
     unsafe {
@@ -317,6 +321,14 @@ impl Intrinsic {
     pub(crate) fn lookup(name: &[u8]) -> Option<Self> {
         let id = unsafe { LLVMLookupIntrinsicID(name.as_c_char_ptr(), name.len()) };
         NonZero::new(id).map(|id| Self { id })
+    }
+
+    pub(crate) fn is_overloaded(self) -> bool {
+        unsafe { LLVMIntrinsicIsOverloaded(self.id).is_true() }
+    }
+
+    pub(crate) fn is_target_specific(self) -> bool {
+        unsafe { LLVMRustIsTargetIntrinsic(self.id) }
     }
 
     pub(crate) fn get_declaration<'ll>(

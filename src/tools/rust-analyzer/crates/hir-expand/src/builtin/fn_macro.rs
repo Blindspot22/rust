@@ -5,10 +5,7 @@ use std::borrow::Cow;
 use base_db::AnchoredPath;
 use cfg::CfgExpr;
 use either::Either;
-use intern::{
-    Symbol,
-    sym::{self},
-};
+use intern::{Symbol, sym};
 use itertools::Itertools;
 use mbe::{DelimiterKind, expect_fragment};
 use span::{Edition, FileId, Span};
@@ -140,6 +137,7 @@ register_builtin! {
     (const_format_args, ConstFormatArgs) => format_args_expand,
     (format_args_nl, FormatArgsNl) => format_args_nl_expand,
     (quote, Quote) => quote_expand,
+    (pattern_type, PatternType) => pattern_type_expand,
 
     EagerExpander:
     (compile_error, CompileError) => compile_error_expand,
@@ -360,7 +358,7 @@ fn cfg_select_expand(
     tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    let loc = db.lookup_intern_macro_call(id);
+    let loc = id.loc(db);
     let cfg_options = loc.krate.cfg_options(db);
 
     let mut iter = tt.iter();
@@ -384,16 +382,40 @@ fn cfg_select_expand(
                 );
             }
         }
-        let expand_to_if_active = match iter.next() {
-            Some(tt::TtElement::Subtree(_, tt)) => tt.remaining(),
-            _ => {
+        let expand_to_if_active = match iter.peek() {
+            Some(tt::TtElement::Subtree(sub, tt)) if sub.delimiter.kind == DelimiterKind::Brace => {
+                iter.next();
+                tt.remaining()
+            }
+            None | Some(TtElement::Leaf(tt::Leaf::Punct(tt::Punct { char: ',', .. }))) => {
                 let err_span = iter.peek().map(|it| it.first_span()).unwrap_or(span);
+                iter.next();
                 return ExpandResult::new(
                     tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
                     ExpandError::other(err_span, "expected a token tree after `=>`"),
                 );
             }
+            Some(_) => {
+                let expr = expect_fragment(
+                    db,
+                    &mut iter,
+                    parser::PrefixEntryPoint::Expr,
+                    tt.top_subtree().delimiter.delim_span(),
+                );
+                if let Some(err) = expr.err {
+                    return ExpandResult::new(
+                        tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
+                        err.into(),
+                    );
+                }
+                expr.value
+            }
         };
+        if let Some(TtElement::Leaf(tt::Leaf::Punct(p))) = iter.peek()
+            && p.char == ','
+        {
+            iter.next();
+        }
 
         if expand_to.is_none() && active {
             expand_to = Some(expand_to_if_active);
@@ -425,7 +447,7 @@ fn cfg_expand(
     tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    let loc = db.lookup_intern_macro_call(id);
+    let loc = id.loc(db);
     let expr = CfgExpr::parse(tt);
     let enabled = loc.krate.cfg_options(db).check(&expr) != Some(false);
     let expanded = if enabled { quote!(span=>true) } else { quote!(span=>false) };
@@ -497,7 +519,7 @@ fn use_panic_2021(db: &dyn ExpandDatabase, span: Span) -> bool {
         let Some(expn) = span.ctx.outer_expn(db) else {
             break false;
         };
-        let expn = db.lookup_intern_macro_call(expn.into());
+        let expn = crate::MacroCallId::from(expn).loc(db);
         // FIXME: Record allow_internal_unstable in the macro def (not been done yet because it
         // would consume quite a bit extra memory for all call locs...)
         // if let Some(features) = expn.def.allow_internal_unstable {
@@ -743,7 +765,7 @@ fn relative_file(
     allow_recursion: bool,
     err_span: Span,
 ) -> Result<EditionedFileId, ExpandError> {
-    let lookup = db.lookup_intern_macro_call(call_id);
+    let lookup = call_id.loc(db);
     let call_site = lookup.kind.file_id().original_file_respecting_includes(db).file_id(db);
     let path = AnchoredPath { anchor: call_site, path: path_str };
     let res: FileId = db
@@ -753,7 +775,7 @@ fn relative_file(
     if res == call_site && !allow_recursion {
         Err(ExpandError::other(err_span, format!("recursive inclusion of `{path_str}`")))
     } else {
-        Ok(EditionedFileId::new(db, res, lookup.krate.data(db).edition, lookup.krate))
+        Ok(EditionedFileId::new(db, res, lookup.krate.data(db).edition))
     }
 }
 
@@ -807,7 +829,7 @@ fn include_expand(
     let span_map = db.real_span_map(editioned_file_id);
     // FIXME: Parse errors
     ExpandResult::ok(syntax_node_to_token_tree(
-        &db.parse(editioned_file_id).syntax_node(),
+        &editioned_file_id.parse(db).syntax_node(),
         SpanMap::RealSpanMap(span_map),
         span,
         syntax_bridge::DocCommentDesugarMode::ProcMacro,
@@ -830,15 +852,10 @@ fn include_bytes_expand(
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
     // FIXME: actually read the file here if the user asked for macro expansion
-    let res = tt::TopSubtree::invisible_from_leaves(
-        span,
-        [tt::Leaf::Literal(tt::Literal {
-            text_and_suffix: Symbol::empty(),
-            span,
-            kind: tt::LitKind::ByteStrRaw(1),
-            suffix_len: 0,
-        })],
-    );
+    let pound = mk_pound(span);
+    let res = quote! {span =>
+        builtin #pound include_bytes
+    };
     ExpandResult::ok(res)
 }
 
@@ -876,7 +893,7 @@ fn include_str_expand(
 }
 
 fn get_env_inner(db: &dyn ExpandDatabase, arg_id: MacroCallId, key: &Symbol) -> Option<String> {
-    let krate = db.lookup_intern_macro_call(arg_id).krate;
+    let krate = arg_id.loc(db).krate;
     krate.env(db).get(key.as_str())
 }
 
@@ -969,4 +986,16 @@ fn unescape_str(s: &str) -> Cow<'_, str> {
     } else {
         Cow::Borrowed(s)
     }
+}
+
+fn pattern_type_expand(
+    _db: &dyn ExpandDatabase,
+    _arg_id: MacroCallId,
+    tt: &tt::TopSubtree,
+    call_site: Span,
+) -> ExpandResult<tt::TopSubtree> {
+    let mut tt = tt.clone();
+    tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Invisible);
+    let pound = mk_pound(call_site);
+    ExpandResult::ok(quote! {call_site => builtin #pound pattern_type ( #tt ) })
 }

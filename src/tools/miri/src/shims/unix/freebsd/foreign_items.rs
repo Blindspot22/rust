@@ -75,6 +75,12 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let set_size = this.read_target_usize(set_size)?; // measured in bytes
                 let mask = this.read_pointer(mask)?;
 
+                if this.machine.thread_cpu_affinity.is_none() {
+                    throw_unsup_format!(
+                        "`cpuset_getaffinity` is not supported on #![no_core] programs"
+                    )
+                }
+
                 let _level_root = this.eval_libc_i32("CPU_LEVEL_ROOT");
                 let _level_cpuset = this.eval_libc_i32("CPU_LEVEL_CPUSET");
                 let level_which = this.eval_libc_i32("CPU_LEVEL_WHICH");
@@ -96,7 +102,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 };
 
                 if this.ptr_is_null(mask)? {
-                    this.set_last_error_and_return(LibcError("EFAULT"), dest)?;
+                    this.set_errno_and_return_neg1(LibcError("EFAULT"), dest)?;
                 }
                 // We only support CPU_LEVEL_WHICH and CPU_WHICH_PID for now.
                 // This is the bare minimum to make the tests pass.
@@ -104,14 +110,16 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     throw_unsup_format!(
                         "`cpuset_getaffinity` is only supported with `level` set to CPU_LEVEL_WHICH and `which` set to CPU_WHICH_PID."
                     );
-                } else if let Some(cpuset) = this.machine.thread_cpu_affinity.get(&id) {
+                } else if let Some(cpuset) =
+                    this.machine.thread_cpu_affinity.as_ref().unwrap().get(&id)
+                {
                     // `cpusetsize` must be large enough to contain the entire CPU mask.
                     // FreeBSD only uses `cpusetsize` to verify that it's sufficient for the kernel's CPU mask.
                     // If it's too small, the syscall returns ERANGE.
                     // If it's large enough, copying the kernel mask to user space is safe, regardless of the actual size.
                     // See https://github.com/freebsd/freebsd-src/blob/909aa6781340f8c0b4ae01c6366bf1556ee2d1be/sys/kern/kern_cpuset.c#L1985
                     if set_size < u64::from(this.machine.num_cpus).div_ceil(8) {
-                        this.set_last_error_and_return(LibcError("ERANGE"), dest)?;
+                        this.set_errno_and_return_neg1(LibcError("ERANGE"), dest)?;
                     } else {
                         let cpuset = cpuset.clone();
                         let byte_count =
@@ -136,14 +144,12 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
 
             // File related shims
-            // For those, we both intercept `func` and `call@FBSD_1.0` symbols cases
-            // since freebsd 12 the former form can be expected.
-            "stat" | "stat@FBSD_1.0" => {
+            "stat@FBSD_1.0" => {
                 let [path, buf] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let result = this.stat(path, buf)?;
                 this.write_scalar(result, dest)?;
             }
-            "lstat" | "lstat@FBSD_1.0" => {
+            "lstat@FBSD_1.0" => {
                 let [path, buf] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let result = this.lstat(path, buf)?;
                 this.write_scalar(result, dest)?;
@@ -153,16 +159,28 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let result = this.fstat(fd, buf)?;
                 this.write_scalar(result, dest)?;
             }
-            "readdir" | "readdir@FBSD_1.0" => {
+            "readdir@FBSD_1.0" => {
                 let [dirp] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
-                let result = this.readdir64("dirent", dirp)?;
-                this.write_scalar(result, dest)?;
+                this.readdir(dirp, dest)?;
             }
             // Miscellaneous
             "__error" => {
                 let [] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
                 let errno_place = this.last_error_place()?;
                 this.write_scalar(errno_place.to_ref(this).to_scalar(), dest)?;
+            }
+            "__xuname" => {
+                // FreeBSD uses __xuname under the hood to implement uname, see:
+                // https://github.com/freebsd/freebsd-src/blob/3542d60fb8042474f66fbf2d779ed8c5a80d0f78/sys/sys/utsname.h#L64
+                // https://github.com/freebsd/freebsd-src/blob/3542d60fb8042474f66fbf2d779ed8c5a80d0f78/lib/libc/gen/uname.c#L44
+                let [size, uname] = this.check_shim_sig(
+                    shim_sig!(extern "C" fn(i32, *mut _) -> i32),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                let result = this.uname(uname, Some(size))?;
+                this.write_scalar(result, dest)?;
             }
 
             // Incomplete shims that we "stub out" just to get pre-main initialization code to work.

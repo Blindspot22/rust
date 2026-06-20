@@ -1,5 +1,5 @@
 /*
- * TODO(antoyo): implement equality in libgccjit based on https://zpz.github.io/blog/overloading-equality-operator-in-cpp-class-hierarchy/ (for type equality?)
+ * FIXME(antoyo): implement equality in libgccjit based on https://zpz.github.io/blog/overloading-equality-operator-in-cpp-class-hierarchy/ (for type equality?)
  * For Thin LTO, this might be helpful:
 // cspell:disable-next-line
  * In gcc 4.6 -fwhopr was removed and became default with -flto. The non-whopr path can still be executed via -flto-partition=none.
@@ -8,9 +8,9 @@
  * Maybe some missing optimizations enabled by rustc's LTO is in there: https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
 // cspell:disable-next-line
  * Like -fipa-icf (should be already enabled) and maybe -fdevirtualize-at-ltrans.
- * TODO: disable debug info always being emitted. Perhaps this slows down things?
+ * FIXME: disable debug info always being emitted. Perhaps this slows down things?
  *
- * TODO(antoyo): remove the patches.
+ * FIXME(antoyo): remove the patches.
  */
 
 #![feature(rustc_private)]
@@ -19,6 +19,7 @@
 #![warn(unused_lifetimes)]
 #![deny(clippy::pattern_type_mismatch)]
 #![expect(clippy::uninlined_format_args)]
+#![allow(clippy::collapsible_match)]
 
 // The rustc crates we need
 extern crate rustc_abi;
@@ -27,10 +28,8 @@ extern crate rustc_ast;
 extern crate rustc_codegen_ssa;
 extern crate rustc_data_structures;
 extern crate rustc_errors;
-extern crate rustc_fluent_macro;
 extern crate rustc_fs_util;
 extern crate rustc_hir;
-extern crate rustc_index;
 #[cfg(feature = "master")]
 extern crate rustc_interface;
 extern crate rustc_log;
@@ -77,35 +76,32 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use back::lto::{ThinBuffer, ThinData};
 use gccjit::{CType, Context, OptimizationLevel};
 #[cfg(feature = "master")]
 use gccjit::{TargetInfo, Version};
 use rustc_ast::expand::allocator::AllocatorMethod;
-use rustc_codegen_ssa::back::lto::{SerializedModule, ThinModule};
+use rustc_codegen_ssa::back::lto::ThinModule;
 use rustc_codegen_ssa::back::write::{
-    CodegenContext, FatLtoInput, ModuleConfig, TargetMachineFactoryFn,
+    CodegenContext, FatLtoInput, ModuleConfig, SharedEmitter, TargetMachineFactoryFn, ThinLtoInput,
 };
 use rustc_codegen_ssa::base::codegen_crate;
 use rustc_codegen_ssa::target_features::cfg_target_feature;
 use rustc_codegen_ssa::traits::{CodegenBackend, ExtraBackendMethods, WriteBackendMethods};
-use rustc_codegen_ssa::{CodegenResults, CompiledModule, ModuleCodegen, TargetConfig};
-use rustc_data_structures::fx::FxIndexMap;
+use rustc_codegen_ssa::{CompiledModule, CompiledModules, CrateInfo, ModuleCodegen, TargetConfig};
+use rustc_data_structures::profiling::SelfProfilerRef;
 use rustc_data_structures::sync::IntoDynSyncSend;
-use rustc_errors::DiagCtxtHandle;
-use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
+use rustc_errors::{DiagCtxt, DiagCtxtHandle};
+use rustc_middle::dep_graph::{WorkProduct, WorkProductMap};
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::util::Providers;
 use rustc_session::Session;
 use rustc_session::config::{OptLevel, OutputFilenames};
-use rustc_span::Symbol;
+use rustc_span::{Symbol, sym};
 use rustc_target::spec::{Arch, RelocModel};
 use tempfile::TempDir;
 
 use crate::back::lto::ModuleBuffer;
 use crate::gcc_util::{target_cpu, to_gcc_features};
-
-rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
 
 pub struct PrintOnPanic<F: Fn() -> String>(pub F);
 
@@ -179,8 +175,6 @@ pub struct GccCodegenBackend {
     lto_supported: Arc<AtomicBool>,
 }
 
-static LTO_SUPPORTED: AtomicBool = AtomicBool::new(false);
-
 fn load_libgccjit_if_needed(libgccjit_target_lib_file: &Path) {
     if gccjit::is_loaded() {
         // Do not load a libgccjit second time.
@@ -197,10 +191,6 @@ fn load_libgccjit_if_needed(libgccjit_target_lib_file: &Path) {
 }
 
 impl CodegenBackend for GccCodegenBackend {
-    fn locale_resource(&self) -> &'static str {
-        crate::DEFAULT_LOCALE_RESOURCE
-    }
-
     fn name(&self) -> &'static str {
         "gcc"
     }
@@ -240,6 +230,8 @@ impl CodegenBackend for GccCodegenBackend {
 
         #[cfg(feature = "master")]
         {
+            gccjit::set_lang_name(c"GNU Rust");
+
             let target_cpu = target_cpu(sess);
 
             // Get the second TargetInfo with the correct CPU features by setting the arch.
@@ -255,7 +247,6 @@ impl CodegenBackend for GccCodegenBackend {
         #[cfg(feature = "master")]
         {
             let lto_supported = gccjit::is_lto_supported();
-            LTO_SUPPORTED.store(lto_supported, Ordering::SeqCst);
             self.lto_supported.store(lto_supported, Ordering::SeqCst);
 
             gccjit::set_global_personality_function_name(b"rust_eh_personality\0");
@@ -285,16 +276,21 @@ impl CodegenBackend for GccCodegenBackend {
         }
     }
 
+    fn thin_lto_supported(&self) -> bool {
+        false
+    }
+
     fn provide(&self, providers: &mut Providers) {
         providers.queries.global_backend_features =
             |tcx, ()| gcc_util::global_gcc_features(tcx.sess)
     }
 
-    fn codegen_crate(&self, tcx: TyCtxt<'_>) -> Box<dyn Any> {
-        let target_cpu = target_cpu(tcx.sess);
-        let res = codegen_crate(self.clone(), tcx, target_cpu.to_string());
+    fn target_cpu(&self, sess: &Session) -> String {
+        target_cpu(sess).to_owned()
+    }
 
-        Box::new(res)
+    fn codegen_crate(&self, tcx: TyCtxt<'_>) -> Box<dyn Any> {
+        Box::new(codegen_crate(self.clone(), tcx))
     }
 
     fn join_codegen(
@@ -302,15 +298,20 @@ impl CodegenBackend for GccCodegenBackend {
         ongoing_codegen: Box<dyn Any>,
         sess: &Session,
         _outputs: &OutputFilenames,
-    ) -> (CodegenResults, FxIndexMap<WorkProductId, WorkProduct>) {
+        crate_info: &CrateInfo,
+    ) -> (CompiledModules, WorkProductMap) {
         ongoing_codegen
             .downcast::<rustc_codegen_ssa::back::write::OngoingCodegen<GccCodegenBackend>>()
             .expect("Expected GccCodegenBackend's OngoingCodegen, found Box<Any>")
-            .join(sess)
+            .join(sess, crate_info)
     }
 
     fn target_config(&self, sess: &Session) -> TargetConfig {
         target_config(sess, &self.target_info)
+    }
+
+    fn fallback_intrinsics(&self) -> Vec<Symbol> {
+        vec![sym::type_id_eq]
     }
 }
 
@@ -330,15 +331,13 @@ fn new_context<'gcc, 'tcx>(tcx: TyCtxt<'tcx>) -> Context<'gcc> {
             version,
         ));
     }
-    // TODO(antoyo): check if this should only be added when using -Cforce-unwind-tables=n.
+    // FIXME(antoyo): check if this should only be added when using -Cforce-unwind-tables=n.
     context.add_command_line_option("-fno-asynchronous-unwind-tables");
     context
 }
 
 impl ExtraBackendMethods for GccCodegenBackend {
-    fn supports_parallel(&self) -> bool {
-        false
-    }
+    type Module = GccContext;
 
     fn codegen_allocator(
         &self,
@@ -372,16 +371,6 @@ impl ExtraBackendMethods for GccCodegenBackend {
             self.target_info.clone(),
             self.lto_supported.load(Ordering::SeqCst),
         )
-    }
-
-    fn target_machine_factory(
-        &self,
-        _sess: &Session,
-        _opt_level: OptLevel,
-        _features: &[String],
-    ) -> TargetMachineFactoryFn<Self> {
-        // TODO(antoyo): set opt level.
-        Arc::new(|_| Ok(()))
     }
 }
 
@@ -428,69 +417,81 @@ unsafe impl Sync for SyncContext {}
 impl WriteBackendMethods for GccCodegenBackend {
     type Module = GccContext;
     type TargetMachine = ();
-    type TargetMachineError = ();
     type ModuleBuffer = ModuleBuffer;
-    type ThinData = ThinData;
-    type ThinBuffer = ThinBuffer;
+    type ThinData = ();
 
-    fn run_and_optimize_fat_lto(
-        cgcx: &CodegenContext<Self>,
+    fn supports_parallel(&self) -> bool {
+        false
+    }
+
+    fn target_machine_factory(
+        &self,
+        _sess: &Session,
+        _opt_level: OptLevel,
+        _features: &[String],
+    ) -> TargetMachineFactoryFn<Self> {
+        // FIXME(antoyo): set opt level.
+        Arc::new(|_, _| ())
+    }
+
+    fn optimize_and_codegen_fat_lto(
+        sess: &Session,
+        cgcx: &CodegenContext,
+        shared_emitter: &SharedEmitter,
+        _tm_factory: TargetMachineFactoryFn<Self>,
         // FIXME(bjorn3): Limit LTO exports to these symbols
         _exported_symbols_for_lto: &[String],
         each_linked_rlib_for_lto: &[PathBuf],
         modules: Vec<FatLtoInput<Self>>,
-    ) -> ModuleCodegen<Self::Module> {
-        back::lto::run_fat(cgcx, each_linked_rlib_for_lto, modules)
+    ) -> CompiledModule {
+        back::lto::run_fat(cgcx, &sess.prof, shared_emitter, each_linked_rlib_for_lto, modules)
     }
 
     fn run_thin_lto(
-        cgcx: &CodegenContext<Self>,
+        _cgcx: &CodegenContext,
+        _prof: &SelfProfilerRef,
+        _dcx: DiagCtxtHandle<'_>,
         // FIXME(bjorn3): Limit LTO exports to these symbols
         _exported_symbols_for_lto: &[String],
-        each_linked_rlib_for_lto: &[PathBuf],
-        modules: Vec<(String, Self::ThinBuffer)>,
-        cached_modules: Vec<(SerializedModule<Self::ModuleBuffer>, WorkProduct)>,
+        _each_linked_rlib_for_lto: &[PathBuf],
+        _modules: Vec<ThinLtoInput<Self>>,
     ) -> (Vec<ThinModule<Self>>, Vec<WorkProduct>) {
-        back::lto::run_thin(cgcx, each_linked_rlib_for_lto, modules, cached_modules)
-    }
-
-    fn print_pass_timings(&self) {
-        unimplemented!();
-    }
-
-    fn print_statistics(&self) {
-        unimplemented!()
+        unreachable!()
     }
 
     fn optimize(
-        _cgcx: &CodegenContext<Self>,
-        _dcx: DiagCtxtHandle<'_>,
+        _cgcx: &CodegenContext,
+        _prof: &SelfProfilerRef,
+        _shared_emitter: &SharedEmitter,
         module: &mut ModuleCodegen<Self::Module>,
         config: &ModuleConfig,
     ) {
         module.module_llvm.context.set_optimization_level(to_gcc_opt_level(config.opt_level));
     }
 
-    fn optimize_thin(
-        cgcx: &CodegenContext<Self>,
-        thin: ThinModule<Self>,
-    ) -> ModuleCodegen<Self::Module> {
-        back::lto::optimize_thin_module(thin, cgcx)
+    fn optimize_and_codegen_thin(
+        _cgcx: &CodegenContext,
+        _prof: &SelfProfilerRef,
+        _shared_emitter: &SharedEmitter,
+        _tm_factory: TargetMachineFactoryFn<Self>,
+        _thin: ThinModule<Self>,
+    ) -> CompiledModule {
+        unreachable!()
     }
 
     fn codegen(
-        cgcx: &CodegenContext<Self>,
+        cgcx: &CodegenContext,
+        prof: &SelfProfilerRef,
+        shared_emitter: &SharedEmitter,
         module: ModuleCodegen<Self::Module>,
         config: &ModuleConfig,
     ) -> CompiledModule {
-        back::write::codegen(cgcx, module, config)
+        let dcx = DiagCtxt::new(Box::new(shared_emitter.clone()));
+        let dcx = dcx.handle();
+        back::write::codegen(cgcx, prof, dcx, module, config)
     }
 
-    fn prepare_thin(module: ModuleCodegen<Self::Module>) -> (String, Self::ThinBuffer) {
-        back::lto::prepare_thin(module)
-    }
-
-    fn serialize_module(_module: ModuleCodegen<Self::Module>) -> (String, Self::ModuleBuffer) {
+    fn serialize_module(_module: Self::Module, _is_thin: bool) -> Self::ModuleBuffer {
         unimplemented!();
     }
 }
@@ -534,7 +535,7 @@ fn target_config(sess: &Session, target_info: &LockedTargetInfo) -> TargetConfig
         sess,
         |feature| to_gcc_features(sess, feature),
         |feature| {
-            // TODO: we disable Neon for now since we don't support the LLVM intrinsics for it.
+            // FIXME: we disable Neon for now since we don't support the LLVM intrinsics for it.
             if feature == "neon" {
                 return false;
             }

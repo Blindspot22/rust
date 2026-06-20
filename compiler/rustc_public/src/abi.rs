@@ -188,8 +188,25 @@ pub enum VariantsShape {
         tag: Scalar,
         tag_encoding: TagEncoding,
         tag_field: usize,
-        variants: Vec<LayoutShape>,
+        variants: Vec<VariantFields>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+pub struct VariantFields {
+    /// Offsets for the first byte of each field,
+    /// ordered to match the source definition order.
+    /// I.e.: It follows the same order as [super::ty::VariantDef::fields()].
+    /// This vector does not go in increasing order.
+    pub offsets: Vec<Size>,
+}
+
+impl VariantFields {
+    pub fn fields_by_offset_order(&self) -> Vec<FieldIdx> {
+        let mut indices = (0..self.offsets.len()).collect::<Vec<_>>();
+        indices.sort_by_key(|idx| self.offsets[*idx]);
+        indices
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
@@ -215,6 +232,10 @@ pub enum TagEncoding {
     },
 }
 
+/// How many scalable vectors are in a `ValueAbi::ScalableVector`?
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+pub struct NumScalableVectors(pub(crate) u8);
+
 /// Describes how values of the type are passed by target ABIs,
 /// in terms of categories of C types there are ABI rules for.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
@@ -228,6 +249,7 @@ pub enum ValueAbi {
     ScalableVector {
         element: Scalar,
         count: u64,
+        number_of_vectors: NumScalableVectors,
     },
     Aggregate {
         /// If true, the size is exact, otherwise it's only a lower bound.
@@ -432,8 +454,12 @@ pub enum CallConvention {
     Cold,
     PreserveMost,
     PreserveAll,
+    PreserveNone,
+    Tail,
 
     Custom,
+
+    Swift,
 
     // Target-specific calling conventions.
     ArmAapcs,

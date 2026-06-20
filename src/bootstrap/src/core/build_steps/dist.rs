@@ -27,10 +27,10 @@ use crate::core::build_steps::gcc::GccTargetPair;
 use crate::core::build_steps::tool::{
     self, RustcPrivateCompilers, ToolTargetBuildMode, get_tool_target_compiler,
 };
-use crate::core::build_steps::vendor::{VENDOR_DIR, Vendor};
+use crate::core::build_steps::vendor::Vendor;
 use crate::core::build_steps::{compile, llvm};
 use crate::core::builder::{Builder, Kind, RunConfig, ShouldRun, Step, StepMetadata};
-use crate::core::config::TargetSelection;
+use crate::core::config::{GccCiMode, TargetSelection};
 use crate::utils::build_stamp::{self, BuildStamp};
 use crate::utils::channel::{self, Info};
 use crate::utils::exec::{BootstrapCommand, command};
@@ -86,6 +86,12 @@ impl Step for Docs {
         // documentation, rather than running all default steps and then read their output
         // from a shared directory.
         builder.run_default_doc_steps();
+
+        // In case no default doc steps are run for host, it is possible that `<host>/doc` directory
+        // is never created.
+        if !builder.config.dry_run() {
+            t!(fs::create_dir_all(builder.doc_out(host)));
+        }
 
         let dest = "share/doc/rust/html";
 
@@ -630,9 +636,9 @@ impl Step for Rustc {
                 let page_src = file_entry.path();
                 let page_dst = man_dst.join(file_entry.file_name());
                 let src_text = t!(std::fs::read_to_string(&page_src));
-                let new_text = src_text.replace("<INSERT VERSION HERE>", &builder.version);
+                let version = builder.rust_info().version(builder.build, &builder.version);
+                let new_text = src_text.replace("<INSERT VERSION HERE>", &version);
                 t!(std::fs::write(&page_dst, &new_text));
-                t!(fs::copy(&page_src, &page_dst));
             }
 
             // Debugger scripts
@@ -754,7 +760,6 @@ impl Step for DebuggerScripts {
 
         cp_debugger_script("lldb_lookup.py");
         cp_debugger_script("lldb_providers.py");
-        cp_debugger_script("lldb_commands")
     }
 }
 
@@ -1008,7 +1013,7 @@ impl Step for Analysis {
         let src = builder
             .stage_out(compiler, Mode::Std)
             .join(target)
-            .join(builder.cargo_dir())
+            .join(builder.cargo_dir(Mode::Std))
             .join("deps")
             .join("save-analysis");
 
@@ -1205,6 +1210,19 @@ impl Step for Src {
             &dst_src,
         );
 
+        // Vendor all Cargo dependencies
+        let vendor = builder.ensure(Vendor {
+            sync_args: vec![],
+            versioned_dirs: true,
+            root_dir: dst_src.clone(),
+            output_dir: None,
+            only_library_workspace: true,
+        });
+
+        let library_cargo_config_dir = dst_src.join("library").join(".cargo");
+        builder.create_dir(&library_cargo_config_dir);
+        builder.create(&library_cargo_config_dir.join("config.toml"), &vendor.config_library);
+
         tarball.generate()
     }
 
@@ -1370,12 +1388,17 @@ fn prepare_source_tarball<'a>(
             sync_args: pkgs_for_pgo_training.collect(),
             versioned_dirs: true,
             root_dir: plain_dst_src.into(),
-            output_dir: VENDOR_DIR.into(),
+            output_dir: None,
+            only_library_workspace: false,
         });
 
         let cargo_config_dir = plain_dst_src.join(".cargo");
         builder.create_dir(&cargo_config_dir);
         builder.create(&cargo_config_dir.join("config.toml"), &vendor.config);
+
+        let library_cargo_config_dir = plain_dst_src.join("library").join(".cargo");
+        builder.create_dir(&library_cargo_config_dir);
+        builder.create(&library_cargo_config_dir.join("config.toml"), &vendor.config_library);
     }
 
     // Delete extraneous directories
@@ -2489,6 +2512,25 @@ fn maybe_install_llvm(
         let llvm_dylib_path = src_libdir.join("libLLVM.dylib");
         if llvm_dylib_path.exists() {
             builder.install(&llvm_dylib_path, dst_libdir, FileType::NativeLibrary);
+
+            if install_symlink && let Some(llvm_config_path) = &builder.llvm_config(target) {
+                let major = llvm::get_llvm_version_major(builder, llvm_config_path);
+                let versioned_name = match &builder.config.llvm_version_suffix {
+                    Some(version_suffix) => format!("libLLVM-{major}{version_suffix}.dylib"),
+                    None => {
+                        // dev builds use `-rust-dev`, while release-channel builds include the Rust version.
+                        if builder.config.channel == "dev" {
+                            format!("libLLVM-{major}-rust-dev.dylib")
+                        } else {
+                            format!(
+                                "libLLVM-{major}-rust-{}-{}.dylib",
+                                builder.version, builder.config.channel
+                            )
+                        }
+                    }
+                };
+                t!(builder.symlink_file("libLLVM.dylib", dst_libdir.join(versioned_name)));
+            }
         }
         !builder.config.dry_run()
     } else if let llvm::LlvmBuildStatus::AlreadyBuilt(llvm::LlvmResult {
@@ -2557,12 +2599,20 @@ pub fn maybe_install_llvm_target(builder: &Builder<'_>, target: TargetSelection,
     ),
 )]
 pub fn maybe_install_llvm_runtime(builder: &Builder<'_>, target: TargetSelection, sysroot: &Path) {
-    let dst_libdir = sysroot.join(builder.sysroot_libdir_relative(Compiler::new(1, target)));
+    let dst_libdir = sysroot.join(builder.libdir_relative(Compiler::new(1, target)));
     // We do not need to copy LLVM files into the sysroot if it is not
     // dynamically linked; it is already included into librustc_llvm
     // statically.
     if builder.llvm_link_shared() {
         maybe_install_llvm(builder, target, &dst_libdir, false);
+
+        // To workaround lack of rpath on Windows, we bundle another copy of
+        // the LLVM DLL to make rust-lld and llvm-tools work when `sysroot/bin`
+        //  is missing from PATH, i.e. when they not launched by rustc.
+        if target.triple.contains("windows") {
+            let dst_libdir = sysroot.join("lib/rustlib").join(target).join("bin");
+            maybe_install_llvm(builder, target, &dst_libdir, false);
+        }
     }
 }
 
@@ -2712,6 +2762,55 @@ impl Step for LlvmBitcodeLinker {
         tarball.is_preview(true);
 
         tarball.add_file(&llbc_linker.tool_path, self_contained_bin_dir, FileType::Executable);
+
+        Some(tarball.generate())
+    }
+}
+
+/// Distributes the `enzyme` library so that it can be used by a compiler whose host
+/// is `target`.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct Enzyme {
+    /// Enzyme will by usable by rustc on this host.
+    pub target: TargetSelection,
+}
+
+impl Step for Enzyme {
+    type Output = Option<GeneratedTarball>;
+    const IS_HOST: bool = true;
+
+    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
+        run.alias("enzyme")
+    }
+
+    fn is_default_step(builder: &Builder<'_>) -> bool {
+        builder.config.llvm_enzyme
+    }
+
+    fn make_run(run: RunConfig<'_>) {
+        run.builder.ensure(Enzyme { target: run.target });
+    }
+
+    fn run(self, builder: &Builder<'_>) -> Option<GeneratedTarball> {
+        // This prevents Enzyme from being built for "dist"
+        // or "install" on the stable/beta channels. It is not yet stable and
+        // should not be included.
+        if !builder.build.unstable_features() {
+            return None;
+        }
+
+        let target = self.target;
+
+        let enzyme = builder.ensure(llvm::Enzyme { target });
+
+        let target_libdir = format!("lib/rustlib/{}/lib", target.triple);
+
+        // Prepare the image directory
+        let mut tarball = Tarball::new(builder, "enzyme", &target.triple);
+        tarball.set_overlay(OverlayKind::Enzyme);
+        tarball.is_preview(true);
+
+        tarball.add_file(enzyme.enzyme_path(), target_libdir, FileType::NativeLibrary);
 
         Some(tarball.generate())
     }
@@ -3033,6 +3132,14 @@ impl Step for Gcc {
         if host != "x86_64-unknown-linux-gnu" {
             builder.info(&format!("host target `{host}` not supported by gcc. skipping"));
             return None;
+        }
+
+        if builder.config.is_running_on_ci() {
+            assert_eq!(
+                builder.config.gcc_ci_mode,
+                GccCiMode::BuildLocally,
+                "Cannot use gcc.download-ci-gcc when distributing GCC on CI"
+            );
         }
 
         // We need the GCC sources to build GCC and also to add its license and README

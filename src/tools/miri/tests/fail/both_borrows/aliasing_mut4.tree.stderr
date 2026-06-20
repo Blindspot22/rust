@@ -2,7 +2,7 @@ error: Undefined Behavior: write access through <TAG> at ALLOC[0x0] is forbidden
   --> RUSTLIB/core/src/mem/mod.rs:LL:CC
    |
 LL |         crate::intrinsics::write_via_move(dest, src);
-   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ Undefined Behavior occurred here
+   |                                                 ^^^ Undefined Behavior occurred here
    |
    = help: this indicates a potential bug in the program: it performed an invalid operation, but the Tree Borrows rules it violated are still experimental
    = help: see https://github.com/rust-lang/unsafe-code-guidelines/blob/master/wip/tree-borrows.md for further information
@@ -20,11 +20,11 @@ help: the protected tag <TAG> was created here, in the initial state Frozen
 LL | fn safe(x: &i32, y: &mut Cell<i32>) {
    |         ^
    = note: stack backtrace:
-           0: std::mem::replace
+           0: std::mem::replace::<i32>
                at RUSTLIB/core/src/mem/mod.rs:LL:CC
-           1: std::cell::Cell::replace
+           1: std::cell::Cell::<i32>::replace
                at RUSTLIB/core/src/cell.rs:LL:CC
-           2: std::cell::Cell::set
+           2: std::cell::Cell::<i32>::set
                at RUSTLIB/core/src/cell.rs:LL:CC
            3: safe
                at tests/fail/both_borrows/aliasing_mut4.rs:LL:CC

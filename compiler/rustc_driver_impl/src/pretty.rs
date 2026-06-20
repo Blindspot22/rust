@@ -2,18 +2,21 @@
 
 use std::cell::Cell;
 use std::fmt::Write;
+use std::fs::File;
+use std::io;
 
+use rustc_ast as ast;
 use rustc_ast_pretty::pprust as pprust_ast;
+use rustc_hir_pretty as pprust_hir;
 use rustc_middle::bug;
 use rustc_middle::mir::{write_mir_graphviz, write_mir_pretty};
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_mir_build::thir::print::{thir_flat, thir_tree};
 use rustc_public::rustc_internal::pretty::write_smir_pretty;
 use rustc_session::Session;
-use rustc_session::config::{OutFileName, PpHirMode, PpMode, PpSourceMode};
+use rustc_session::config::{OutFileName, OutputType, PpHirMode, PpMode, PpSourceMode};
 use rustc_span::{FileName, Ident};
 use tracing::debug;
-use {rustc_ast as ast, rustc_hir_pretty as pprust_hir};
 
 pub use self::PpMode::*;
 pub use self::PpSourceMode::*;
@@ -211,7 +214,7 @@ impl<'tcx> PrintExtra<'tcx> {
     {
         match self {
             PrintExtra::AfterParsing { krate, .. } => f(krate),
-            PrintExtra::NeedsAstMap { tcx } => f(&tcx.resolver_for_lowering().borrow().1),
+            PrintExtra::NeedsAstMap { tcx } => f(&tcx.resolver_for_lowering().1.borrow()),
         }
     }
 
@@ -236,7 +239,6 @@ pub fn print<'tcx>(sess: &Session, ppm: PpMode, ex: PrintExtra<'tcx>) {
             let annotation: Box<dyn pprust_ast::PpAnn> = match s {
                 Normal => Box::new(AstNoAnn),
                 Expanded => Box::new(AstNoAnn),
-                Identified => Box::new(AstIdentifiedAnn),
                 ExpandedIdentified => Box::new(AstIdentifiedAnn),
                 ExpandedHygiene => Box::new(AstHygieneAnn { sess }),
             };
@@ -261,7 +263,7 @@ pub fn print<'tcx>(sess: &Session, ppm: PpMode, ex: PrintExtra<'tcx>) {
         }
         AstTreeExpanded => {
             debug!("pretty-printing expanded AST");
-            format!("{:#?}", ex.tcx().resolver_for_lowering().borrow().1)
+            format!("{:#?}", ex.tcx().resolver_for_lowering().1.borrow())
         }
         Hir(s) => {
             debug!("pretty printing HIR {:?}", s);
@@ -300,12 +302,12 @@ pub fn print<'tcx>(sess: &Session, ppm: PpMode, ex: PrintExtra<'tcx>) {
         }
         Mir => {
             let mut out = Vec::new();
-            write_mir_pretty(ex.tcx(), None, &mut out).unwrap();
+            write_mir_pretty(ex.tcx(), &mut out).unwrap();
             String::from_utf8(out).unwrap()
         }
         MirCFG => {
             let mut out = Vec::new();
-            write_mir_graphviz(ex.tcx(), None, &mut out).unwrap();
+            write_mir_graphviz(ex.tcx(), &mut out).unwrap();
             String::from_utf8(out).unwrap()
         }
         StableMir => {
@@ -338,4 +340,22 @@ pub fn print<'tcx>(sess: &Session, ppm: PpMode, ex: PrintExtra<'tcx>) {
     };
 
     write_or_print(&out, sess);
+}
+
+/// Implementation of `--emit=mir`.
+pub fn emit_mir(tcx: TyCtxt<'_>) -> io::Result<()> {
+    match tcx.output_filenames(()).path(OutputType::Mir) {
+        OutFileName::Stdout => {
+            let mut f = io::stdout();
+            write_mir_pretty(tcx, &mut f)?;
+        }
+        OutFileName::Real(path) => {
+            let mut f = File::create_buffered(&path)?;
+            write_mir_pretty(tcx, &mut f)?;
+            if tcx.sess.opts.json_artifact_notifications {
+                tcx.dcx().emit_artifact_notification(&path, "mir");
+            }
+        }
+    }
+    Ok(())
 }

@@ -6,7 +6,7 @@ use crate::cell::{Cell, Ref, RefCell, RefMut, SyncUnsafeCell, UnsafeCell};
 use crate::char::EscapeDebugExtArgs;
 use crate::hint::assert_unchecked;
 use crate::marker::{PhantomData, PointeeSized};
-use crate::num::fmt as numfmt;
+use crate::num::imp::fmt as numfmt;
 use crate::ops::Deref;
 use crate::ptr::NonNull;
 use crate::{iter, mem, result, str};
@@ -36,8 +36,10 @@ pub enum Alignment {
     Center,
 }
 
-#[unstable(feature = "int_format_into", issue = "138215")]
-pub use num_buffer::{NumBuffer, NumBufferTrait};
+#[stable(feature = "int_format_into", since = "CURRENT_RUSTC_VERSION")]
+pub use num_buffer::NumBuffer;
+#[unstable(feature = "fmt_internals", issue = "none")]
+pub use num_buffer::NumBufferTrait;
 
 #[stable(feature = "debug_builders", since = "1.2.0")]
 pub use self::builders::{DebugList, DebugMap, DebugSet, DebugStruct, DebugTuple};
@@ -1037,9 +1039,10 @@ impl Display for Arguments<'_> {
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_on_unimplemented(
     on(
-        crate_local,
+        all(crate_local, not(Self = "{union}")),
         note = "add `#[derive(Debug)]` to `{Self}` or manually `impl {This} for {Self}`"
     ),
+    on(all(crate_local, Self = "{union}"), note = "manually `impl {This} for {Self}`"),
     on(
         from_desugaring = "FormatLiteral",
         label = "`{Self}` cannot be formatted using `{{:?}}` because it doesn't implement `{This}`"
@@ -2006,7 +2009,13 @@ impl<'a> Formatter<'a> {
                 // SAFETY: Per the precondition.
                 unsafe { self.write_formatted_parts(&formatted) }
             } else {
-                let post_padding = self.padding(width - len as u16, Alignment::Right)?;
+                // Padding widths are capped at `u16`, so reaching this branch means
+                // the formatted output is also shorter than `u16::MAX`.
+                let len = match u16::try_from(len) {
+                    Ok(len) => len,
+                    Err(_) => unreachable!(),
+                };
+                let post_padding = self.padding(width - len, Alignment::Right)?;
                 // SAFETY: Per the precondition.
                 unsafe {
                     self.write_formatted_parts(&formatted)?;
@@ -2934,7 +2943,7 @@ impl Debug for str {
             let mut chars = rest.chars();
             if let Some(c) = chars.next() {
                 let esc = c.escape_debug_ext(EscapeDebugExtArgs {
-                    escape_grapheme_extended: true,
+                    escape_grapheme_extender: true,
                     escape_single_quote: false,
                     escape_double_quote: true,
                 });
@@ -2966,7 +2975,7 @@ impl Debug for char {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         f.write_char('\'')?;
         let esc = self.escape_debug_ext(EscapeDebugExtArgs {
-            escape_grapheme_extended: true,
+            escape_grapheme_extender: true,
             escape_single_quote: true,
             escape_double_quote: false,
         });
@@ -2989,20 +2998,19 @@ impl Display for char {
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: PointeeSized> Pointer for *const T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-        if <<T as core::ptr::Pointee>::Metadata as core::unit::IsUnit>::is_unit() {
-            pointer_fmt_inner(self.expose_provenance(), f)
+        // Since the formatting will be identical for all pointer types, erase the pointee type and
+        // metadata type to reduce the amount of codegen work needed for each distinct type.
+        let ptr: *const T = *self;
+        let ptr_addr = ptr.expose_provenance();
+        if <<T as core::ptr::Pointee>::Metadata as core::unit::IsUnit>::IS_UNIT {
+            pointer_fmt_inner(ptr_addr, f)
         } else {
-            f.debug_struct("Pointer")
-                .field_with("addr", |f| pointer_fmt_inner(self.expose_provenance(), f))
-                .field("metadata", &core::ptr::metadata(*self))
-                .finish()
+            wide_pointer_fmt_inner(ptr_addr, &core::ptr::metadata(ptr), f)
         }
     }
 }
 
-/// Since the formatting will be identical for all pointer types, uses a
-/// non-monomorphized implementation for the actual formatting to reduce the
-/// amount of codegen work needed.
+/// Formats an address in `fmt::Pointer` style.
 ///
 /// This uses `ptr_addr: usize` and not `ptr: *const ()` to be able to use this for
 /// `fn(...) -> ...` without using [problematic] "Oxford Casts".
@@ -3029,6 +3037,14 @@ pub(crate) fn pointer_fmt_inner(ptr_addr: usize, f: &mut Formatter<'_>) -> Resul
     f.options = old_options;
 
     ret
+}
+
+/// Formats a wide pointer (address and type-erased metadata) in `fmt::Pointer` style.
+fn wide_pointer_fmt_inner(ptr_addr: usize, metadata: &dyn Debug, f: &mut Formatter<'_>) -> Result {
+    f.debug_struct("Pointer")
+        .field_with("addr", move |f| pointer_fmt_inner(ptr_addr, f))
+        .field("metadata", metadata)
+        .finish()
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]

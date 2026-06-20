@@ -37,17 +37,14 @@ impl Creation {
         let tag = self.retag.new_tag;
         if let Some(perm) = self.retag.permission {
             (
-                format!(
-                    "{tag:?} was created by a {:?} retag at offsets {:?}",
-                    perm, self.retag.range,
-                ),
+                format!("{tag:?} was created by a {perm:?} retag at offsets {}", self.retag.range),
                 self.span.data(),
             )
         } else {
             assert!(self.retag.range.size == Size::ZERO);
             (
                 format!(
-                    "{tag:?} would have been created here, but this is a zero-size retag ({:?}) so the tag in question does not exist anywhere",
+                    "{tag:?} would have been created here, but this is a zero-size retag ({}) so the tag in question does not exist anywhere",
                     self.retag.range,
                 ),
                 self.span.data(),
@@ -79,12 +76,12 @@ impl Invalidation {
             // For a FnEntry retag, our Span points at the caller.
             // See `DiagnosticCx::log_invalidation`.
             format!(
-                "{:?} was later invalidated at offsets {:?} by a {} inside this call",
+                "{:?} was later invalidated at offsets {} by a {} inside this call",
                 self.tag, self.range, self.cause
             )
         } else {
             format!(
-                "{:?} was later invalidated at offsets {:?} by a {}",
+                "{:?} was later invalidated at offsets {} by a {}",
                 self.tag, self.range, self.cause
             )
         };
@@ -194,7 +191,6 @@ struct RetagOp {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RetagInfo {
     pub cause: RetagCause,
-    pub in_field: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -343,7 +339,7 @@ impl<'history, 'ecx, 'tcx> DiagnosticCx<'history, 'ecx, 'tcx> {
                 if self.history.root.0.tag() == tag {
                     Some((
                         format!(
-                            "{tag:?} was created here, as the root tag for {:?}",
+                            "{tag:?} was created here, as the root tag for {}",
                             self.history.id
                         ),
                         self.history.root.1.data(),
@@ -383,16 +379,13 @@ impl<'history, 'ecx, 'tcx> DiagnosticCx<'history, 'ecx, 'tcx> {
         let perm =
             op.permission.expect("`start_grant` must be called before calling `grant_error`");
         let action = format!(
-            "trying to retag from {:?} for {:?} permission at {:?}[{:#x}]",
+            "trying to retag from {:?} for {:?} permission at {}[{:#x}]",
             op.orig_tag,
             perm,
             self.history.id,
             self.offset.bytes(),
         );
-        let mut helps = vec![operation_summary(&op.info.summary(), self.history.id, op.range)];
-        if op.info.in_field {
-            helps.push(format!("errors for retagging in fields are fairly new; please reach out to us (e.g. at <https://rust-lang.zulipchat.com/#narrow/stream/269128-miri>) if you find this error troubling"));
-        }
+        let helps = vec![operation_summary(&op.info.summary(), self.history.id, op.range)];
         err_sb_ub(
             format!("{action}{}", error_cause(stack, op.orig_tag)),
             helps,
@@ -410,7 +403,7 @@ impl<'history, 'ecx, 'tcx> DiagnosticCx<'history, 'ecx, 'tcx> {
             Operation::Dealloc(_) => return self.dealloc_error(stack),
         };
         let action = format!(
-            "attempting a {access} using {tag:?} at {alloc_id:?}[{offset:#x}]",
+            "attempting a {access} using {tag:?} at {alloc_id}[{offset:#x}]",
             access = op.kind,
             tag = op.tag,
             alloc_id = self.history.id,
@@ -455,7 +448,7 @@ impl<'history, 'ecx, 'tcx> DiagnosticCx<'history, 'ecx, 'tcx> {
         };
         err_sb_ub(
             format!(
-                "attempting deallocation using {tag:?} at {alloc_id:?}{cause}",
+                "attempting deallocation using {tag:?} at {alloc_id}{cause}",
                 tag = op.tag,
                 alloc_id = self.history.id,
                 cause = error_cause(stack, op.tag),
@@ -488,7 +481,7 @@ impl<'history, 'ecx, 'tcx> DiagnosticCx<'history, 'ecx, 'tcx> {
 }
 
 fn operation_summary(operation: &str, alloc_id: AllocId, alloc_range: AllocRange) -> String {
-    format!("this error occurs as part of {operation} at {alloc_id:?}{alloc_range:?}")
+    format!("this error occurs as part of {operation} at {alloc_id}{alloc_range}")
 }
 
 fn error_cause(stack: &Stack, prov_extra: ProvenanceExtra) -> &'static str {
@@ -508,16 +501,12 @@ fn error_cause(stack: &Stack, prov_extra: ProvenanceExtra) -> &'static str {
 
 impl RetagInfo {
     fn summary(&self) -> String {
-        let mut s = match self.cause {
+        match self.cause {
             RetagCause::Normal => "retag",
             RetagCause::FnEntry => "function-entry retag",
             RetagCause::InPlaceFnPassing => "in-place function argument/return passing protection",
             RetagCause::TwoPhase => "two-phase retag",
         }
-        .to_string();
-        if self.in_field {
-            s.push_str(" (of a reference/box inside this compound value)");
-        }
-        s
+        .to_string()
     }
 }

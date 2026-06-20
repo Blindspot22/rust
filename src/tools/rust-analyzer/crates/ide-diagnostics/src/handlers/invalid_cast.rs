@@ -18,7 +18,10 @@ macro_rules! format_ty {
 // Diagnostic: invalid-cast
 //
 // This diagnostic is triggered if the code contains an illegal cast
-pub(crate) fn invalid_cast(ctx: &DiagnosticsContext<'_>, d: &hir::InvalidCast<'_>) -> Diagnostic {
+pub(crate) fn invalid_cast(
+    ctx: &DiagnosticsContext<'_, '_>,
+    d: &hir::InvalidCast<'_>,
+) -> Diagnostic {
     let display_range = ctx.sema.diagnostics_display_range(d.expr.map(|it| it.into()));
     let (code, message) = match d.error {
         CastError::CastToBool => (
@@ -51,7 +54,7 @@ pub(crate) fn invalid_cast(ctx: &DiagnosticsContext<'_>, d: &hir::InvalidCast<'_
             DiagnosticCode::RustcHardError("E0606"),
             format_ty!(ctx, "casting `{}` as `{}` is invalid", d.expr_ty, d.cast_ty),
         ),
-        CastError::IntToFatCast => (
+        CastError::IntToWideCast => (
             DiagnosticCode::RustcHardError("E0606"),
             format_ty!(ctx, "cannot cast `{}` to a fat pointer `{}`", d.expr_ty, d.cast_ty),
         ),
@@ -95,6 +98,10 @@ pub(crate) fn invalid_cast(ctx: &DiagnosticsContext<'_>, d: &hir::InvalidCast<'_
             DiagnosticCode::RustcHardError("E0605"),
             format_ty!(ctx, "non-primitive cast: `{}` as `{}`", d.expr_ty, d.cast_ty),
         ),
+        CastError::PtrPtrAddingAutoTraits => (
+            DiagnosticCode::RustcHardError("E0804"),
+            "cannot add auto trait to dyn bound via pointer cast".to_owned(),
+        ),
         // CastError::UnknownCastPtrKind | CastError::UnknownExprPtrKind => (
         //     DiagnosticCode::RustcHardError("E0641"),
         //     "cannot cast to a pointer of an unknown kind".to_owned(),
@@ -107,7 +114,7 @@ pub(crate) fn invalid_cast(ctx: &DiagnosticsContext<'_>, d: &hir::InvalidCast<'_
 //
 // This diagnostic is triggered when casting to an unsized type
 pub(crate) fn cast_to_unsized(
-    ctx: &DiagnosticsContext<'_>,
+    ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::CastToUnsized<'_>,
 ) -> Diagnostic {
     let display_range = ctx.sema.diagnostics_display_range(d.expr.map(|it| it.into()));
@@ -383,7 +390,7 @@ struct Bar;
 
 impl Foo for Bar {}
 
-fn to_raw<T>(_: *mut T) -> *mut () {
+fn to_raw<T: ?Sized>(_: *mut T) -> *mut () {
     loop {}
 }
 
@@ -444,8 +451,8 @@ fn main() {
     q as *const [i32];
   //^^^^^^^^^^^^^^^^^ error: cannot cast thin pointer `*const i32` to fat pointer `*const [i32]`
 
-    // FIXME: This should emit diagnostics but disabled to prevent many false positives
     let t: *mut (dyn Trait + 'static) = 0 as *mut _;
+                                      //^^^^^^^^^^^ error: cannot cast `usize` to a fat pointer `*mut (dyn Trait + 'static)`
 
     let mut fail: *const str = 0 as *const str;
                              //^^^^^^^^^^^^^^^ error: cannot cast `usize` to a fat pointer `*const str`
@@ -513,11 +520,13 @@ trait Trait<'a> {}
 
 fn add_auto<'a>(x: *mut dyn Trait<'a>) -> *mut (dyn Trait<'a> + Send) {
     x as _
+  //^^^^^^ error: cannot add auto trait to dyn bound via pointer cast
 }
 
 // (to test diagnostic list formatting)
 fn add_multiple_auto<'a>(x: *mut dyn Trait<'a>) -> *mut (dyn Trait<'a> + Send + Sync + Unpin) {
     x as _
+  //^^^^^^ error: cannot add auto trait to dyn bound via pointer cast
 }
 "#,
         );
@@ -543,7 +552,7 @@ fn main() {
     fn ptr_to_trait_obj_ok() {
         check_diagnostics(
             r#"
-//- minicore: pointee
+//- minicore: pointee, send, sync
 trait Trait<'a> {}
 
 fn remove_auto<'a>(x: *mut (dyn Trait<'a> + Send)) -> *mut dyn Trait<'a> {
@@ -981,7 +990,7 @@ fn main() {
     fn rustc_issue_106883() {
         check_diagnostics_with_disabled(
             r#"
-//- minicore: sized, deref
+//- minicore: sized, deref, coerce_unsized, unsize
 use core::ops::Deref;
 
 struct Foo;

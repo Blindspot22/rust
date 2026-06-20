@@ -5,7 +5,7 @@ use either::Either;
 use hir::{
     Adt, AsAssocItem, AsExternAssocItem, CaptureKind, DisplayTarget, DropGlue,
     DynCompatibilityViolation, HasCrate, HasSource, HirDisplay, Layout, LayoutError,
-    MethodViolationCode, Name, Semantics, Symbol, Trait, Type, TypeInfo, VariantDef,
+    MethodViolationCode, Name, Semantics, Symbol, Trait, Type, TypeInfo, Variant,
     db::ExpandDatabase,
 };
 use ide_db::{
@@ -74,7 +74,7 @@ pub(super) fn try_expr(
                 ast::Fn(fn_) => sema.to_def(&fn_)?.ret_type(sema.db),
                 ast::Item(__) => return None,
                 ast::ClosureExpr(closure) => sema.type_of_expr(&closure.body()?)?.original,
-                ast::BlockExpr(block_expr) => if matches!(block_expr.modifier(), Some(ast::BlockModifier::Async(_) | ast::BlockModifier::Try(_)| ast::BlockModifier::Const(_))) {
+                ast::BlockExpr(block_expr) => if matches!(block_expr.modifier(), Some(ast::BlockModifier::Async(_) | ast::BlockModifier::Try { .. } | ast::BlockModifier::Const(_))) {
                     sema.type_of_expr(&block_expr.into())?.original
                 } else {
                     continue;
@@ -272,9 +272,9 @@ pub(super) fn struct_rest_pat(
     edition: Edition,
     display_target: DisplayTarget,
 ) -> HoverResult {
-    let missing_fields = sema.record_pattern_missing_fields(pattern);
+    let matched_fields = sema.record_pattern_matched_fields(pattern);
 
-    // if there are no missing fields, the end result is a hover that shows ".."
+    // if there are no matched fields, the end result is a hover that shows ".."
     // should be left in to indicate that there are no more fields in the pattern
     // example, S {a: 1, b: 2, ..} when struct S {a: u32, b: u32}
 
@@ -285,13 +285,13 @@ pub(super) fn struct_rest_pat(
             targets.push(item);
         }
     };
-    for (_, t) in &missing_fields {
+    for (_, t) in &matched_fields {
         walk_and_push_ty(sema.db, t, &mut push_new_def);
     }
 
     res.markup = {
         let mut s = String::from(".., ");
-        for (f, _) in &missing_fields {
+        for (f, _) in &matched_fields {
             s += f.display(sema.db, display_target).to_string().as_ref();
             s += ", ";
         }
@@ -366,14 +366,14 @@ fn definition_owner_name(db: &RootDatabase, def: Definition, edition: Edition) -
             let parent_name = parent.name(db);
             let parent_name = parent_name.display(db, edition).to_string();
             return match parent {
-                VariantDef::Variant(variant) => {
+                Variant::EnumVariant(variant) => {
                     let enum_name = variant.parent_enum(db).name(db);
                     Some(format!("{}::{parent_name}", enum_name.display(db, edition)))
                 }
                 _ => Some(parent_name),
             };
         }
-        Definition::Variant(e) => Some(e.parent_enum(db).name(db)),
+        Definition::EnumVariant(e) => Some(e.parent_enum(db).name(db)),
         Definition::GenericParam(generic_param) => match generic_param.parent() {
             hir::GenericDef::Adt(it) => Some(it.name(db)),
             hir::GenericDef::Trait(it) => Some(it.name(db)),
@@ -470,7 +470,7 @@ pub(super) fn definition(
         Definition::Adt(adt @ (Adt::Struct(_) | Adt::Union(_))) => {
             adt.display_limited(db, config.max_fields_count, display_target).to_string()
         }
-        Definition::Variant(variant) => {
+        Definition::EnumVariant(variant) => {
             variant.display_limited(db, config.max_fields_count, display_target).to_string()
         }
         Definition::Adt(adt @ Adt::Enum(_)) => {
@@ -499,7 +499,7 @@ pub(super) fn definition(
     };
     let docs = def.docs_with_rangemap(db, famous_defs, display_target);
     let value = || match def {
-        Definition::Variant(it) => {
+        Definition::EnumVariant(it) => {
             if !it.parent_enum(db).is_data_carrying(db) {
                 match it.eval(db) {
                     Ok(it) => {
@@ -544,7 +544,7 @@ pub(super) fn definition(
                     let mut body = source.value.body()?.syntax().clone();
                     if let Some(macro_file) = source.file_id.macro_file() {
                         let span_map = db.expansion_span_map(macro_file);
-                        body = prettify_macro_expansion(db, body, &span_map, it.krate(db).into());
+                        body = prettify_macro_expansion(db, body, span_map, it.krate(db).into());
                     }
                     if env::var_os("RA_DEV").is_some() {
                         format!("{body}\n{}", render_const_eval_error(db, err, display_target))
@@ -576,7 +576,7 @@ pub(super) fn definition(
                     let mut body = source.value.body()?.syntax().clone();
                     if let Some(macro_file) = source.file_id.macro_file() {
                         let span_map = db.expansion_span_map(macro_file);
-                        body = prettify_macro_expansion(db, body, &span_map, it.krate(db).into());
+                        body = prettify_macro_expansion(db, body, span_map, it.krate(db).into());
                     }
                     if env::var_os("RA_DEV").is_some() {
                         format!("{body}\n{}", render_const_eval_error(db, err, display_target))
@@ -596,7 +596,7 @@ pub(super) fn definition(
             |_| {
                 let var_def = it.parent_def(db);
                 match var_def {
-                    hir::VariantDef::Struct(s) => {
+                    hir::Variant::Struct(s) => {
                         Adt::from(s).layout(db).ok().and_then(|layout| layout.field_offset(it))
                     }
                     _ => None,
@@ -627,7 +627,7 @@ pub(super) fn definition(
             |_| None,
             |_| None,
         ),
-        Definition::Variant(it) => render_memory_layout(
+        Definition::EnumVariant(it) => render_memory_layout(
             config.memory_layout,
             || it.layout(db),
             |_| None,
@@ -664,14 +664,14 @@ pub(super) fn definition(
         }
         let drop_info = match def {
             Definition::Field(field) => {
-                DropInfo { drop_glue: field.ty(db).to_type(db).drop_glue(db), has_dtor: None }
+                DropInfo { drop_glue: field.ty(db).drop_glue(db), has_dtor: None }
             }
             Definition::Adt(Adt::Struct(strukt)) => {
-                let struct_drop_glue = strukt.ty_params(db).drop_glue(db);
+                let struct_drop_glue = strukt.ty(db).drop_glue(db);
                 let mut fields_drop_glue = strukt
                     .fields(db)
                     .iter()
-                    .map(|field| field.ty(db).to_type(db).drop_glue(db))
+                    .map(|field| field.ty(db).drop_glue(db))
                     .max()
                     .unwrap_or(DropGlue::None);
                 let has_dtor = match (fields_drop_glue, struct_drop_glue) {
@@ -688,10 +688,10 @@ pub(super) fn definition(
             // Unions cannot have fields with drop glue.
             Definition::Adt(Adt::Union(union)) => DropInfo {
                 drop_glue: DropGlue::None,
-                has_dtor: Some(union.ty_params(db).drop_glue(db) != DropGlue::None),
+                has_dtor: Some(union.ty(db).drop_glue(db) != DropGlue::None),
             },
             Definition::Adt(Adt::Enum(enum_)) => {
-                let enum_drop_glue = enum_.ty_params(db).drop_glue(db);
+                let enum_drop_glue = enum_.ty(db).drop_glue(db);
                 let fields_drop_glue = enum_
                     .variants(db)
                     .iter()
@@ -699,7 +699,7 @@ pub(super) fn definition(
                         variant
                             .fields(db)
                             .iter()
-                            .map(|field| field.ty(db).to_type(db).drop_glue(db))
+                            .map(|field| field.ty(db).drop_glue(db))
                             .max()
                             .unwrap_or(DropGlue::None)
                     })
@@ -710,17 +710,17 @@ pub(super) fn definition(
                     has_dtor: Some(enum_drop_glue > fields_drop_glue),
                 }
             }
-            Definition::Variant(variant) => {
+            Definition::EnumVariant(variant) => {
                 let fields_drop_glue = variant
                     .fields(db)
                     .iter()
-                    .map(|field| field.ty(db).to_type(db).drop_glue(db))
+                    .map(|field| field.ty(db).drop_glue(db))
                     .max()
                     .unwrap_or(DropGlue::None);
                 DropInfo { drop_glue: fields_drop_glue, has_dtor: None }
             }
             Definition::TypeAlias(type_alias) => {
-                DropInfo { drop_glue: type_alias.ty_params(db).drop_glue(db), has_dtor: None }
+                DropInfo { drop_glue: type_alias.ty(db).drop_glue(db), has_dtor: None }
             }
             Definition::Local(local) => {
                 DropInfo { drop_glue: local.ty(db).drop_glue(db), has_dtor: None }
@@ -1009,8 +1009,9 @@ fn closure_ty(
     display_target: DisplayTarget,
 ) -> Option<HoverResult> {
     let c = original.as_closure()?;
-    let mut captures_rendered = c.captured_items(sema.db)
-        .into_iter()
+    let captures = c.captured_items(sema.db);
+    let mut captures_rendered = captures
+        .iter()
         .map(|it| {
             let borrow_kind = match it.kind() {
                 CaptureKind::SharedRef => "immutable borrow",
@@ -1018,7 +1019,7 @@ fn closure_ty(
                 CaptureKind::MutableRef => "mutable borrow",
                 CaptureKind::Move => "move",
             };
-            format!("* `{}` by {}", it.display_place(sema.db), borrow_kind)
+            format!("* `{}` by {}", it.display_place_source_code(sema.db, display_target.edition), borrow_kind)
         })
         .join("\n");
     if captures_rendered.trim().is_empty() {
@@ -1031,8 +1032,8 @@ fn closure_ty(
         }
     };
     walk_and_push_ty(sema.db, original, &mut push_new_def);
-    c.capture_types(sema.db).into_iter().for_each(|ty| {
-        walk_and_push_ty(sema.db, &ty, &mut push_new_def);
+    captures.iter().for_each(|capture| {
+        walk_and_push_ty(sema.db, &capture.ty(sema.db), &mut push_new_def);
     });
 
     let adjusted = if let Some(adjusted_ty) = adjusted {
@@ -1135,12 +1136,12 @@ fn markup(
     }
 }
 
-fn render_memory_layout(
+fn render_memory_layout<'db>(
     config: Option<MemoryLayoutHoverConfig>,
-    layout: impl FnOnce() -> Result<Layout, LayoutError>,
-    offset: impl FnOnce(&Layout) -> Option<u64>,
-    padding: impl FnOnce(&Layout) -> Option<(&str, u64)>,
-    tag: impl FnOnce(&Layout) -> Option<usize>,
+    layout: impl FnOnce() -> Result<Layout<'db>, LayoutError>,
+    offset: impl FnOnce(&Layout<'db>) -> Option<u64>,
+    padding: impl for<'a> FnOnce(&'a Layout<'db>) -> Option<(&'a str, u64)>,
+    tag: impl FnOnce(&Layout<'db>) -> Option<usize>,
 ) -> Option<String> {
     let config = config?;
     let layout = layout().ok()?;

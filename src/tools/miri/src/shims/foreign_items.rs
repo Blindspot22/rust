@@ -2,7 +2,7 @@ use std::collections::hash_map::Entry;
 use std::io::Write;
 use std::path::Path;
 
-use rustc_abi::{Align, CanonAbi, Size};
+use rustc_abi::{Align, CanonAbi, Endian, ExternAbi, Size};
 use rustc_ast::expand::allocator::NO_ALLOC_SHIM_IS_UNSTABLE;
 use rustc_data_structures::either::Either;
 use rustc_hir::attrs::Linkage;
@@ -255,7 +255,7 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let this = self.eval_context_mut();
 
         // First deal with any external C functions in linked .so file.
-        #[cfg(all(unix, feature = "native-lib"))]
+        #[cfg(all(feature = "native-lib", unix))]
         if !this.machine.native_lib.is_empty() {
             use crate::shims::native_lib::EvalContextExt as _;
             // An Ok(false) here means that the function being called was not exported
@@ -434,6 +434,46 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                     this.write_path_to_c_str(Path::new(&path), out, out_size)?;
                 // Return value: 0 on success, otherwise the size it would have needed.
                 this.write_int(if success { 0 } else { needed_size }, dest)?;
+            }
+            "miri_thread_spawn" => {
+                // FIXME: `check_shim_sig` does not work with function pointers.
+                let [start_routine, func_arg] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
+                let start_routine = this.read_pointer(start_routine)?;
+                let func_arg = this.read_immediate(func_arg)?;
+
+                this.start_regular_thread(
+                    Some(dest.clone()),
+                    start_routine,
+                    ExternAbi::Rust,
+                    func_arg,
+                    this.machine.layouts.unit,
+                )?;
+            }
+            "miri_thread_join" => {
+                let [thread_id] = this.check_shim_sig(
+                    shim_sig!(extern "Rust" fn(usize) -> bool),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+
+                let thread = this.read_target_usize(thread_id)?;
+                // Joining a terminated thread is valid.
+                use crate::concurrency::thread::ThreadLookupError;
+                let thread = match this.thread_id_try_from(thread) {
+                    Ok(id) | Err(ThreadLookupError::Terminated(id)) => Some(id),
+                    Err(ThreadLookupError::InvalidId) => None,
+                };
+                if let Some(thread) = thread {
+                    this.join_thread_exclusive(
+                        thread,
+                        /* success_retval */ Scalar::from_bool(true),
+                        dest,
+                    )?;
+                } else {
+                    this.write_scalar(Scalar::from_bool(false), dest)?;
+                }
             }
             // Hint that a loop is spinning indefinitely.
             "miri_spin_loop" => {
@@ -777,7 +817,9 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
             // Used to implement the x86 `_mm{,256,512}_popcnt_epi{8,16,32,64}` and wasm
             // `{i,u}8x16_popcnt` functions.
-            name if name.starts_with("llvm.ctpop.v") => {
+            name if name.starts_with("llvm.ctpop.v")
+                && this.tcx.sess.target.endian == Endian::Little =>
+            {
                 let [op] = this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
                 let (op, op_len) = this.project_to_simd(op)?;
@@ -800,16 +842,26 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
             // Target-specific shims
             name if name.starts_with("llvm.x86.")
-                && matches!(this.tcx.sess.target.arch, Arch::X86 | Arch::X86_64) =>
+                && matches!(this.tcx.sess.target.arch, Arch::X86 | Arch::X86_64)
+                && this.tcx.sess.target.endian == Endian::Little =>
             {
                 return shims::x86::EvalContextExt::emulate_x86_intrinsic(
                     this, link_name, abi, args, dest,
                 );
             }
             name if name.starts_with("llvm.aarch64.")
-                && this.tcx.sess.target.arch == Arch::AArch64 =>
+                && this.tcx.sess.target.arch == Arch::AArch64
+                && this.tcx.sess.target.endian == Endian::Little =>
             {
                 return shims::aarch64::EvalContextExt::emulate_aarch64_intrinsic(
+                    this, link_name, abi, args, dest,
+                );
+            }
+            name if name.starts_with("llvm.loongarch.")
+                && matches!(this.tcx.sess.target.arch, Arch::LoongArch32 | Arch::LoongArch64)
+                && this.tcx.sess.target.endian == Endian::Little =>
+            {
+                return shims::loongarch::EvalContextExt::emulate_loongarch_intrinsic(
                     this, link_name, abi, args, dest,
                 );
             }
@@ -817,7 +869,6 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
             // Fallback to shims in submodules.
             _ => {
                 // Math shims
-                #[expect(irrefutable_let_patterns)]
                 if let res = shims::math::EvalContextExt::emulate_foreign_item_inner(
                     this, link_name, abi, args, dest,
                 )? && !matches!(res, EmulateItemResult::NotSupported)

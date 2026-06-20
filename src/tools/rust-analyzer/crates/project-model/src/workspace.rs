@@ -216,6 +216,7 @@ impl ProjectWorkspace {
             features,
             rustc_source,
             extra_args,
+            metadata_extra_args,
             extra_env,
             set_test,
             cfg_overrides,
@@ -289,6 +290,7 @@ impl ProjectWorkspace {
                 features: features.clone(),
                 targets: targets.clone(),
                 extra_args: extra_args.clone(),
+                metadata_extra_args: metadata_extra_args.clone(),
                 extra_env: extra_env.clone(),
                 toolchain_version: toolchain.clone(),
                 kind: "workspace",
@@ -343,6 +345,7 @@ impl ProjectWorkspace {
                             features: crate::CargoFeatures::default(),
                             targets: targets.clone(),
                             extra_args: extra_args.clone(),
+                            metadata_extra_args: metadata_extra_args.clone(),
                             extra_env: extra_env.clone(),
                             toolchain_version: toolchain.clone(),
                             kind: "rustc-dev"
@@ -575,6 +578,7 @@ impl ProjectWorkspace {
                 features: config.features.clone(),
                 targets,
                 extra_args: config.extra_args.clone(),
+                metadata_extra_args: config.metadata_extra_args.clone(),
                 extra_env: config.extra_env.clone(),
                 toolchain_version: toolchain.clone(),
                 kind: "detached-file",
@@ -744,7 +748,7 @@ impl ProjectWorkspace {
                     .packages()
                     .filter_map(|pkg| {
                         if ws[pkg].is_local {
-                            // the local ones are included in the main `PackageRoot`` below
+                            // the local ones are included in the main `PackageRoot` below
                             return None;
                         }
                         let pkg_root = ws[pkg].manifest.parent().to_path_buf();
@@ -1161,6 +1165,8 @@ fn project_json_to_crate_graph(
                                 name: Some(name.canonical_name().to_owned()),
                             }
                         }
+                    } else if is_sysroot {
+                        CrateOrigin::Lang(LangCrateOrigin::Dependency)
                     } else {
                         CrateOrigin::Local { repo: None, name: None }
                     },
@@ -1294,6 +1300,8 @@ fn cargo_to_crate_graph(
                             name: Some(Symbol::intern(&pkg_data.name)),
                         }
                     }
+                } else if cargo.is_sysroot() {
+                    CrateOrigin::Lang(LangCrateOrigin::Dependency)
                 } else {
                     CrateOrigin::Library {
                         repo: pkg_data.repository.clone(),
@@ -1717,7 +1725,7 @@ fn extend_crate_graph_with_sysroot(
                     !matches!(lang_crate, LangCrateOrigin::Test | LangCrateOrigin::Alloc),
                 )),
                 LangCrateOrigin::ProcMacro => libproc_macro = Some(cid),
-                LangCrateOrigin::Other => (),
+                LangCrateOrigin::Other | LangCrateOrigin::Dependency => (),
             }
         }
     }
@@ -1827,7 +1835,7 @@ fn sysroot_to_crate_graph(
                     let display_name = CrateDisplayName::from_canonical_name(&stitched[krate].name);
                     let crate_id = crate_graph.add_crate_root(
                         file_id,
-                        Edition::CURRENT_FIXME,
+                        stitched.edition,
                         Some(display_name),
                         None,
                         cfg_options.clone(),
@@ -1938,6 +1946,7 @@ fn sysroot_metadata_config(
         features: Default::default(),
         targets,
         extra_args: Default::default(),
+        metadata_extra_args: config.metadata_extra_args.clone(),
         extra_env: config.extra_env.clone(),
         toolchain_version,
         kind: "sysroot",

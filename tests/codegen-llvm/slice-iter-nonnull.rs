@@ -51,11 +51,11 @@ pub fn slice_iter_next_back<'a>(it: &mut std::slice::Iter<'a, u32>) -> Option<&'
 // attribute is there, and confirms adding the assume back doesn't do anything.
 
 // CHECK-LABEL: @slice_iter_new
-// CHECK-SAME: (ptr noalias noundef nonnull {{.+}} %slice.0, {{.+}} noundef range({{.+}}) %slice.1)
+// CHECK-SAME: (ptr noalias nofree noundef nonnull {{.+}} %slice.0, {{.+}} noundef range({{.+}}) %slice.1)
 #[no_mangle]
 pub fn slice_iter_new(slice: &[u32]) -> std::slice::Iter<'_, u32> {
     // CHECK-NOT: slice
-    // CHECK: %[[END:.+]] = getelementptr inbounds{{( nuw)?}} i32{{.+}} %slice.0{{.+}} %slice.1
+    // CHECK: %[[END:.+]] = getelementptr inbounds{{( nuw)?}} {{i32|\[4 x i8\]}}{{.+}} %slice.0{{.+}} %slice.1
     // CHECK-NOT: slice
     // CHECK: insertvalue {{.+}} ptr %slice.0, 0
     // CHECK-NOT: slice
@@ -66,11 +66,11 @@ pub fn slice_iter_new(slice: &[u32]) -> std::slice::Iter<'_, u32> {
 }
 
 // CHECK-LABEL: @slice_iter_mut_new
-// CHECK-SAME: (ptr noalias noundef nonnull {{.+}} %slice.0, {{.+}} noundef range({{.+}}) %slice.1)
+// CHECK-SAME: (ptr noalias nofree noundef nonnull {{.+}} %slice.0, {{.+}} noundef range({{.+}}) %slice.1)
 #[no_mangle]
 pub fn slice_iter_mut_new(slice: &mut [u32]) -> std::slice::IterMut<'_, u32> {
     // CHECK-NOT: slice
-    // CHECK: %[[END:.+]] = getelementptr inbounds{{( nuw)?}} i32{{.+}} %slice.0{{.+}} %slice.1
+    // CHECK: %[[END:.+]] = getelementptr inbounds{{( nuw)?}} {{i32|\[4 x i8\]}}{{.+}} %slice.0{{.+}} %slice.1
     // CHECK-NOT: slice
     // CHECK: insertvalue {{.+}} ptr %slice.0, 0
     // CHECK-NOT: slice

@@ -4,6 +4,8 @@ use gccjit::{Context, OutputKind};
 use rustc_codegen_ssa::back::link::ensure_removed;
 use rustc_codegen_ssa::back::write::{BitcodeSection, CodegenContext, EmitObj, ModuleConfig};
 use rustc_codegen_ssa::{CompiledModule, ModuleCodegen};
+use rustc_data_structures::profiling::SelfProfilerRef;
+use rustc_errors::DiagCtxtHandle;
 use rustc_fs_util::link_or_copy;
 use rustc_log::tracing::debug;
 use rustc_session::config::OutputType;
@@ -11,40 +13,30 @@ use rustc_target::spec::SplitDebuginfo;
 
 use crate::base::add_pic_option;
 use crate::errors::CopyBitcode;
-use crate::{GccCodegenBackend, GccContext, LtoMode};
+use crate::{GccContext, LtoMode};
 
 pub(crate) fn codegen(
-    cgcx: &CodegenContext<GccCodegenBackend>,
+    cgcx: &CodegenContext,
+    prof: &SelfProfilerRef,
+    dcx: DiagCtxtHandle<'_>,
     module: ModuleCodegen<GccContext>,
     config: &ModuleConfig,
 ) -> CompiledModule {
-    let dcx = cgcx.create_dcx();
-    let dcx = dcx.handle();
-
-    let _timer = cgcx.prof.generic_activity_with_arg("GCC_module_codegen", &*module.name);
+    let _timer = prof.generic_activity_with_arg("GCC_module_codegen", &*module.name);
     {
         let context = &module.module_llvm.context;
 
         let lto_mode = module.module_llvm.lto_mode;
         let lto_supported = module.module_llvm.lto_supported;
 
-        let bc_out = cgcx.output_filenames.temp_path_for_cgu(
-            OutputType::Bitcode,
-            &module.name,
-            cgcx.invocation_temp.as_deref(),
-        );
-        let obj_out = cgcx.output_filenames.temp_path_for_cgu(
-            OutputType::Object,
-            &module.name,
-            cgcx.invocation_temp.as_deref(),
-        );
+        let bc_out = cgcx.output_filenames.temp_path_for_cgu(OutputType::Bitcode, &module.name);
+        let obj_out = cgcx.output_filenames.temp_path_for_cgu(OutputType::Object, &module.name);
 
         if config.bitcode_needed() {
-            let _timer = cgcx
-                .prof
-                .generic_activity_with_arg("GCC_module_codegen_make_bitcode", &*module.name);
+            let _timer =
+                prof.generic_activity_with_arg("GCC_module_codegen_make_bitcode", &*module.name);
 
-            // TODO(antoyo)
+            // FIXME(antoyo)
             /*if let Some(bitcode_filename) = bc_out.file_name() {
                 cgcx.prof.artifact_size(
                     "llvm_bitcode",
@@ -54,8 +46,7 @@ pub(crate) fn codegen(
             }*/
 
             if config.emit_bc || config.emit_obj == EmitObj::Bitcode {
-                let _timer = cgcx
-                    .prof
+                let _timer = prof
                     .generic_activity_with_arg("GCC_module_codegen_emit_bitcode", &*module.name);
                 if lto_supported {
                     context.add_command_line_option("-flto=auto");
@@ -66,48 +57,39 @@ pub(crate) fn codegen(
             }
 
             if config.emit_obj == EmitObj::ObjectCode(BitcodeSection::Full) {
-                let _timer = cgcx
-                    .prof
+                let _timer = prof
                     .generic_activity_with_arg("GCC_module_codegen_embed_bitcode", &*module.name);
                 if lto_supported {
-                    // TODO(antoyo): maybe we should call embed_bitcode to have the proper iOS fixes?
+                    // FIXME(antoyo): maybe we should call embed_bitcode to have the proper iOS fixes?
                     //embed_bitcode(cgcx, llcx, llmod, &config.bc_cmdline, data);
 
                     context.add_command_line_option("-flto=auto");
                     context.add_command_line_option("-flto-partition=one");
                     context.add_command_line_option("-ffat-lto-objects");
                 }
-                // TODO(antoyo): Send -plugin/usr/lib/gcc/x86_64-pc-linux-gnu/11.1.0/liblto_plugin.so to linker (this should be done when specifying the appropriate rustc cli argument).
+                // FIXME(antoyo): Send -plugin/usr/lib/gcc/x86_64-pc-linux-gnu/11.1.0/liblto_plugin.so to linker (this should be done when specifying the appropriate rustc cli argument).
                 context
                     .compile_to_file(OutputKind::ObjectFile, bc_out.to_str().expect("path to str"));
             }
         }
 
         if config.emit_ir {
-            let out = cgcx.output_filenames.temp_path_for_cgu(
-                OutputType::LlvmAssembly,
-                &module.name,
-                cgcx.invocation_temp.as_deref(),
-            );
+            let out =
+                cgcx.output_filenames.temp_path_for_cgu(OutputType::LlvmAssembly, &module.name);
             std::fs::write(out, "").expect("write file");
         }
 
         if config.emit_asm {
             let _timer =
-                cgcx.prof.generic_activity_with_arg("GCC_module_codegen_emit_asm", &*module.name);
-            let path = cgcx.output_filenames.temp_path_for_cgu(
-                OutputType::Assembly,
-                &module.name,
-                cgcx.invocation_temp.as_deref(),
-            );
+                prof.generic_activity_with_arg("GCC_module_codegen_emit_asm", &*module.name);
+            let path = cgcx.output_filenames.temp_path_for_cgu(OutputType::Assembly, &module.name);
             context.compile_to_file(OutputKind::Assembler, path.to_str().expect("path to str"));
         }
 
         match config.emit_obj {
             EmitObj::ObjectCode(_) => {
-                let _timer = cgcx
-                    .prof
-                    .generic_activity_with_arg("GCC_module_codegen_emit_obj", &*module.name);
+                let _timer =
+                    prof.generic_activity_with_arg("GCC_module_codegen_emit_obj", &*module.name);
                 if env::var("CG_GCCJIT_DUMP_MODULE_NAMES").as_deref() == Ok("1") {
                     println!("Module {}", module.name);
                 }
@@ -138,7 +120,7 @@ pub(crate) fn codegen(
 
                         // NOTE: without -fuse-linker-plugin, we get the following error:
                         // lto1: internal compiler error: decompressed stream: Destination buffer is too small
-                        // TODO(antoyo): since we do not do LTO when the linker is invoked anymore, perhaps
+                        // FIXME(antoyo): since we do not do LTO when the linker is invoked anymore, perhaps
                         // the following flag is not necessary anymore.
                         context.add_driver_option("-fuse-linker-plugin");
                     }
@@ -218,12 +200,11 @@ pub(crate) fn codegen(
         config.emit_asm,
         config.emit_ir,
         &cgcx.output_filenames,
-        cgcx.invocation_temp.as_deref(),
     )
 }
 
 pub(crate) fn save_temp_bitcode(
-    cgcx: &CodegenContext<GccCodegenBackend>,
+    cgcx: &CodegenContext,
     _module: &ModuleCodegen<GccContext>,
     _name: &str,
 ) {

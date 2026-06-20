@@ -98,17 +98,18 @@ use crate::fmt;
 ///    run on the thread that causes the process to exit. This is because the
 ///    other threads may be forcibly terminated.
 ///
-/// ## Synchronization in thread-local destructors
+///    If a thread is [converted into a fiber], destructors will not be run unless
+///    the fiber is [converted back into a thread] before the underlying thread exits.
 ///
-/// On Windows, synchronization operations (such as [`JoinHandle::join`]) in
-/// thread local destructors are prone to deadlocks and so should be avoided.
-/// This is because the [loader lock] is held while a destructor is run. The
-/// lock is acquired whenever a thread starts or exits or when a DLL is loaded
-/// or unloaded. Therefore these events are blocked for as long as a thread
-/// local destructor is running.
+///    If a process loads a Rust `cdylib`, it must not cause the Rust TLS destructor support
+//     to be initialized for the first time during process shutdown.
 ///
+///    When dynamically unloading a Rust `cdylib`, pending TLS destructors may run
+//     during the unload or may be leaked.
+///
+/// [converted into a fiber]: https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-convertthreadtofiber
+/// [converted back into a thread]: https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-convertfibertothread
 /// [loader lock]: https://docs.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-best-practices
-/// [`JoinHandle::join`]: crate::thread::JoinHandle::join
 /// [`with`]: LocalKey::with
 #[cfg_attr(not(test), rustc_diagnostic_item = "LocalKey")]
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -198,41 +199,10 @@ pub macro thread_local_process_attrs {
         );
     ),
 
-    // it's a nested `cfg_attr(true, ...)`; recurse into RHS
-    (
-        [$($prev_align_attrs:tt)*] [$($prev_other_attrs:tt)*];
-        @processing_cfg_attr { pred: ($($predicate:tt)*), rhs: [cfg_attr(true, $($cfg_rhs:tt)*) $(, $($attr_rhs:tt)*)?] };
-        $($rest:tt)*
-    ) => (
-        $crate::thread::local_impl::thread_local_process_attrs!(
-            [] [];
-            @processing_cfg_attr { pred: (true), rhs: [$($cfg_rhs)*] };
-            [$($prev_align_attrs)*] [$($prev_other_attrs)*];
-            @processing_cfg_attr { pred: ($($predicate)*), rhs: [$($($attr_rhs)*)?] };
-            $($rest)*
-        );
-    ),
-
-    // it's a nested `cfg_attr(false, ...)`; recurse into RHS
-    (
-        [$($prev_align_attrs:tt)*] [$($prev_other_attrs:tt)*];
-        @processing_cfg_attr { pred: ($($predicate:tt)*), rhs: [cfg_attr(false, $($cfg_rhs:tt)*) $(, $($attr_rhs:tt)*)?] };
-        $($rest:tt)*
-    ) => (
-        $crate::thread::local_impl::thread_local_process_attrs!(
-            [] [];
-            @processing_cfg_attr { pred: (false), rhs: [$($cfg_rhs)*] };
-            [$($prev_align_attrs)*] [$($prev_other_attrs)*];
-            @processing_cfg_attr { pred: ($($predicate)*), rhs: [$($($attr_rhs)*)?] };
-            $($rest)*
-        );
-    ),
-
-
     // it's a nested `cfg_attr(..., ...)`; recurse into RHS
     (
         [$($prev_align_attrs:tt)*] [$($prev_other_attrs:tt)*];
-        @processing_cfg_attr { pred: ($($predicate:tt)*), rhs: [cfg_attr($cfg_lhs:meta, $($cfg_rhs:tt)*) $(, $($attr_rhs:tt)*)?] };
+        @processing_cfg_attr { pred: ($($predicate:tt)*), rhs: [cfg_attr($cfg_lhs:expr, $($cfg_rhs:tt)*) $(, $($attr_rhs:tt)*)?] };
         $($rest:tt)*
     ) => (
         $crate::thread::local_impl::thread_local_process_attrs!(
@@ -268,28 +238,8 @@ pub macro thread_local_process_attrs {
         );
     ),
 
-    // `cfg_attr(true, ...)` attribute; parse it
-    ([$($prev_align_attrs:tt)*] [$($prev_other_attrs:tt)*]; #[cfg_attr(true, $($cfg_rhs:tt)*)] $($rest:tt)*) => (
-        $crate::thread::local_impl::thread_local_process_attrs!(
-            [] [];
-            @processing_cfg_attr { pred: (true), rhs: [$($cfg_rhs)*] };
-            [$($prev_align_attrs)*] [$($prev_other_attrs)*];
-            $($rest)*
-        );
-    ),
-
-    // `cfg_attr(false, ...)` attribute; parse it
-    ([$($prev_align_attrs:tt)*] [$($prev_other_attrs:tt)*]; #[cfg_attr(false, $($cfg_rhs:tt)*)] $($rest:tt)*) => (
-        $crate::thread::local_impl::thread_local_process_attrs!(
-            [] [];
-            @processing_cfg_attr { pred: (false), rhs: [$($cfg_rhs)*] };
-            [$($prev_align_attrs)*] [$($prev_other_attrs)*];
-            $($rest)*
-        );
-    ),
-
     // `cfg_attr(..., ...)` attribute; parse it
-    ([$($prev_align_attrs:tt)*] [$($prev_other_attrs:tt)*]; #[cfg_attr($cfg_pred:meta, $($cfg_rhs:tt)*)] $($rest:tt)*) => (
+    ([$($prev_align_attrs:tt)*] [$($prev_other_attrs:tt)*]; #[cfg_attr($cfg_pred:expr, $($cfg_rhs:tt)*)] $($rest:tt)*) => (
         $crate::thread::local_impl::thread_local_process_attrs!(
             [] [];
             @processing_cfg_attr { pred: ($cfg_pred), rhs: [$($cfg_rhs)*] };

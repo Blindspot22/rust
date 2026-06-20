@@ -5,11 +5,9 @@
 //! This API is completely unstable and subject to change.
 
 // tidy-alphabetical-start
-#![cfg_attr(bootstrap, feature(array_windows))]
 #![doc(test(attr(deny(warnings), allow(internal_features))))]
 #![feature(associated_type_defaults)]
-#![feature(box_patterns)]
-#![feature(if_let_guard)]
+#![feature(deref_patterns)]
 #![feature(iter_order_by)]
 #![feature(macro_metavar_expr)]
 #![recursion_limit = "256"]
@@ -38,8 +36,3 @@ pub mod visit;
 
 pub use self::ast::*;
 pub use self::ast_traits::{AstNodeWrapper, HasAttrs, HasNodeId, HasTokens};
-
-/// Requirements for a `StableHashingContext` to be used in this crate.
-/// This is a hack to allow using the `HashStable_Generic` derive macro
-/// instead of implementing everything in `rustc_middle`.
-pub trait HashStableContext: rustc_span::HashStableContext {}

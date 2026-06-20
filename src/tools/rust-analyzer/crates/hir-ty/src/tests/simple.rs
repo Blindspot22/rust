@@ -64,20 +64,37 @@ fn type_alias_in_struct_lit() {
 
 #[test]
 fn infer_ranges() {
-    check_types(
+    check_no_mismatches(
         r#"
-//- minicore: range
-fn test() {
-    let a = ..;
-    let b = 1..;
-    let c = ..2u32;
-    let d = 1..2usize;
-    let e = ..=10;
-    let f = 'a'..='z';
+//- minicore: range, new_range
 
-    let t = (a, b, c, d, e, f);
-    t;
-} //^ (RangeFull, RangeFrom<i32>, RangeTo<u32>, Range<usize>, RangeToInclusive<i32>, RangeInclusive<char>)
+fn test() {
+    let _: core::ops::RangeFull = ..;
+    let _: core::ops::RangeFrom<i32> = 1..;
+    let _: core::ops::RangeTo<u32> = ..2u32;
+    let _: core::ops::Range<usize> = 1..2usize;
+    let _: core::ops::RangeToInclusive<i32> = ..=10;
+    let _: core::ops::RangeInclusive<char> = 'a'..='z';
+}
+"#,
+    );
+}
+
+#[test]
+fn infer_ranges_new_range() {
+    check_no_mismatches(
+        r#"
+//- minicore: range, new_range
+#![feature(new_range)]
+
+fn test() {
+    let _: core::ops::RangeFull = ..;
+    let _: core::range::RangeFrom<i32> = 1..;
+    let _: core::ops::RangeTo<u32> = ..2u32;
+    let _: core::range::Range<usize> = 1..2usize;
+    let _: core::range::RangeToInclusive<i32> = ..=10;
+    let _: core::range::RangeInclusive<char> = 'a'..='z';
+}
 "#,
     );
 }
@@ -118,7 +135,7 @@ fn test(a: u32, b: isize, c: !, d: &str) {
             16..17 'b': isize
             26..27 'c': !
             32..33 'd': &'? str
-            41..120 '{     ...f32; }': ()
+            41..120 '{     ...f32; }': !
             47..48 'a': u32
             54..55 'b': isize
             61..62 'c': !
@@ -1001,14 +1018,14 @@ fn foo() {
             28..32 'true': bool
             33..50 '{     ...     }': i32
             43..44 '1': i32
-            56..79 '{     ...     }': i32
+            56..79 '{     ...     }': !
             66..72 'return': !
             89..92 '_x2': i32
             95..148 'if tru...     }': i32
             98..102 'true': bool
             103..120 '{     ...     }': i32
             113..114 '2': i32
-            126..148 '{     ...     }': !
+            126..148 '{     ...     }': i32
             136..142 'return': !
             158..161 '_x3': i32
             164..246 'match ...     }': i32
@@ -1017,7 +1034,7 @@ fn foo() {
             185..189 'true': bool
             193..194 '3': i32
             204..205 '_': bool
-            209..240 '{     ...     }': i32
+            209..240 '{     ...     }': !
             223..229 'return': !
             256..259 '_x4': i32
             262..319 'match ...     }': i32
@@ -1223,6 +1240,9 @@ fn infer_array() {
             274..275 'x': [u8; 0]
             287..289 '[]': [u8; 0]
             299..300 'y': [u8; 4]
+            307..308 '2': usize
+            307..310 '2+2': usize
+            309..310 '2': usize
             314..323 '[1,2,3,4]': [u8; 4]
             315..316 '1': u8
             317..318 '2': u8
@@ -1794,8 +1814,6 @@ impl Foo for u8 {
 }
 
 #[test]
-// FIXME
-#[should_panic]
 fn const_eval_in_function_signature() {
     check_types(
         r#"
@@ -1921,7 +1939,7 @@ fn closure_return() {
             16..58 '{     ...; }; }': u32
             26..27 'x': impl Fn() -> usize
             30..55 '|| -> ...n 1; }': impl Fn() -> usize
-            42..55 '{ return 1; }': usize
+            42..55 '{ return 1; }': !
             44..52 'return 1': !
             51..52 '1': usize
         "#]],
@@ -1940,7 +1958,7 @@ fn closure_return_unit() {
             16..47 '{     ...; }; }': u32
             26..27 'x': impl Fn()
             30..44 '|| { return; }': impl Fn()
-            33..44 '{ return; }': ()
+            33..44 '{ return; }': !
             35..41 'return': !
         "#]],
     );
@@ -2049,6 +2067,138 @@ fn test() {
 }
 
 #[test]
+fn gen_block_types_inferred() {
+    check_infer(
+        r#"
+//- minicore: iterator, deref
+use core::iter::Iterator;
+
+fn test() {
+    let mut generator = gen {
+        yield 1i8;
+    };
+    let result = generator.next();
+}
+        "#,
+        expect![[r#"
+            37..131 '{     ...t(); }': ()
+            47..60 'mut generator': impl Iterator<Item = i8>
+            63..93 'gen { ...     }': impl Iterator<Item = i8>
+            77..86 'yield 1i8': ()
+            83..86 '1i8': i8
+            103..109 'result': Option<i8>
+            112..121 'generator': impl Iterator<Item = i8>
+            112..128 'genera...next()': Option<i8>
+        "#]],
+    );
+}
+
+#[test]
+fn async_gen_block_types_inferred() {
+    check_infer(
+        r#"
+//- minicore: async_iterator, option, future, deref, pin
+use core::async_iter::AsyncIterator;
+use core::pin::Pin;
+use core::task::Context;
+
+fn test(mut cx: Context<'_>) {
+    let mut generator = async gen {
+        yield 1i8;
+    };
+    let result = Pin::new(&mut generator).poll_next(&mut cx);
+}
+        "#,
+        expect![[r#"
+            91..97 'mut cx': Context<'?>
+            112..239 '{     ...cx); }': ()
+            122..135 'mut generator': impl AsyncIterator<Item = {unknown}>
+            138..174 'async ...     }': impl AsyncIterator<Item = {unknown}>
+            158..167 'yield 1i8': ()
+            164..167 '1i8': i8
+            184..190 'result': Poll<Option<{unknown}>>
+            193..201 'Pin::new': fn new<&'? mut impl AsyncIterator<Item = {unknown}>>(&'? mut impl AsyncIterator<Item = {unknown}>) -> Pin<&'? mut impl AsyncIterator<Item = {unknown}>>
+            193..217 'Pin::n...rator)': Pin<&'? mut impl AsyncIterator<Item = {unknown}>>
+            193..236 'Pin::n...ut cx)': Poll<Option<{unknown}>>
+            202..216 '&mut generator': &'? mut impl AsyncIterator<Item = {unknown}>
+            207..216 'generator': impl AsyncIterator<Item = {unknown}>
+            228..235 '&mut cx': &'? mut Context<'?>
+            233..235 'cx': Context<'?>
+        "#]],
+    );
+}
+
+#[test]
+fn gen_fn_types_inferred() {
+    check_infer(
+        r#"
+//- minicore: iterator, deref
+use core::iter::Iterator;
+
+gen fn html() {
+    yield ();
+}
+
+fn test() {
+    let mut generator = html();
+    let result = generator.next();
+}
+        "#,
+        expect![[r#"
+            41..58 '{     ... (); }': ()
+            47..55 'yield ()': ()
+            53..55 '()': ()
+            70..140 '{     ...t(); }': ()
+            80..93 'mut generator': impl Iterator<Item = ()>
+            96..100 'html': fn html() -> impl Iterator<Item = ()>
+            96..102 'html()': impl Iterator<Item = ()>
+            112..118 'result': Option<()>
+            121..130 'generator': impl Iterator<Item = ()>
+            121..137 'genera...next()': Option<()>
+        "#]],
+    );
+}
+
+#[test]
+fn async_gen_fn_types_inferred() {
+    check_infer(
+        r#"
+//- minicore: async_iterator, option, future, deref, pin
+use core::async_iter::AsyncIterator;
+use core::pin::Pin;
+use core::task::Context;
+
+async gen fn html() {
+    yield ();
+}
+
+fn test(mut cx: Context<'_>) {
+    let mut generator = html();
+    let result = Pin::new(&mut generator).poll_next(&mut cx);
+}
+        "#,
+        expect![[r#"
+            103..120 '{     ... (); }': ()
+            109..117 'yield ()': ()
+            115..117 '()': ()
+            130..136 'mut cx': Context<'?>
+            151..248 '{     ...cx); }': ()
+            161..174 'mut generator': impl AsyncIterator<Item = ()>
+            177..181 'html': fn html() -> impl AsyncIterator<Item = ()>
+            177..183 'html()': impl AsyncIterator<Item = ()>
+            193..199 'result': Poll<Option<()>>
+            202..210 'Pin::new': fn new<&'? mut impl AsyncIterator<Item = ()>>(&'? mut impl AsyncIterator<Item = ()>) -> Pin<&'? mut impl AsyncIterator<Item = ()>>
+            202..226 'Pin::n...rator)': Pin<&'? mut impl AsyncIterator<Item = ()>>
+            202..245 'Pin::n...ut cx)': Poll<Option<()>>
+            211..225 '&mut generator': &'? mut impl AsyncIterator<Item = ()>
+            216..225 'generator': impl AsyncIterator<Item = ()>
+            237..244 '&mut cx': &'? mut Context<'?>
+            242..244 'cx': Context<'?>
+        "#]],
+    );
+}
+
+#[test]
 fn tuple_pattern_nested_match_ergonomics() {
     check_no_mismatches(
         r#"
@@ -2135,11 +2285,11 @@ async fn main() {
     let z: core::ops::ControlFlow<(), _> = try { () };
     let w = const { 92 };
     let t = 'a: { 92 };
+    let u = try bikeshed core::ops::ControlFlow<(), _> { () };
 }
         "#,
         expect![[r#"
-            16..193 '{     ...2 }; }': ()
-            16..193 '{     ...2 }; }': impl Future<Output = ()>
+            16..256 '{     ...) }; }': ()
             26..27 'x': i32
             30..43 'unsafe { 92 }': i32
             39..41 '92': i32
@@ -2160,6 +2310,13 @@ async fn main() {
             176..177 't': i32
             180..190 ''a: { 92 }': i32
             186..188 '92': i32
+            200..201 'u': ControlFlow<(), ()>
+            204..253 'try bi...{ () }': ControlFlow<(), ()>
+            204..253 'try bi...{ () }': fn from_output<ControlFlow<(), ()>>(<ControlFlow<(), ()> as Try>::Output) -> ControlFlow<(), ()>
+            204..253 'try bi...{ () }': ControlFlow<(), ()>
+            204..253 'try bi...{ () }': ControlFlow<(), ()>
+            204..253 'try bi...{ () }': ControlFlow<(), ()>
+            249..251 '()': ()
         "#]],
     )
 }
@@ -2247,6 +2404,7 @@ fn infer_generic_from_later_assignment() {
             89..127 'loop {...     }': !
             94..127 '{     ...     }': ()
             104..107 'end': Option<bool>
+            104..107 'end': Option<bool>
             104..120 'end = ...(true)': ()
             110..114 'Some': fn Some<bool>(bool) -> Option<bool>
             110..120 'Some(true)': Option<bool>
@@ -2276,10 +2434,10 @@ fn infer_loop_break_with_val() {
             59..168 '{     ...  }; }': ()
             69..70 'x': Option<bool>
             73..165 'loop {...     }': Option<bool>
-            78..165 '{     ...     }': ()
+            78..165 '{     ...     }': !
             88..132 'if fal...     }': ()
             91..96 'false': bool
-            97..132 '{     ...     }': ()
+            97..132 '{     ...     }': !
             111..121 'break None': !
             117..121 'None': Option<bool>
             142..158 'break ...(true)': !
@@ -2312,7 +2470,7 @@ fn infer_loop_break_without_val() {
             78..133 '{     ...     }': ()
             88..127 'if fal...     }': ()
             91..96 'false': bool
-            97..127 '{     ...     }': ()
+            97..127 '{     ...     }': !
             111..116 'break': !
         "#]],
     );
@@ -2342,24 +2500,24 @@ fn infer_labelled_break_with_val() {
             19..21 '_x': impl Fn() -> bool
             24..332 '|| 'ou...     }': impl Fn() -> bool
             27..332 ''outer...     }': bool
-            40..332 '{     ...     }': ()
+            40..332 '{     ...     }': !
             54..59 'inner': i8
             62..300 ''inner...     }': i8
-            75..300 '{     ...     }': ()
+            75..300 '{     ...     }': !
             93..94 'i': bool
             97..113 'Defaul...efault': {unknown}
             97..115 'Defaul...ault()': bool
             129..269 'if (br...     }': ()
             133..147 'break 'outer i': !
             146..147 'i': bool
-            149..208 '{     ...     }': ()
+            149..208 '{     ...     }': !
             167..193 'loop {...5i8; }': !
-            172..193 '{ brea...5i8; }': ()
+            172..193 '{ brea...5i8; }': !
             174..190 'break ...er 5i8': !
             187..190 '5i8': i8
             214..269 'if tru...     }': ()
             217..221 'true': bool
-            222..269 '{     ...     }': ()
+            222..269 '{     ...     }': !
             240..254 'break 'inner 6': !
             253..254 '6': i8
             282..289 'break 7': !
@@ -2408,12 +2566,12 @@ fn foo() {
             140..270 'if (br...     }': ()
             144..158 'break 'outer i': !
             157..158 'i': bool
-            160..209 '{     ...     }': ()
+            160..209 '{     ...     }': !
             178..194 'break ...er 5i8': !
             191..194 '5i8': i8
             215..270 'if tru...     }': ()
             218..222 'true': bool
-            223..270 '{     ...     }': ()
+            223..270 '{     ...     }': !
             241..255 'break 'inner 6': !
             254..255 '6': i8
             283..313 'break ... { 0 }': !
@@ -2508,7 +2666,7 @@ fn generic_default_in_struct_literal() {
         }
         "#,
         expect![[r#"
-            99..319 '{     ...32); }': ()
+            99..319 '{     ...32); }': !
             109..110 'x': Thing<!>
             113..133 'Thing ...p {} }': Thing<!>
             124..131 'loop {}': !
@@ -2539,7 +2697,6 @@ fn generic_default_in_struct_literal() {
 
 #[test]
 fn generic_default_depending_on_other_type_arg() {
-    // FIXME: the {unknown} is a bug
     check_infer(
         r#"
         struct Thing<T = u128, F = fn() -> T> { t: T }
@@ -2556,7 +2713,7 @@ fn generic_default_depending_on_other_type_arg() {
             83..130 '{     ...2 }; }': ()
             89..91 't1': Thing<u32, fn() -> u32>
             97..99 't2': Thing<u128, fn() -> u128>
-            105..127 'Thing:...1u32 }': Thing<u32, fn() -> {unknown}>
+            105..127 'Thing:...1u32 }': Thing<u32, fn() -> u32>
             121..125 '1u32': u32
         "#]],
     );
@@ -3097,9 +3254,9 @@ fn main() {
         expect![[r#"
             104..108 'self': &'? Box<T>
             188..192 'self': &'a Box<Foo<T>>
-            218..220 '{}': &'a T
+            218..220 '{}': &'? T
             242..246 'self': &'a Box<Foo<T>>
-            275..277 '{}': &'a Foo<T>
+            275..277 '{}': &'? Foo<T>
             297..301 'self': Box<Foo<T>>
             322..324 '{}': Foo<T>
             338..559 '{     ...r(); }': ()
@@ -3435,15 +3592,13 @@ struct TS(usize);
 fn main() {
     let x;
     [x,] = &[1,];
-  //^^^^expected &'? [i32; 1], got [{unknown}]
 
     let x;
     [(x,),] = &[(1,),];
-  //^^^^^^^expected &'? [(i32,); 1], got [{unknown}]
 
     let x;
     ((x,),) = &((1,),);
-  //^^^^^^^expected &'? ((i32,),), got (({unknown},),)
+  //^^^^^^^expected &'? ((i32,),), got ({unknown},)
 
     let x;
     (x,) = &(1,);
@@ -3451,7 +3606,7 @@ fn main() {
 
     let x;
     (S { a: x },) = &(S { a: 42 },);
-  //^^^^^^^^^^^^^expected &'? (S,), got (S,)
+  //^^^^^^^^^^^^^expected &'? (S,), got ({unknown},)
 
     let x;
     S { a: x } = &S { a: 42 };
@@ -3875,6 +4030,7 @@ fn main() {
             100..147 'async_...    })': ()
             114..146 'async ...     }': impl AsyncFnOnce(i32)
             121..124 'arg': i32
+            121..124 'arg': i32
             126..146 '{     ...     }': ()
             136..139 'arg': i32
             153..160 'closure': fn closure<impl FnOnce(i32)>(impl FnOnce(i32))
@@ -3981,5 +4137,189 @@ fn foo() {
             54..55 'a': i32
             51..55: expected fn() -> i32, got impl Fn() -> i32
         "#]],
+    );
+}
+
+#[test]
+fn naked_asm_returns_never() {
+    check_no_mismatches(
+        r#"
+//- minicore: asm
+
+#[unsafe(naked)]
+extern "C" fn foo() -> ! {
+    core::arch::naked_asm!("");
+}
+    "#,
+    );
+}
+
+#[test]
+fn regression_21478() {
+    check_infer(
+        r#"
+//- minicore: unsize, coerce_unsized
+struct LazyLock<T>(T);
+
+impl<T> LazyLock<T> {
+    const fn new() -> Self {
+        loop {}
+    }
+
+    fn force(this: &Self) -> &T {
+        loop {}
+    }
+}
+
+static VALUES_LAZY_LOCK: LazyLock<[u32; { 0 }]> = LazyLock::new();
+
+fn foo() {
+    let _ = LazyLock::force(&VALUES_LAZY_LOCK);
+}
+    "#,
+        expect![[r#"
+            73..96 '{     ...     }': LazyLock<T>
+            83..90 'loop {}': !
+            88..90 '{}': ()
+            111..115 'this': &'? LazyLock<T>
+            130..153 '{     ...     }': &'? T
+            140..147 'loop {}': !
+            145..147 '{}': ()
+            207..220 'LazyLock::new': fn new<[u32; 0]>() -> LazyLock<[u32; 0]>
+            207..222 'LazyLock::new()': LazyLock<[u32; 0]>
+            234..285 '{     ...CK); }': ()
+            244..245 '_': &'? [u32; 0]
+            248..263 'LazyLock::force': fn force<[u32; 0]>(&'? LazyLock<[u32; 0]>) -> &'? [u32; 0]
+            248..282 'LazyLo..._LOCK)': &'? [u32; 0]
+            264..281 '&VALUE...Y_LOCK': &'? LazyLock<[u32; 0]>
+            265..281 'VALUES...Y_LOCK': LazyLock<[u32; 0]>
+            197..202 '{ 0 }': usize
+            199..200 '0': usize
+        "#]],
+    );
+}
+
+#[test]
+fn include_bytes_len_mismatch() {
+    check_no_mismatches(
+        r#"
+//- minicore: include_bytes
+static S: &[u8; 158] = include_bytes!("/foo/bar/baz.txt");
+    "#,
+    );
+}
+
+#[test]
+fn proc_macros_are_functions_inside_defining_crate_and_macros_outside() {
+    check_types(
+        r#"
+//- /pm.rs crate:pm
+#![crate_type = "proc-macro"]
+
+#[proc_macro_attribute]
+pub fn proc_macro() {}
+
+fn foo() {
+    proc_macro;
+ // ^^^^^^^^^^ fn proc_macro()
+}
+
+mod bar {
+    use super::proc_macro;
+
+    fn baz() {
+        super::proc_macro;
+     // ^^^^^^^^^^^^^^^^^ fn proc_macro()
+        proc_macro;
+     // ^^^^^^^^^^ fn proc_macro()
+    }
+}
+
+//- /lib.rs crate:lib deps:pm
+fn foo() {
+    pm::proc_macro;
+ // ^^^^^^^^^^^^^^ {unknown}
+}
+    "#,
+    );
+}
+
+#[test]
+fn signature_inference() {
+    check_infer(
+        r#"
+trait Trait<const A: u8> {}
+struct S<T: Trait<2>, const C: f32 = 0.0>
+where
+    (): Trait<2>
+{
+    field: [(); { C as usize }],
+    field2: *mut S<T, 5.0>
+}
+
+struct S2<const C: u16>;
+
+type Alias = S2<0>;
+impl S2<0> {}
+enum E {
+    V(S2<0>) = 0,
+}
+union U {
+    field: S2<0>
+}
+    "#,
+        expect![[r#"
+            242..243 '0': isize
+            111..125 '{ C as usize }': usize
+            113..114 'C': f32
+            113..123 'C as usize': usize
+        "#]],
+    );
+}
+
+#[test]
+fn async_closure_with_params() {
+    check_no_mismatches(
+        r#"
+fn foo() {
+    let capture = false;
+    async move |param: i32| {
+        capture;
+    };
+}
+    "#,
+    );
+}
+
+#[test]
+fn enum_variant_anon_const() {
+    check_infer(
+        r#"
+enum Enum {
+    Variant([(); { 2 }]),
+}
+    "#,
+        expect![[r#"
+            29..34 '{ 2 }': usize
+            31..32 '2': usize
+        "#]],
+    );
+}
+
+#[test]
+fn labelled_block_break() {
+    check_types(
+        r#"
+//- minicore: option
+fn foo() {
+    'a: {
+        if false {
+            break 'a Some(1);
+        }
+        None
+     // ^^^^ Option<i32>
+    };
+}
+    "#,
     );
 }

@@ -14,7 +14,7 @@ use rustc_infer::traits::query::{
 };
 use rustc_middle::ty::error::TypeError;
 use rustc_middle::ty::{
-    self, RePlaceholder, Region, RegionVid, Ty, TyCtxt, TypeFoldable, UniverseIndex,
+    self, RePlaceholder, Region, RegionVid, Ty, TyCtxt, TypeFoldable, UniverseIndex, Unnormalized,
 };
 use rustc_span::Span;
 use rustc_trait_selection::error_reporting::InferCtxtErrorExt;
@@ -24,7 +24,6 @@ use rustc_traits::{type_op_ascribe_user_type_with_span, type_op_prove_predicate_
 use tracing::{debug, instrument};
 
 use crate::MirBorrowckCtxt;
-use crate::region_infer::values::RegionElement;
 use crate::session_diagnostics::{
     HigherRankedErrorCause, HigherRankedLifetimeError, HigherRankedSubtypeError,
 };
@@ -49,11 +48,12 @@ impl<'tcx> UniverseInfo<'tcx> {
         UniverseInfo::RelateTys { expected, found }
     }
 
+    /// Report an error where an element erroneously made its way into `placeholder`.
     pub(crate) fn report_erroneous_element(
         &self,
         mbcx: &mut MirBorrowckCtxt<'_, '_, 'tcx>,
         placeholder: ty::PlaceholderRegion<'tcx>,
-        error_element: RegionElement<'tcx>,
+        error_element: Option<ty::PlaceholderRegion<'tcx>>,
         cause: ObligationCause<'tcx>,
     ) {
         match *self {
@@ -146,14 +146,14 @@ pub(crate) trait TypeOpInfo<'tcx> {
     ) -> Option<Diag<'infcx>>;
 
     /// Constraints require that `error_element` appear in the
-    ///  values of `placeholder`, but this cannot be proven to
+    /// values of `placeholder`, but this cannot be proven to
     /// hold. Report an error.
     #[instrument(level = "debug", skip(self, mbcx))]
     fn report_erroneous_element(
         &self,
         mbcx: &mut MirBorrowckCtxt<'_, '_, 'tcx>,
         placeholder: ty::PlaceholderRegion<'tcx>,
-        error_element: RegionElement<'tcx>,
+        error_element: Option<ty::PlaceholderRegion<'tcx>>,
         cause: ObligationCause<'tcx>,
     ) {
         let tcx = mbcx.infcx.tcx;
@@ -169,22 +169,20 @@ pub(crate) trait TypeOpInfo<'tcx> {
 
         let placeholder_region = ty::Region::new_placeholder(
             tcx,
-            ty::Placeholder::new(adjusted_universe.into(), placeholder.bound),
+            ty::PlaceholderRegion::new(adjusted_universe.into(), placeholder.bound),
         );
 
-        let error_region =
-            if let RegionElement::PlaceholderRegion(error_placeholder) = error_element {
-                let adjusted_universe =
-                    error_placeholder.universe.as_u32().checked_sub(base_universe.as_u32());
-                adjusted_universe.map(|adjusted| {
-                    ty::Region::new_placeholder(
-                        tcx,
-                        ty::Placeholder::new(adjusted.into(), error_placeholder.bound),
-                    )
-                })
-            } else {
-                None
-            };
+        // FIXME: one day this should just be error_element,
+        // and this method shouldn't do anything.
+        let error_region = error_element.and_then(|e| {
+            let adjusted_universe = e.universe.as_u32().checked_sub(base_universe.as_u32());
+            adjusted_universe.map(|adjusted| {
+                ty::Region::new_placeholder(
+                    tcx,
+                    ty::PlaceholderRegion::new(adjusted.into(), e.bound),
+                )
+            })
+        });
 
         debug!(?placeholder_region);
 
@@ -277,7 +275,7 @@ where
         // the former fails to normalize the `nll/relate_tys/impl-fn-ignore-binder-via-bottom.rs`
         // test. Check after #85499 lands to see if its fixes have erased this difference.
         let ty::ParamEnvAnd { param_env, value } = key;
-        let _ = ocx.normalize(&cause, param_env, value.value);
+        let _ = ocx.normalize(&cause, param_env, Unnormalized::new_wip(value.value));
 
         let diag = try_extract_error_from_fulfill_cx(
             &ocx,
@@ -324,7 +322,7 @@ where
         let ocx = ObligationCtxt::new(&infcx);
 
         let ty::ParamEnvAnd { param_env, value } = key;
-        let _ = ocx.deeply_normalize(&cause, param_env, value.value);
+        let _ = ocx.deeply_normalize(&cause, param_env, Unnormalized::new_wip(value.value));
 
         let diag = try_extract_error_from_fulfill_cx(
             &ocx,
@@ -453,7 +451,7 @@ fn try_extract_error_from_region_constraints<'a, 'tcx>(
             (RePlaceholder(a_p), RePlaceholder(b_p)) => a_p.bound == b_p.bound,
             _ => a_region == b_region,
         };
-    let mut check = |c: &Constraint<'tcx>, cause: &SubregionOrigin<'tcx>, exact| match c.kind {
+    let mut check = |c: Constraint<'tcx>, cause: &SubregionOrigin<'tcx>, exact| match c.kind {
         ConstraintKind::RegSubReg
             if ((exact && c.sup == placeholder_region)
                 || (!exact && regions_the_same(c.sup, placeholder_region)))
@@ -469,13 +467,23 @@ fn try_extract_error_from_region_constraints<'a, 'tcx>(
         {
             Some((c.sub, cause.clone()))
         }
-        _ => None,
+        ConstraintKind::VarSubVar
+        | ConstraintKind::RegSubVar
+        | ConstraintKind::VarSubReg
+        | ConstraintKind::RegSubReg => None,
+
+        ConstraintKind::VarEqVar | ConstraintKind::VarEqReg | ConstraintKind::RegEqReg => {
+            unreachable!()
+        }
     };
 
     let mut find_culprit = |exact_match: bool| {
         region_constraints
             .constraints
             .iter()
+            .flat_map(|(constraint, cause)| {
+                constraint.iter_outlives().map(move |constraint| (constraint, cause))
+            })
             .find_map(|(constraint, cause)| check(constraint, cause, exact_match))
     };
 

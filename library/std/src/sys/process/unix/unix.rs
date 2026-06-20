@@ -16,7 +16,7 @@ use crate::num::NonZero;
 use crate::process::StdioPipes;
 use crate::sys::cvt;
 #[cfg(target_os = "linux")]
-use crate::sys::pal::linux::pidfd::PidFd;
+use crate::sys::process::PidFd;
 use crate::{fmt, mem, sys};
 
 cfg_select! {
@@ -318,7 +318,7 @@ impl Command {
                         // An alternative would be to require CAP_SETGID (in
                         // addition to CAP_SETUID) for setting the UID.
                         if e.raw_os_error() != Some(libc::EPERM) {
-                            return Err(e.into());
+                            return Err(e);
                         }
                     }
                 }
@@ -356,7 +356,7 @@ impl Command {
             // If -Zon-broken-pipe is not used, reset SIGPIPE to SIG_DFL for backward compatibility.
             //
             // -Zon-broken-pipe is an opportunity to change the default here.
-            if !crate::sys::pal::on_broken_pipe_flag_used() {
+            if !crate::sys::pal::on_broken_pipe_used() {
                 #[cfg(target_os = "android")] // see issue #88585
                 {
                     let mut action: libc::sigaction = mem::zeroed();
@@ -455,7 +455,7 @@ impl Command {
         use core::sync::atomic::{Atomic, AtomicU8, Ordering};
 
         use crate::mem::MaybeUninit;
-        use crate::sys::{self, cvt_nz, on_broken_pipe_flag_used};
+        use crate::sys::{self, cvt_nz, on_broken_pipe_used};
 
         if self.get_gid().is_some()
             || self.get_uid().is_some()
@@ -524,7 +524,7 @@ impl Command {
                             return Ok(None);
                         }
                     }
-                    core::assert_matches::debug_assert_matches!(support, SPAWN | NO);
+                    core::debug_assert_matches!(support, SPAWN | NO);
                 }
             }
             _ => {
@@ -537,7 +537,7 @@ impl Command {
         // Only glibc 2.24+ posix_spawn() supports returning ENOENT directly.
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
         {
-            if let Some(version) = sys::os::glibc_version() {
+            if let Some(version) = sys::pal::conf::glibc_version() {
                 if version < (2, 24) {
                     return Ok(None);
                 }
@@ -731,7 +731,7 @@ impl Command {
             // If -Zon-broken-pipe is not used, reset SIGPIPE to SIG_DFL for backward compatibility.
             //
             // -Zon-broken-pipe is an opportunity to change the default here.
-            if !on_broken_pipe_flag_used() {
+            if !on_broken_pipe_used() {
                 let mut default_set = MaybeUninit::<libc::sigset_t>::uninit();
                 cvt(sigemptyset(default_set.as_mut_ptr()))?;
                 cvt(sigaddset(default_set.as_mut_ptr(), libc::SIGPIPE))?;
@@ -881,7 +881,7 @@ impl Command {
 
             // we send the 0-length message even if we failed to acquire the pidfd
             // so we get a consistent SEQPACKET order
-            match cvt_r(|| libc::sendmsg(sock.as_raw(), &msg, 0)) {
+            match cvt_r(|| libc::sendmsg(sock.as_raw(), &msg, libc::MSG_EOR)) {
                 Ok(0) => {}
                 other => rtabort!("failed to communicate with parent process. {:?}", other),
             }
@@ -1000,6 +1000,19 @@ impl Process {
             return pid_fd.send_signal(signal);
         }
         cvt(unsafe { libc::kill(self.pid, signal) }).map(drop)
+    }
+
+    pub(crate) fn send_process_group_signal(&self, signal: i32) -> io::Result<()> {
+        // See note in `send_signal` regarding recycled PIDs.
+        if self.status.is_some() {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(pid_fd) = self.pidfd.as_ref() {
+            // The `PIDFD_SIGNAL_PROCESS_GROUP` flag requires kernel >= 6.9
+            return pid_fd.send_process_group_signal(signal);
+        }
+        cvt(unsafe { libc::killpg(self.pid, signal) }).map(drop)
     }
 
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
@@ -1266,8 +1279,7 @@ impl ExitStatusError {
 mod linux_child_ext {
     use crate::io::ErrorKind;
     use crate::os::linux::process as os;
-    use crate::sys::FromInner;
-    use crate::sys::pal::linux::pidfd as imp;
+    use crate::sys::{FromInner, process as imp};
     use crate::{io, mem};
 
     #[unstable(feature = "linux_pidfd", issue = "82971")]

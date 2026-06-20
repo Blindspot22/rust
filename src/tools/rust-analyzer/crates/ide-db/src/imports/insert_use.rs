@@ -6,12 +6,11 @@ use std::cmp::Ordering;
 
 use hir::Semantics;
 use syntax::{
-    Direction, NodeOrToken, SyntaxKind, SyntaxNode, algo,
+    NodeOrToken, SyntaxKind, SyntaxNode,
     ast::{
-        self, AstNode, HasAttrs, HasModuleItem, HasVisibility, PathSegmentKind,
-        edit_in_place::Removable, make,
+        self, AstNode, HasAttrs, HasModuleItem, HasVisibility, PathSegmentKind, edit::IndentLevel,
     },
-    ted,
+    syntax_editor::{Position, SyntaxEditor},
 };
 
 use crate::{
@@ -93,26 +92,49 @@ impl ImportScope {
                     .item_list()
                     .map(ImportScopeKind::Module)
                     .map(|kind| ImportScope { kind, required_cfgs });
-            } else if let Some(has_attrs) = ast::AnyHasAttrs::cast(syntax) {
+            } else if let Some(has_attrs) = ast::AnyHasAttrs::cast(syntax.clone()) {
                 if block.is_none()
                     && let Some(b) = ast::BlockExpr::cast(has_attrs.syntax().clone())
                     && let Some(b) = sema.original_ast_node(b)
                 {
                     block = b.stmt_list();
                 }
-                if has_attrs
-                    .attrs()
-                    .any(|attr| attr.as_simple_call().is_some_and(|(ident, _)| ident == "cfg"))
+                if has_attrs.attrs().any(|attr| matches!(attr.meta(), Some(ast::Meta::CfgMeta(_))))
                 {
-                    if let Some(b) = block {
-                        return Some(ImportScope {
-                            kind: ImportScopeKind::Block(b),
-                            required_cfgs,
-                        });
+                    if let Some(b) = block.clone() {
+                        let current_cfgs = has_attrs
+                            .attrs()
+                            .filter(|attr| matches!(attr.meta(), Some(ast::Meta::CfgMeta(_))));
+
+                        let total_cfgs: Vec<_> =
+                            required_cfgs.iter().cloned().chain(current_cfgs).collect();
+
+                        let parent = syntax.parent();
+                        let mut can_merge = false;
+                        if let Some(parent) = parent {
+                            can_merge = parent.children().filter_map(ast::Use::cast).any(|u| {
+                                let u_attrs = u.attrs().filter(|attr| {
+                                    matches!(attr.meta(), Some(ast::Meta::CfgMeta(_)))
+                                });
+                                crate::imports::merge_imports::eq_attrs(
+                                    u_attrs,
+                                    total_cfgs.iter().cloned(),
+                                )
+                            });
+                        }
+
+                        if !can_merge {
+                            return Some(ImportScope {
+                                kind: ImportScopeKind::Block(b),
+                                required_cfgs,
+                            });
+                        }
                     }
-                    required_cfgs.extend(has_attrs.attrs().filter(|attr| {
-                        attr.as_simple_call().is_some_and(|(ident, _)| ident == "cfg")
-                    }));
+                    required_cfgs.extend(
+                        has_attrs
+                            .attrs()
+                            .filter(|attr| matches!(attr.meta(), Some(ast::Meta::CfgMeta(_)))),
+                    );
                 }
             }
         }
@@ -126,29 +148,58 @@ impl ImportScope {
             ImportScopeKind::Block(block) => block.syntax(),
         }
     }
-
-    pub fn clone_for_update(&self) -> Self {
-        Self {
-            kind: match &self.kind {
-                ImportScopeKind::File(file) => ImportScopeKind::File(file.clone_for_update()),
-                ImportScopeKind::Module(item_list) => {
-                    ImportScopeKind::Module(item_list.clone_for_update())
-                }
-                ImportScopeKind::Block(block) => ImportScopeKind::Block(block.clone_for_update()),
-            },
-            required_cfgs: self.required_cfgs.iter().map(|attr| attr.clone_for_update()).collect(),
-        }
-    }
 }
 
 /// Insert an import path into the given file/node. A `merge` value of none indicates that no import merging is allowed to occur.
-pub fn insert_use(scope: &ImportScope, path: ast::Path, cfg: &InsertUseConfig) {
-    insert_use_with_alias_option(scope, path, cfg, None);
+pub fn insert_use_with_editor(
+    scope: &ImportScope,
+    path: ast::Path,
+    cfg: &InsertUseConfig,
+    syntax_editor: &SyntaxEditor,
+) {
+    insert_use_with_alias_option_with_editor(scope, path, cfg, None, syntax_editor);
 }
 
-pub fn insert_use_as_alias(scope: &ImportScope, path: ast::Path, cfg: &InsertUseConfig) {
+pub fn insert_uses_with_editor(
+    scope: &ImportScope,
+    paths: impl IntoIterator<Item = ast::Path>,
+    cfg: &InsertUseConfig,
+    syntax_editor: &SyntaxEditor,
+) {
+    let paths = paths.into_iter().collect::<Vec<_>>();
+    if paths.len() > 1
+        && scope.as_syntax_node().parent().is_none()
+        && scope.required_cfgs.is_empty()
+        && !scope.as_syntax_node().children().any(|node| ast::Use::cast(node).is_some())
+    {
+        let make = syntax_editor.make();
+        let elements = paths
+            .into_iter()
+            .flat_map(|path| {
+                let use_tree = make.use_tree(path, None, None, false);
+                let use_item = make.use_(None, None, use_tree);
+                [use_item.syntax().clone().into(), make.whitespace("\n").into()]
+            })
+            .chain([make.whitespace("\n").into()])
+            .collect();
+        syntax_editor.insert_all(Position::first_child_of(scope.as_syntax_node()), elements);
+        return;
+    }
+
+    for path in paths {
+        insert_use_with_editor(scope, path, cfg, syntax_editor);
+    }
+}
+
+pub fn insert_use_as_alias_with_editor(
+    scope: &ImportScope,
+    path: ast::Path,
+    cfg: &InsertUseConfig,
+    edition: span::Edition,
+    editor: &SyntaxEditor,
+) {
     let text: &str = "use foo as _";
-    let parse = syntax::SourceFile::parse(text, span::Edition::CURRENT_FIXME);
+    let parse = syntax::SourceFile::parse(text, edition);
     let node = parse
         .tree()
         .syntax()
@@ -157,15 +208,17 @@ pub fn insert_use_as_alias(scope: &ImportScope, path: ast::Path, cfg: &InsertUse
         .expect("Failed to make ast node `Rename`");
     let alias = node.rename();
 
-    insert_use_with_alias_option(scope, path, cfg, alias);
+    insert_use_with_alias_option_with_editor(scope, path, cfg, alias, editor);
 }
 
-fn insert_use_with_alias_option(
+fn insert_use_with_alias_option_with_editor(
     scope: &ImportScope,
     path: ast::Path,
     cfg: &InsertUseConfig,
     alias: Option<ast::Rename>,
+    syntax_editor: &SyntaxEditor,
 ) {
+    let make = syntax_editor.make();
     let _p = tracing::info_span!("insert_use_with_alias_option").entered();
     let mut mb = match cfg.granularity {
         ImportGranularity::Crate => Some(MergeBehavior::Crate),
@@ -195,17 +248,14 @@ fn insert_use_with_alias_option(
         };
     }
 
-    let mut use_tree = make::use_tree(path, None, alias, false);
-    if mb == Some(MergeBehavior::One) && use_tree.path().is_some() {
-        use_tree = use_tree.clone_for_update();
-        use_tree.wrap_in_tree_list();
-    }
-    let use_item = make::use_(None, None, use_tree).clone_for_update();
-    for attr in
-        scope.required_cfgs.iter().map(|attr| attr.syntax().clone_subtree().clone_for_update())
+    let mut use_tree = make.use_tree(path, None, alias, false);
+    if mb == Some(MergeBehavior::One)
+        && use_tree.path().is_some()
+        && let Some(wrapped) = use_tree.wrap_in_tree_list_with_editor()
     {
-        ted::insert(ted::Position::first_child_of(use_item.syntax()), attr);
+        use_tree = wrapped;
     }
+    let use_item = make.use_(scope.required_cfgs.iter().cloned().rev(), None, use_tree);
 
     // merge into existing imports if possible
     if let Some(mb) = mb {
@@ -214,34 +264,24 @@ fn insert_use_with_alias_option(
             scope.as_syntax_node().children().filter_map(ast::Use::cast).filter(filter)
         {
             if let Some(merged) = try_merge_imports(&existing_use, &use_item, mb) {
-                ted::replace(existing_use.syntax(), merged.syntax());
+                syntax_editor.replace(existing_use.syntax(), merged.syntax());
                 return;
             }
         }
     }
     // either we weren't allowed to merge or there is no import that fits the merge conditions
     // so look for the place we have to insert to
-    insert_use_(scope, use_item, cfg.group);
+    insert_use_with_editor_(scope, use_item, cfg.group, syntax_editor);
 }
 
-pub fn ast_to_remove_for_path_in_use_stmt(path: &ast::Path) -> Option<Box<dyn Removable>> {
-    // FIXME: improve this
-    if path.parent_path().is_some() {
-        return None;
-    }
-    let use_tree = path.syntax().parent().and_then(ast::UseTree::cast)?;
+pub fn remove_use_tree_if_simple(use_tree: &ast::UseTree, editor: &SyntaxEditor) {
     if use_tree.use_tree_list().is_some() || use_tree.star_token().is_some() {
-        return None;
+        return;
     }
     if let Some(use_) = use_tree.syntax().parent().and_then(ast::Use::cast) {
-        return Some(Box::new(use_));
-    }
-    Some(Box::new(use_tree))
-}
-
-pub fn remove_path_if_in_use_stmt(path: &ast::Path) {
-    if let Some(node) = ast_to_remove_for_path_in_use_stmt(path) {
-        node.remove();
+        syntax::syntax_editor::Removable::remove(&use_, editor);
+    } else {
+        syntax::syntax_editor::Removable::remove(use_tree, editor);
     }
 }
 
@@ -380,7 +420,13 @@ fn guess_granularity_from_scope(scope: &ImportScope) -> ImportGranularityGuess {
     }
 }
 
-fn insert_use_(scope: &ImportScope, use_item: ast::Use, group_imports: bool) {
+fn insert_use_with_editor_(
+    scope: &ImportScope,
+    use_item: ast::Use,
+    group_imports: bool,
+    syntax_editor: &SyntaxEditor,
+) {
+    let make = syntax_editor.make();
     let scope_syntax = scope.as_syntax_node();
     let insert_use_tree =
         use_item.use_tree().expect("`use_item` should have a use tree for `insert_path`");
@@ -411,12 +457,18 @@ fn insert_use_(scope: &ImportScope, use_item: ast::Use, group_imports: bool) {
         if let Some((.., node)) = post_insert {
             cov_mark::hit!(insert_group);
             // insert our import before that element
-            return ted::insert(ted::Position::before(node), use_item.syntax());
+            return syntax_editor.insert_all(
+                Position::before(node),
+                vec![use_item.syntax().clone().into(), make.whitespace("\n").into()],
+            );
         }
         if let Some(node) = last {
             cov_mark::hit!(insert_group_last);
             // there is no element after our new import, so append it to the end of the group
-            return ted::insert(ted::Position::after(node), use_item.syntax());
+            return syntax_editor.insert_all(
+                Position::after(node),
+                vec![make.whitespace("\n").into(), use_item.syntax().clone().into()],
+            );
         }
 
         // the group we were looking for actually doesn't exist, so insert
@@ -428,24 +480,29 @@ fn insert_use_(scope: &ImportScope, use_item: ast::Use, group_imports: bool) {
             .find(|(use_tree, ..)| ImportGroup::new(use_tree) > group);
         if let Some((.., node)) = post_group {
             cov_mark::hit!(insert_group_new_group);
-            ted::insert(ted::Position::before(&node), use_item.syntax());
-            if let Some(node) = algo::non_trivia_sibling(node.into(), Direction::Prev) {
-                ted::insert(ted::Position::after(node), make::tokens::single_newline());
-            }
+            syntax_editor.insert_all(
+                Position::before(&node),
+                vec![use_item.syntax().clone().into(), make.whitespace("\n\n").into()],
+            );
             return;
         }
         // there is no such group, so append after the last one
         if let Some(node) = last {
             cov_mark::hit!(insert_group_no_group);
-            ted::insert(ted::Position::after(&node), use_item.syntax());
-            ted::insert(ted::Position::after(node), make::tokens::single_newline());
+            syntax_editor.insert_all(
+                Position::after(&node),
+                vec![make.whitespace("\n\n").into(), use_item.syntax().clone().into()],
+            );
             return;
         }
     } else {
         // There exists a group, so append to the end of it
         if let Some((_, node)) = path_node_iter.last() {
             cov_mark::hit!(insert_no_grouping_last);
-            ted::insert(ted::Position::after(node), use_item.syntax());
+            syntax_editor.insert_all(
+                Position::after(node),
+                vec![make.whitespace("\n").into(), use_item.syntax().clone().into()],
+            );
             return;
         }
     }
@@ -464,7 +521,9 @@ fn insert_use_(scope: &ImportScope, use_item: ast::Use, group_imports: bool) {
         // skip the curly brace
         .skip(l_curly.is_some() as usize)
         .take_while(|child| match child {
-            NodeOrToken::Node(node) => is_inner_attribute(node.clone()),
+            NodeOrToken::Node(node) => {
+                is_inner_attribute(node.clone()) && ast::Item::cast(node.clone()).is_none()
+            }
             NodeOrToken::Token(token) => {
                 [SyntaxKind::WHITESPACE, SyntaxKind::COMMENT, SyntaxKind::SHEBANG]
                     .contains(&token.kind())
@@ -474,22 +533,38 @@ fn insert_use_(scope: &ImportScope, use_item: ast::Use, group_imports: bool) {
         .last()
     {
         cov_mark::hit!(insert_empty_inner_attr);
-        ted::insert(ted::Position::after(&last_inner_element), use_item.syntax());
-        ted::insert(ted::Position::after(last_inner_element), make::tokens::single_newline());
+        let indent = if l_curly.is_some() {
+            IndentLevel::from_node(scope_syntax) + 1
+        } else {
+            IndentLevel::zero()
+        };
+        syntax_editor.insert_all(
+            Position::after(&last_inner_element),
+            vec![
+                make.whitespace(&format!("\n\n{indent}")).into(),
+                use_item.syntax().clone().into(),
+            ],
+        );
     } else {
         match l_curly {
             Some(b) => {
                 cov_mark::hit!(insert_empty_module);
-                ted::insert(ted::Position::after(&b), make::tokens::single_newline());
-                ted::insert(ted::Position::after(&b), use_item.syntax());
+                let indent = IndentLevel::from_node(scope_syntax) + 1;
+                syntax_editor.insert_all(
+                    Position::after(&b),
+                    vec![
+                        make.whitespace(&format!("\n{indent}")).into(),
+                        use_item.syntax().clone().into(),
+                        make.whitespace("\n").into(),
+                    ],
+                );
             }
             None => {
                 cov_mark::hit!(insert_empty_file);
-                ted::insert(
-                    ted::Position::first_child_of(scope_syntax),
-                    make::tokens::blank_line(),
+                syntax_editor.insert_all(
+                    Position::first_child_of(scope_syntax),
+                    vec![use_item.syntax().clone().into(), make.whitespace("\n\n").into()],
                 );
-                ted::insert(ted::Position::first_child_of(scope_syntax), use_item.syntax());
             }
         }
     }

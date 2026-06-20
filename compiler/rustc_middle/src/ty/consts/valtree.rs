@@ -5,7 +5,7 @@ use rustc_abi::{FIRST_VARIANT, VariantIdx};
 use rustc_data_structures::intern::Interned;
 use rustc_hir::def::Namespace;
 use rustc_macros::{
-    HashStable, Lift, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable, extension,
+    Lift, StableHash, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable, extension,
 };
 
 use super::ScalarInt;
@@ -26,16 +26,10 @@ impl<'tcx> ty::ValTreeKind<TyCtxt<'tcx>> {
 ///
 /// [dev guide]: https://rustc-dev-guide.rust-lang.org/mir/index.html#valtrees
 #[derive(Copy, Clone, Hash, Eq, PartialEq)]
-#[derive(HashStable)]
+#[derive(StableHash)]
 // FIXME(mgca): Try not interning here. We already intern `ty::Const` which `ValTreeKind`
 // recurses through
 pub struct ValTree<'tcx>(pub(crate) Interned<'tcx, ty::ValTreeKind<TyCtxt<'tcx>>>);
-
-impl<'tcx> rustc_type_ir::inherent::ValTree<TyCtxt<'tcx>> for ValTree<'tcx> {
-    fn kind(&self) -> &ty::ValTreeKind<TyCtxt<'tcx>> {
-        &self
-    }
-}
 
 impl<'tcx> ValTree<'tcx> {
     /// Returns the zero-sized valtree: `Branch([])`.
@@ -44,7 +38,7 @@ impl<'tcx> ValTree<'tcx> {
     }
 
     pub fn is_zst(self) -> bool {
-        matches!(*self, ty::ValTreeKind::Branch(box []))
+        matches!(*self, ty::ValTreeKind::Branch(consts) if consts.is_empty())
     }
 
     pub fn from_raw_bytes(tcx: TyCtxt<'tcx>, bytes: &[u8]) -> Self {
@@ -58,7 +52,9 @@ impl<'tcx> ValTree<'tcx> {
         tcx: TyCtxt<'tcx>,
         branches: impl IntoIterator<Item = ty::Const<'tcx>>,
     ) -> Self {
-        tcx.intern_valtree(ty::ValTreeKind::Branch(branches.into_iter().collect()))
+        tcx.intern_valtree(ty::ValTreeKind::Branch(
+            tcx.mk_const_list_from_iter(branches.into_iter()),
+        ))
     }
 
     pub fn from_scalar_int(tcx: TyCtxt<'tcx>, i: ScalarInt) -> Self {
@@ -81,6 +77,14 @@ impl fmt::Debug for ValTree<'_> {
     }
 }
 
+impl<'tcx> rustc_type_ir::inherent::IntoKind for ty::ValTree<'tcx> {
+    type Kind = ty::ValTreeKind<TyCtxt<'tcx>>;
+
+    fn kind(self) -> Self::Kind {
+        *self.0
+    }
+}
+
 /// `Ok(Err(ty))` indicates the constant was fine, but the valtree couldn't be constructed
 /// because the value contains something of type `ty` that is not valtree-compatible.
 /// The caller can then show an appropriate error; the query does not have the
@@ -93,7 +97,7 @@ pub type ConstToValTreeResult<'tcx> = Result<Result<ValTree<'tcx>, Ty<'tcx>>, Er
 /// Note that this is also used by pattern elaboration to represent values which cannot occur in types,
 /// such as raw pointers and floats.
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
-#[derive(HashStable, TyEncodable, TyDecodable, TypeFoldable, TypeVisitable, Lift)]
+#[derive(StableHash, TyEncodable, TyDecodable, TypeFoldable, TypeVisitable, Lift)]
 pub struct Value<'tcx> {
     pub ty: Ty<'tcx>,
     pub valtree: ValTree<'tcx>,
@@ -136,18 +140,28 @@ impl<'tcx> Value<'tcx> {
             ty::Ref(_, inner_ty, _) => match inner_ty.kind() {
                 // `&str` can be interpreted as raw bytes
                 ty::Str => {}
-                // `&[u8]` can be interpreted as raw bytes
-                ty::Slice(slice_ty) if *slice_ty == tcx.types.u8 => {}
+                // `&[T]` can be interpreted as raw bytes if elements are `u8`
+                ty::Slice(_) => {}
                 // other `&_` can't be interpreted as raw bytes
                 _ => return None,
             },
-            // `[u8; N]` can be interpreted as raw bytes
-            ty::Array(array_ty, _) if *array_ty == tcx.types.u8 => {}
+            // `[T; N]` can be interpreted as raw bytes if elements are `u8`
+            ty::Array(_, _) => {}
             // Otherwise, type cannot be interpreted as raw bytes
             _ => return None,
         }
 
-        Some(tcx.arena.alloc_from_iter(self.to_branch().into_iter().map(|ct| ct.to_leaf().to_u8())))
+        // We create an iterator that yields `Option<u8>`
+        let iterator = self.to_branch().into_iter().map(|ct| {
+            (*ct)
+                .try_to_value()
+                .and_then(|value| (value.ty == tcx.types.u8).then_some(value))
+                .and_then(|value| value.try_to_leaf().map(|leaf| leaf.to_u8()))
+        });
+        // If there is `None` in the iterator, then the array is not a valid array of u8s and we return `None`
+        let bytes: Vec<u8> = iterator.collect::<Option<Vec<u8>>>()?;
+
+        Some(tcx.arena.alloc_from_iter(bytes))
     }
 
     /// Converts to a `ValTreeKind::Leaf` value, `panic`'ing
@@ -224,9 +238,8 @@ impl<'tcx> rustc_type_ir::inherent::ValueConst<TyCtxt<'tcx>> for Value<'tcx> {
 impl<'tcx> fmt::Display for Value<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         ty::tls::with(move |tcx| {
-            let cv = tcx.lift(*self).unwrap();
             let mut p = FmtPrinter::new(tcx, Namespace::ValueNS);
-            p.pretty_print_const_valtree(cv, /*print_ty*/ true)?;
+            p.pretty_print_const_valtree(tcx.lift(*self), /*print_ty*/ true)?;
             f.write_str(&p.into_buffer())
         })
     }

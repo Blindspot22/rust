@@ -1,5 +1,5 @@
 error[E0539]: malformed `should_panic` attribute input
-  --> $DIR/test-should-panic-attr.rs:10:1
+  --> $DIR/test-should-panic-attr.rs:11:1
    |
 LL | #[should_panic(expected)]
    | ^^^^^^^^^^^^^^^--------^^
@@ -19,12 +19,12 @@ LL + #[should_panic]
    |
 
 error[E0539]: malformed `should_panic` attribute input
-  --> $DIR/test-should-panic-attr.rs:19:1
+  --> $DIR/test-should-panic-attr.rs:20:1
    |
 LL | #[should_panic(expect)]
-   | ^^^^^^^^^^^^^^--------^
-   |               |
-   |               the only valid argument here is "expected"
+   | ^^^^^^^^^^^^^^^------^^
+   |                |
+   |                expected this to be of the form `expected = "..."`
    |
    = note: for more information, visit <https://doc.rust-lang.org/reference/attributes/testing.html#the-should_panic-attribute>
 help: try changing it to one of the following valid forms of the attribute
@@ -39,7 +39,7 @@ LL + #[should_panic]
    |
 
 error[E0539]: malformed `should_panic` attribute input
-  --> $DIR/test-should-panic-attr.rs:28:1
+  --> $DIR/test-should-panic-attr.rs:29:1
    |
 LL | #[should_panic(expected(foo, bar))]
    | ^^^^^^^^^^^^^^^------------------^^
@@ -60,7 +60,7 @@ LL + #[should_panic]
    |
 
 error[E0805]: malformed `should_panic` attribute input
-  --> $DIR/test-should-panic-attr.rs:37:1
+  --> $DIR/test-should-panic-attr.rs:38:1
    |
 LL | #[should_panic(expected = "foo", bar)]
    | ^^^^^^^^^^^^^^-----------------------^

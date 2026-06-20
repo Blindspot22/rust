@@ -5,12 +5,10 @@ use rustc_infer::infer::canonical::Canonical;
 use rustc_infer::infer::outlives::env::RegionBoundPairs;
 use rustc_middle::bug;
 use rustc_middle::mir::{Body, ConstraintCategory};
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeFoldable, Upcast};
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeFoldable, Unnormalized, Upcast};
 use rustc_span::Span;
 use rustc_span::def_id::DefId;
-use rustc_trait_selection::solve::NoSolution;
 use rustc_trait_selection::traits::ObligationCause;
-use rustc_trait_selection::traits::query::type_op::custom::CustomTypeOp;
 use rustc_trait_selection::traits::query::type_op::{self, TypeOpOutput};
 use tracing::{debug, instrument};
 
@@ -185,7 +183,11 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         );
     }
 
-    pub(super) fn normalize<T>(&mut self, value: T, location: impl NormalizeLocation) -> T
+    pub(super) fn normalize<T>(
+        &mut self,
+        value: Unnormalized<'tcx, T>,
+        location: impl NormalizeLocation,
+    ) -> T
     where
         T: type_op::normalize::Normalizable<'tcx> + fmt::Display + Copy + 'tcx,
     {
@@ -207,13 +209,14 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
     #[instrument(skip(self), level = "debug")]
     pub(super) fn normalize_with_category<T>(
         &mut self,
-        value: T,
+        value: Unnormalized<'tcx, T>,
         location: impl NormalizeLocation,
         category: ConstraintCategory<'tcx>,
     ) -> T
     where
         T: type_op::normalize::Normalizable<'tcx> + fmt::Display + Copy + 'tcx,
     {
+        let value = value.skip_normalization();
         let param_env = self.infcx.param_env;
         let result: Result<_, ErrorGuaranteed> = self.fully_perform_op(
             location.to_locations(),
@@ -237,75 +240,8 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
             body.source.def_id().expect_local(),
         );
 
-        if self.infcx.next_trait_solver() {
-            let param_env = self.infcx.param_env;
-            // FIXME: Make this into a real type op?
-            self.fully_perform_op(
-                location.to_locations(),
-                ConstraintCategory::Boring,
-                CustomTypeOp::new(
-                    |ocx| {
-                        let structurally_normalize = |ty| {
-                            ocx.structurally_normalize_ty(
-                                &cause,
-                                param_env,
-                                ty,
-                            )
-                            .unwrap_or_else(|_| bug!("struct tail should have been computable, since we computed it in HIR"))
-                        };
-
-                        let tail = tcx.struct_tail_raw(
-                            ty,
-                            &cause,
-                            structurally_normalize,
-                            || {},
-                        );
-
-                        Ok(tail)
-                    },
-                    "normalizing struct tail",
-                ),
-            )
-            .unwrap_or_else(|guar| Ty::new_error(tcx, guar))
-        } else {
-            let mut normalize = |ty| self.normalize(ty, location);
-            let tail = tcx.struct_tail_raw(ty, &cause, &mut normalize, || {});
-            normalize(tail)
-        }
-    }
-
-    #[instrument(skip(self), level = "debug")]
-    pub(super) fn structurally_resolve(
-        &mut self,
-        ty: Ty<'tcx>,
-        location: impl NormalizeLocation,
-    ) -> Ty<'tcx> {
-        if self.infcx.next_trait_solver() {
-            let body = self.body;
-            let param_env = self.infcx.param_env;
-            // FIXME: Make this into a real type op?
-            self.fully_perform_op(
-                location.to_locations(),
-                ConstraintCategory::Boring,
-                CustomTypeOp::new(
-                    |ocx| {
-                        ocx.structurally_normalize_ty(
-                            &ObligationCause::misc(
-                                location.to_locations().span(body),
-                                body.source.def_id().expect_local(),
-                            ),
-                            param_env,
-                            ty,
-                        )
-                        .map_err(|_| NoSolution)
-                    },
-                    "normalizing struct tail",
-                ),
-            )
-            .unwrap_or_else(|guar| Ty::new_error(self.tcx(), guar))
-        } else {
-            self.normalize(ty, location)
-        }
+        let mut normalize = |ty| self.normalize(ty, location);
+        tcx.struct_tail_raw(ty, &cause, &mut normalize, || {})
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -343,8 +279,15 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
             return;
         }
 
-        // FIXME: Ideally MIR types are normalized, but this is not always true.
-        let mir_ty = self.normalize(mir_ty, Locations::All(span));
+        // This is a hack. `body.local_decls` are not necessarily normalized in the old
+        // solver due to not deeply normalizing in writeback. So we must re-normalize here.
+        //
+        // I am not sure of a test case where this actually matters. There is a similar
+        // hack in `equate_inputs_and_outputs` which does have associated test cases.
+        let mir_ty = match self.infcx.next_trait_solver() {
+            true => mir_ty,
+            false => self.normalize(Unnormalized::new_wip(mir_ty), Locations::All(span)),
+        };
 
         let cause = ObligationCause::dummy_with_span(span);
         let param_env = self.infcx.param_env;
@@ -353,7 +296,11 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
             ConstraintCategory::Boring,
             type_op::custom::CustomTypeOp::new(
                 |ocx| {
-                    let user_ty = ocx.normalize(&cause, param_env, user_ty);
+                    // The `AscribeUserType` query would normally emit a wf
+                    // obligation for the unnormalized user_ty here. This is
+                    // where the "incorrectly skips the WF checks we normally do"
+                    // happens
+                    let user_ty = ocx.normalize(&cause, param_env, Unnormalized::new_wip(user_ty));
                     ocx.eq(&cause, param_env, user_ty, mir_ty)?;
                     Ok(())
                 },

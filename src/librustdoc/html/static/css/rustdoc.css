@@ -20,6 +20,7 @@
 	--src-sidebar-width: 300px;
 	--desktop-sidebar-z-index: 100;
 	--sidebar-elems-left-padding: 24px;
+	--popover-top-margin: 7px;
 	/* clipboard <https://github.com/rust-lang/crates.io/commits/main/public/assets/copy.svg> */
 	--clipboard-image: url('data:image/svg+xml,<svg width="19" height="18" viewBox="0 0 24 25" \
 xmlns="http://www.w3.org/2000/svg" aria-label="Copy to clipboard">\
@@ -64,7 +65,7 @@ xmlns="http://www.w3.org/2000/svg" fill="black" height="18px">\
 		<path d="M3,5h16M3,11h16M3,17h16" stroke-width="2.75"/></svg>');
 }
 
-:root.sans-serif {
+:root.sans-serif-fonts {
 	--font-family: "Fira Sans", sans-serif;
 	--font-family-code: "Fira Mono", monospace;
 }
@@ -209,6 +210,24 @@ body {
 	color: var(--main-color);
 }
 
+/* Skip navigation link for keyboard users (WCAG 2.4.1) */
+.skip-main-content {
+	position: absolute;
+	left: 0;
+	top: -100%;
+	z-index: 1000;
+	padding: 0.5rem 1rem;
+	background-color: var(--main-background-color);
+	color: var(--main-color);
+	text-decoration: none;
+	font-weight: 500;
+	border-bottom-right-radius: 4px;
+	outline: 2px solid var(--search-input-focused-border-color);
+}
+.skip-main-content:focus {
+	top: 0;
+}
+
 h1 {
 	font-size: 1.5rem; /* 24px */
 }
@@ -340,7 +359,8 @@ summary.hideme,
 .rustdoc-breadcrumbs,
 .search-switcher,
 /* This selector is for the items listed in the "all items" page. */
-ul.all-items {
+ul.all-items,
+.deprecated-count {
 	font-family: "Fira Sans", Arial, NanumBarunGothic, sans-serif;
 }
 
@@ -711,7 +731,8 @@ ul.block, .block li, .block ul {
 }
 
 .block ul a {
-	padding-left: 1rem;
+	/* extend click target to far edge of screen (mile wide bar) */
+	padding-left: calc(1rem + var(--sidebar-elems-left-padding));
 }
 
 .sidebar-elems a,
@@ -720,7 +741,7 @@ ul.block, .block li, .block ul {
 	padding: 0.25rem; /* 4px */
 	margin-right: 0.25rem;
 	/* extend click target to far edge of screen (mile wide bar) */
-	border-left: solid var(--sidebar-elems-left-padding) transparent;
+	padding-left: calc(0.25rem + var(--sidebar-elems-left-padding));
 	margin-left: calc(-0.25rem - var(--sidebar-elems-left-padding));
 	background-clip: border-box;
 }
@@ -841,7 +862,7 @@ ul.block, .block li, .block ul {
 		|        └─────┘
 		*/
 	margin-top: -16px;
-	border-top: solid 16px transparent;
+	padding-top: 16px;
 	box-sizing: content-box;
 	position: relative;
 	background-clip: border-box;
@@ -850,8 +871,6 @@ ul.block, .block li, .block ul {
 
 .sidebar-crate h2 a {
 	display: block;
-	/* extend click target to far edge of screen (mile wide bar) */
-	border-left: solid var(--sidebar-elems-left-padding) transparent;
 	background-clip: border-box;
 	margin: 0 calc(-24px + 0.25rem) 0 calc(-0.2rem - var(--sidebar-elems-left-padding));
 	/* Align the sidebar crate link with the search bar, which have different
@@ -868,7 +887,8 @@ ul.block, .block li, .block ul {
 		x = ( 16px - 0.57rem ) / 2
 	*/
 	padding: calc( ( 16px - 0.57rem ) / 2 ) 0.25rem;
-	padding-left: 0.2rem;
+	/* extend click target to far edge of screen (mile wide bar) */
+	padding-left: calc(0.2rem + var(--sidebar-elems-left-padding));
 }
 
 .sidebar-crate h2 .version {
@@ -1113,6 +1133,7 @@ pre, .rustdoc.src .example-wrap, .example-wrap .src-line-numbers {
 
 #main-content {
 	position: relative;
+	outline: none;
 }
 
 .docblock table {
@@ -1156,6 +1177,10 @@ div.where {
 .impl-items > .item-info {
 	/* Margin of docblocks + margin of impl block items. */
 	margin-left: calc(var(--docblock-indent) + var(--impl-items-indent));
+}
+
+.impl-restriction {
+	margin-bottom: 0.75em;
 }
 
 #synthetic-implementors-list:not(.loaded), #implementors-list:not(.loaded) {
@@ -1435,7 +1460,7 @@ so that we can apply CSS-filters to change the arrow color in themes */
 	top: 100%;
 	right: 0;
 	z-index: calc(var(--desktop-sidebar-z-index) + 1);
-	margin-top: 7px;
+	margin-top: var(--popover-top-margin);
 	border-radius: 3px;
 	border: 1px solid var(--border-color);
 	background-color: var(--main-background-color);
@@ -1585,7 +1610,6 @@ so that we can apply CSS-filters to change the arrow color in themes */
 	color: var(--main-color);
 	background-color: var(--stab-background-color);
 	width: fit-content;
-	white-space: pre-wrap;
 	border-radius: 3px;
 	display: inline;
 	vertical-align: baseline;
@@ -2642,6 +2666,27 @@ However, it's not needed with smaller screen width because the doc/code block is
 	}
 }
 
+/* Items on module pages */
+.hide-deprecated-items dt.deprecated,
+.hide-deprecated-items dt.deprecated + dd,
+/* Items on item pages */
+.hide-deprecated-items .deprecated,
+.hide-deprecated-items .deprecated + .item-info {
+	display: none;
+}
+
+.deprecated-count {
+	display: none;
+}
+/*
+The `:not(:empty)` is a little trick to not have to add conditions in JS to hide/show the marker.
+It's entirely based on whether it has content and if the setting is enabled.
+*/
+.hide-deprecated-items .deprecated-count:not(:empty) {
+	display: block;
+	margin: 10px 0;
+}
+
 /*
 WARNING: RUSTDOC_MOBILE_BREAKPOINT MEDIA QUERY
 If you update this line, then you also need to update the line with the same warning
@@ -2650,6 +2695,7 @@ in src-script.js and main.js
 @media (max-width: 700px) {
 	:root {
 		--impl-items-indent: 0.7em;
+		--topbar-height: 45px;
 	}
 
 	/* When linking to an item with an `id` (for instance, by clicking a link in the sidebar,
@@ -2657,7 +2703,7 @@ in src-script.js and main.js
 	   by the topbar. Anything with an `id` gets scroll-margin-top equal to rustdoc-topbar's size.
 	*/
 	*[id] {
-		scroll-margin-top: 45px;
+		scroll-margin-top: var(--topbar-height);
 	}
 
 	/* We don't display this button on mobile devices. */
@@ -2689,13 +2735,22 @@ in src-script.js and main.js
 		background: var(--main-background-color);
 		border-radius: 0;
 	}
-	#settings.popover {
+	#settings.popover, #help.popover {
 		top: 32px;
+		/* The `+ 1px` part is for the bottom border to be visible. */
+		height: calc(100vh - var(--topbar-height) + var(--popover-top-margin) - 1px);
+	}
+	#settings.popover {
 		--popover-arrow-offset: 48px;
 	}
 	#help.popover {
-		top: 32px;
 		--popover-arrow-offset: 12px;
+	}
+	/* The `overflow-y` property is used on an internal content instead of the top one otherwise the
+	   little arrow at the top can't be displayed. */
+	#settings.popover .settings, #help.popover .content {
+		overflow-y: scroll;
+		height: 100%;
 	}
 
 	.rustdoc {
@@ -2719,13 +2774,13 @@ in src-script.js and main.js
 
 	.sidebar {
 		position: fixed;
-		top: 45px;
+		top: var(--topbar-height);
 		/* Hide the sidebar offscreen while not in use. Doing this instead of display: none means
 		   the sidebar stays visible for screen readers, which is useful for navigation. */
 		left: -1000px;
 		z-index: 11;
 		/* Reduce height slightly to account for mobile topbar. */
-		height: calc(100vh - 45px);
+		height: calc(100vh - var(--topbar-height));
 		/* resize indicator: hide this when on touch or mobile */
 		border-right: none;
 		width: 100%;
@@ -2790,7 +2845,7 @@ in src-script.js and main.js
 		flex-direction: row;
 		position: sticky;
 		z-index: 10;
-		height: 45px;
+		height: var(--topbar-height);
 		width: 100%;
 		left: 0;
 		top: 0;
@@ -3247,7 +3302,7 @@ by default.
 	--headings-border-bottom-color: #d2d2d2;
 	--border-color: #e0e0e0;
 	--button-background-color: #f0f0f0;
-	--right-side-color: grey;
+	--right-side-color: #d0d0d0;
 	--code-attribute-color: #999;
 	--toggles-color: #999;
 	--toggle-filter: invert(100%);

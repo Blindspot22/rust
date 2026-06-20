@@ -232,7 +232,7 @@ impl FromClean<clean::GenericArg> for GenericArg {
         match arg {
             Lifetime(l) => GenericArg::Lifetime(l.into_json(renderer)),
             Type(t) => GenericArg::Type(t.into_json(renderer)),
-            Const(box c) => GenericArg::Const(c.into_json(renderer)),
+            Const(c) => GenericArg::Const(c.into_json(renderer)),
             Infer => GenericArg::Infer,
         }
     }
@@ -296,7 +296,7 @@ fn from_clean_item(item: &clean::Item, renderer: &JsonRenderer<'_>) -> ItemEnum 
         MethodItem(m, _) => {
             ItemEnum::Function(from_clean_function(m, true, header.unwrap(), renderer))
         }
-        RequiredMethodItem(m) => {
+        RequiredMethodItem(m, _) => {
             ItemEnum::Function(from_clean_function(m, false, header.unwrap(), renderer))
         }
         ImplItem(i) => ItemEnum::Impl(i.into_json(renderer)),
@@ -309,7 +309,7 @@ fn from_clean_item(item: &clean::Item, renderer: &JsonRenderer<'_>) -> ItemEnum 
             type_: ci.type_.into_json(renderer),
             const_: ci.kind.into_json(renderer),
         },
-        MacroItem(m) => ItemEnum::Macro(m.source.clone()),
+        MacroItem(m, _) => ItemEnum::Macro(m.source.clone()),
         ProcMacroItem(m) => ItemEnum::ProcMacro(m.into_json(renderer)),
         PrimitiveItem(p) => {
             ItemEnum::Primitive(Primitive {
@@ -336,7 +336,8 @@ fn from_clean_item(item: &clean::Item, renderer: &JsonRenderer<'_>) -> ItemEnum 
             bounds: b.into_json(renderer),
             type_: Some(t.item_type.as_ref().unwrap_or(&t.type_).into_json(renderer)),
         },
-        // `convert_item` early returns `None` for stripped items, keywords and attributes.
+        // `convert_item` early returns `None` for stripped items, keywords, attributes and
+        // "special" macro rules.
         KeywordItem | AttributeItem => unreachable!(),
         StrippedItem(inner) => {
             match inner.as_ref() {
@@ -353,6 +354,8 @@ fn from_clean_item(item: &clean::Item, renderer: &JsonRenderer<'_>) -> ItemEnum 
             name: name.as_ref().unwrap().to_string(),
             rename: src.map(|x| x.to_string()),
         },
+        // All placeholder impl items should have been removed in the stripper passes.
+        PlaceholderImplItem => unreachable!(),
     }
 }
 
@@ -407,7 +410,7 @@ impl FromClean<rustc_hir::FnHeader> for FunctionHeader {
         };
         FunctionHeader {
             is_async: header.is_async(),
-            is_const: header.is_const(),
+            is_const: matches!(header.constness, rustc_hir::Constness::Const { .. }),
             is_unsafe,
             abi: header.abi.into_json(renderer),
         }
@@ -494,7 +497,7 @@ impl FromClean<clean::WherePredicate> for WherePredicate {
                     })
                     .collect(),
             },
-            EqPredicate { lhs, rhs } => WherePredicate::EqPredicate {
+            ProjectionPredicate { lhs, rhs } => WherePredicate::EqPredicate {
                 // The LHS currently has type `Type` but it should be a `QualifiedPath` since it may
                 // refer to an associated const. However, `EqPredicate` shouldn't exist in the first
                 // place: <https://github.com/rust-lang/rust/141368>.
@@ -579,6 +582,8 @@ impl FromClean<clean::Type> for Type {
                 type_: Box::new(t.into_json(renderer)),
                 __pat_unstable_do_not_use: p.to_string(),
             },
+            // FIXME(FRTs): implement
+            clean::Type::FieldOf(..) => todo!(),
             ImplTrait(g) => Type::ImplTrait(g.into_json(renderer)),
             Infer => Type::Infer,
             RawPointer(mutability, type_) => Type::RawPointer {
@@ -711,7 +716,8 @@ impl FromClean<clean::PolyTrait> for PolyTrait {
 impl FromClean<clean::Impl> for Impl {
     fn from_clean(impl_: &clean::Impl, renderer: &JsonRenderer<'_>) -> Self {
         let provided_trait_methods = impl_.provided_trait_methods(renderer.tcx);
-        let clean::Impl { safety, generics, trait_, for_, items, polarity, kind } = impl_;
+        let clean::Impl { safety, generics, trait_, for_, items, polarity, kind, is_deprecated: _ } =
+            impl_;
         // FIXME: use something like ImplKind in JSON?
         let (is_synthetic, blanket_impl) = match kind {
             clean::ImplKind::Normal | clean::ImplKind::FakeVariadic => (false, None),
@@ -893,8 +899,8 @@ impl FromClean<ItemType> for ItemKind {
             Keyword => ItemKind::Keyword,
             Attribute => ItemKind::Attribute,
             TraitAlias => ItemKind::TraitAlias,
-            ProcAttribute => ItemKind::ProcAttribute,
-            ProcDerive => ItemKind::ProcDerive,
+            ProcAttribute | DeclMacroAttribute => ItemKind::ProcAttribute,
+            ProcDerive | DeclMacroDerive => ItemKind::ProcDerive,
         }
     }
 }
@@ -915,7 +921,7 @@ fn maybe_from_hir_attr(attr: &hir::Attribute, item_id: ItemId, tcx: TyCtxt<'_>) 
     };
 
     vec![match kind {
-        AK::Deprecation { .. } => return Vec::new(), // Handled separately into Item::deprecation.
+        AK::Deprecated { .. } => return Vec::new(), // Handled separately into Item::deprecation.
         AK::DocComment { .. } => unreachable!("doc comments stripped out earlier"),
 
         AK::MacroExport { .. } => Attribute::MacroExport,
@@ -927,14 +933,14 @@ fn maybe_from_hir_attr(attr: &hir::Attribute, item_id: ItemId, tcx: TyCtxt<'_>) 
             item_id.as_def_id().expect("all items that could have #[repr] have a DefId"),
         ),
         AK::ExportName { name, span: _ } => Attribute::ExportName(name.to_string()),
-        AK::LinkSection { name, span: _ } => Attribute::LinkSection(name.to_string()),
+        AK::LinkSection { name } => Attribute::LinkSection(name.to_string()),
         AK::TargetFeature { features, .. } => Attribute::TargetFeature {
             enable: features.iter().map(|(feat, _span)| feat.to_string()).collect(),
         },
 
         AK::NoMangle(_) => Attribute::NoMangle,
         AK::NonExhaustive(_) => Attribute::NonExhaustive,
-        AK::AutomaticallyDerived(_) => Attribute::AutomaticallyDerived,
+        AK::AutomaticallyDerived => Attribute::AutomaticallyDerived,
         AK::Doc(d) => {
             fn toggle_attr(ret: &mut Vec<Attribute>, name: &str, v: &Option<rustc_span::Span>) {
                 if v.is_some() {
@@ -955,6 +961,7 @@ fn maybe_from_hir_attr(attr: &hir::Attribute, item_id: ItemId, tcx: TyCtxt<'_>) 
             }
 
             let DocAttribute {
+                first_span: _,
                 aliases,
                 hidden,
                 inline,
@@ -1038,10 +1045,10 @@ fn maybe_from_hir_attr(attr: &hir::Attribute, item_id: ItemId, tcx: TyCtxt<'_>) 
             for attr_span in test_attrs {
                 // FIXME: This is ugly, remove when `test_attrs` has been ported to new attribute API.
                 if let Ok(snippet) = source_map.span_to_snippet(*attr_span) {
-                    ret.push(Attribute::Other(format!("#[doc(test(attr({snippet})))")));
+                    ret.push(Attribute::Other(format!("#[doc(test(attr({snippet})))]")));
                 }
             }
-            toggle_attr(&mut ret, "no_crate_inject", no_crate_inject);
+            toggle_attr(&mut ret, "test(no_crate_inject)", no_crate_inject);
             return ret;
         }
 

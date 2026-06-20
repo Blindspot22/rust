@@ -80,6 +80,9 @@ impl ScopeData {
 ///
 /// All threads spawned within the scope that haven't been manually joined
 /// will be automatically joined before this function returns.
+/// However, note that joining will only wait for the main function of these threads to finish; even
+/// when this function returns, destructors of thread-local variables in these threads might still
+/// be running.
 ///
 /// # Panics
 ///
@@ -174,7 +177,7 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     /// Spawns a new thread within a scope, returning a [`ScopedJoinHandle`] for it.
     ///
     /// Unlike non-scoped threads, threads spawned with this function may
-    /// borrow non-`'static` data from the outside the scope. See [`scope`] for
+    /// borrow non-`'static` data from outside the scope. See [`scope`] for
     /// details.
     ///
     /// The join handle provides a [`join`] method that can be used to join the spawned
@@ -290,6 +293,8 @@ impl<'scope, T> ScopedJoinHandle<'scope, T> {
     /// Waits for the associated thread to finish.
     ///
     /// This function will return immediately if the associated thread has already finished.
+    /// Otherwise, it fully waits for the thread to finish, including all destructors
+    /// for thread-local variables that might be running after the main function of the thread.
     ///
     /// In terms of [atomic memory orderings], the completion of the associated
     /// thread synchronizes with this function returning.

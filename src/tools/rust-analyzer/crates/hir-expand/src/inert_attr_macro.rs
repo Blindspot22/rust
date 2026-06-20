@@ -124,8 +124,6 @@ pub const INERT_ATTRIBUTES: &[BuiltinAttribute] = &[
         should_panic, Normal,
         template!(Word, List: r#"expected = "reason""#, NameValueStr: "reason"), FutureWarnFollowing,
     ),
-    // FIXME(Centril): This can be used on stable but shouldn't.
-    ungated!(reexport_test_harness_main, CrateLevel, template!(NameValueStr: "name"), ErrorFollowing),
 
     // Macros:
     ungated!(automatically_derived, Normal, template!(Word), WarnFollowing),
@@ -264,6 +262,13 @@ pub const INERT_ATTRIBUTES: &[BuiltinAttribute] = &[
         test_runner, CrateLevel, template!(List: "path"), ErrorFollowing, custom_test_frameworks,
         "custom test frameworks are an unstable feature",
     ),
+
+    gated!(
+        reexport_test_harness_main, CrateLevel, template!(NameValueStr: "name"),
+        ErrorFollowing, custom_test_frameworks,
+        "custom test frameworks are an unstable feature",
+    ),
+
     // RFC #1268
     gated!(
         marker, Normal, template!(Word), WarnFollowing, @only_local: true,
@@ -467,9 +472,6 @@ pub const INERT_ATTRIBUTES: &[BuiltinAttribute] = &[
     // Used by the `rustc::untracked_query_information` lint to warn methods which
     // might break incremental compilation.
     rustc_attr!(rustc_lint_untracked_query_information, Normal, template!(Word), WarnFollowing, INTERNAL_UNSTABLE),
-    // Used by the `rustc::untranslatable_diagnostic` and `rustc::diagnostic_outside_of_impl` lints
-    // to assist in changes to diagnostic APIs.
-    rustc_attr!(rustc_lint_diagnostics, Normal, template!(Word), WarnFollowing, INTERNAL_UNSTABLE),
     // Used by the `rustc::bad_opt_access` lint to identify `DebuggingOptions` and `CodegenOptions`
     // types (as well as any others in future).
     rustc_attr!(rustc_lint_opt_ty, Normal, template!(Word), WarnFollowing, INTERNAL_UNSTABLE),
@@ -700,6 +702,7 @@ pub const INERT_ATTRIBUTES: &[BuiltinAttribute] = &[
     rustc_attr!(TEST, rustc_dump_program_clauses, Normal, template!(Word), WarnFollowing),
     rustc_attr!(TEST, rustc_dump_env_program_clauses, Normal, template!(Word), WarnFollowing),
     rustc_attr!(TEST, rustc_object_lifetime_default, Normal, template!(Word), WarnFollowing),
+    rustc_attr!(TEST, rustc_dyn_incompatible_trait, Normal, template!(Word), WarnFollowing),
     rustc_attr!(TEST, rustc_dump_vtable, Normal, template!(Word), WarnFollowing),
     rustc_attr!(TEST, rustc_dummy, Normal, template!(Word /* doesn't matter*/), DuplicatesOk),
     gated!(

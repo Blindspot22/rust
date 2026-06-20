@@ -19,6 +19,7 @@ use indexmap::IndexSet;
 use rustc_codegen_ssa::debuginfo::type_names;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefIdMap;
+use rustc_middle::ty::Unnormalized;
 use rustc_session::Session;
 use rustc_session::config::DebugInfo;
 use rustc_span::{RemapPathScopeComponents, SourceFileHash, StableSourceFileId};
@@ -242,9 +243,12 @@ impl DebugContext {
         let generics = tcx.generics_of(enclosing_fn_def_id);
         let args = instance.args.truncate_to(tcx, generics);
 
-        type_names::push_generic_params(
+        type_names::push_generic_args(
             tcx,
-            tcx.normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), args),
+            tcx.normalize_erasing_regions(
+                ty::TypingEnv::fully_monomorphized(),
+                Unnormalized::new_wip(args),
+            ),
             &mut name,
         );
 

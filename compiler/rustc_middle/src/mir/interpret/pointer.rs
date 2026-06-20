@@ -3,7 +3,7 @@ use std::num::NonZero;
 
 use rustc_abi::{HasDataLayout, Size};
 use rustc_data_structures::static_assert_size;
-use rustc_macros::{HashStable, TyDecodable, TyEncodable};
+use rustc_macros::{StableHash, TyDecodable, TyEncodable};
 
 use super::AllocId;
 
@@ -222,7 +222,7 @@ impl Provenance for AllocId {
 ///
 /// Pointers are "tagged" with provenance information; typically the `AllocId` they belong to.
 #[derive(Copy, Clone, Eq, PartialEq, TyEncodable, TyDecodable, Hash)]
-#[derive(HashStable)]
+#[derive(StableHash)]
 pub struct Pointer<Prov = CtfeProvenance> {
     pub(super) offset: Size, // kept private to avoid accidental misinterpretation (meaning depends on `Prov` type)
     pub provenance: Prov,
@@ -236,6 +236,12 @@ static_assert_size!(Pointer<Option<CtfeProvenance>>, 16);
 // We want the `Debug` output to be readable as it is used by `derive(Debug)` for
 // all the Miri types.
 impl<Prov: Provenance> fmt::Debug for Pointer<Prov> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Provenance::fmt(self, f)
+    }
+}
+
+impl<Prov: Provenance> fmt::Display for Pointer<Prov> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         Provenance::fmt(self, f)
     }

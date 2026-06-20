@@ -11,12 +11,12 @@ use rustc_hir::LangItem;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt, elaborate};
-use rustc_session::parse::feature_err;
+use rustc_session::errors::feature_err;
 use rustc_span::{ErrorGuaranteed, sym};
 use tracing::debug;
 
 use crate::check::always_applicable;
-use crate::errors;
+use crate::diagnostics;
 
 mod builtin;
 mod inherent_impls;
@@ -97,8 +97,18 @@ fn enforce_trait_manually_implementable(
             && !impl_header_span.allows_unstable(sym::specialization)
             && !impl_header_span.allows_unstable(sym::min_specialization)
         {
-            return Err(tcx.dcx().emit_err(errors::SpecializationTrait { span: impl_header_span }));
+            return Err(tcx
+                .dcx()
+                .emit_err(diagnostics::SpecializationTrait { span: impl_header_span }));
         }
+    }
+
+    if !trait_def.impl_restriction.is_allowed_in(impl_def_id.to_def_id(), tcx) {
+        return Err(tcx.dcx().emit_err(diagnostics::ImplOfRestrictedTrait {
+            impl_span: impl_header_span,
+            restriction_span: trait_def.impl_restriction.expect_span(),
+            restriction_path: trait_def.impl_restriction.restriction_path(tcx),
+        }));
     }
     Ok(())
 }
@@ -160,18 +170,18 @@ fn coherent_trait(tcx: TyCtxt<'_>, def_id: DefId) -> Result<(), ErrorGuaranteed>
     }
     // Trigger building the specialization graph for the trait. This will detect and report any
     // overlap errors.
-    let mut res = tcx.ensure_ok().specialization_graph_of(def_id);
+    let mut res = tcx.ensure_result().specialization_graph_of(def_id);
 
     for &impl_def_id in impls {
         let impl_header = tcx.impl_trait_header(impl_def_id);
-        let trait_ref = impl_header.trait_ref.instantiate_identity();
+        let trait_ref = impl_header.trait_ref.instantiate_identity().skip_norm_wip();
         let trait_def = tcx.trait_def(trait_ref.def_id);
 
         res = res
             .and(check_impl(tcx, impl_def_id, trait_ref, trait_def, impl_header.polarity))
             .and(check_object_overlap(tcx, impl_def_id, trait_ref))
             .and(unsafety::check_item(tcx, impl_def_id, impl_header, trait_def))
-            .and(tcx.ensure_ok().orphan_check_impl(impl_def_id))
+            .and(tcx.ensure_result().orphan_check_impl(impl_def_id))
             .and(builtin::check_trait(tcx, def_id, impl_def_id, impl_header));
     }
 
@@ -211,9 +221,7 @@ fn check_object_overlap<'tcx>(
                 // This is a WF error tested by `coherence-impl-trait-for-trait-dyn-compatible.rs`.
             } else {
                 let mut supertrait_def_ids = elaborate::supertrait_def_ids(tcx, component_def_id);
-                if supertrait_def_ids
-                    .any(|d| d == trait_def_id && tcx.trait_def(d).implement_via_object)
-                {
+                if supertrait_def_ids.any(|d| d == trait_def_id) {
                     let span = tcx.def_span(impl_def_id);
                     return Err(struct_span_code_err!(
                         tcx.dcx(),

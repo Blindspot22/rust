@@ -1,7 +1,8 @@
-use std::assert_matches::assert_matches;
+use std::assert_matches;
 use std::ops::Deref;
 
 use rustc_abi::{Align, Scalar, Size, WrappingRange};
+use rustc_hir::attrs::AttributeKind;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
 use rustc_middle::mir;
 use rustc_middle::ty::layout::{FnAbiOf, LayoutOf, TyAndLayout};
@@ -50,10 +51,10 @@ pub trait BuilderMethods<'a, 'tcx>:
     type CodegenCx: CodegenMethods<
             'tcx,
             Value = Self::Value,
-            Metadata = Self::Metadata,
             Function = Self::Function,
             BasicBlock = Self::BasicBlock,
             Type = Self::Type,
+            FunctionSignature = Self::FunctionSignature,
             Funclet = Self::Funclet,
             DIScope = Self::DIScope,
             DILocation = Self::DILocation,
@@ -77,6 +78,9 @@ pub trait BuilderMethods<'a, 'tcx>:
     fn ret_void(&mut self);
     fn ret(&mut self, v: Self::Value);
     fn br(&mut self, dest: Self::BasicBlock);
+    fn br_with_attrs(&mut self, dest: Self::BasicBlock, _attributes: &[AttributeKind]) {
+        self.br(dest)
+    }
     fn cond_br(
         &mut self,
         cond: Self::Value,
@@ -125,7 +129,7 @@ pub trait BuilderMethods<'a, 'tcx>:
 
     fn invoke(
         &mut self,
-        llty: Self::Type,
+        llty: Self::FunctionSignature,
         fn_attrs: Option<&CodegenFnAttrs>,
         fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
         llfn: Self::Value,
@@ -235,7 +239,7 @@ pub trait BuilderMethods<'a, 'tcx>:
     fn to_immediate_scalar(&mut self, val: Self::Value, scalar: Scalar) -> Self::Value;
 
     fn alloca(&mut self, size: Size, align: Align) -> Self::Value;
-    fn scalable_alloca(&mut self, elt: u64, align: Align, element_ty: Ty<'_>) -> Self::Value;
+    fn alloca_with_ty(&mut self, layout: TyAndLayout<'tcx>) -> Self::Value;
 
     fn load(&mut self, ty: Self::Type, ptr: Self::Value, align: Align) -> Self::Value;
     fn volatile_load(&mut self, ty: Self::Type, ptr: Self::Value) -> Self::Value;
@@ -552,12 +556,12 @@ pub trait BuilderMethods<'a, 'tcx>:
 
     fn set_personality_fn(&mut self, personality: Self::Function);
 
-    // These are used by everyone except msvc
+    // These are used by everyone except msvc and wasm EH
     fn cleanup_landing_pad(&mut self, pers_fn: Self::Function) -> (Self::Value, Self::Value);
     fn filter_landing_pad(&mut self, pers_fn: Self::Function);
     fn resume(&mut self, exn0: Self::Value, exn1: Self::Value);
 
-    // These are used only by msvc
+    // These are used by msvc and wasm EH
     fn cleanup_pad(&mut self, parent: Option<Self::Value>, args: &[Self::Value]) -> Self::Funclet;
     fn cleanup_ret(&mut self, funclet: &Self::Funclet, unwind: Option<Self::BasicBlock>);
     fn catch_pad(&mut self, parent: Self::Value, args: &[Self::Value]) -> Self::Funclet;
@@ -567,6 +571,7 @@ pub trait BuilderMethods<'a, 'tcx>:
         unwind: Option<Self::BasicBlock>,
         handlers: &[Self::BasicBlock],
     ) -> Self::Value;
+    fn get_funclet_cleanuppad(&self, funclet: &Self::Funclet) -> Self::Value;
 
     fn atomic_cmpxchg(
         &mut self,
@@ -600,10 +605,13 @@ pub trait BuilderMethods<'a, 'tcx>:
     ///
     /// ## Arguments
     ///
-    /// The `fn_attrs`, `fn_abi`, and `instance` arguments are Options because they are advisory.
-    /// They relate to optional codegen enhancements like LLVM CFI, and do not affect ABI per se.
-    /// Any ABI-related transformations should be handled by different, earlier stages of codegen.
-    /// For instance, in the caller of `BuilderMethods::call`.
+    /// `caller_attrs` are the attributes of the surrounding caller; they have nothing to do with
+    /// the callee.
+    ///
+    /// The `caller_attrs`, `fn_abi`, and `callee_instance` arguments are Options because they are
+    /// advisory. They relate to optional codegen enhancements like LLVM CFI, and do not affect ABI
+    /// per se. Any ABI-related transformations should be handled by different, earlier stages of
+    /// codegen. For instance, in the caller of `BuilderMethods::call`.
     ///
     /// This means that a codegen backend which disregards `fn_attrs`, `fn_abi`, and `instance`
     /// should still do correct codegen, and code should not be miscompiled if they are omitted.
@@ -619,24 +627,24 @@ pub trait BuilderMethods<'a, 'tcx>:
     /// assuming the function does not explicitly pass the destination as a pointer in `args`.
     fn call(
         &mut self,
-        llty: Self::Type,
-        fn_attrs: Option<&CodegenFnAttrs>,
+        llty: Self::FunctionSignature,
+        caller_attrs: Option<&CodegenFnAttrs>,
         fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
         fn_val: Self::Value,
         args: &[Self::Value],
         funclet: Option<&Self::Funclet>,
-        instance: Option<Instance<'tcx>>,
+        callee_instance: Option<Instance<'tcx>>,
     ) -> Self::Value;
 
     fn tail_call(
         &mut self,
-        llty: Self::Type,
-        fn_attrs: Option<&CodegenFnAttrs>,
+        llty: Self::FunctionSignature,
+        caller_attrs: Option<&CodegenFnAttrs>,
         fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
         llfn: Self::Value,
         args: &[Self::Value],
         funclet: Option<&Self::Funclet>,
-        instance: Option<Instance<'tcx>>,
+        callee_instance: Option<Instance<'tcx>>,
     );
 
     fn zext(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value;

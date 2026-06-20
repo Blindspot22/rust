@@ -3,6 +3,7 @@ Thir {
     body_type: Const(
         Foo,
     ),
+    attributes: {},
     arms: [],
     blocks: [],
     exprs: [
@@ -17,9 +18,7 @@ Thir {
         Expr {
             kind: Scope {
                 region_scope: Node(7),
-                lint_level: Explicit(
-                    HirId(DefId(0:8 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR1).7),
-                ),
+                hir_id: HirId(DefId(0:8 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR1).7),
                 value: e0,
             },
             ty: (),
@@ -49,9 +48,7 @@ Thir {
         Expr {
             kind: Scope {
                 region_scope: Node(3),
-                lint_level: Explicit(
-                    HirId(DefId(0:8 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR1).3),
-                ),
+                hir_id: HirId(DefId(0:8 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR1).3),
                 value: e2,
             },
             ty: Foo,
@@ -68,6 +65,7 @@ Thir {
     body_type: Const(
         Foo,
     ),
+    attributes: {},
     arms: [],
     blocks: [],
     exprs: [
@@ -82,9 +80,7 @@ Thir {
         Expr {
             kind: Scope {
                 region_scope: Node(8),
-                lint_level: Explicit(
-                    HirId(DefId(0:9 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR2).8),
-                ),
+                hir_id: HirId(DefId(0:9 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR2).8),
                 value: e0,
             },
             ty: (),
@@ -114,9 +110,7 @@ Thir {
         Expr {
             kind: Scope {
                 region_scope: Node(3),
-                lint_level: Explicit(
-                    HirId(DefId(0:9 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR2).3),
-                ),
+                hir_id: HirId(DefId(0:9 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR2).3),
                 value: e2,
             },
             ty: Foo,
@@ -133,6 +127,7 @@ Thir {
     body_type: Const(
         Foo,
     ),
+    attributes: {},
     arms: [],
     blocks: [],
     exprs: [
@@ -147,9 +142,7 @@ Thir {
         Expr {
             kind: Scope {
                 region_scope: Node(7),
-                lint_level: Explicit(
-                    HirId(DefId(0:10 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR3).7),
-                ),
+                hir_id: HirId(DefId(0:10 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR3).7),
                 value: e0,
             },
             ty: (),
@@ -179,9 +172,7 @@ Thir {
         Expr {
             kind: Scope {
                 region_scope: Node(3),
-                lint_level: Explicit(
-                    HirId(DefId(0:10 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR3).3),
-                ),
+                hir_id: HirId(DefId(0:10 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR3).3),
                 value: e2,
             },
             ty: Foo,
@@ -198,6 +189,7 @@ Thir {
     body_type: Const(
         Foo,
     ),
+    attributes: {},
     arms: [],
     blocks: [],
     exprs: [
@@ -212,9 +204,7 @@ Thir {
         Expr {
             kind: Scope {
                 region_scope: Node(8),
-                lint_level: Explicit(
-                    HirId(DefId(0:11 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR4).8),
-                ),
+                hir_id: HirId(DefId(0:11 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR4).8),
                 value: e0,
             },
             ty: (),
@@ -244,9 +234,7 @@ Thir {
         Expr {
             kind: Scope {
                 region_scope: Node(3),
-                lint_level: Explicit(
-                    HirId(DefId(0:11 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR4).3),
-                ),
+                hir_id: HirId(DefId(0:11 ~ thir_flat_const_variant[1f54]::{impl#0}::BAR4).3),
                 value: e2,
             },
             ty: Foo,
@@ -263,6 +251,7 @@ Thir {
     body_type: Fn(
         fn(),
     ),
+    attributes: {},
     arms: [],
     blocks: [
         Block {
@@ -286,9 +275,7 @@ Thir {
         Expr {
             kind: Scope {
                 region_scope: Node(2),
-                lint_level: Explicit(
-                    HirId(DefId(0:12 ~ thir_flat_const_variant[1f54]::main).2),
-                ),
+                hir_id: HirId(DefId(0:12 ~ thir_flat_const_variant[1f54]::main).2),
                 value: e0,
             },
             ty: (),

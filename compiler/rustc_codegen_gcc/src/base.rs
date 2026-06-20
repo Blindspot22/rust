@@ -8,10 +8,11 @@ use rustc_codegen_ssa::ModuleCodegen;
 use rustc_codegen_ssa::base::maybe_create_entry_wrapper;
 use rustc_codegen_ssa::mono_item::MonoItemExt;
 use rustc_codegen_ssa::traits::DebugInfoCodegenMethods;
-use rustc_hir::attrs::Linkage;
+use rustc_hir::attrs::{AttributeKind, Linkage};
+use rustc_hir::find_attr;
 use rustc_middle::dep_graph;
 #[cfg(feature = "master")]
-use rustc_middle::mir::mono::Visibility;
+use rustc_middle::mono::Visibility;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::DebugInfo;
 use rustc_span::Symbol;
@@ -50,7 +51,7 @@ pub fn global_linkage_to_gcc(linkage: Linkage) -> GlobalKind {
         Linkage::WeakAny => unimplemented!(),
         Linkage::WeakODR => unimplemented!(),
         Linkage::Internal => GlobalKind::Internal,
-        Linkage::ExternalWeak => GlobalKind::Imported, // TODO(antoyo): should be weak linkage.
+        Linkage::ExternalWeak => GlobalKind::Imported, // FIXME(antoyo): should be weak linkage.
         Linkage::Common => unimplemented!(),
     }
 }
@@ -58,7 +59,7 @@ pub fn global_linkage_to_gcc(linkage: Linkage) -> GlobalKind {
 pub fn linkage_to_gcc(linkage: Linkage) -> FunctionType {
     match linkage {
         Linkage::External => FunctionType::Exported,
-        // TODO(antoyo): set the attribute externally_visible.
+        // FIXME(antoyo): set the attribute externally_visible.
         Linkage::AvailableExternally => FunctionType::Extern,
         Linkage::LinkOnceAny => unimplemented!(),
         Linkage::LinkOnceODR => unimplemented!(),
@@ -83,8 +84,7 @@ pub fn compile_codegen_unit(
     let (module, _) = tcx.dep_graph.with_task(
         dep_node,
         tcx,
-        (cgu_name, target_info, lto_supported),
-        module_codegen,
+        || module_codegen(tcx, cgu_name, target_info, lto_supported),
         Some(dep_graph::hash_result),
     );
     let time_to_codegen = start_time.elapsed();
@@ -96,7 +96,9 @@ pub fn compile_codegen_unit(
 
     fn module_codegen(
         tcx: TyCtxt<'_>,
-        (cgu_name, target_info, lto_supported): (Symbol, LockedTargetInfo, bool),
+        cgu_name: Symbol,
+        target_info: LockedTargetInfo,
+        lto_supported: bool,
     ) -> ModuleCodegen<GccContext> {
         let cgu = tcx.codegen_unit(cgu_name);
         // Instantiate monomorphizations without filling out definitions yet...
@@ -135,6 +137,17 @@ pub fn compile_codegen_unit(
         context.add_command_line_option("-fno-strict-aliasing");
         // NOTE: Rust relies on LLVM doing wrapping on overflow.
         context.add_command_line_option("-fwrapv");
+
+        // NOTE: We need to honor the `#![no_builtins]` attribute to prevent GCC from
+        // replacing code patterns (like loops) with calls to builtins (like memset).
+        // The `-fno-tree-loop-distribute-patterns` flag disables the loop distribution pass
+        // that transforms loops into calls to library functions (memset, memcpy, etc.).
+        // See GCC handling for more details:
+        // https://github.com/rust-lang/gcc/blob/efdd0a7290c22f5438d7c5380105d353ee3e8518/gcc/c-family/c-opts.cc#L953
+        let crate_attrs = tcx.hir_attrs(rustc_hir::CRATE_HIR_ID);
+        if find_attr!(crate_attrs, AttributeKind::NoBuiltins) {
+            context.add_command_line_option("-fno-tree-loop-distribute-patterns");
+        }
 
         if let Some(model) = tcx.sess.code_model() {
             use rustc_target::spec::CodeModel;
@@ -198,7 +211,7 @@ pub fn compile_codegen_unit(
         context.set_allow_unreachable_blocks(true);
 
         {
-            // TODO: to make it less error-prone (calling get_target_info() will add the flag
+            // FIXME: to make it less error-prone (calling get_target_info() will add the flag
             // -fsyntax-only), forbid the compilation when get_target_info() is called on a
             // context.
             let f16_type_supported = target_info.supports_target_dependent_type(CType::Float16);
@@ -206,7 +219,7 @@ pub fn compile_codegen_unit(
             let f64_type_supported = target_info.supports_target_dependent_type(CType::Float64);
             let f128_type_supported = target_info.supports_target_dependent_type(CType::Float128);
             let u128_type_supported = target_info.supports_target_dependent_type(CType::UInt128t);
-            // TODO: improve this to avoid passing that many arguments.
+            // FIXME: improve this to avoid passing that many arguments.
             let mut cx = CodegenCx::new(
                 &context,
                 cgu,

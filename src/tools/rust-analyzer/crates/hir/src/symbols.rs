@@ -5,11 +5,14 @@ use std::marker::PhantomData;
 use base_db::FxIndexSet;
 use either::Either;
 use hir_def::{
-    AdtId, AssocItemId, Complete, DefWithBodyId, ExternCrateId, HasModule, ImplId, Lookup, MacroId,
-    ModuleDefId, ModuleId, TraitId,
+    AdtId, AssocItemId, AstIdLoc, Complete, DefWithBodyId, ExternCrateId, HasModule, ImplId,
+    Lookup, MacroId, ModuleDefId, ModuleId, TraitId,
     db::DefDatabase,
+    expr_store::Body,
     item_scope::{ImportId, ImportOrExternCrate, ImportOrGlob},
+    nameres::crate_def_map,
     per_ns::Item,
+    signatures::{EnumSignature, ImplSignature, TraitSignature},
     src::{HasChildSource, HasSource},
     visibility::{Visibility, VisibilityExplicitness},
 };
@@ -22,7 +25,7 @@ use intern::Symbol;
 use rustc_hash::FxHashMap;
 use syntax::{AstNode, AstPtr, SyntaxNode, SyntaxNodePtr, ToSmolStr, ast::HasName};
 
-use crate::{HasCrate, Module, ModuleDef, Semantics};
+use crate::{Crate, HasCrate, Module, ModuleDef, Semantics};
 
 /// The actual data that is stored in the index. It should be as compact as
 /// possible.
@@ -40,14 +43,14 @@ pub struct FileSymbol<'db> {
     _marker: PhantomData<&'db ()>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct DeclarationLocation {
     /// The file id for both the `ptr` and `name_ptr`.
     pub hir_file_id: HirFileId,
     /// This points to the whole syntax node of the declaration.
     pub ptr: SyntaxNodePtr,
     /// This points to the [`syntax::ast::Name`] identifier of the declaration.
-    pub name_ptr: AstPtr<Either<syntax::ast::Name, syntax::ast::NameRef>>,
+    pub name_ptr: Option<AstPtr<Either<syntax::ast::Name, syntax::ast::NameRef>>>,
 }
 
 impl DeclarationLocation {
@@ -108,6 +111,51 @@ impl<'a> SymbolCollector<'a> {
         }
     }
 
+    /// Push a symbol for a crate's root module.
+    /// This allows crate roots to appear in the symbol index for queries like `::` or `::foo`.
+    pub fn push_crate_root(&mut self, krate: Crate) {
+        let Some(display_name) = krate.display_name(self.db) else { return };
+        let crate_name = display_name.crate_name();
+        let canonical_name = display_name.canonical_name();
+
+        let def_map = crate_def_map(self.db, krate.into());
+        let module_data = &def_map[def_map.crate_root(self.db)];
+
+        let definition = module_data.origin.definition_source(self.db);
+        let hir_file_id = definition.file_id;
+        let syntax_node = definition.value.node();
+        let ptr = SyntaxNodePtr::new(&syntax_node);
+
+        let loc = DeclarationLocation { hir_file_id, ptr, name_ptr: None };
+        let root_module = krate.root_module(self.db);
+
+        self.symbols.insert(FileSymbol {
+            name: crate_name.symbol().clone(),
+            def: ModuleDef::Module(root_module),
+            loc,
+            container_name: None,
+            is_alias: false,
+            is_assoc: false,
+            is_import: false,
+            do_not_complete: Complete::Yes,
+            _marker: PhantomData,
+        });
+
+        if canonical_name != crate_name.symbol() {
+            self.symbols.insert(FileSymbol {
+                name: canonical_name.clone(),
+                def: ModuleDef::Module(root_module),
+                loc,
+                container_name: None,
+                is_alias: false,
+                is_assoc: false,
+                is_import: false,
+                do_not_complete: Complete::Yes,
+                _marker: PhantomData,
+            });
+        }
+    }
+
     pub fn finish(self) -> Box<[FileSymbol<'a>]> {
         self.symbols.into_iter().collect()
     }
@@ -123,6 +171,7 @@ impl<'a> SymbolCollector<'a> {
 
     fn collect_from_module(&mut self, module_id: ModuleId) {
         let collect_pub_only = self.collect_pub_only;
+        let is_block_module = module_id.is_block_module(self.db);
         let push_decl = |this: &mut Self, def: ModuleDefId, name, vis| {
             if collect_pub_only && vis != Visibility::Public {
                 return;
@@ -138,11 +187,11 @@ impl<'a> SymbolCollector<'a> {
                 }
                 ModuleDefId::AdtId(AdtId::EnumId(id)) => {
                     this.push_decl(id, name, false, None);
-                    let enum_name = Symbol::intern(this.db.enum_signature(id).name.as_str());
+                    let enum_name = Symbol::intern(EnumSignature::of(this.db, id).name.as_str());
                     this.with_container_name(Some(enum_name), |this| {
                         let variants = id.enum_variants(this.db);
-                        for (variant_id, variant_name, _) in &variants.variants {
-                            this.push_decl(*variant_id, variant_name, true, None);
+                        for (variant_name, (variant_id, _)) in &variants.variants {
+                            this.push_decl(*variant_id, variant_name, false, None);
                         }
                     });
                 }
@@ -194,6 +243,10 @@ impl<'a> SymbolCollector<'a> {
             let source = import_child_source_cache
                 .entry(i.use_)
                 .or_insert_with(|| i.use_.child_source(this.db));
+            if is_block_module && source.file_id.is_macro() {
+                // Macros tend to generate a lot of imports, the user really won't care about them
+                return;
+            }
             let Some(use_tree_src) = source.value.get(i.idx) else { return };
             let rename = use_tree_src.rename().and_then(|rename| rename.name());
             let name_syntax = match rename {
@@ -209,7 +262,7 @@ impl<'a> SymbolCollector<'a> {
             let dec_loc = DeclarationLocation {
                 hir_file_id: source.file_id,
                 ptr: SyntaxNodePtr::new(use_tree_src.syntax()),
-                name_ptr: AstPtr::new(&name_syntax),
+                name_ptr: Some(AstPtr::new(&name_syntax)),
             };
             this.symbols.insert(FileSymbol {
                 name: name.symbol().clone(),
@@ -230,6 +283,12 @@ impl<'a> SymbolCollector<'a> {
                     return;
                 }
                 let loc = i.lookup(this.db);
+                if is_block_module && loc.ast_id().file_id.is_macro() {
+                    // Macros (especially derivves) tend to generate renamed extern crate items,
+                    // the user really won't care about them
+                    return;
+                }
+
                 let source = loc.source(this.db);
                 let rename = source.value.rename().and_then(|rename| rename.name());
 
@@ -244,7 +303,7 @@ impl<'a> SymbolCollector<'a> {
                 let dec_loc = DeclarationLocation {
                     hir_file_id: source.file_id,
                     ptr: SyntaxNodePtr::new(source.value.syntax()),
-                    name_ptr: AstPtr::new(&name_syntax),
+                    name_ptr: Some(AstPtr::new(&name_syntax)),
                 };
                 this.symbols.insert(FileSymbol {
                     name: name.symbol().clone(),
@@ -329,7 +388,7 @@ impl<'a> SymbolCollector<'a> {
             return;
         }
         let body_id = body_id.into();
-        let body = self.db.body(body_id);
+        let body = Body::of(self.db, body_id);
 
         // Descend into the blocks and enqueue collection of all modules within.
         for (_, def_map) in body.blocks(self.db) {
@@ -340,9 +399,9 @@ impl<'a> SymbolCollector<'a> {
     }
 
     fn collect_from_impl(&mut self, impl_id: ImplId) {
-        let impl_data = self.db.impl_signature(impl_id);
+        let impl_data = ImplSignature::of(self.db, impl_id);
         let impl_name = Some(
-            hir_display_with_store(impl_data.self_ty, &impl_data.store)
+            hir_display_with_store(impl_data.self_ty, impl_id.into(), &impl_data.store)
                 .display(
                     self.db,
                     crate::Impl::from(impl_id).krate(self.db).to_display_target(self.db),
@@ -362,7 +421,7 @@ impl<'a> SymbolCollector<'a> {
     }
 
     fn collect_from_trait(&mut self, trait_id: TraitId, trait_do_not_complete: Complete) {
-        let trait_data = self.db.trait_signature(trait_id);
+        let trait_data = TraitSignature::of(self.db, trait_id);
         self.with_container_name(Some(Symbol::intern(trait_data.name.as_str())), |s| {
             for &(ref name, assoc_item_id) in &trait_id.trait_items(self.db).items {
                 s.push_assoc_item(assoc_item_id, name, Some(trait_do_not_complete));
@@ -409,10 +468,10 @@ impl<'a> SymbolCollector<'a> {
         let source = loc.source(self.db);
         let Some(name_node) = source.value.name() else { return Complete::Yes };
         let def = ModuleDef::from(id.into());
-        let dec_loc = DeclarationLocation {
+        let loc = DeclarationLocation {
             hir_file_id: source.file_id,
             ptr: SyntaxNodePtr::new(source.value.syntax()),
-            name_ptr: AstPtr::new(&name_node).wrap_left(),
+            name_ptr: Some(AstPtr::new(&name_node).wrap_left()),
         };
 
         let mut do_not_complete = Complete::Yes;
@@ -427,7 +486,7 @@ impl<'a> SymbolCollector<'a> {
                 self.symbols.insert(FileSymbol {
                     name: alias.clone(),
                     def,
-                    loc: dec_loc.clone(),
+                    loc,
                     container_name: self.current_container_name.clone(),
                     is_alias: true,
                     is_assoc,
@@ -442,7 +501,7 @@ impl<'a> SymbolCollector<'a> {
             name: name.symbol().clone(),
             def,
             container_name: self.current_container_name.clone(),
-            loc: dec_loc,
+            loc,
             is_alias: false,
             is_assoc,
             is_import: false,
@@ -459,10 +518,10 @@ impl<'a> SymbolCollector<'a> {
         let Some(declaration) = module_data.origin.declaration() else { return };
         let module = declaration.to_node(self.db);
         let Some(name_node) = module.name() else { return };
-        let dec_loc = DeclarationLocation {
+        let loc = DeclarationLocation {
             hir_file_id: declaration.file_id,
             ptr: SyntaxNodePtr::new(module.syntax()),
-            name_ptr: AstPtr::new(&name_node).wrap_left(),
+            name_ptr: Some(AstPtr::new(&name_node).wrap_left()),
         };
 
         let def = ModuleDef::Module(module_id.into());
@@ -475,7 +534,7 @@ impl<'a> SymbolCollector<'a> {
                 self.symbols.insert(FileSymbol {
                     name: alias.clone(),
                     def,
-                    loc: dec_loc.clone(),
+                    loc,
                     container_name: self.current_container_name.clone(),
                     is_alias: true,
                     is_assoc: false,
@@ -490,7 +549,7 @@ impl<'a> SymbolCollector<'a> {
             name: name.symbol().clone(),
             def: ModuleDef::Module(module_id.into()),
             container_name: self.current_container_name.clone(),
-            loc: dec_loc,
+            loc,
             is_alias: false,
             is_assoc: false,
             is_import: false,

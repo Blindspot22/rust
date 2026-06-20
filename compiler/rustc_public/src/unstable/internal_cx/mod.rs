@@ -44,7 +44,7 @@ impl<'tcx> InternalCx<'tcx> for TyCtxt<'tcx> {
         self
     }
 
-    fn lift<T: ty::Lift<TyCtxt<'tcx>>>(self, value: T) -> Option<T::Lifted> {
+    fn lift<T: ty::Lift<TyCtxt<'tcx>>>(self, value: T) -> T::Lifted {
         TyCtxt::lift(self, value)
     }
 
@@ -78,7 +78,10 @@ impl<'tcx> InternalCx<'tcx> for TyCtxt<'tcx> {
     fn mk_bound_variable_kinds_from_iter<I, T>(self, iter: I) -> T::Output
     where
         I: Iterator<Item = T>,
-        T: ty::CollectAndApply<ty::BoundVariableKind, &'tcx List<ty::BoundVariableKind>>,
+        T: ty::CollectAndApply<
+                ty::BoundVariableKind<'tcx>,
+                &'tcx List<ty::BoundVariableKind<'tcx>>,
+            >,
     {
         TyCtxt::mk_bound_variable_kinds_from_iter(self, iter)
     }
@@ -89,5 +92,13 @@ impl<'tcx> InternalCx<'tcx> for TyCtxt<'tcx> {
 
     fn adt_def(self, def_id: rustc_hir::def_id::DefId) -> ty::AdtDef<'tcx> {
         self.adt_def(def_id)
+    }
+
+    fn mk_patterns_from_iter<I, T>(self, iter: I) -> T::Output
+    where
+        I: Iterator<Item = T>,
+        T: ty::CollectAndApply<ty::Pattern<'tcx>, &'tcx List<ty::Pattern<'tcx>>>,
+    {
+        TyCtxt::mk_patterns_from_iter(self, iter)
     }
 }

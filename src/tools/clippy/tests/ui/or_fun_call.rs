@@ -6,6 +6,7 @@
     clippy::unnecessary_literal_unwrap,
     clippy::unnecessary_result_map_or_else,
     clippy::unnecessary_option_map_or_else,
+    clippy::map_or_identity,
     clippy::useless_vec
 )]
 
@@ -53,7 +54,7 @@ fn or_fun_call() {
     with_constructor.unwrap_or(make());
     //~^ or_fun_call
 
-    let with_new = Some(vec![1]);
+    let with_new: Option<Vec<i32>> = Some(vec![1]);
     with_new.unwrap_or(Vec::new());
     //~^ unwrap_or_default
 
@@ -101,7 +102,7 @@ fn or_fun_call() {
     real_default.unwrap_or(<FakeDefault as Default>::default());
     //~^ unwrap_or_default
 
-    let with_vec = Some(vec![1]);
+    let with_vec: Option<Vec<i32>> = Some(vec![1]);
     with_vec.unwrap_or(Vec::new());
     //~^ unwrap_or_default
 
@@ -329,7 +330,7 @@ mod lazy {
             }
         }
 
-        let with_new = Some(vec![1]);
+        let with_new: Option<Vec<i32>> = Some(vec![1]);
         with_new.unwrap_or_else(Vec::new);
         //~^ unwrap_or_default
 

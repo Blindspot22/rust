@@ -88,4 +88,18 @@ raw  { \n
     //~^ ERROR invalid format string: expected `}`, found `?`
     println!("{x,}, world!",);
     //~^ ERROR invalid format string: python's numeric grouping `,` is not supported in rust format strings
+
+    println!("{x=}");
+    //~^ ERROR invalid format string: python's f-string debug `=` is not supported in rust, use `dbg(x)` instead
+
+    println!(
+        "fn main() {\n\
+            \n\
+        }"
+        //~^^^ ERROR 1 positional argument in format string
+    );
+
+    // Don't emit note suggesting an escaping `{` for `{ }`.
+    println!("{ }");
+    //~^ ERROR 1 positional argument in format string
 }

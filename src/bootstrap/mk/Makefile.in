@@ -53,13 +53,18 @@ check-aux:
 		src/tools/cargotest \
 		src/tools/test-float-parse \
 		$(BOOTSTRAP_ARGS)
+	# The build-std suite is off by default because it is uncommonly slow
+	# and memory-hungry.
+	$(Q)$(BOOTSTRAP) test --stage 2 \
+		build-std \
+		$(BOOTSTRAP_ARGS)
 	# Run standard library tests in Miri.
 	$(Q)MIRIFLAGS="-Zmiri-strict-provenance" \
 		$(BOOTSTRAP) miri --stage 2 \
 		library/core \
 		library/alloc \
 		$(BOOTSTRAP_ARGS) \
-		--no-doc
+		--tests # exclude doc tests
 	# Some doctests use file system operations to demonstrate dealing with `Result`,
 	# so we have to run them with isolation disabled.
 	$(Q)MIRIFLAGS="-Zmiri-disable-isolation" \

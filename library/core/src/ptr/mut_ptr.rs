@@ -174,6 +174,7 @@ impl<T: PointeeSized> *mut T {
     /// [`with_exposed_provenance_mut`]: with_exposed_provenance_mut
     #[inline(always)]
     #[stable(feature = "exposed_provenance", since = "1.84.0")]
+    #[expect(lossy_provenance_casts, reason = "this *is* the replacement")]
     pub fn expose_provenance(self) -> usize {
         self.cast::<()>() as usize
     }
@@ -230,7 +231,7 @@ impl<T: PointeeSized> *mut T {
     /// let ptr: *mut u8 = &mut 10u8 as *mut u8;
     ///
     /// unsafe {
-    ///     let val_back = &*ptr;
+    ///     let val_back = ptr.as_ref_unchecked();
     ///     println!("We got back the value: {val_back}!");
     /// }
     /// ```
@@ -252,7 +253,8 @@ impl<T: PointeeSized> *mut T {
     /// For the mutable counterpart see [`as_mut`].
     ///
     /// [`is_null`]: #method.is_null-1
-    /// [`as_uninit_ref`]: pointer#method.as_uninit_ref-1
+    /// [`as_uninit_ref`]: #method.as_uninit_ref-1
+    /// [`as_ref_unchecked`]: #method.as_ref_unchecked-1
     /// [`as_mut`]: #method.as_mut
 
     #[stable(feature = "ptr_as_ref", since = "1.9.0")]
@@ -281,15 +283,14 @@ impl<T: PointeeSized> *mut T {
     /// # Examples
     ///
     /// ```
-    /// #![feature(ptr_as_ref_unchecked)]
     /// let ptr: *mut u8 = &mut 10u8 as *mut u8;
     ///
     /// unsafe {
     ///     println!("We got back the value: {}!", ptr.as_ref_unchecked());
     /// }
     /// ```
-    // FIXME: mention it in the docs for `as_ref` and `as_uninit_ref` once stabilized.
-    #[unstable(feature = "ptr_as_ref_unchecked", issue = "122034")]
+    #[stable(feature = "ptr_as_ref_unchecked", since = "1.95.0")]
+    #[rustc_const_stable(feature = "ptr_as_ref_unchecked", since = "1.95.0")]
     #[inline]
     #[must_use]
     pub const unsafe fn as_ref_unchecked<'a>(self) -> &'a T {
@@ -332,6 +333,10 @@ impl<T: PointeeSized> *mut T {
     }
 
     #[doc = include_str!("./docs/offset.md")]
+    ///
+    /// Consider using [`wrapping_offset`](#method.wrapping_offset) instead if these constraints are
+    /// difficult to satisfy. The only advantage of this method is that it
+    /// enables more aggressive compiler optimizations.
     ///
     /// # Examples
     ///
@@ -531,11 +536,13 @@ impl<T: PointeeSized> *mut T {
 
     /// Returns `None` if the pointer is null, or else returns a unique reference to
     /// the value wrapped in `Some`. If the value may be uninitialized, [`as_uninit_mut`]
-    /// must be used instead.
+    /// must be used instead. If the value is known to be non-null, [`as_mut_unchecked`]
+    /// can be used instead.
     ///
     /// For the shared counterpart see [`as_ref`].
     ///
     /// [`as_uninit_mut`]: #method.as_uninit_mut
+    /// [`as_mut_unchecked`]: #method.as_mut_unchecked
     /// [`as_ref`]: pointer#method.as_ref-1
     ///
     /// # Safety
@@ -564,14 +571,13 @@ impl<T: PointeeSized> *mut T {
     ///
     /// # Null-unchecked version
     ///
-    /// If you are sure the pointer can never be null and are looking for some kind of
-    /// `as_mut_unchecked` that returns the `&mut T` instead of `Option<&mut T>`, know that
-    /// you can dereference the pointer directly.
+    /// If you are sure the pointer can never be null, you can use `as_mut_unchecked` which returns
+    /// `&mut T` instead of `Option<&mut T>`.
     ///
     /// ```
     /// let mut s = [1, 2, 3];
     /// let ptr: *mut u32 = s.as_mut_ptr();
-    /// let first_value = unsafe { &mut *ptr };
+    /// let first_value = unsafe { ptr.as_mut_unchecked() };
     /// *first_value = 4;
     /// # assert_eq!(s, [4, 2, 3]);
     /// println!("{s:?}"); // It'll print: "[4, 2, 3]".
@@ -593,7 +599,7 @@ impl<T: PointeeSized> *mut T {
     ///
     /// [`as_mut`]: #method.as_mut
     /// [`as_uninit_mut`]: #method.as_uninit_mut
-    /// [`as_ref_unchecked`]: #method.as_mut_unchecked
+    /// [`as_ref_unchecked`]: #method.as_ref_unchecked
     ///
     /// # Safety
     ///
@@ -603,7 +609,6 @@ impl<T: PointeeSized> *mut T {
     /// # Examples
     ///
     /// ```
-    /// #![feature(ptr_as_ref_unchecked)]
     /// let mut s = [1, 2, 3];
     /// let ptr: *mut u32 = s.as_mut_ptr();
     /// let first_value = unsafe { ptr.as_mut_unchecked() };
@@ -611,8 +616,8 @@ impl<T: PointeeSized> *mut T {
     /// # assert_eq!(s, [4, 2, 3]);
     /// println!("{s:?}"); // It'll print: "[4, 2, 3]".
     /// ```
-    // FIXME: mention it in the docs for `as_mut` and `as_uninit_mut` once stabilized.
-    #[unstable(feature = "ptr_as_ref_unchecked", issue = "122034")]
+    #[stable(feature = "ptr_as_ref_unchecked", since = "1.95.0")]
+    #[rustc_const_stable(feature = "ptr_as_ref_unchecked", since = "1.95.0")]
     #[inline]
     #[must_use]
     pub const unsafe fn as_mut_unchecked<'a>(self) -> &'a mut T {
@@ -908,6 +913,10 @@ impl<T: PointeeSized> *mut T {
 
     #[doc = include_str!("./docs/add.md")]
     ///
+    /// Consider using [`wrapping_add`](#method.wrapping_add) instead if these constraints are
+    /// difficult to satisfy. The only advantage of this method is that it
+    /// enables more aggressive compiler optimizations.
+    ///
     /// # Examples
     ///
     /// ```
@@ -981,38 +990,11 @@ impl<T: PointeeSized> *mut T {
         unsafe { self.cast::<u8>().add(count).with_metadata_of(self) }
     }
 
-    /// Subtracts an unsigned offset from a pointer.
+    #[doc = include_str!("./docs/sub.md")]
     ///
-    /// This can only move the pointer backward (or not move it). If you need to move forward or
-    /// backward depending on the value, then you might want [`offset`](#method.offset) instead
-    /// which takes a signed offset.
-    ///
-    /// `count` is in units of T; e.g., a `count` of 3 represents a pointer
-    /// offset of `3 * size_of::<T>()` bytes.
-    ///
-    /// # Safety
-    ///
-    /// If any of the following conditions are violated, the result is Undefined Behavior:
-    ///
-    /// * The offset in bytes, `count * size_of::<T>()`, computed on mathematical integers (without
-    ///   "wrapping around"), must fit in an `isize`.
-    ///
-    /// * If the computed offset is non-zero, then `self` must be [derived from][crate::ptr#provenance] a pointer to some
-    ///   [allocation], and the entire memory range between `self` and the result must be in
-    ///   bounds of that allocation. In particular, this range must not "wrap around" the edge
-    ///   of the address space.
-    ///
-    /// Allocations can never be larger than `isize::MAX` bytes, so if the computed offset
-    /// stays in bounds of the allocation, it is guaranteed to satisfy the first requirement.
-    /// This implies, for instance, that `vec.as_ptr().add(vec.len())` (for `vec: Vec<T>`) is always
-    /// safe.
-    ///
-    /// Consider using [`wrapping_sub`] instead if these constraints are
+    /// Consider using [`wrapping_sub`](#method.wrapping_sub) instead if these constraints are
     /// difficult to satisfy. The only advantage of this method is that it
     /// enables more aggressive compiler optimizations.
-    ///
-    /// [`wrapping_sub`]: #method.wrapping_sub
-    /// [allocation]: crate::ptr#allocation
     ///
     /// # Examples
     ///
@@ -1655,7 +1637,53 @@ impl<T> *mut T {
     pub const fn cast_uninit(self) -> *mut MaybeUninit<T> {
         self as _
     }
+
+    /// Forms a raw mutable slice from a pointer and a length.
+    ///
+    /// The `len` argument is the number of **elements**, not the number of bytes.
+    ///
+    /// Performs the same functionality as [`cast_slice`] on a `*const T`, except that a
+    /// raw mutable slice is returned, as opposed to a raw immutable slice.
+    ///
+    /// This function is safe, but actually using the return value is unsafe.
+    /// See the documentation of [`slice::from_raw_parts_mut`] for slice safety requirements.
+    ///
+    /// [`slice::from_raw_parts_mut`]: crate::slice::from_raw_parts_mut
+    /// [`cast_slice`]: pointer::cast_slice
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// #![feature(ptr_cast_slice)]
+    ///
+    /// let x = &mut [5, 6, 7];
+    /// let raw_mut_slice = x.as_mut_ptr().cast_slice(3);
+    ///
+    /// unsafe {
+    ///     (*raw_mut_slice)[2] = 99; // assign a value at an index in the slice
+    /// };
+    ///
+    /// assert_eq!(unsafe { &*raw_mut_slice }[2], 99);
+    /// ```
+    ///
+    /// You must ensure that the pointer is valid and not null before dereferencing
+    /// the raw slice. A slice reference must never have a null pointer, even if it's empty.
+    ///
+    /// ```rust,should_panic
+    /// #![feature(ptr_cast_slice)]
+    /// use std::ptr;
+    /// let danger: *mut [u8] = ptr::null_mut::<u8>().cast_slice(0);
+    /// unsafe {
+    ///     danger.as_mut().expect("references must not be null");
+    /// }
+    /// ```
+    #[inline]
+    #[unstable(feature = "ptr_cast_slice", issue = "149103")]
+    pub const fn cast_slice(self, len: usize) -> *mut [T] {
+        slice_from_raw_parts_mut(self, len)
+    }
 }
+
 impl<T> *mut MaybeUninit<T> {
     /// Casts from a maybe-uninitialized type to its initialized version.
     ///
@@ -1755,7 +1783,6 @@ impl<T> *mut [T] {
     ///
     /// ```
     /// #![feature(raw_slice_split)]
-    /// #![feature(slice_ptr_get)]
     ///
     /// let mut v = [1, 0, 3, 0, 5, 6];
     /// let ptr = &mut v as *mut [_];

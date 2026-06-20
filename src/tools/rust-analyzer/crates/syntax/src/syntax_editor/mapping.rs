@@ -1,6 +1,6 @@
 //! Maps syntax elements through disjoint syntax nodes.
 //!
-//! [`SyntaxMappingBuilder`] should be used to create mappings to add to a [`SyntaxEditor`]
+//! [`SyntaxMappingBuilder`] should be used to create mappings to add to a `SyntaxEditor`
 
 use itertools::Itertools;
 use rustc_hash::FxHashMap;
@@ -161,7 +161,7 @@ impl SyntaxMapping {
         // Try to follow the mapping tree, if it exists
         let input_mapping = self.upmap_node_single(input);
         let input_ancestor =
-            input.ancestors().find_map(|ancestor| self.upmap_node_single(&ancestor));
+            input.ancestors().find(|ancestor| self.upmap_node_single(ancestor).is_some());
 
         match (input_mapping, input_ancestor) {
             (Some(input_mapping), _) => {

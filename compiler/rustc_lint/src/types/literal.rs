@@ -1,11 +1,14 @@
 use hir::{ExprKind, Node};
 use rustc_abi::{Integer, Size};
+use rustc_apfloat::Float;
+use rustc_apfloat::ieee::{DoubleS, HalfS, IeeeFloat, QuadS, Semantics, SingleS};
+use rustc_ast as ast;
+use rustc_hir as hir;
 use rustc_hir::{HirId, attrs};
 use rustc_middle::ty::Ty;
 use rustc_middle::ty::layout::IntegerExt;
 use rustc_middle::{bug, ty};
-use rustc_span::Span;
-use {rustc_ast as ast, rustc_hir as hir};
+use rustc_span::{Span, Symbol};
 
 use crate::LateContext;
 use crate::context::LintContext;
@@ -155,8 +158,21 @@ fn report_bin_hex_error(
             (t.name_str(), actually.to_string())
         }
     };
-    let sign =
-        if negative { OverflowingBinHexSign::Negative } else { OverflowingBinHexSign::Positive };
+    let sign = if negative {
+        OverflowingBinHexSign::Negative {
+            lit: repr_str.clone(),
+            dec: val,
+            actually: actually.clone(),
+            ty: t,
+        }
+    } else {
+        OverflowingBinHexSign::Positive {
+            lit: repr_str.clone(),
+            dec: val,
+            actually: actually.clone(),
+            ty: t,
+        }
+    };
     let sub = get_type_suggestion(cx.typeck_results().node_type(hir_id), val, negative).map(
         |suggestion_ty| {
             if let Some(pos) = repr_str.chars().position(|c| c == 'i' || c == 'u') {
@@ -192,7 +208,7 @@ fn report_bin_hex_error(
             Some(OverflowingBinHexSignBitSub {
                 span,
                 lit_no_suffix,
-                negative_val: actually.clone(),
+                negative_val: actually,
                 int_ty: int_ty.name_str(),
                 uint_ty: Integer::fit_unsigned(val).uint_ty_str(),
             })
@@ -202,15 +218,7 @@ fn report_bin_hex_error(
     cx.emit_span_lint(
         OVERFLOWING_LITERALS,
         span,
-        OverflowingBinHex {
-            ty: t,
-            lit: repr_str.clone(),
-            dec: val,
-            actually,
-            sign,
-            sub,
-            sign_bit_sub,
-        },
+        OverflowingBinHex { ty: t, sign, sub, sign_bit_sub },
     )
 }
 
@@ -383,6 +391,13 @@ fn lint_uint_literal<'tcx>(
     }
 }
 
+/// `None` if `v` does not parse as the float type, otherwise indicates whether a literal rounds
+/// to infinity.
+fn float_is_infinite<S: Semantics>(v: Symbol) -> Option<bool> {
+    let x: IeeeFloat<S> = v.as_str().parse().ok()?;
+    Some(x.is_infinite())
+}
+
 pub(crate) fn lint_literal<'tcx>(
     cx: &LateContext<'tcx>,
     type_limits: &TypeLimits,
@@ -405,18 +420,18 @@ pub(crate) fn lint_literal<'tcx>(
             lint_uint_literal(cx, hir_id, span, lit, t)
         }
         ty::Float(t) => {
-            let (is_infinite, sym) = match lit.node {
-                ast::LitKind::Float(v, _) => match t {
-                    // FIXME(f16_f128): add this check once `is_infinite` is reliable (ABI
-                    // issues resolved).
-                    ty::FloatTy::F16 => (Ok(false), v),
-                    ty::FloatTy::F32 => (v.as_str().parse().map(f32::is_infinite), v),
-                    ty::FloatTy::F64 => (v.as_str().parse().map(f64::is_infinite), v),
-                    ty::FloatTy::F128 => (Ok(false), v),
-                },
-                _ => bug!(),
+            let ast::LitKind::Float(v, _) = lit.node else {
+                bug!();
             };
-            if is_infinite == Ok(true) {
+
+            let is_infinite = match t {
+                ty::FloatTy::F16 => float_is_infinite::<HalfS>(v),
+                ty::FloatTy::F32 => float_is_infinite::<SingleS>(v),
+                ty::FloatTy::F64 => float_is_infinite::<DoubleS>(v),
+                ty::FloatTy::F128 => float_is_infinite::<QuadS>(v),
+            };
+
+            if is_infinite == Some(true) {
                 cx.emit_span_lint(
                     OVERFLOWING_LITERALS,
                     span,
@@ -426,7 +441,7 @@ pub(crate) fn lint_literal<'tcx>(
                             .sess()
                             .source_map()
                             .span_to_snippet(lit.span)
-                            .unwrap_or_else(|_| sym.to_string()),
+                            .unwrap_or_else(|_| v.to_string()),
                     },
                 );
             }

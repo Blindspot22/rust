@@ -5,19 +5,18 @@
 )]
 #![feature(ascii_char)]
 #![feature(ascii_char_variants)]
-#![feature(assert_matches)]
-#![feature(box_into_inner)]
-#![feature(box_patterns)]
+#![feature(deref_patterns)]
 #![feature(file_buffered)]
 #![feature(formatting_options)]
-#![feature(if_let_guard)]
-#![feature(iter_advance_by)]
 #![feature(iter_intersperse)]
 #![feature(iter_order_by)]
 #![feature(rustc_private)]
 #![feature(test)]
 #![feature(trim_prefix_suffix)]
+#![feature(variant_count)]
+#![recursion_limit = "256"]
 #![warn(rustc::internal)]
+#![warn(rustc::symbol_intern_string_literal)]
 // tidy-alphabetical-end
 
 // N.B. these need `extern crate` even in 2018 edition
@@ -71,18 +70,20 @@ extern crate tikv_jemalloc_sys as _;
 use std::env::{self, VarError};
 use std::io::{self, IsTerminal};
 use std::path::Path;
-use std::process;
+use std::process::ExitCode;
 
+use rustc_ast::ast;
 use rustc_errors::DiagCtxtHandle;
 use rustc_hir::def_id::LOCAL_CRATE;
-use rustc_hir::lints::DelayedLint;
 use rustc_interface::interface;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{ErrorOutputType, RustcOptGroup, make_crate_type_option};
 use rustc_session::{EarlyDiagCtxt, getopts};
+use rustc_span::{BytePos, Span, SyntaxContext};
 use tracing::info;
 
 use crate::clean::utils::DOC_RUST_LANG_ORG_VERSION;
+use crate::config::EmitType;
 use crate::error::Error;
 use crate::formats::cache::Cache;
 
@@ -126,7 +127,7 @@ mod visit;
 mod visit_ast;
 mod visit_lib;
 
-pub fn main() {
+pub fn main() -> ExitCode {
     let mut early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
 
     rustc_driver::install_ice_hook(
@@ -164,11 +165,10 @@ pub fn main() {
         Err(error) => early_dcx.early_fatal(error.to_string()),
     }
 
-    let exit_code = rustc_driver::catch_with_exit_code(|| {
+    rustc_driver::catch_with_exit_code(|| {
         let at_args = rustc_driver::args::raw_args(&early_dcx);
         main_args(&mut early_dcx, &at_args);
-    });
-    process::exit(exit_code);
+    })
 }
 
 fn init_logging(early_dcx: &EarlyDiagCtxt) {
@@ -459,6 +459,14 @@ fn opts() -> Vec<RustcOptGroup> {
                 By default, it is at `forbid` level.",
             "LEVEL",
         ),
+        opt(
+            Stable,
+            Multi,
+            "",
+            "remap-path-prefix",
+            "Remap source names in compiler messages",
+            "FROM=TO",
+        ),
         opt(Unstable, Opt, "", "index-page", "Markdown file to be used as index page", "PATH"),
         opt(
             Unstable,
@@ -535,12 +543,12 @@ fn opts() -> Vec<RustcOptGroup> {
             "",
         ),
         opt(
-            Unstable,
+            Stable,
             Multi,
             "",
             "emit",
             "Comma separated list of types of output for rustdoc to emit",
-            "[toolchain-shared-resources,invocation-specific,dep-info]",
+            "[html-static-files,html-non-static-files,dep-info]",
         ),
         opt(Unstable, FlagMulti, "", "no-run", "Compile doctests without running them", ""),
         opt(
@@ -553,11 +561,11 @@ fn opts() -> Vec<RustcOptGroup> {
         ),
         opt(
             Unstable,
-            Multi,
+            Opt,
             "",
-            "remap-path-prefix",
-            "Remap source names in compiler messages",
-            "FROM=TO",
+            "remap-path-scope",
+            "Defines which scopes of paths should be remapped by `--remap-path-prefix`",
+            "[macro,diagnostics,debuginfo,coverage,object,all]",
         ),
         opt(
             Unstable,
@@ -841,8 +849,41 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String]) {
             // `run_compiler`.
             return wrap_return(
                 dcx,
-                interface::run_compiler(config, |_compiler| {
-                    markdown::render_and_write(&md_input, render_options, edition)
+                interface::run_compiler(config, |compiler| {
+                    // construct a phony "crate" without actually running the parser
+                    // allows us to use other compiler infrastructure like dep-info
+                    let file =
+                        compiler.sess.source_map().load_file(&md_input).map_err(|e| {
+                            format!("{md_input}: {e}", md_input = md_input.display())
+                        })?;
+                    let inner_span = Span::new(
+                        file.start_pos,
+                        BytePos(file.start_pos.0 + file.normalized_source_len.0),
+                        SyntaxContext::root(),
+                        None,
+                    );
+                    let krate = ast::Crate {
+                        attrs: Default::default(),
+                        items: Default::default(),
+                        spans: ast::ModSpans { inner_span, ..Default::default() },
+                        id: ast::DUMMY_NODE_ID,
+                        is_placeholder: false,
+                    };
+                    rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
+                        let has_dep_info = render_options.dep_info().is_some();
+                        if render_options.emit.contains(&EmitType::HtmlNonStaticFiles) {
+                            markdown::render_and_write(file, render_options, edition)?;
+                        }
+                        if has_dep_info {
+                            // Register the loaded external files in the source map so they show up in depinfo.
+                            // We can't load them via the source map because it gets created after we process the options.
+                            for external_path in &loaded_paths {
+                                let _ = compiler.sess.source_map().load_binary_file(external_path);
+                            }
+                            rustc_interface::passes::write_dep_info(tcx);
+                        }
+                        Ok(())
+                    })
                 }),
             );
         }
@@ -909,29 +950,7 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String]) {
                 return;
             }
 
-            for owner_id in tcx.hir_crate_items(()).delayed_lint_items() {
-                if let Some(delayed_lints) = tcx.opt_ast_lowering_delayed_lints(owner_id) {
-                    for lint in &delayed_lints.lints {
-                        match lint {
-                            DelayedLint::AttributeParsing(attribute_lint) => {
-                                tcx.node_span_lint(
-                                    attribute_lint.lint_id.lint,
-                                    attribute_lint.id,
-                                    attribute_lint.span,
-                                    |diag| {
-                                        rustc_lint::decorate_attribute_lint(
-                                            tcx.sess,
-                                            Some(tcx),
-                                            &attribute_lint.kind,
-                                            diag,
-                                        );
-                                    },
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+            rustc_interface::passes::emit_delayed_lints(tcx);
 
             if render_opts.dep_info().is_some() {
                 rustc_interface::passes::write_dep_info(tcx);
@@ -975,15 +994,15 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String]) {
     })
 }
 
-fn dump_feature_usage_metrics(tcxt: TyCtxt<'_>, metrics_dir: &Path) {
-    let hash = tcxt.crate_hash(LOCAL_CRATE);
-    let crate_name = tcxt.crate_name(LOCAL_CRATE);
+fn dump_feature_usage_metrics(tcx: TyCtxt<'_>, metrics_dir: &Path) {
+    let hash = tcx.crate_hash(LOCAL_CRATE);
+    let crate_name = tcx.crate_name(LOCAL_CRATE);
     let metrics_file_name = format!("unstable_feature_usage_metrics-{crate_name}-{hash}.json");
     let metrics_path = metrics_dir.join(metrics_file_name);
-    if let Err(error) = tcxt.features().dump_feature_usage_metrics(metrics_path) {
+    if let Err(error) = tcx.features().dump_feature_usage_metrics(metrics_path) {
         // FIXME(yaahc): once metrics can be enabled by default we will want "failure to emit
         // default metrics" to only produce a warning when metrics are enabled by default and emit
         // an error only when the user manually enables metrics
-        tcxt.dcx().err(format!("cannot emit feature usage metrics: {error}"));
+        tcx.dcx().err(format!("cannot emit feature usage metrics: {error}"));
     }
 }

@@ -5,12 +5,10 @@
 //! builders. The tidy checks can be executed with `./x.py test tidy`.
 
 use std::collections::VecDeque;
-use std::num::NonZeroUsize;
-use std::path::PathBuf;
-use std::str::FromStr;
 use std::thread::{self, ScopedJoinHandle, scope};
 use std::{env, process};
 
+use tidy::arg_parser::TidyArgParser;
 use tidy::diagnostics::{COLOR_ERROR, COLOR_SUCCESS, TidyCtx, TidyFlags, output_message};
 use tidy::*;
 
@@ -22,16 +20,16 @@ fn main() {
         env::set_var("RUSTC_BOOTSTRAP", "1");
     }
 
-    let root_path: PathBuf = env::args_os().nth(1).expect("need path to root of repo").into();
-    let cargo: PathBuf = env::args_os().nth(2).expect("need path to cargo").into();
-    let output_directory: PathBuf =
-        env::args_os().nth(3).expect("need path to output directory").into();
-    let concurrency: NonZeroUsize =
-        FromStr::from_str(&env::args().nth(4).expect("need concurrency"))
-            .expect("concurrency must be a number");
-    let npm: PathBuf = env::args_os().nth(5).expect("need name/path of npm command").into();
+    let parsed_args = TidyArgParser::parse();
+
+    let root_path = parsed_args.root_path;
+    let cargo = parsed_args.cargo;
+    let output_directory = parsed_args.output_directory;
+    let concurrency = parsed_args.concurrency.get();
+    let npm = parsed_args.npm;
 
     let root_manifest = root_path.join("Cargo.toml");
+    let typos_toml = root_path.join("typos.toml");
     let src_path = root_path.join("src");
     let tests_path = root_path.join("tests");
     let library_path = root_path.join("library");
@@ -40,18 +38,13 @@ fn main() {
     let tools_path = src_path.join("tools");
     let crashes_path = tests_path.join("crashes");
 
-    let args: Vec<String> = env::args().skip(1).collect();
-    let (cfg_args, pos_args) = match args.iter().position(|arg| arg == "--") {
-        Some(pos) => (&args[..pos], &args[pos + 1..]),
-        None => (&args[..], [].as_slice()),
-    };
-    let verbose = cfg_args.iter().any(|s| *s == "--verbose");
-    let extra_checks =
-        cfg_args.iter().find(|s| s.starts_with("--extra-checks=")).map(String::as_str);
+    let verbose = parsed_args.verbose;
+    let bless = parsed_args.bless;
+    let ci = parsed_args.ci;
+    let extra_checks = parsed_args.extra_checks;
+    let pos_args = parsed_args.pos_args;
 
-    let tidy_flags = TidyFlags::new(cfg_args);
-    let tidy_ctx = TidyCtx::new(&root_path, verbose, tidy_flags);
-    let ci_info = CiInfo::new(tidy_ctx.clone());
+    let tidy_ctx = TidyCtx::new(&root_path, verbose, ci, TidyFlags::new(bless));
 
     let drain_handles = |handles: &mut VecDeque<ScopedJoinHandle<'_, ()>>| {
         // poll all threads for completion before awaiting the oldest one
@@ -61,14 +54,13 @@ fn main() {
             }
         }
 
-        while handles.len() >= concurrency.get() {
+        while handles.len() >= concurrency {
             handles.pop_front().unwrap().join().unwrap();
         }
     };
 
     scope(|s| {
-        let mut handles: VecDeque<ScopedJoinHandle<'_, ()>> =
-            VecDeque::with_capacity(concurrency.get());
+        let mut handles: VecDeque<ScopedJoinHandle<'_, ()>> = VecDeque::with_capacity(concurrency);
 
         macro_rules! check {
             ($p:ident) => {
@@ -109,17 +101,15 @@ fn main() {
         check!(rustdoc_gui_tests, &tests_path);
         check!(rustdoc_css_themes, &librustdoc_path);
         check!(rustdoc_templates, &librustdoc_path);
-        check!(rustdoc_json, &src_path, &ci_info);
+        check!(rustdoc_json, &src_path);
         check!(known_bug, &crashes_path);
         check!(unknown_revision, &tests_path);
 
         // Checks that only make sense for the compiler.
-        check!(error_codes, &root_path, &[&compiler_path, &librustdoc_path], &ci_info);
-        check!(fluent_alphabetical, &compiler_path);
-        check!(fluent_period, &compiler_path);
-        check!(fluent_lowercase, &compiler_path);
+        check!(error_codes, &root_path, &[&compiler_path, &librustdoc_path]);
         check!(target_policy, &root_path);
         check!(gcc_submodule, &root_path, &compiler_path);
+        check!(codegen, &compiler_path);
 
         // Checks that only make sense for the std libs.
         check!(pal, &library_path);
@@ -143,6 +133,7 @@ fn main() {
         check!(edition, &library_path);
 
         check!(alphabetical, &root_manifest);
+        check!(alphabetical, &typos_toml);
         check!(alphabetical, &src_path);
         check!(alphabetical, &tests_path);
         check!(alphabetical, &compiler_path);
@@ -164,7 +155,6 @@ fn main() {
             extra_checks,
             &root_path,
             &output_directory,
-            &ci_info,
             &librustdoc_path,
             &tools_path,
             &npm,

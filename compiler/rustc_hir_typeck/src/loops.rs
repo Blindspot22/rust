@@ -3,7 +3,6 @@ use std::fmt;
 
 use Context::*;
 use rustc_hir as hir;
-use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
 use rustc_hir::intravisit::{self, Visitor};
@@ -14,7 +13,7 @@ use rustc_middle::ty::TyCtxt;
 use rustc_span::hygiene::DesugaringKind;
 use rustc_span::{BytePos, Span};
 
-use crate::errors::{
+use crate::diagnostics::{
     BreakInsideClosure, BreakInsideCoroutine, BreakNonLoop, ConstContinueBadLabel,
     ContinueLabeledBlock, OutsideLoop, OutsideLoopSuggestion, UnlabeledCfInWhileCondition,
     UnlabeledInLabeledBlock,
@@ -208,7 +207,7 @@ impl<'hir> Visitor<'hir> for CheckLoopVisitor<'hir> {
                 };
 
                 // A `#[const_continue]` must break to a block in a `#[loop_match]`.
-                if find_attr!(self.tcx.hir_attrs(e.hir_id), AttributeKind::ConstContinue(_)) {
+                if find_attr!(self.tcx, e.hir_id, ConstContinue(_)) {
                     let Some(label) = break_destination.label else {
                         let span = e.span;
                         self.tcx.dcx().emit_fatal(ConstContinueBadLabel { span });
@@ -271,7 +270,13 @@ impl<'hir> Visitor<'hir> for CheckLoopVisitor<'hir> {
                     }
                 }
 
-                let sp_lo = e.span.with_lo(e.span.lo() + BytePos("break".len() as u32));
+                let sp_lo = if let Ok(snippet) = self.tcx.sess.source_map().span_to_snippet(e.span)
+                    && let Some(break_pos) = snippet.find("break")
+                {
+                    e.span.with_lo(e.span.lo() + BytePos((break_pos + "break".len()) as u32))
+                } else {
+                    e.span.with_lo(e.span.lo() + BytePos("break".len() as u32))
+                };
                 let label_sp = match break_destination.label {
                     Some(label) => sp_lo.with_hi(label.ident.span.hi()),
                     None => sp_lo.shrink_to_lo(),
@@ -421,7 +426,7 @@ impl<'hir> CheckLoopVisitor<'hir> {
         e: &'hir hir::Expr<'hir>,
         body: &'hir hir::Block<'hir>,
     ) -> Option<Destination> {
-        if !find_attr!(self.tcx.hir_attrs(e.hir_id), AttributeKind::LoopMatch(_)) {
+        if !find_attr!(self.tcx, e.hir_id, LoopMatch(_)) {
             return None;
         }
 

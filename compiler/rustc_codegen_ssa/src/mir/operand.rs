@@ -103,6 +103,7 @@ impl<V: CodegenObject> OperandValue<V> {
         PlaceValue { llval, llextra, align }
     }
 
+    #[must_use]
     pub(crate) fn is_expected_variant_for_type<'tcx, Cx: LayoutTypeCodegenMethods<'tcx>>(
         &self,
         cx: &Cx,
@@ -245,10 +246,7 @@ impl<'a, 'tcx, V: CodegenObject> OperandRef<'tcx, V> {
             _ if layout.is_zst() => OperandRef::zero_sized(layout),
             _ => {
                 // Neither a scalar nor scalar pair. Load from a place
-                // FIXME: should we cache `const_data_from_alloc` to avoid repeating this for the
-                // same `ConstAllocation`?
-                let init = bx.const_data_from_alloc(alloc);
-                let base_addr = bx.static_addr_of(init, alloc_align, None);
+                let base_addr = bx.static_addr_of(alloc, None);
 
                 let llval = bx.const_ptr_byte_offset(base_addr, offset);
                 bx.load_operand(PlaceRef::new_sized(llval, layout))
@@ -299,15 +297,28 @@ impl<'a, 'tcx, V: CodegenObject> OperandRef<'tcx, V> {
         bx: &mut Bx,
         dest: PlaceRef<'tcx, V>,
     ) {
+        self.store_with_annotation_and_flags(bx, dest, MemFlags::empty())
+    }
+
+    /// Same as store_with_annotation(), but also specify flags for the store.
+    pub fn store_with_annotation_and_flags<Bx: BuilderMethods<'a, 'tcx, Value = V>>(
+        self,
+        bx: &mut Bx,
+        dest: PlaceRef<'tcx, V>,
+        flags: MemFlags,
+    ) {
         if let Some(instance) = self.move_annotation {
-            bx.with_move_annotation(instance, |bx| self.val.store(bx, dest))
+            bx.with_move_annotation(instance, |bx| self.val.store_with_flags(bx, dest, flags))
         } else {
-            self.val.store(bx, dest)
+            self.val.store_with_flags(bx, dest, flags)
         }
     }
 
     /// If this operand is a `Pair`, we return an aggregate with the two values.
     /// For other cases, see `immediate`.
+    ///
+    /// Note: The use of this is discouraged outside cg_llvm, as some other backends
+    /// don't natively support packing multiple things into one like this.
     pub fn immediate_or_packed_pair<Bx: BuilderMethods<'a, 'tcx, Value = V>>(
         self,
         bx: &mut Bx,
@@ -326,6 +337,9 @@ impl<'a, 'tcx, V: CodegenObject> OperandRef<'tcx, V> {
     }
 
     /// If the type is a pair, we return a `Pair`, otherwise, an `Immediate`.
+    ///
+    /// Note: The use of this is discouraged outside cg_llvm, as some other backends
+    /// don't natively support packing multiple things into one like this.
     pub fn from_immediate_or_packed_pair<Bx: BuilderMethods<'a, 'tcx, Value = V>>(
         bx: &mut Bx,
         llval: V,
@@ -407,7 +421,7 @@ impl<'a, 'tcx, V: CodegenObject> OperandRef<'tcx, V> {
                 }
                 BackendRepr::ScalarPair(_, _)
                 | BackendRepr::Memory { .. }
-                | BackendRepr::ScalableVector { .. } => bug!(),
+                | BackendRepr::SimdScalableVector { .. } => bug!(),
             })
         };
 
@@ -496,7 +510,7 @@ impl<'a, 'tcx, V: CodegenObject> OperandRef<'tcx, V> {
                 // `layout_sanity_check` ensures that we only get here for cases where the discriminant
                 // value and the variant index match, since that's all `Niche` can encode.
 
-                let relative_max = niche_variants.end().as_u32() - niche_variants.start().as_u32();
+                let relative_max = niche_variants.last.as_u32() - niche_variants.start.as_u32();
                 let niche_start_const = bx.cx().const_uint_big(tag_llty, niche_start);
 
                 // We have a subrange `niche_start..=niche_end` inside `range`.
@@ -525,7 +539,7 @@ impl<'a, 'tcx, V: CodegenObject> OperandRef<'tcx, V> {
                     // }
                     let is_niche = bx.icmp(IntPredicate::IntEQ, tag, niche_start_const);
                     let tagged_discr =
-                        bx.cx().const_uint(cast_to, niche_variants.start().as_u32() as u64);
+                        bx.cx().const_uint(cast_to, niche_variants.start.as_u32() as u64);
                     (is_niche, tagged_discr, 0)
                 } else {
                     // Thanks to parameter attributes and load metadata, LLVM already knows
@@ -551,7 +565,7 @@ impl<'a, 'tcx, V: CodegenObject> OperandRef<'tcx, V> {
                     {
                         let impossible = niche_start
                             .wrapping_add(u128::from(untagged_variant.as_u32()))
-                            .wrapping_sub(u128::from(niche_variants.start().as_u32()));
+                            .wrapping_sub(u128::from(niche_variants.start.as_u32()));
                         let impossible = bx.cx().const_uint_big(tag_llty, impossible);
                         let ne = bx.icmp(IntPredicate::IntNE, tag, impossible);
                         bx.assume(ne);
@@ -635,7 +649,7 @@ impl<'a, 'tcx, V: CodegenObject> OperandRef<'tcx, V> {
                         )
                     };
 
-                    (is_niche, cast_tag, niche_variants.start().as_u32() as u128)
+                    (is_niche, cast_tag, niche_variants.start.as_u32() as u128)
                 };
 
                 let tagged_discr = if delta == 0 {
@@ -694,7 +708,7 @@ impl<'a, 'tcx, V: CodegenObject> OperandRefBuilder<'tcx, V> {
             BackendRepr::ScalarPair(a, b) => {
                 OperandValueBuilder::Pair(Either::Right(a), Either::Right(b))
             }
-            BackendRepr::SimdVector { .. } | BackendRepr::ScalableVector { .. } => {
+            BackendRepr::SimdVector { .. } | BackendRepr::SimdScalableVector { .. } => {
                 OperandValueBuilder::Vector(Either::Right(()))
             }
             BackendRepr::Memory { .. } => {
@@ -957,7 +971,8 @@ impl<'a, 'tcx, V: CodegenObject> OperandValue<V> {
                 let llptr = bx.inbounds_ptradd(dest.val.llval, bx.const_usize(b_offset.bytes()));
                 let val = bx.from_immediate(b);
                 let align = dest.val.align.restrict_for_offset(b_offset);
-                bx.store_with_flags(val, llptr, align, flags);
+                // The CAPTURES_READ_ONLY flag only applies to the first element.
+                bx.store_with_flags(val, llptr, align, flags & !MemFlags::CAPTURES_READ_ONLY);
             }
         }
     }
@@ -1074,8 +1089,14 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 if constant_ty.is_simd() {
                     // However, some SIMD types do not actually use the vector ABI
                     // (in particular, packed SIMD types do not). Ensure we exclude those.
+                    //
+                    // We also have to exclude vectors of pointers because `immediate_const_vector`
+                    // does not work for those.
                     let layout = bx.layout_of(constant_ty);
-                    if let BackendRepr::SimdVector { .. } = layout.backend_repr {
+                    let (_, element_ty) = constant_ty.simd_size_and_type(bx.tcx());
+                    if let BackendRepr::SimdVector { .. } = layout.backend_repr
+                        && element_ty.is_numeric()
+                    {
                         let (llval, ty) = self.immediate_const_vector(bx, constant);
                         return OperandRef {
                             val: OperandValue::Immediate(llval),

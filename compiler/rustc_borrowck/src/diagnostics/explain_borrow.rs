@@ -1,9 +1,6 @@
 //! Print diagnostics to explain why values are borrowed.
 
-#![allow(rustc::diagnostic_outside_of_impl)]
-#![allow(rustc::untranslatable_diagnostic)]
-
-use std::assert_matches::assert_matches;
+use std::assert_matches;
 
 use rustc_errors::{Applicability, Diag, EmissionGuarantee};
 use rustc_hir as hir;
@@ -653,8 +650,8 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
         // We want to focus on relevant live locals in diagnostics, so when polonius is enabled, we
         // ensure that we don't emit live boring locals as explanations.
         let is_local_boring = |local| {
-            if let Some(polonius_diagnostics) = self.polonius_diagnostics {
-                polonius_diagnostics.boring_nll_locals.contains(&local)
+            if let Some(polonius_context) = self.polonius_context {
+                polonius_context.boring_nll_locals.contains(&local)
             } else {
                 assert!(!tcx.sess.opts.unstable_opts.polonius.is_next_enabled());
 
@@ -790,7 +787,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
                 let block = &self.body.basic_blocks[location.block];
 
                 let kind = if let Some(&Statement {
-                    kind: StatementKind::FakeRead(box (FakeReadCause::ForLet(_), place)),
+                    kind: StatementKind::FakeRead((FakeReadCause::ForLet(_), place)),
                     ..
                 }) = block.statements.get(location.statement_index)
                 {
@@ -852,7 +849,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
         // will only ever have one item at any given time, but by using a vector, we can pop from
         // it which simplifies the termination logic.
         let mut queue = vec![location];
-        let Some(Statement { kind: StatementKind::Assign(box (place, _)), .. }) = stmt else {
+        let Some(Statement { kind: StatementKind::Assign((place, _)), .. }) = stmt else {
             return false;
         };
         let Some(mut target) = place.as_local() else { return false };
@@ -868,7 +865,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
                 debug!("was_captured_by_trait_object: stmt={:?}", stmt);
 
                 // The only kind of statement that we care about is assignments...
-                if let StatementKind::Assign(box (place, rvalue)) = &stmt.kind {
+                if let StatementKind::Assign((place, rvalue)) = &stmt.kind {
                     let Some(into) = place.local_or_deref_local() else {
                         // Continue at the next location.
                         queue.push(current_location.successor_within_block());
@@ -878,7 +875,7 @@ impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
                     match rvalue {
                         // If we see a use, we should check whether it is our data, and if so
                         // update the place that we're looking for to that new place.
-                        Rvalue::Use(operand) => match operand {
+                        Rvalue::Use(operand, _) => match operand {
                             Operand::Copy(place) | Operand::Move(place) => {
                                 if let Some(from) = place.as_local() {
                                     if from == target {

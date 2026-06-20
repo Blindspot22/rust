@@ -1,12 +1,9 @@
 #![unstable(feature = "maybe_dangling", issue = "118166")]
 
+use crate::marker::StructuralPartialEq;
 use crate::{mem, ptr};
 
 /// Allows wrapped [references] and [boxes] to dangle.
-///
-/// <section class="warning">
-/// This type is not properly implemented yet, and the documentation below is thus not accurate.
-/// </section>
 ///
 /// That is, if a reference (or a `Box`) is wrapped in `MaybeDangling` (including when in a
 /// (nested) field of a compound type wrapped in `MaybeDangling`), it does not have to follow
@@ -16,7 +13,6 @@ use crate::{mem, ptr};
 /// executing (particularly in concurrent code). As a somewhat absurd example, consider this code:
 ///
 /// ```rust,no_run
-/// #![feature(box_as_ptr)]
 /// # use std::alloc::{dealloc, Layout};
 /// # use std::mem;
 ///
@@ -29,7 +25,7 @@ use crate::{mem, ptr};
 /// mem::forget(boxed); // <-- this is UB!
 /// ```
 ///
-/// Even though the `Box`e's destructor is not run (and thus we don't have a double free bug), this
+/// Even though the `Box`'s destructor is not run (and thus we don't have a double free bug), this
 /// code is still UB. This is because when moving `boxed` into `forget`, its validity invariants
 /// are asserted, causing UB since the `Box` is dangling. The safety comment is as such wrong, as
 /// moving the `boxed` variable as part of the `forget` call *is* a use.
@@ -38,7 +34,7 @@ use crate::{mem, ptr};
 ///
 // FIXME: remove `no_run` once the semantics are actually implemented
 /// ```rust,no_run
-/// #![feature(maybe_dangling, box_as_ptr)]
+/// #![feature(maybe_dangling)]
 /// # use std::alloc::{dealloc, Layout};
 /// # use std::mem::{self, MaybeDangling};
 ///
@@ -73,6 +69,7 @@ use crate::{mem, ptr};
 #[repr(transparent)]
 #[rustc_pub_transparent]
 #[derive(Debug, Copy, Clone, Default)]
+#[lang = "maybe_dangling"]
 pub struct MaybeDangling<P: ?Sized>(P);
 
 impl<P: ?Sized> MaybeDangling<P> {
@@ -112,3 +109,5 @@ impl<P: ?Sized> MaybeDangling<P> {
         x
     }
 }
+
+impl<T: ?Sized> StructuralPartialEq for MaybeDangling<T> {}

@@ -187,6 +187,9 @@ pub enum Suggestion {
     /// Add missing colon:
     /// `format!("{foo?}")` -> `format!("{foo:?}")`
     AddMissingColon(Range<usize>),
+    /// Use Rust format string:
+    /// `format!("{x=}")` -> `dbg!(x)`
+    UseRustDebugPrintingMacro,
 }
 
 /// The parser structure for interpreting the input format string. This is
@@ -307,24 +310,49 @@ impl<'input> Parser<'input> {
 
         let (is_source_literal, end_of_snippet, pre_input_vec) = if let Some(snippet) = snippet {
             if let Some(nr_hashes) = style {
-                // snippet is a raw string, which starts with 'r', a number of hashes, and a quote
-                // and ends with a quote and the same number of hashes
-                (true, snippet.len() - nr_hashes - 1, vec![])
+                // snippet is a raw string
+
+                // validate snippet because a proc macro may have
+                // respanned it to something completely different (fixes #114865)
+                let prefix_len = nr_hashes + 2; // r + hashes + opening "
+                let suffix_len = nr_hashes + 1; // closing " + hashes
+                let snippet_bytes = snippet.as_bytes();
+                let content_end = snippet.len() - suffix_len;
+                if snippet.len() >= prefix_len + suffix_len // is sufficiently long
+                    && snippet_bytes[0] == b'r'
+                    && snippet_bytes[1..1 + nr_hashes].iter().all(|&c| c == b'#')
+                    && snippet_bytes[1 + nr_hashes] == b'"'
+                    && snippet_bytes[content_end] == b'"'
+                    && snippet_bytes[content_end + 1..].iter().all(|&c| c == b'#')
+                {
+                    let snippet_without_quotes = &snippet[prefix_len..content_end];
+                    let input_without_newline =
+                        if appended_newline { &input[..input.len() - 1] } else { input };
+                    if snippet_without_quotes == input_without_newline {
+                        (true, snippet.len() - suffix_len, vec![])
+                    } else {
+                        (false, snippet.len(), vec![])
+                    }
+                } else {
+                    (false, snippet.len(), vec![])
+                }
             } else {
                 // snippet is not a raw string
                 if snippet.starts_with('"') {
                     // snippet looks like an ordinary string literal
                     // check whether it is the escaped version of input
-                    let without_quotes = &snippet[1..snippet.len() - 1];
+                    let snippet_without_quotes = &snippet[1..snippet.len() - 1];
                     let (mut ok, mut vec) = (true, vec![]);
                     let mut chars = input.chars();
-                    rustc_literal_escaper::unescape_str(without_quotes, |range, res| match res {
-                        Ok(ch) if ok && chars.next().is_some_and(|c| ch == c) => {
-                            vec.push((range, ch));
-                        }
-                        _ => {
-                            ok = false;
-                            vec = vec![];
+                    rustc_literal_escaper::unescape_str(snippet_without_quotes, |range, res| {
+                        match res {
+                            Ok(ch) if ok && chars.next().is_some_and(|c| ch == c) => {
+                                vec.push((range, ch));
+                            }
+                            _ => {
+                                ok = false;
+                                vec = vec![];
+                            }
                         }
                     });
                     let end = vec.last().map(|(r, _)| r.end).unwrap_or(0);
@@ -462,6 +490,8 @@ impl<'input> Parser<'input> {
                 ('?', _) => self.suggest_format_debug(),
                 ('<' | '^' | '>', _) => self.suggest_format_align(c),
                 (',', _) => self.suggest_unsupported_python_numeric_grouping(),
+                ('=', '}') => self.suggest_rust_debug_printing_macro(),
+                ('+', _) => self.suggest_format_missing_colon_for_sign(),
                 _ => self.suggest_positional_arg_instead_of_captured_arg(arg),
             }
         }
@@ -721,15 +751,15 @@ impl<'input> Parser<'input> {
         spec
     }
 
-    /// Always returns an empty `FormatSpec`
+    /// Always returns an empty `FormatSpec`, except for the `ty` and `ty_span` fields.
     fn diagnostic(&mut self) -> FormatSpec<'input> {
         let mut spec = FormatSpec::default();
 
-        let Some((Range { start, .. }, start_idx)) = self.consume_pos(':') else {
+        let Some((Range { start, .. }, _)) = self.consume_pos(':') else {
             return spec;
         };
 
-        spec.ty = self.string(start_idx);
+        spec.ty = self.string(self.input_vec_index);
         spec.ty_span = {
             let end = self.input_vec_index2range(self.input_vec_index).start;
             Some(start..end)
@@ -758,7 +788,7 @@ impl<'input> Parser<'input> {
     }
 
     /// Parses a word starting at the current position. A word is the same as a
-    /// Rust identifier, except that it can't start with `_` character.
+    /// Rust identifier or keyword, except that it can't be a bare `_` character.
     fn word(&mut self) -> &'input str {
         let index = self.input_vec_index;
         match self.peek() {
@@ -871,6 +901,27 @@ impl<'input> Parser<'input> {
         }
     }
 
+    fn suggest_rust_debug_printing_macro(&mut self) {
+        if let Some((range, _)) = self.consume_pos('=') {
+            self.errors.insert(
+                0,
+                ParseError {
+                    description:
+                        "python's f-string debug `=` is not supported in rust, use `dbg(x)` instead"
+                            .to_owned(),
+                    note: Some(format!("to print `{{`, you can escape it using `{{{{`",)),
+                    label: "expected `}`".to_owned(),
+                    span: range,
+                    secondary_label: self
+                        .last_open_brace
+                        .clone()
+                        .map(|sp| ("because of this opening brace".to_owned(), sp)),
+                    suggestion: Suggestion::UseRustDebugPrintingMacro,
+                },
+            );
+        }
+    }
+
     fn suggest_format_align(&mut self, alignment: char) {
         if let Some((range, _)) = self.consume_pos(alignment) {
             self.errors.insert(
@@ -881,6 +932,23 @@ impl<'input> Parser<'input> {
                             .to_owned(),
                     note: None,
                     label: format!("expected `{}` to occur after `:`", alignment),
+                    span: range,
+                    secondary_label: None,
+                    suggestion: Suggestion::None,
+                },
+            );
+        }
+    }
+
+    fn suggest_format_missing_colon_for_sign(&mut self) {
+        if let Some((range, _)) = self.consume_pos('+') {
+            self.errors.insert(
+                0,
+                ParseError {
+                    description: "the `+` sign flag must appear after `:` in a format string"
+                        .to_owned(),
+                    note: Some("`+` comes after `:`, try `{:+}` instead of `{+}`".to_owned()),
+                    label: "expected `:` before `+` sign flag".to_owned(),
                     span: range,
                     secondary_label: None,
                     suggestion: Suggestion::None,
@@ -909,7 +977,11 @@ impl<'input> Parser<'input> {
                             0,
                             ParseError {
                                 description: "field access isn't supported".to_string(),
-                                note: None,
+                                note: Some(
+                                    "consider moving this expression to a local variable and then \
+                                     using the local here instead"
+                                        .to_owned(),
+                                ),
                                 label: "not supported".to_string(),
                                 span: arg.position_span.start..field.position_span.end,
                                 secondary_label: None,
@@ -922,7 +994,11 @@ impl<'input> Parser<'input> {
                             0,
                             ParseError {
                                 description: "tuple index access isn't supported".to_string(),
-                                note: None,
+                                note: Some(
+                                    "consider moving this expression to a local variable and then \
+                                     using the local here instead"
+                                        .to_owned(),
+                                ),
                                 label: "not supported".to_string(),
                                 span: arg.position_span.start..field.position_span.end,
                                 secondary_label: None,

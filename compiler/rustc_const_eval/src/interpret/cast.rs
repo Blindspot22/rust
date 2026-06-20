@@ -1,4 +1,4 @@
-use std::assert_matches::assert_matches;
+use std::assert_matches;
 
 use rustc_abi::{FieldIdx, Integer};
 use rustc_apfloat::ieee::{Double, Half, Quad, Single};
@@ -14,10 +14,10 @@ use tracing::trace;
 use super::util::ensure_monomorphic_enough;
 use super::{
     FnVal, ImmTy, Immediate, InterpCx, Machine, OpTy, PlaceTy, err_inval, interp_ok, throw_ub,
-    throw_ub_custom,
+    throw_ub_format,
 };
+use crate::enter_trace_span;
 use crate::interpret::Writeable;
-use crate::{enter_trace_span, fluent_generated as fluent};
 
 impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     pub fn cast(
@@ -138,8 +138,8 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 assert!(dest.layout.is_sized());
                 assert_eq!(cast_ty, dest.layout.ty); // we otherwise ignore `cast_ty` enirely...
                 if src.layout.size != dest.layout.size {
-                    throw_ub_custom!(
-                        fluent::const_eval_invalid_transmute,
+                    throw_ub_format!(
+                        "transmuting from {src_bytes}-byte type to {dest_bytes}-byte type: `{src}` -> `{dest}`",
                         src_bytes = src.layout.size.bytes(),
                         dest_bytes = dest.layout.size.bytes(),
                         src = src.layout.ty,

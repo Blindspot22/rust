@@ -7,29 +7,22 @@
 //!
 //! * We use `tt` for proc-macro `TokenStream` server, it is easier to manipulate and interact with
 //!   RA than `proc-macro2` token stream.
-//! * By **copying** the whole rustc `lib_proc_macro` code, we are able to build this with `stable`
-//!   rustc rather than `unstable`. (Although in general ABI compatibility is still an issue)…
 
-#![cfg(feature = "sysroot-abi")]
-#![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
-#![feature(proc_macro_internals, proc_macro_diagnostic, proc_macro_span)]
-#![allow(
-    unreachable_pub,
-    internal_features,
-    clippy::disallowed_types,
-    clippy::print_stderr,
-    unused_crate_dependencies
-)]
+#![cfg(feature = "in-rust-tree")]
+#![feature(proc_macro_internals, proc_macro_diagnostic, proc_macro_span, rustc_private)]
+#![expect(unreachable_pub, internal_features, clippy::disallowed_types, clippy::print_stderr)]
+#![allow(unused_features, unused_crate_dependencies)]
 #![deny(deprecated_safe, clippy::undocumented_unsafe_blocks)]
 
-extern crate proc_macro;
-#[cfg(feature = "in-rust-tree")]
+extern crate rustc_codegen_ssa;
 extern crate rustc_driver as _;
-
-#[cfg(not(feature = "in-rust-tree"))]
-extern crate ra_ap_rustc_lexer as rustc_lexer;
-#[cfg(feature = "in-rust-tree")]
+extern crate rustc_interface;
 extern crate rustc_lexer;
+extern crate rustc_metadata;
+extern crate rustc_proc_macro;
+extern crate rustc_session;
+extern crate rustc_span;
+extern crate rustc_target;
 
 mod bridge;
 mod dylib;
@@ -37,22 +30,23 @@ mod server_impl;
 mod token_stream;
 
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
     env,
     ffi::OsString,
     fs,
+    ops::Range,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
     thread,
 };
 
 use paths::{Utf8Path, Utf8PathBuf};
-use span::Span;
+use span::{FIXUP_ERASED_FILE_AST_ID_MARKER, Span};
 use temp_dir::TempDir;
 
 pub use crate::server_impl::token_id::SpanId;
 
-pub use proc_macro::Delimiter;
+pub use rustc_proc_macro::Delimiter;
 pub use span;
 
 pub use crate::bridge::*;
@@ -92,18 +86,55 @@ impl<'env> ProcMacroSrv<'env> {
     }
 }
 
+#[derive(Debug)]
+pub enum ProcMacroClientError {
+    Cancelled { reason: String },
+    Io(std::io::Error),
+    Protocol(String),
+    Eof,
+}
+
+#[derive(Debug)]
+pub enum ProcMacroPanicMarker {
+    Cancelled { reason: String },
+    Internal { reason: String },
+}
+
 pub type ProcMacroClientHandle<'a> = &'a mut (dyn ProcMacroClientInterface + Sync + Send);
 
 pub trait ProcMacroClientInterface {
     fn file(&mut self, file_id: span::FileId) -> String;
     fn source_text(&mut self, span: Span) -> Option<String>;
     fn local_file(&mut self, file_id: span::FileId) -> Option<String>;
+    /// Line and column are 1-based.
+    fn line_column(&mut self, span: Span) -> Option<(u32, u32)>;
+
+    fn byte_range(&mut self, span: Span) -> Range<usize>;
+    fn span_source(&mut self, span: Span) -> Span;
+    fn span_parent(&mut self, span: Span) -> Option<Span>;
+    fn span_join(&mut self, first: Span, second: Span) -> Option<Span>;
 }
 
 const EXPANDER_STACK_SIZE: usize = 8 * 1024 * 1024;
 
+pub enum ExpandError {
+    Panic(PanicMessage),
+    Cancelled { reason: Option<String> },
+    Internal { reason: Option<String> },
+}
+
+impl ExpandError {
+    pub fn into_string(self) -> Option<String> {
+        match self {
+            ExpandError::Panic(panic_message) => panic_message.into_string(),
+            ExpandError::Cancelled { reason } => reason,
+            ExpandError::Internal { reason } => reason,
+        }
+    }
+}
+
 impl ProcMacroSrv<'_> {
-    pub fn expand<S: ProcMacroSrvSpan>(
+    pub fn expand<'a, S: ProcMacroSrvSpan + 'a>(
         &self,
         lib: impl AsRef<Utf8Path>,
         env: &[(String, String)],
@@ -114,11 +145,12 @@ impl ProcMacroSrv<'_> {
         def_site: S,
         call_site: S,
         mixed_site: S,
-        callback: Option<ProcMacroClientHandle<'_>>,
-    ) -> Result<token_stream::TokenStream<S>, PanicMessage> {
+        tracked_env: &'a mut TrackedEnv,
+        callback: Option<ProcMacroClientHandle<'a>>,
+    ) -> Result<token_stream::TokenStream<S>, ExpandError> {
         let snapped_env = self.env;
-        let expander = self.expander(lib.as_ref()).map_err(|err| PanicMessage {
-            message: Some(format!("failed to load macro: {err}")),
+        let expander = self.expander(lib.as_ref()).map_err(|err| ExpandError::Internal {
+            reason: Some(format!("failed to load macro: {err}")),
         })?;
 
         let prev_env = EnvChange::apply(snapped_env, env, current_dir.as_ref().map(<_>::as_ref));
@@ -131,13 +163,32 @@ impl ProcMacroSrv<'_> {
                 .name(macro_name.to_owned())
                 .spawn_scoped(s, move || {
                     expander.expand(
-                        macro_name, macro_body, attribute, def_site, call_site, mixed_site,
+                        macro_name,
+                        macro_body,
+                        attribute,
+                        def_site,
+                        call_site,
+                        mixed_site,
+                        tracked_env,
                         callback,
                     )
                 });
             match thread.unwrap().join() {
-                Ok(res) => res,
-                Err(e) => std::panic::resume_unwind(e),
+                Ok(res) => res.map_err(ExpandError::Panic),
+                Err(payload) => {
+                    if let Some(marker) = payload.downcast_ref::<ProcMacroPanicMarker>() {
+                        return match marker {
+                            ProcMacroPanicMarker::Cancelled { reason } => {
+                                Err(ExpandError::Cancelled { reason: Some(reason.clone()) })
+                            }
+                            ProcMacroPanicMarker::Internal { reason } => {
+                                Err(ExpandError::Internal { reason: Some(reason.clone()) })
+                            }
+                        };
+                    }
+
+                    std::panic::resume_unwind(payload)
+                }
             }
         });
         prev_env.rollback();
@@ -180,12 +231,21 @@ impl ProcMacroSrv<'_> {
     }
 }
 
+#[derive(Default)]
+pub struct TrackedEnv {
+    pub env_vars: HashMap<Box<str>, Option<Box<str>>>,
+    pub paths: HashSet<Box<str>>,
+}
+
 pub trait ProcMacroSrvSpan: Copy + Send + Sync {
-    type Server<'a>: proc_macro::bridge::server::Server<TokenStream = crate::token_stream::TokenStream<Self>>;
+    type Server<'a>: rustc_proc_macro::bridge::server::Server<
+            TokenStream = crate::token_stream::TokenStream<Self>,
+        >;
     fn make_server<'a>(
         call_site: Self,
         def_site: Self,
         mixed_site: Self,
+        tracked_env: &'a mut TrackedEnv,
         callback: Option<ProcMacroClientHandle<'a>>,
     ) -> Self::Server<'a>;
 }
@@ -197,16 +257,10 @@ impl ProcMacroSrvSpan for SpanId {
         call_site: Self,
         def_site: Self,
         mixed_site: Self,
+        _: &'a mut TrackedEnv,
         callback: Option<ProcMacroClientHandle<'a>>,
     ) -> Self::Server<'a> {
-        Self::Server {
-            call_site,
-            def_site,
-            mixed_site,
-            callback,
-            tracked_env_vars: Default::default(),
-            tracked_paths: Default::default(),
-        }
+        Self::Server { call_site, def_site, mixed_site, callback }
     }
 }
 
@@ -216,6 +270,7 @@ impl ProcMacroSrvSpan for Span {
         call_site: Self,
         def_site: Self,
         mixed_site: Self,
+        tracked_env: &'a mut TrackedEnv,
         callback: Option<ProcMacroClientHandle<'a>>,
     ) -> Self::Server<'a> {
         Self::Server {
@@ -223,8 +278,8 @@ impl ProcMacroSrvSpan for Span {
             def_site,
             mixed_site,
             callback,
-            tracked_env_vars: Default::default(),
-            tracked_paths: Default::default(),
+            tracked_env,
+            fixup_id: FIXUP_ERASED_FILE_AST_ID_MARKER,
         }
     }
 }
@@ -271,7 +326,7 @@ impl<'snap> EnvChange<'snap> {
                 let prev_working_dir = std::env::current_dir().ok();
                 if let Err(err) = std::env::set_current_dir(dir) {
                     eprintln!(
-                        "Failed to set the current working dir to {}. Error: {err:?}",
+                        "Failed to change the current working dir to {}. Error: {err:?}",
                         dir.display()
                     )
                 }
@@ -313,7 +368,7 @@ impl Drop for EnvChange<'_> {
             && let Err(err) = std::env::set_current_dir(dir)
         {
             eprintln!(
-                "Failed to set the current working dir to {}. Error: {:?}",
+                "Failed to change the current working dir back to {}. Error: {:?}",
                 dir.display(),
                 err
             )

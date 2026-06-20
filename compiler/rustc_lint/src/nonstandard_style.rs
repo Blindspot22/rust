@@ -1,6 +1,8 @@
 use rustc_abi::ExternAbi;
+use rustc_ast as ast;
 use rustc_attr_parsing::AttributeParser;
-use rustc_errors::Applicability;
+use rustc_errors::{Applicability, Diag, DiagCtxtHandle, Diagnostic, Level};
+use rustc_hir as hir;
 use rustc_hir::attrs::{AttributeKind, ReprAttr};
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
@@ -12,7 +14,6 @@ use rustc_session::config::CrateType;
 use rustc_session::{declare_lint, declare_lint_pass};
 use rustc_span::def_id::LocalDefId;
 use rustc_span::{BytePos, Ident, Span, sym};
-use {rustc_ast as ast, rustc_hir as hir};
 
 use crate::lints::{
     NonCamelCaseType, NonCamelCaseTypeSub, NonSnakeCaseDiag, NonSnakeCaseDiagSub,
@@ -46,38 +47,46 @@ declare_lint! {
 
 declare_lint_pass!(NonCamelCaseTypes => [NON_CAMEL_CASE_TYPES]);
 
-/// Some unicode characters *have* case, are considered upper case or lower case, but they *can't*
-/// be upper cased or lower cased. For the purposes of the lint suggestion, we care about being able
+/// Some unicode characters *have* case, are considered upper, title, or lower case, but they *can't*
+/// be title cased or lower cased. For the purposes of the lint suggestion, we care about being able
 /// to change the char's case.
 fn char_has_case(c: char) -> bool {
-    let mut l = c.to_lowercase();
-    let mut u = c.to_uppercase();
-    while let Some(l) = l.next() {
-        match u.next() {
-            Some(u) if l != u => return true,
-            _ => {}
+    !c.to_lowercase().eq(c.to_titlecase())
+}
+
+/// FIXME: we should add a more efficient version
+/// in the stdlib for this
+fn changes_when_titlecased(c: char) -> bool {
+    !c.to_titlecase().eq([c])
+}
+
+// contains a capitalisable character followed by, or preceded by, an underscore,
+// or contains an uppercase character that changes when titlecased,
+// or contains `__`
+fn not_camel_case(s: &str) -> bool {
+    let mut last = '\0';
+    s.chars().any(|snd| {
+        let fst = std::mem::replace(&mut last, snd);
+        match (fst, snd) {
+            ('_', '_') => return true,
+            ('_', _) if char_has_case(snd) => return true,
+            (_, '_') if char_has_case(fst) => return true,
+            _ => snd.is_uppercase() && changes_when_titlecased(snd),
         }
-    }
-    u.next().is_some()
+    })
 }
 
-fn is_camel_case(name: &str) -> bool {
+fn is_upper_camel_case(name: &str) -> bool {
     let name = name.trim_matches('_');
-    if name.is_empty() {
+    let Some(first) = name.chars().next() else {
         return true;
-    }
+    };
 
-    // start with a non-lowercase letter rather than non-uppercase
-    // ones (some scripts don't have a concept of upper/lowercase)
-    !name.chars().next().unwrap().is_lowercase()
-        && !name.contains("__")
-        && !name.chars().collect::<Vec<_>>().array_windows().any(|&[fst, snd]| {
-            // contains a capitalisable character followed by, or preceded by, an underscore
-            char_has_case(fst) && snd == '_' || char_has_case(snd) && fst == '_'
-        })
+    // some scripts don't have a concept of upper/lowercase
+    !(changes_when_titlecased(first) || not_camel_case(name))
 }
 
-fn to_camel_case(s: &str) -> String {
+fn to_upper_camel_case(s: &str) -> String {
     s.trim_matches('_')
         .split('_')
         .filter(|component| !component.is_empty())
@@ -86,22 +95,29 @@ fn to_camel_case(s: &str) -> String {
 
             let mut new_word = true;
             let mut prev_is_lower_case = true;
+            let mut prev_is_lowercased_sigma = false;
 
             for c in component.chars() {
                 // Preserve the case if an uppercase letter follows a lowercase letter, so that
                 // `camelCase` is converted to `CamelCase`.
-                if prev_is_lower_case && c.is_uppercase() {
+                if prev_is_lower_case && (c.is_uppercase() | c.is_titlecase()) {
                     new_word = true;
                 }
 
                 if new_word {
-                    camel_cased_component.extend(c.to_uppercase());
+                    camel_cased_component.extend(c.to_titlecase());
                 } else {
                     camel_cased_component.extend(c.to_lowercase());
                 }
 
-                prev_is_lower_case = c.is_lowercase();
+                prev_is_lower_case = c.is_lowercase() || c.is_titlecase();
+                prev_is_lowercased_sigma = !new_word && c == 'Σ';
                 new_word = false;
+            }
+
+            if prev_is_lowercased_sigma {
+                camel_cased_component.pop();
+                camel_cased_component.push('ς');
             }
 
             camel_cased_component
@@ -125,8 +141,8 @@ impl NonCamelCaseTypes {
     fn check_case(&self, cx: &EarlyContext<'_>, sort: &str, ident: &Ident) {
         let name = ident.name.as_str();
 
-        if !is_camel_case(name) {
-            let cc = to_camel_case(name);
+        if !is_upper_camel_case(name) {
+            let cc = to_upper_camel_case(name);
             let sub = if *name != cc {
                 NonCamelCaseTypeSub::Suggestion { span: ident.span, replace: cc }
             } else {
@@ -144,7 +160,7 @@ impl NonCamelCaseTypes {
 impl EarlyLintPass for NonCamelCaseTypes {
     fn check_item(&mut self, cx: &EarlyContext<'_>, it: &ast::Item) {
         let has_repr_c = matches!(
-            AttributeParser::parse_limited(cx.sess(), &it.attrs, sym::repr, it.span, it.id, None),
+            AttributeParser::parse_limited(cx.sess(), &it.attrs, &[sym::repr]),
             Some(Attribute::Parsed(AttributeKind::Repr { reprs, ..})) if reprs.iter().any(|(r, _)| r == &ReprAttr::ReprC)
         );
 
@@ -153,14 +169,12 @@ impl EarlyLintPass for NonCamelCaseTypes {
         }
 
         match &it.kind {
-            ast::ItemKind::TyAlias(box ast::TyAlias { ident, .. })
+            ast::ItemKind::TyAlias(ast::TyAlias { ident, .. })
             | ast::ItemKind::Enum(ident, ..)
             | ast::ItemKind::Struct(ident, ..)
             | ast::ItemKind::Union(ident, ..) => self.check_case(cx, "type", ident),
-            ast::ItemKind::Trait(box ast::Trait { ident, .. }) => {
-                self.check_case(cx, "trait", ident)
-            }
-            ast::ItemKind::TraitAlias(box ast::TraitAlias { ident, .. }) => {
+            ast::ItemKind::Trait(ast::Trait { ident, .. }) => self.check_case(cx, "trait", ident),
+            ast::ItemKind::TraitAlias(ast::TraitAlias { ident, .. }) => {
                 self.check_case(cx, "trait alias", ident)
             }
 
@@ -238,14 +252,20 @@ impl NonSnakeCase {
                 continue;
             }
             for ch in s.chars() {
-                if !buf.is_empty() && buf != "'" && ch.is_uppercase() && !last_upper {
-                    words.push(buf);
+                if !buf.is_empty()
+                    && buf != "'"
+                    && (ch.is_uppercase() || ch.is_titlecase())
+                    && !last_upper
+                {
+                    // We lowercase only at the end, to handle final sigma correctly
+                    words.push(buf.to_lowercase());
                     buf = String::new();
                 }
-                last_upper = ch.is_uppercase();
-                buf.extend(ch.to_lowercase());
+                last_upper = ch.is_uppercase() || ch.is_titlecase();
+                buf.push(ch);
             }
-            words.push(buf);
+            // We lowercase only at the end, to handle final sigma correctly
+            words.push(buf.to_lowercase());
         }
         words.join("_")
     }
@@ -265,7 +285,8 @@ impl NonSnakeCase {
 
             // This correctly handles letters in languages with and without
             // cases, as well as numbers and underscores.
-            !ident.chars().any(char::is_uppercase)
+            // FIXME: we should add a standard library impl of `c.to_lowercase().eq([c])`
+            ident.chars().all(|c| c.to_lowercase().eq([c]))
         }
 
         let name = ident.name.as_str();
@@ -290,18 +311,18 @@ impl NonSnakeCase {
                                 suggestion: sc_ident,
                             }
                         } else {
-                            NonSnakeCaseDiagSub::SuggestionAndNote { span }
+                            NonSnakeCaseDiagSub::SuggestionAndNote { sc, span }
                         }
                     } else {
-                        NonSnakeCaseDiagSub::ConvertSuggestion { span, suggestion: sc.clone() }
+                        NonSnakeCaseDiagSub::ConvertSuggestion { span, suggestion: sc }
                     }
                 } else {
-                    NonSnakeCaseDiagSub::Help
+                    NonSnakeCaseDiagSub::Help { sc }
                 }
             } else {
                 NonSnakeCaseDiagSub::Label { span }
             };
-            cx.emit_span_lint(NON_SNAKE_CASE, span, NonSnakeCaseDiag { sort, name, sc, sub });
+            cx.emit_span_lint(NON_SNAKE_CASE, span, NonSnakeCaseDiag { sort, name, sub });
         }
     }
 }
@@ -322,7 +343,7 @@ impl<'tcx> LateLintPass<'tcx> for NonSnakeCase {
         let crate_ident = if let Some(name) = &cx.tcx.sess.opts.crate_name {
             Some(Ident::from_str(name))
         } else {
-            find_attr!(cx.tcx.hir_attrs(hir::CRATE_HIR_ID), AttributeKind::CrateName{name, name_span,..} => (name, name_span)).map(
+            find_attr!(cx.tcx, crate, CrateName{name, name_span,..} => (name, name_span)).map(
                 |(&name, &span)| {
                     // Discard the double quotes surrounding the literal.
                     let sp = cx
@@ -335,8 +356,7 @@ impl<'tcx> LateLintPass<'tcx> for NonSnakeCase {
                             let right = snippet.rfind('"').map(|pos| snippet.len() - pos)?;
 
                             Some(
-                                span
-                                    .with_lo(span.lo() + BytePos(left as u32 + 1))
+                                span.with_lo(span.lo() + BytePos(left as u32 + 1))
                                     .with_hi(span.hi() - BytePos(right as u32)),
                             )
                         })
@@ -370,9 +390,7 @@ impl<'tcx> LateLintPass<'tcx> for NonSnakeCase {
         match &fk {
             FnKind::Method(ident, sig, ..) => match cx.tcx.associated_item(id).container {
                 AssocContainer::InherentImpl => {
-                    if sig.header.abi != ExternAbi::Rust
-                        && find_attr!(cx.tcx.get_all_attrs(id), AttributeKind::NoMangle(..))
-                    {
+                    if sig.header.abi != ExternAbi::Rust && find_attr!(cx.tcx, id, NoMangle(..)) {
                         return;
                     }
                     self.check_snake_case(cx, "method", ident);
@@ -384,9 +402,7 @@ impl<'tcx> LateLintPass<'tcx> for NonSnakeCase {
             },
             FnKind::ItemFn(ident, _, header) => {
                 // Skip foreign-ABI #[no_mangle] functions (Issue #31924)
-                if header.abi != ExternAbi::Rust
-                    && find_attr!(cx.tcx.get_all_attrs(id), AttributeKind::NoMangle(..))
-                {
+                if header.abi != ExternAbi::Rust && find_attr!(cx.tcx, id, NoMangle(..)) {
                     return;
                 }
                 self.check_snake_case(cx, "function", ident);
@@ -466,13 +482,28 @@ declare_lint! {
 
 declare_lint_pass!(NonUpperCaseGlobals => [NON_UPPER_CASE_GLOBALS]);
 
+struct NonUpperCaseGlobalGenerator<'a, F: FnOnce() -> NonUpperCaseGlobal<'a>> {
+    callback: F,
+}
+
+impl<'a, 'b, F: FnOnce() -> NonUpperCaseGlobal<'b>> Diagnostic<'a, ()>
+    for NonUpperCaseGlobalGenerator<'b, F>
+{
+    fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, ()> {
+        let Self { callback } = self;
+        callback().into_diag(dcx, level)
+    }
+}
+
 impl NonUpperCaseGlobals {
     fn check_upper_case(cx: &LateContext<'_>, sort: &str, did: Option<LocalDefId>, ident: &Ident) {
         let name = ident.name.as_str();
-        if name.chars().any(|c| c.is_lowercase()) {
+        // FIXME: we should add a more efficient version
+        // in the stdlib for `c.to_uppercase().eq([c])`
+        if !name.chars().all(|c| c.to_uppercase().eq([c])) {
             let uc = NonSnakeCase::to_snake_case(name).to_uppercase();
 
-            // If the item is exported, suggesting changing it's name would be breaking-change
+            // If the item is exported, suggesting changing its name would be a breaking change
             // and could break users without a "nice" applicable fix, so let's avoid it.
             let can_change_usages = if let Some(did) = did {
                 !cx.tcx.effective_visibilities(()).is_exported(did)
@@ -522,7 +553,7 @@ impl NonUpperCaseGlobals {
                 }
             }
 
-            cx.emit_span_lint_lazy(NON_UPPER_CASE_GLOBALS, ident.span, || {
+            let callback = || {
                 // Compute usages lazily as it can expansive and useless when the lint is allowed.
                 // cf. https://github.com/rust-lang/rust/pull/142645#issuecomment-2993024625
                 let usages = if can_change_usages
@@ -542,7 +573,12 @@ impl NonUpperCaseGlobals {
                 };
 
                 NonUpperCaseGlobal { sort, name, sub, usages }
-            });
+            };
+            cx.emit_span_lint(
+                NON_UPPER_CASE_GLOBALS,
+                ident.span,
+                NonUpperCaseGlobalGenerator { callback },
+            );
         }
     }
 }
@@ -551,9 +587,7 @@ impl<'tcx> LateLintPass<'tcx> for NonUpperCaseGlobals {
     fn check_item(&mut self, cx: &LateContext<'_>, it: &hir::Item<'_>) {
         let attrs = cx.tcx.hir_attrs(it.hir_id());
         match it.kind {
-            hir::ItemKind::Static(_, ident, ..)
-                if !find_attr!(attrs, AttributeKind::NoMangle(..)) =>
-            {
+            hir::ItemKind::Static(_, ident, ..) if !find_attr!(attrs, NoMangle(..)) => {
                 NonUpperCaseGlobals::check_upper_case(
                     cx,
                     "static variable",
@@ -594,7 +628,7 @@ impl<'tcx> LateLintPass<'tcx> for NonUpperCaseGlobals {
             ..
         }) = p.kind
         {
-            if let Res::Def(DefKind::Const, _) = path.res
+            if let Res::Def(DefKind::Const { .. }, _) = path.res
                 && let [segment] = path.segments
             {
                 NonUpperCaseGlobals::check_upper_case(

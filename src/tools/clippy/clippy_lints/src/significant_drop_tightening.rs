@@ -2,13 +2,14 @@ use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::res::MaybeResPath;
 use clippy_utils::source::{indent_of, snippet};
 use clippy_utils::{expr_or_init, get_builtin_attr, peel_hir_expr_unary, sym};
+use rustc_ast::BindingMode;
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
 use rustc_errors::Applicability;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::intravisit::{Visitor, walk_expr};
 use rustc_hir::{self as hir, HirId};
-use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_middle::ty::{GenericArgKind, Ty};
+use rustc_lint::{LateContext, LateLintPass};
+use rustc_middle::ty::{GenericArgKind, Ty, Unnormalized};
 use rustc_session::impl_lint_pass;
 use rustc_span::symbol::Ident;
 use rustc_span::{DUMMY_SP, Span};
@@ -89,20 +90,21 @@ impl<'tcx> LateLintPass<'tcx> for SignificantDropTightening<'tcx> {
                 |diag| {
                     match apa.counter {
                         0 | 1 => {},
-                        2 => {
+                        2 if let Some(last_method_span) = apa.last_method_span => {
                             let indent = " ".repeat(indent_of(cx, apa.last_stmt_span).unwrap_or(0));
                             let init_method = snippet(cx, apa.first_method_span, "..");
-                            let usage_method = snippet(cx, apa.last_method_span, "..");
-                            let stmt = if let Some(last_bind_ident) = apa.last_bind_ident {
+                            let usage_method = snippet(cx, last_method_span, "..");
+                            let stmt = if let Some((binding_mode, last_bind_ident)) = apa.last_bind_ident {
                                 format!(
-                                    "\n{indent}let {} = {init_method}.{usage_method};",
+                                    "\n{indent}let {}{} = {init_method}.{usage_method};",
+                                    binding_mode.prefix_str(),
                                     snippet(cx, last_bind_ident.span, ".."),
                                 )
                             } else {
                                 format!("\n{indent}{init_method}.{usage_method};")
                             };
 
-                            diag.multipart_suggestion_verbose(
+                            diag.multipart_suggestion(
                                 "merge the temporary construction with its single usage",
                                 vec![(apa.first_stmt_span, stmt), (apa.last_stmt_span, String::new())],
                                 Applicability::MaybeIncorrect,
@@ -152,7 +154,7 @@ impl<'cx, 'others, 'tcx> AttrChecker<'cx, 'others, 'tcx> {
         let ty = self
             .cx
             .tcx
-            .try_normalize_erasing_regions(self.cx.typing_env(), ty)
+            .try_normalize_erasing_regions(self.cx.typing_env(), Unnormalized::new_wip(ty))
             .unwrap_or(ty);
         match self.type_cache.entry(ty) {
             Entry::Occupied(e) => return *e.get(),
@@ -168,7 +170,7 @@ impl<'cx, 'others, 'tcx> AttrChecker<'cx, 'others, 'tcx> {
     fn has_sig_drop_attr_uncached(&mut self, ty: Ty<'tcx>, depth: usize) -> bool {
         if let Some(adt) = ty.ty_adt_def() {
             let mut iter = get_builtin_attr(
-                self.cx.sess(),
+                #[allow(deprecated)]
                 self.cx.tcx.get_all_attrs(adt.did()),
                 sym::has_significant_drop,
             );
@@ -179,7 +181,7 @@ impl<'cx, 'others, 'tcx> AttrChecker<'cx, 'others, 'tcx> {
         match ty.kind() {
             rustc_middle::ty::Adt(a, b) => {
                 for f in a.all_fields() {
-                    let ty = f.ty(self.cx.tcx, b);
+                    let ty = f.ty(self.cx.tcx, b).skip_norm_wip();
                     if self.has_sig_drop_attr(ty, depth) {
                         return true;
                     }
@@ -310,13 +312,13 @@ impl<'tcx> Visitor<'tcx> for StmtsChecker<'_, '_, '_, '_, 'tcx> {
                 };
                 match self.ap.curr_stmt.kind {
                     hir::StmtKind::Let(local) => {
-                        if let hir::PatKind::Binding(_, _, ident, _) = local.pat.kind {
-                            apa.last_bind_ident = Some(ident);
+                        if let hir::PatKind::Binding(binding_mode, _, ident, _) = local.pat.kind {
+                            apa.last_bind_ident = Some((binding_mode, ident));
                         }
                         if let Some(local_init) = local.init
                             && let hir::ExprKind::MethodCall(_, _, _, span) = local_init.kind
                         {
-                            apa.last_method_span = span;
+                            apa.last_method_span = Some(span);
                         }
                     },
                     hir::StmtKind::Semi(semi_expr) => {
@@ -326,7 +328,7 @@ impl<'tcx> Visitor<'tcx> for StmtsChecker<'_, '_, '_, '_, 'tcx> {
                             return;
                         }
                         if let hir::ExprKind::MethodCall(_, _, _, span) = semi_expr.kind {
-                            apa.last_method_span = span;
+                            apa.last_method_span = Some(span);
                         }
                     },
                     _ => {},
@@ -385,9 +387,9 @@ struct AuxParamsAttr {
 
     /// The last visited binding or variable span within a block that had any referenced inner type
     /// marked with `#[has_significant_drop]`.
-    last_bind_ident: Option<Ident>,
+    last_bind_ident: Option<(BindingMode, Ident)>,
     /// Similar to `last_bind_span` but encompasses the right-hand method call.
-    last_method_span: Span,
+    last_method_span: Option<Span>,
     /// Similar to `last_bind_span` but encompasses the whole contained statement.
     last_stmt_span: Span,
 }
@@ -403,7 +405,7 @@ impl Default for AuxParamsAttr {
             first_method_span: DUMMY_SP,
             first_stmt_span: DUMMY_SP,
             last_bind_ident: None,
-            last_method_span: DUMMY_SP,
+            last_method_span: None,
             last_stmt_span: DUMMY_SP,
         }
     }

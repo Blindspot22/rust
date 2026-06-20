@@ -150,8 +150,12 @@ impl<'a, 'b, 'tcx> NllTypeRelating<'a, 'b, 'tcx> {
         };
 
         let (a, b) = match (a.kind(), b.kind()) {
-            (&ty::Alias(ty::Opaque, ..), _) => (a, enable_subtyping(b, true)?),
-            (_, &ty::Alias(ty::Opaque, ..)) => (enable_subtyping(a, false)?, b),
+            (&ty::Alias(ty::AliasTy { kind: ty::Opaque { .. }, .. }), _) => {
+                (a, enable_subtyping(b, true)?)
+            }
+            (_, &ty::Alias(ty::AliasTy { kind: ty::Opaque { .. }, .. })) => {
+                (enable_subtyping(a, false)?, b)
+            }
             _ => unreachable!(
                 "expected at least one opaque type in `relate_opaques`, got {a} and {b}."
             ),
@@ -174,7 +178,7 @@ impl<'a, 'b, 'tcx> NllTypeRelating<'a, 'b, 'tcx> {
             let infcx = self.type_checker.infcx;
             let mut lazy_universe = None;
             let delegate = FnMutDelegate {
-                regions: &mut |br: ty::BoundRegion| {
+                regions: &mut |br: ty::BoundRegion<'tcx>| {
                     // The first time this closure is called, create a
                     // new universe for the placeholders we will make
                     // from here out.
@@ -191,10 +195,10 @@ impl<'a, 'b, 'tcx> NllTypeRelating<'a, 'b, 'tcx> {
 
                     placeholder_reg
                 },
-                types: &mut |_bound_ty: ty::BoundTy| {
+                types: &mut |_bound_ty: ty::BoundTy<'tcx>| {
                     unreachable!("we only replace regions in nll_relate, not types")
                 },
-                consts: &mut |_bound_const: ty::BoundConst| {
+                consts: &mut |_bound_const: ty::BoundConst<'tcx>| {
                     unreachable!("we only replace regions in nll_relate, not consts")
                 },
             };
@@ -218,7 +222,7 @@ impl<'a, 'b, 'tcx> NllTypeRelating<'a, 'b, 'tcx> {
         let infcx = self.type_checker.infcx;
         let mut reg_map = FxHashMap::default();
         let delegate = FnMutDelegate {
-            regions: &mut |br: ty::BoundRegion| {
+            regions: &mut |br: ty::BoundRegion<'tcx>| {
                 if let Some(ex_reg_var) = reg_map.get(&br) {
                     *ex_reg_var
                 } else {
@@ -230,10 +234,10 @@ impl<'a, 'b, 'tcx> NllTypeRelating<'a, 'b, 'tcx> {
                     ex_reg_var
                 }
             },
-            types: &mut |_bound_ty: ty::BoundTy| {
+            types: &mut |_bound_ty: ty::BoundTy<'tcx>| {
                 unreachable!("we only replace regions in nll_relate, not types")
             },
-            consts: &mut |_bound_const: ty::BoundConst| {
+            consts: &mut |_bound_const: ty::BoundConst<'tcx>| {
                 unreachable!("we only replace regions in nll_relate, not consts")
             },
         };
@@ -268,7 +272,7 @@ impl<'a, 'b, 'tcx> NllTypeRelating<'a, 'b, 'tcx> {
             ty::BoundRegionKind::Anon => sym::anon,
             ty::BoundRegionKind::Named(def_id) => self.type_checker.tcx().item_name(def_id),
             ty::BoundRegionKind::ClosureEnv => sym::env,
-            ty::BoundRegionKind::NamedAnon(_) => bug!("only used for pretty printing"),
+            ty::BoundRegionKind::NamedForPrinting(_) => bug!("only used for pretty printing"),
         };
 
         if cfg!(debug_assertions) {
@@ -382,8 +386,8 @@ impl<'b, 'tcx> TypeRelation<TyCtxt<'tcx>> for NllTypeRelating<'_, 'b, 'tcx> {
             }
 
             (
-                &ty::Alias(ty::Opaque, ty::AliasTy { def_id: a_def_id, .. }),
-                &ty::Alias(ty::Opaque, ty::AliasTy { def_id: b_def_id, .. }),
+                &ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id: a_def_id }, .. }),
+                &ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id: b_def_id }, .. }),
             ) if a_def_id == b_def_id || infcx.next_trait_solver() => {
                 super_combine_tys(&infcx.infcx, self, a, b).map(|_| ()).or_else(|err| {
                     // This behavior is only there for the old solver, the new solver
@@ -397,8 +401,8 @@ impl<'b, 'tcx> TypeRelation<TyCtxt<'tcx>> for NllTypeRelating<'_, 'b, 'tcx> {
                     if a_def_id.is_local() { self.relate_opaques(a, b) } else { Err(err) }
                 })?;
             }
-            (&ty::Alias(ty::Opaque, ty::AliasTy { def_id, .. }), _)
-            | (_, &ty::Alias(ty::Opaque, ty::AliasTy { def_id, .. }))
+            (&ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id }, .. }), _)
+            | (_, &ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id }, .. }))
                 if def_id.is_local() && !self.type_checker.infcx.next_trait_solver() =>
             {
                 self.relate_opaques(a, b)?;

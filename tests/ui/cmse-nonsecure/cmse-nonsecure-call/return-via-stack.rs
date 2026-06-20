@@ -13,6 +13,9 @@ use minicore::*;
 #[repr(C)]
 pub struct ReprCU64(u64);
 
+#[repr(Rust)]
+pub struct ReprRustU64(u64);
+
 #[repr(C)]
 pub struct ReprCBytes(u8, u8, u8, u8, u8);
 
@@ -25,10 +28,11 @@ pub struct ReprCAlign16(u16);
 #[no_mangle]
 pub fn test(
     f1: extern "cmse-nonsecure-call" fn() -> ReprCU64, //~ ERROR [E0798]
-    f2: extern "cmse-nonsecure-call" fn() -> ReprCBytes, //~ ERROR [E0798]
-    f3: extern "cmse-nonsecure-call" fn() -> U64Compound, //~ ERROR [E0798]
-    f4: extern "cmse-nonsecure-call" fn() -> ReprCAlign16, //~ ERROR [E0798]
-    f5: extern "cmse-nonsecure-call" fn() -> [u8; 5],  //~ ERROR [E0798]
+    f2: extern "cmse-nonsecure-call" fn() -> ReprRustU64, //~ ERROR [E0798]
+    f3: extern "cmse-nonsecure-call" fn() -> ReprCBytes, //~ ERROR [E0798]
+    f4: extern "cmse-nonsecure-call" fn() -> U64Compound, //~ ERROR [E0798]
+    f5: extern "cmse-nonsecure-call" fn() -> ReprCAlign16, //~ ERROR [E0798]
+    f6: extern "cmse-nonsecure-call" fn() -> [u8; 5],  //~ ERROR [E0798]
 ) {
 }
 
@@ -38,13 +42,13 @@ struct Test {
     i128: extern "cmse-nonsecure-call" fn() -> i128, //~ ERROR [E0798]
 }
 
-#[repr(C)]
-pub union ReprCUnionU64 {
+#[repr(Rust)]
+pub union ReprRustUnionU64 {
     _unused: u64,
 }
 
-#[repr(Rust)]
-pub union ReprRustUnionU64 {
+#[repr(C)]
+pub union ReprCUnionU64 {
     _unused: u64,
 }
 
@@ -52,5 +56,11 @@ pub union ReprRustUnionU64 {
 pub fn test_union(
     f1: extern "cmse-nonsecure-call" fn() -> ReprRustUnionU64, //~ ERROR [E0798]
     f2: extern "cmse-nonsecure-call" fn() -> ReprCUnionU64,    //~ ERROR [E0798]
+
+    // MaybeUninit is a transparent union, and hence MaybeUninit<u64> is abi-compatible with u64,
+    // and thus allowed as a return type.
+    f3: extern "cmse-nonsecure-call" fn() -> MaybeUninit<u32>,
+    f4: extern "cmse-nonsecure-call" fn() -> MaybeUninit<u64>,
+    f5: extern "cmse-nonsecure-call" fn() -> MaybeUninit<f64>,
 ) {
 }

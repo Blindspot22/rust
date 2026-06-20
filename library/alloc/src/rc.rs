@@ -245,14 +245,14 @@ use core::any::Any;
 use core::cell::{Cell, CloneFromCell};
 #[cfg(not(no_global_oom_handling))]
 use core::clone::TrivialClone;
-use core::clone::{CloneToUninit, UseCloned};
+use core::clone::{CloneToUninit, Share, UseCloned};
 use core::cmp::Ordering;
 use core::hash::{Hash, Hasher};
 use core::intrinsics::abort;
 #[cfg(not(no_global_oom_handling))]
 use core::iter;
 use core::marker::{PhantomData, Unsize};
-use core::mem::{self, ManuallyDrop, align_of_val_raw};
+use core::mem::{self, Alignment, ManuallyDrop};
 use core::num::NonZeroUsize;
 use core::ops::{CoerceUnsized, Deref, DerefMut, DerefPure, DispatchFromDyn, LegacyReceiver};
 #[cfg(not(no_global_oom_handling))]
@@ -311,6 +311,12 @@ fn rc_inner_layout_for_value_layout(layout: Layout) -> Layout {
 #[rustc_diagnostic_item = "Rc"]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_insignificant_dtor]
+#[diagnostic::on_move(
+    message = "the type `{Self}` does not implement `Copy`",
+    label = "this move could be avoided by cloning the original `{Self}`, which is inexpensive",
+    note = "consider using `Rc::clone`"
+)]
+
 pub struct Rc<
     T: ?Sized,
     #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global,
@@ -737,6 +743,7 @@ impl<T, A: Allocator> Rc<T, A> {
     ///
     /// ```
     /// #![feature(allocator_api)]
+    ///
     /// use std::rc::Rc;
     /// use std::alloc::System;
     ///
@@ -1153,31 +1160,8 @@ impl<T> Rc<[T]> {
             Rc::from_ptr(Rc::allocate_for_layout(
                 Layout::array::<T>(len).unwrap(),
                 |layout| Global.allocate_zeroed(layout),
-                |mem| {
-                    ptr::slice_from_raw_parts_mut(mem.cast::<T>(), len)
-                        as *mut RcInner<[mem::MaybeUninit<T>]>
-                },
+                |mem| mem.cast::<T>().cast_slice(len) as *mut RcInner<[mem::MaybeUninit<T>]>,
             ))
-        }
-    }
-
-    /// Converts the reference-counted slice into a reference-counted array.
-    ///
-    /// This operation does not reallocate; the underlying array of the slice is simply reinterpreted as an array type.
-    ///
-    /// If `N` is not exactly equal to the length of `self`, then this method returns `None`.
-    #[unstable(feature = "alloc_slice_into_array", issue = "148082")]
-    #[inline]
-    #[must_use]
-    pub fn into_array<const N: usize>(self) -> Option<Rc<[T; N]>> {
-        if self.len() == N {
-            let ptr = Self::into_raw(self) as *const [T; N];
-
-            // SAFETY: The underlying array of a slice has the exact same layout as an actual array `[T; N]` if `N` is equal to the slice's length.
-            let me = unsafe { Rc::from_raw(ptr) };
-            Some(me)
-        } else {
-            None
         }
     }
 }
@@ -1244,13 +1228,44 @@ impl<T, A: Allocator> Rc<[T], A> {
                 Rc::allocate_for_layout(
                     Layout::array::<T>(len).unwrap(),
                     |layout| alloc.allocate_zeroed(layout),
-                    |mem| {
-                        ptr::slice_from_raw_parts_mut(mem.cast::<T>(), len)
-                            as *mut RcInner<[mem::MaybeUninit<T>]>
-                    },
+                    |mem| mem.cast::<T>().cast_slice(len) as *mut RcInner<[mem::MaybeUninit<T>]>,
                 ),
                 alloc,
             )
+        }
+    }
+
+    /// Converts the reference-counted slice into a reference-counted array.
+    ///
+    /// This operation does not reallocate; the underlying array of the slice is simply reinterpreted as an array type.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original `Rc<[T]>` in the `Err` variant if `self.len()` does not equal `N`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(alloc_slice_into_array)]
+    /// use std::rc::Rc;
+    ///
+    /// let rc_slice: Rc<[i32]> = Rc::new([1, 2, 3]);
+    ///
+    /// let rc_array: Rc<[i32; 3]> = rc_slice.into_array().unwrap();
+    /// ```
+    #[unstable(feature = "alloc_slice_into_array", issue = "148082")]
+    #[inline]
+    #[must_use]
+    pub fn into_array<const N: usize>(self) -> Result<Rc<[T; N], A>, Self> {
+        if self.len() == N {
+            let (ptr, alloc) = Self::into_raw_with_allocator(self);
+            let ptr = ptr as *const [T; N];
+
+            // SAFETY: The underlying array of a slice has the exact same layout as an actual array `[T; N]` if `N` is equal to the slice's length.
+            let me = unsafe { Rc::from_raw_in(ptr, alloc) };
+            Ok(me)
+        } else {
+            Err(self)
         }
     }
 }
@@ -1430,29 +1445,32 @@ impl<T: ?Sized> Rc<T> {
     /// Constructs an `Rc<T>` from a raw pointer.
     ///
     /// The raw pointer must have been previously returned by a call to
-    /// [`Rc<U>::into_raw`][into_raw] with the following requirements:
+    /// [`Rc<U>::into_raw`][into_raw] or [`Rc<U>::into_raw_with_allocator`][into_raw_with_allocator].
     ///
+    /// # Safety
+    ///
+    /// * Creating a `Rc<T>` from a pointer other than one returned from
+    ///   [`Rc<U>::into_raw`][into_raw] or [`Rc<U>::into_raw_with_allocator`][into_raw_with_allocator]
+    ///   is undefined behavior.
     /// * If `U` is sized, it must have the same size and alignment as `T`. This
     ///   is trivially true if `U` is `T`.
     /// * If `U` is unsized, its data pointer must have the same size and
     ///   alignment as `T`. This is trivially true if `Rc<U>` was constructed
     ///   through `Rc<T>` and then converted to `Rc<U>` through an [unsized
     ///   coercion].
-    ///
-    /// Note that if `U` or `U`'s data pointer is not `T` but has the same size
-    /// and alignment, this is basically like transmuting references of
-    /// different types. See [`mem::transmute`][transmute] for more information
-    /// on what restrictions apply in this case.
-    ///
-    /// The raw pointer must point to a block of memory allocated by the global allocator
-    ///
-    /// The user of `from_raw` has to make sure a specific value of `T` is only
-    /// dropped once.
+    /// * Note that if `U` or `U`'s data pointer is not `T` but has the same size
+    ///   and alignment, this is basically like transmuting references of
+    ///   different types. See [`mem::transmute`][transmute] for more information
+    ///   on what restrictions apply in this case.
+    /// * The raw pointer must point to a block of memory allocated by the global allocator
+    /// * The user of `from_raw` has to make sure a specific value of `T` is only
+    ///   dropped once.
     ///
     /// This function is unsafe because improper use may lead to memory unsafety,
     /// even if the returned `Rc<T>` is never accessed.
     ///
     /// [into_raw]: Rc::into_raw
+    /// [into_raw_with_allocator]: Rc::into_raw_with_allocator
     /// [transmute]: core::mem::transmute
     /// [unsized coercion]: https://doc.rust-lang.org/reference/type-coercions.html#unsized-coercions
     ///
@@ -1523,13 +1541,11 @@ impl<T: ?Sized> Rc<T> {
     ///
     /// # Safety
     ///
-    /// The pointer must have been obtained through `Rc::into_raw` and must satisfy the
-    /// same layout requirements specified in [`Rc::from_raw_in`][from_raw_in].
+    /// The pointer must have been obtained through [`Rc::into_raw`] and must satisfy the
+    /// same layout requirements specified in [`Rc::from_raw_in`].
     /// The associated `Rc` instance must be valid (i.e. the strong count must be at
     /// least 1) for the duration of this method, and `ptr` must point to a block of memory
     /// allocated by the global allocator.
-    ///
-    /// [from_raw_in]: Rc::from_raw_in
     ///
     /// # Examples
     ///
@@ -1559,7 +1575,7 @@ impl<T: ?Sized> Rc<T> {
     ///
     /// # Safety
     ///
-    /// The pointer must have been obtained through `Rc::into_raw`and must satisfy the
+    /// The pointer must have been obtained through `Rc::into_raw` and must satisfy the
     /// same layout requirements specified in [`Rc::from_raw_in`][from_raw_in].
     /// The associated `Rc` instance must be valid (i.e. the strong count must be at
     /// least 1) when invoking this method, and `ptr` must point to a block of memory
@@ -1662,29 +1678,32 @@ impl<T: ?Sized, A: Allocator> Rc<T, A> {
     /// Constructs an `Rc<T, A>` from a raw pointer in the provided allocator.
     ///
     /// The raw pointer must have been previously returned by a call to [`Rc<U,
-    /// A>::into_raw`][into_raw] with the following requirements:
+    /// A>::into_raw`][into_raw] or [`Rc<U, A>::into_raw_with_allocator`][into_raw_with_allocator].
     ///
+    /// # Safety
+    ///
+    /// * Creating a `Rc<T, A>` from a pointer other than one returned from
+    ///   [`Rc<U, A>::into_raw`][into_raw] or [`Rc<U, A>::into_raw_with_allocator`][into_raw_with_allocator]
+    ///   is undefined behavior.
     /// * If `U` is sized, it must have the same size and alignment as `T`. This
     ///   is trivially true if `U` is `T`.
     /// * If `U` is unsized, its data pointer must have the same size and
-    ///   alignment as `T`. This is trivially true if `Rc<U>` was constructed
-    ///   through `Rc<T>` and then converted to `Rc<U>` through an [unsized
+    ///   alignment as `T`. This is trivially true if `Rc<U, A>` was constructed
+    ///   through `Rc<T, A>` and then converted to `Rc<U, A>` through an [unsized
     ///   coercion].
-    ///
-    /// Note that if `U` or `U`'s data pointer is not `T` but has the same size
-    /// and alignment, this is basically like transmuting references of
-    /// different types. See [`mem::transmute`][transmute] for more information
-    /// on what restrictions apply in this case.
-    ///
-    /// The raw pointer must point to a block of memory allocated by `alloc`
-    ///
-    /// The user of `from_raw` has to make sure a specific value of `T` is only
-    /// dropped once.
+    /// * Note that if `U` or `U`'s data pointer is not `T` but has the same size
+    ///   and alignment, this is basically like transmuting references of
+    ///   different types. See [`mem::transmute`][transmute] for more information
+    ///   on what restrictions apply in this case.
+    /// * The raw pointer must point to a block of memory allocated by `alloc`
+    /// * The user of `from_raw` has to make sure a specific value of `T` is only
+    ///   dropped once.
     ///
     /// This function is unsafe because improper use may lead to memory unsafety,
-    /// even if the returned `Rc<T>` is never accessed.
+    /// even if the returned `Rc<T, A>` is never accessed.
     ///
     /// [into_raw]: Rc::into_raw
+    /// [into_raw_with_allocator]: Rc::into_raw_with_allocator
     /// [transmute]: core::mem::transmute
     /// [unsized coercion]: https://doc.rust-lang.org/reference/type-coercions.html#unsized-coercions
     ///
@@ -2300,7 +2319,7 @@ impl<T> Rc<[T]> {
             Self::allocate_for_layout(
                 Layout::array::<T>(len).unwrap(),
                 |layout| Global.allocate(layout),
-                |mem| ptr::slice_from_raw_parts_mut(mem.cast::<T>(), len) as *mut RcInner<[T]>,
+                |mem| mem.cast::<T>().cast_slice(len) as *mut RcInner<[T]>,
             )
         }
     }
@@ -2377,7 +2396,7 @@ impl<T, A: Allocator> Rc<[T], A> {
             Rc::<[T]>::allocate_for_layout(
                 Layout::array::<T>(len).unwrap(),
                 |layout| alloc.allocate(layout),
-                |mem| ptr::slice_from_raw_parts_mut(mem.cast::<T>(), len) as *mut RcInner<[T]>,
+                |mem| mem.cast::<T>().cast_slice(len) as *mut RcInner<[T]>,
             )
         }
     }
@@ -2423,9 +2442,6 @@ unsafe impl<T: ?Sized, A: Allocator> PinCoerceUnsized for Rc<T, A> {}
 //#[unstable(feature = "unique_rc_arc", issue = "112566")]
 #[unstable(feature = "pin_coerce_unsized_trait", issue = "150112")]
 unsafe impl<T: ?Sized, A: Allocator> PinCoerceUnsized for UniqueRc<T, A> {}
-
-#[unstable(feature = "pin_coerce_unsized_trait", issue = "150112")]
-unsafe impl<T: ?Sized, A: Allocator> PinCoerceUnsized for Weak<T, A> {}
 
 #[unstable(feature = "deref_pure_trait", issue = "87121")]
 unsafe impl<T: ?Sized, A: Allocator> DerefPure for Rc<T, A> {}
@@ -2502,6 +2518,9 @@ impl<T: ?Sized, A: Allocator + Clone> Clone for Rc<T, A> {
 
 #[unstable(feature = "ergonomic_clones", issue = "132290")]
 impl<T: ?Sized, A: Allocator + Clone> UseCloned for Rc<T, A> {}
+
+#[unstable(feature = "share_trait", issue = "156756")]
+impl<T: ?Sized, A: Allocator + Clone> Share for Rc<T, A> {}
 
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -2593,7 +2612,7 @@ impl<T: ?Sized + PartialEq, A: Allocator> RcEqIdent<T, A> for Rc<T, A> {
 #[rustc_unsafe_specialization_marker]
 pub(crate) trait MarkerEq: PartialEq<Self> {}
 
-impl<T: Eq> MarkerEq for T {}
+impl<T: ?Sized + Eq> MarkerEq for T {}
 
 /// We're doing this specialization here, and not as a more general optimization on `&T`, because it
 /// would otherwise add a cost to all equality checks on refs. We assume that `Rc`s are used to
@@ -2606,12 +2625,12 @@ impl<T: Eq> MarkerEq for T {}
 impl<T: ?Sized + MarkerEq, A: Allocator> RcEqIdent<T, A> for Rc<T, A> {
     #[inline]
     fn eq(&self, other: &Rc<T, A>) -> bool {
-        Rc::ptr_eq(self, other) || **self == **other
+        ptr::eq(self.ptr.as_ptr(), other.ptr.as_ptr()) || **self == **other
     }
 
     #[inline]
     fn ne(&self, other: &Rc<T, A>) -> bool {
-        !Rc::ptr_eq(self, other) && **self != **other
+        !ptr::eq(self.ptr.as_ptr(), other.ptr.as_ptr()) && **self != **other
     }
 }
 
@@ -3491,7 +3510,13 @@ impl<T: ?Sized, A: Allocator> Weak<T, A> {
     /// Attempts to upgrade the `Weak` pointer to an [`Rc`], delaying
     /// dropping of the inner value if successful.
     ///
-    /// Returns [`None`] if the inner value has since been dropped.
+    /// Returns [`None`] in the following cases:
+    ///
+    /// 1. The inner value has since been dropped or moved out.
+    ///
+    /// 2. This `Weak` does not point to an allocation.
+    ///
+    /// 3. The owning reference this `Weak` is associated with is either not fully-constructed or does not allow an upgrade.
     ///
     /// # Examples
     ///
@@ -3845,15 +3870,15 @@ unsafe fn data_offset<T: ?Sized>(ptr: *const T) -> usize {
     // Because RcInner is repr(C), it will always be the last field in memory.
     // SAFETY: since the only unsized types possible are slices, trait objects,
     // and extern types, the input safety requirement is currently enough to
-    // satisfy the requirements of align_of_val_raw; this is an implementation
+    // satisfy the requirements of Alignment::of_val_raw; this is an implementation
     // detail of the language that must not be relied upon outside of std.
-    unsafe { data_offset_align(align_of_val_raw(ptr)) }
+    unsafe { data_offset_alignment(Alignment::of_val_raw(ptr)) }
 }
 
 #[inline]
-fn data_offset_align(align: usize) -> usize {
+fn data_offset_alignment(alignment: Alignment) -> usize {
     let layout = Layout::new::<RcInner<()>>();
-    layout.size() + layout.padding_needed_for(align)
+    layout.size() + layout.padding_needed_for(alignment)
 }
 
 /// A uniquely owned [`Rc`].
@@ -3979,6 +4004,15 @@ impl<T: ?Sized, A: Allocator> AsMut<T> for UniqueRc<T, A> {
 
 #[unstable(feature = "unique_rc_arc", issue = "112566")]
 impl<T: ?Sized, A: Allocator> Unpin for UniqueRc<T, A> {}
+
+#[cfg(not(no_global_oom_handling))]
+#[unstable(feature = "unique_rc_arc", issue = "112566")]
+impl<T> From<T> for UniqueRc<T> {
+    #[inline(always)]
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
+}
 
 #[unstable(feature = "unique_rc_arc", issue = "112566")]
 impl<T: ?Sized + PartialEq, A: Allocator> PartialEq for UniqueRc<T, A> {
@@ -4478,7 +4512,7 @@ impl<T: ?Sized, A: Allocator> UniqueRcUninit<T, A> {
 
     /// Returns the pointer to be written into to initialize the [`Rc`].
     fn data_ptr(&mut self) -> *mut T {
-        let offset = data_offset_align(self.layout_for_value.align());
+        let offset = data_offset_alignment(self.layout_for_value.alignment());
         unsafe { self.ptr.as_ptr().byte_add(offset) as *mut T }
     }
 

@@ -4,12 +4,11 @@
 //! to help with the tedium.
 
 use std::fmt::{self, Debug};
-use std::marker::PhantomData;
 
 use rustc_abi::TyAndLayout;
 use rustc_hir::def::Namespace;
 use rustc_hir::def_id::LocalDefId;
-use rustc_span::source_map::Spanned;
+use rustc_span::Spanned;
 use rustc_type_ir::{ConstKind, TypeFolder, VisitorResult, try_visit};
 
 use super::{GenericArg, GenericArgKind, Pattern, Region};
@@ -62,21 +61,6 @@ impl<'tcx> fmt::Debug for ty::adjustment::Adjustment<'tcx> {
 impl<'tcx> fmt::Debug for ty::adjustment::PatAdjustment<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} -> {:?}", self.source, self.kind)
-    }
-}
-
-impl fmt::Debug for ty::BoundRegionKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            ty::BoundRegionKind::Anon => write!(f, "BrAnon"),
-            ty::BoundRegionKind::NamedAnon(name) => {
-                write!(f, "BrNamedAnon({name})")
-            }
-            ty::BoundRegionKind::Named(did) => {
-                write!(f, "BrNamed({did:?})")
-            }
-            ty::BoundRegionKind::ClosureEnv => write!(f, "BrEnv"),
-        }
     }
 }
 
@@ -175,15 +159,6 @@ impl<'tcx> fmt::Debug for ty::Const<'tcx> {
     }
 }
 
-impl fmt::Debug for ty::BoundTy {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.kind {
-            ty::BoundTyKind::Anon => write!(f, "{:?}", self.var),
-            ty::BoundTyKind::Param(def_id) => write!(f, "{def_id:?}"),
-        }
-    }
-}
-
 impl<'tcx> fmt::Debug for GenericArg<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind() {
@@ -209,7 +184,6 @@ impl<'tcx> fmt::Debug for Region<'tcx> {
 // For things for which the type library provides traversal implementations
 // for all Interners, we only need to provide a Lift implementation.
 TrivialLiftImpls! {
-    (),
     bool,
     usize,
     u64,
@@ -222,6 +196,7 @@ TrivialLiftImpls! {
     rustc_abi::Size,
     rustc_hir::Safety,
     rustc_middle::mir::ConstValue,
+    rustc_span::Symbol,
     rustc_type_ir::BoundConstness,
     rustc_type_ir::PredicatePolarity,
     // tidy-alphabetical-end
@@ -245,17 +220,18 @@ TrivialTypeTraversalImpls! {
     crate::mir::MirPhase,
     crate::mir::Promoted,
     crate::mir::RawPtrKind,
-    crate::mir::RetagKind,
     crate::mir::SourceInfo,
     crate::mir::SourceScope,
     crate::mir::SourceScopeLocalData,
     crate::mir::SwitchTargets,
+    crate::mir::WithRetag,
     crate::traits::IsConstable,
     crate::traits::OverflowError,
     crate::ty::AdtKind,
     crate::ty::AssocItem,
     crate::ty::AssocKind,
-    crate::ty::BoundRegion,
+    crate::ty::BoundRegion<'tcx>,
+    crate::ty::BoundTy<'tcx>,
     crate::ty::ScalarInt,
     crate::ty::UserTypeAnnotationIndex,
     crate::ty::abstract_const::NotConstEvaluatable,
@@ -269,6 +245,7 @@ TrivialTypeTraversalImpls! {
     rustc_hir::HirId,
     rustc_hir::MatchSource,
     rustc_hir::RangeEnd,
+    rustc_hir::attrs::AttributeKind,
     rustc_hir::def_id::LocalDefId,
     rustc_span::Ident,
     rustc_span::Span,
@@ -284,7 +261,6 @@ TrivialTypeTraversalImpls! {
 TrivialTypeTraversalAndLiftImpls! {
     // tidy-alphabetical-start
     crate::mir::RuntimeChecks,
-    crate::ty::BoundTy,
     crate::ty::ParamTy,
     crate::ty::instance::ReifyReason,
     rustc_hir::def_id::DefId,
@@ -294,29 +270,27 @@ TrivialTypeTraversalAndLiftImpls! {
 ///////////////////////////////////////////////////////////////////////////
 // Lift implementations
 
-impl<'tcx> Lift<TyCtxt<'tcx>> for PhantomData<&()> {
-    type Lifted = PhantomData<&'tcx ()>;
-    fn lift_to_interner(self, _: TyCtxt<'tcx>) -> Option<Self::Lifted> {
-        Some(PhantomData)
+impl<'a, 'tcx> Lift<TyCtxt<'tcx>> for ty::ParamEnv<'a> {
+    type Lifted = ty::ParamEnv<'tcx>;
+
+    fn lift_to_interner(self, tcx: TyCtxt<'tcx>) -> Self::Lifted {
+        ty::ParamEnv::new(tcx.lift(self.caller_bounds()))
     }
 }
 
 impl<'tcx, T: Lift<TyCtxt<'tcx>>> Lift<TyCtxt<'tcx>> for Option<T> {
     type Lifted = Option<T::Lifted>;
-    fn lift_to_interner(self, tcx: TyCtxt<'tcx>) -> Option<Self::Lifted> {
-        Some(match self {
-            Some(x) => Some(tcx.lift(x)?),
-            None => None,
-        })
+    fn lift_to_interner(self, tcx: TyCtxt<'tcx>) -> Self::Lifted {
+        self.map(|x| tcx.lift(x))
     }
 }
 
 impl<'a, 'tcx> Lift<TyCtxt<'tcx>> for Term<'a> {
     type Lifted = ty::Term<'tcx>;
-    fn lift_to_interner(self, tcx: TyCtxt<'tcx>) -> Option<Self::Lifted> {
+    fn lift_to_interner(self, tcx: TyCtxt<'tcx>) -> Self::Lifted {
         match self.kind() {
-            TermKind::Ty(ty) => tcx.lift(ty).map(Into::into),
-            TermKind::Const(c) => tcx.lift(c).map(Into::into),
+            TermKind::Ty(ty) => tcx.lift(ty).into(),
+            TermKind::Const(c) => tcx.lift(c).into(),
         }
     }
 }
@@ -398,7 +372,7 @@ impl<'tcx> TypeSuperFoldable<TyCtxt<'tcx>> for Ty<'tcx> {
             ty::CoroutineClosure(did, args) => {
                 ty::CoroutineClosure(did, args.try_fold_with(folder)?)
             }
-            ty::Alias(kind, data) => ty::Alias(kind, data.try_fold_with(folder)?),
+            ty::Alias(data) => ty::Alias(data.try_fold_with(folder)?),
             ty::Pat(ty, pat) => ty::Pat(ty.try_fold_with(folder)?, pat.try_fold_with(folder)?),
 
             ty::Bool
@@ -437,7 +411,7 @@ impl<'tcx> TypeSuperFoldable<TyCtxt<'tcx>> for Ty<'tcx> {
             ty::CoroutineWitness(did, args) => ty::CoroutineWitness(did, args.fold_with(folder)),
             ty::Closure(did, args) => ty::Closure(did, args.fold_with(folder)),
             ty::CoroutineClosure(did, args) => ty::CoroutineClosure(did, args.fold_with(folder)),
-            ty::Alias(kind, data) => ty::Alias(kind, data.fold_with(folder)),
+            ty::Alias(data) => ty::Alias(data.fold_with(folder)),
             ty::Pat(ty, pat) => ty::Pat(ty.fold_with(folder), pat.fold_with(folder)),
 
             ty::Bool
@@ -485,7 +459,7 @@ impl<'tcx> TypeSuperVisitable<TyCtxt<'tcx>> for Ty<'tcx> {
             ty::CoroutineWitness(_did, args) => args.visit_with(visitor),
             ty::Closure(_did, args) => args.visit_with(visitor),
             ty::CoroutineClosure(_did, args) => args.visit_with(visitor),
-            ty::Alias(_, data) => data.visit_with(visitor),
+            ty::Alias(data) => data.visit_with(visitor),
 
             ty::Pat(ty, pat) => {
                 try_visit!(ty.visit_with(visitor));
@@ -829,4 +803,5 @@ list_fold! {
     &'tcx ty::List<PlaceElem<'tcx>> : mk_place_elems,
     &'tcx ty::List<ty::Pattern<'tcx>> : mk_patterns,
     &'tcx ty::List<ty::ArgOutlivesPredicate<'tcx>> : mk_outlives,
+    &'tcx ty::List<ty::Const<'tcx>> : mk_const_list,
 }

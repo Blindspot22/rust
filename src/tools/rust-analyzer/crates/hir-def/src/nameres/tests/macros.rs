@@ -1,3 +1,4 @@
+use base_db::all_crates;
 use expect_test::expect;
 
 use itertools::Itertools;
@@ -1068,10 +1069,8 @@ pub fn derive_macro_2(_item: TokenStream) -> TokenStream {
             - AnotherTrait : macro#
             - DummyTrait : macro#
             - TokenStream : type value
-            - attribute_macro : value macro#
-            - derive_macro : value
-            - derive_macro_2 : value
-            - function_like_macro : value macro!
+            - attribute_macro : macro#
+            - function_like_macro : macro!
         "#]],
     );
 }
@@ -1131,7 +1130,7 @@ pub fn derive_macro_2(_item: TokenStream) -> TokenStream {
 }
 "#,
     );
-    let krate = *db.all_crates().last().expect("no crate graph present");
+    let krate = *all_crates(&db).last().expect("no crate graph present");
     let def_map = crate_def_map(&db, krate);
 
     assert_eq!(def_map.data.exported_derives.len(), 1);
@@ -1499,7 +1498,7 @@ struct TokenStream;
 fn proc_attr(a: TokenStream, b: TokenStream) -> TokenStream { a }
     "#,
     );
-    let krate = *db.all_crates().last().expect("no crate graph present");
+    let krate = *all_crates(&db).last().expect("no crate graph present");
     let def_map = crate_def_map(&db, krate);
 
     let root_module = &def_map[def_map.root].scope;

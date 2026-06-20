@@ -1,3 +1,4 @@
+use rustc_ast as ast;
 use rustc_ast::tokenstream::TokenStream;
 use rustc_ast::{AsmMacro, token};
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
@@ -5,13 +6,13 @@ use rustc_errors::PResult;
 use rustc_expand::base::*;
 use rustc_index::bit_set::GrowableBitSet;
 use rustc_parse::parser::asm::*;
+use rustc_parse_format as parse;
 use rustc_session::lint;
 use rustc_span::{ErrorGuaranteed, InnerSpan, Span, Symbol, sym};
 use rustc_target::asm::InlineAsmArch;
 use smallvec::smallvec;
-use {rustc_ast as ast, rustc_parse_format as parse};
 
-use crate::errors;
+use crate::diagnostics;
 use crate::util::{ExprToSpannedString, expr_to_spanned_string};
 
 /// Validated assembly arguments, ready for macro expansion.
@@ -64,7 +65,7 @@ fn validate_asm_args<'a>(
     for arg in args {
         for attr in arg.attributes.0.iter() {
             if !matches!(attr.name(), Some(sym::cfg | sym::cfg_attr)) {
-                ecx.dcx().emit_err(errors::AsmAttributeNotSupported { span: attr.span() });
+                ecx.dcx().emit_err(diagnostics::AsmAttributeNotSupported { span: attr.span() });
             }
         }
 
@@ -85,7 +86,7 @@ fn validate_asm_args<'a>(
                             ) => {}
                         ast::ExprKind::MacCall(..) => {}
                         _ => {
-                            let err = dcx.create_err(errors::AsmExpectedOther {
+                            let err = dcx.create_err(diagnostics::AsmExpectedOther {
                                 span: template.span,
                                 is_inline_asm: matches!(asm_macro, AsmMacro::Asm),
                             });
@@ -110,12 +111,12 @@ fn validate_asm_args<'a>(
 
                 if explicit_reg {
                     if name.is_some() {
-                        dcx.emit_err(errors::AsmExplicitRegisterName { span });
+                        dcx.emit_err(diagnostics::AsmExplicitRegisterName { span });
                     }
                     validated.reg_args.insert(slot);
                 } else if let Some(name) = name {
                     if let Some(&prev) = validated.named_args.get(&name) {
-                        dcx.emit_err(errors::AsmDuplicateArg {
+                        dcx.emit_err(diagnostics::AsmDuplicateArg {
                             span,
                             name,
                             prev: validated.operands[prev].1,
@@ -129,7 +130,7 @@ fn validate_asm_args<'a>(
                     let explicit =
                         validated.reg_args.iter().map(|p| validated.operands[p].1).collect();
 
-                    dcx.emit_err(errors::AsmPositionalAfter { span, named, explicit });
+                    dcx.emit_err(diagnostics::AsmPositionalAfter { span, named, explicit });
                 }
             }
             AsmArgKind::Options(new_options) => {
@@ -140,7 +141,7 @@ fn validate_asm_args<'a>(
 
                     if !asm_macro.is_supported_option(options) {
                         // Tool-only output.
-                        dcx.emit_err(errors::AsmUnsupportedOption {
+                        dcx.emit_err(diagnostics::AsmUnsupportedOption {
                             span,
                             symbol,
                             span_with_comma,
@@ -148,7 +149,7 @@ fn validate_asm_args<'a>(
                         });
                     } else if validated.options.contains(options) {
                         // Tool-only output.
-                        dcx.emit_err(errors::AsmOptAlreadyprovided {
+                        dcx.emit_err(diagnostics::AsmOptAlreadyprovided {
                             span,
                             symbol,
                             span_with_comma,
@@ -177,13 +178,13 @@ fn validate_asm_args<'a>(
         && validated.options.contains(ast::InlineAsmOptions::READONLY)
     {
         let spans = validated.options_spans.clone();
-        dcx.emit_err(errors::AsmMutuallyExclusive { spans, opt1: "nomem", opt2: "readonly" });
+        dcx.emit_err(diagnostics::AsmMutuallyExclusive { spans, opt1: "nomem", opt2: "readonly" });
     }
     if validated.options.contains(ast::InlineAsmOptions::PURE)
         && validated.options.contains(ast::InlineAsmOptions::NORETURN)
     {
         let spans = validated.options_spans.clone();
-        dcx.emit_err(errors::AsmMutuallyExclusive { spans, opt1: "pure", opt2: "noreturn" });
+        dcx.emit_err(diagnostics::AsmMutuallyExclusive { spans, opt1: "pure", opt2: "noreturn" });
     }
     if validated.options.contains(ast::InlineAsmOptions::PURE)
         && !validated
@@ -191,7 +192,7 @@ fn validate_asm_args<'a>(
             .intersects(ast::InlineAsmOptions::NOMEM | ast::InlineAsmOptions::READONLY)
     {
         let spans = validated.options_spans.clone();
-        dcx.emit_err(errors::AsmPureCombine { spans });
+        dcx.emit_err(diagnostics::AsmPureCombine { spans });
     }
 
     let mut have_real_output = false;
@@ -222,24 +223,24 @@ fn validate_asm_args<'a>(
         }
     }
     if validated.options.contains(ast::InlineAsmOptions::PURE) && !have_real_output {
-        dcx.emit_err(errors::AsmPureNoOutput { spans: validated.options_spans.clone() });
+        dcx.emit_err(diagnostics::AsmPureNoOutput { spans: validated.options_spans.clone() });
     }
     if validated.options.contains(ast::InlineAsmOptions::NORETURN)
         && !outputs_sp.is_empty()
         && labels_sp.is_empty()
     {
-        let err = dcx.create_err(errors::AsmNoReturn { outputs_sp });
+        let err = dcx.create_err(diagnostics::AsmNoReturn { outputs_sp });
         // Bail out now since this is likely to confuse MIR
         return Err(err);
     }
     if validated.options.contains(ast::InlineAsmOptions::MAY_UNWIND) && !labels_sp.is_empty() {
-        dcx.emit_err(errors::AsmMayUnwind { labels_sp });
+        dcx.emit_err(diagnostics::AsmMayUnwind { labels_sp });
     }
 
     if !validated.clobber_abis.is_empty() {
         match asm_macro {
             AsmMacro::GlobalAsm | AsmMacro::NakedAsm => {
-                let err = dcx.create_err(errors::AsmUnsupportedClobberAbi {
+                let err = dcx.create_err(diagnostics::AsmUnsupportedClobberAbi {
                     spans: validated.clobber_abis.iter().map(|(_, span)| *span).collect(),
                     macro_name: asm_macro.macro_name(),
                 });
@@ -249,7 +250,7 @@ fn validate_asm_args<'a>(
             }
             AsmMacro::Asm => {
                 if !regclass_outputs.is_empty() {
-                    dcx.emit_err(errors::AsmClobberNoReg {
+                    dcx.emit_err(diagnostics::AsmClobberNoReg {
                         spans: regclass_outputs,
                         clobbers: validated.clobber_abis.iter().map(|(_, span)| *span).collect(),
                     });
@@ -288,6 +289,18 @@ fn expand_preparsed_asm(
         let msg = "asm template must be a string literal";
         let template_sp = template_expr.span;
         let template_is_mac_call = matches!(template_expr.kind, ast::ExprKind::MacCall(_));
+
+        // Gets the span inside `template_sp` corresponding to the given range
+        let span_in_template = |range: std::ops::Range<usize>| -> Span {
+            if template_is_mac_call {
+                // When the template is a macro call we can't reliably get inner spans
+                // so just use the entire template span (see ICEs #129503, #131292)
+                template_sp
+            } else {
+                template_sp.from_inner(InnerSpan::new(range.start, range.end))
+            }
+        };
+
         let ExprToSpannedString {
             symbol: template_str,
             style: template_style,
@@ -341,7 +354,7 @@ fn expand_preparsed_asm(
                     lint::builtin::BAD_ASM_STYLE,
                     find_span(".intel_syntax"),
                     ecx.current_expansion.lint_node_id,
-                    errors::AvoidIntelSyntax,
+                    diagnostics::AvoidIntelSyntax,
                 );
             }
             if template_str.contains(".att_syntax") {
@@ -349,7 +362,7 @@ fn expand_preparsed_asm(
                     lint::builtin::BAD_ASM_STYLE,
                     find_span(".att_syntax"),
                     ecx.current_expansion.lint_node_id,
-                    errors::AvoidAttSyntax,
+                    diagnostics::AvoidAttSyntax,
                 );
             }
         }
@@ -382,13 +395,8 @@ fn expand_preparsed_asm(
 
         if !parser.errors.is_empty() {
             let err = parser.errors.remove(0);
-            let err_sp = if template_is_mac_call {
-                // If the template is a macro call we can't reliably point to the error's
-                // span so just use the template's span as the error span (fixes #129503)
-                template_span
-            } else {
-                template_span.from_inner(InnerSpan::new(err.span.start, err.span.end))
-            };
+
+            let err_sp = span_in_template(err.span);
 
             let msg = format!("invalid asm template string: {}", err.description);
             let mut e = ecx.dcx().struct_span_err(err_sp, msg);
@@ -397,8 +405,7 @@ fn expand_preparsed_asm(
                 e.note(note);
             }
             if let Some((label, span)) = err.secondary_label {
-                let err_sp = template_span.from_inner(InnerSpan::new(span.start, span.end));
-                e.span_label(err_sp, label);
+                e.span_label(span_in_template(span), label);
             }
             let guar = e.emit();
             return ExpandResult::Ready(Err(guar));
@@ -475,10 +482,9 @@ fn expand_preparsed_asm(
                                 None => {
                                     let span = arg.position_span;
                                     ecx.dcx()
-                                        .create_err(errors::AsmNoMatchedArgumentName {
+                                        .create_err(diagnostics::AsmNoMatchedArgumentName {
                                             name: name.to_owned(),
-                                            span: template_span
-                                                .from_inner(InnerSpan::new(span.start, span.end)),
+                                            span: span_in_template(span),
                                         })
                                         .emit();
                                     None
@@ -490,12 +496,8 @@ fn expand_preparsed_asm(
                     let mut chars = arg.format.ty.chars();
                     let mut modifier = chars.next();
                     if chars.next().is_some() {
-                        let span = arg
-                            .format
-                            .ty_span
-                            .map(|sp| template_sp.from_inner(InnerSpan::new(sp.start, sp.end)))
-                            .unwrap_or(template_sp);
-                        ecx.dcx().emit_err(errors::AsmModifierInvalid { span });
+                        let span = arg.format.ty_span.map(span_in_template).unwrap_or(template_sp);
+                        ecx.dcx().emit_err(diagnostics::AsmModifierInvalid { span });
                         modifier = None;
                     }
 

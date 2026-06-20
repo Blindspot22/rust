@@ -1886,7 +1886,7 @@ fn test_align_to_empty_mid() {
     type Chunk = u32;
     for offset in 0..4 {
         let (_, mid, _) = unsafe { bytes[offset..offset + 1].align_to::<Chunk>() };
-        assert_eq!(mid.as_ptr() as usize % align_of::<Chunk>(), 0);
+        assert_eq!(mid.as_ptr().addr() % align_of::<Chunk>(), 0);
     }
 }
 
@@ -2506,4 +2506,42 @@ fn test_slice_from_raw_parts_in_const() {
         unsafe { std::slice::from_raw_parts(std::ptr::without_provenance(123456), 0) };
     assert_eq!(EMPTY_SLICE.as_ptr().addr(), 123456);
     assert_eq!(EMPTY_SLICE.len(), 0);
+}
+
+#[test]
+fn test_shift_left() {
+    #[track_caller]
+    fn case<const M: usize, const N: usize>(
+        mut a: [i32; M],
+        i: [i32; N],
+        j: [i32; N],
+        b: [i32; M],
+    ) {
+        assert_eq!((a.shift_left(i), a), (j, b));
+    }
+    case([], [1, 2, 3, 4, 5], [1, 2, 3, 4, 5], []);
+    case([1], [2, 3, 4, 5], [1, 2, 3, 4], [5]);
+    case([1, 2], [3, 4, 5], [1, 2, 3], [4, 5]);
+    case([1, 2, 3], [4, 5], [1, 2], [3, 4, 5]);
+    case([1, 2, 3, 4], [5], [1], [2, 3, 4, 5]);
+    case([1, 2, 3, 4, 5], [], [], [1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn test_shift_right() {
+    #[track_caller]
+    fn case<const M: usize, const N: usize>(
+        i: [i32; N],
+        mut a: [i32; M],
+        b: [i32; M],
+        j: [i32; N],
+    ) {
+        assert_eq!((a.shift_right(i), a), (j, b));
+    }
+    case([], [1, 2, 3, 4, 5], [1, 2, 3, 4, 5], []);
+    case([1], [2, 3, 4, 5], [1, 2, 3, 4], [5]);
+    case([1, 2], [3, 4, 5], [1, 2, 3], [4, 5]);
+    case([1, 2, 3], [4, 5], [1, 2], [3, 4, 5]);
+    case([1, 2, 3, 4], [5], [1], [2, 3, 4, 5]);
+    case([1, 2, 3, 4, 5], [], [], [1, 2, 3, 4, 5]);
 }

@@ -63,6 +63,9 @@ pub fn phase_cargo_miri(mut args: impl Iterator<Item = String>) {
         "setup" => MiriCommand::Setup,
         "test" | "t" | "run" | "r" | "nextest" => MiriCommand::Forward(subcommand),
         "clean" => MiriCommand::Clean,
+        // For use by the `./miri test` dependency builder.
+        "build" if env::var_os("MIRI_BUILD_TEST_DEPS").is_some() =>
+            MiriCommand::Forward("build".into()),
         _ => {
             // Check for version and help flags.
             if has_arg_flag("--help") || has_arg_flag("-h") {
@@ -84,7 +87,9 @@ pub fn phase_cargo_miri(mut args: impl Iterator<Item = String>) {
                 println!("`cargo miri {verb}` supports the same flags as `cargo {verb}`:\n");
                 let mut cmd = cargo();
                 cmd.arg(verb);
-                cmd.arg("--help");
+                // Forward all arguments (some of them can influence the help output, e.g.
+                // the nextest verb).
+                cmd.args(args);
                 exec(cmd);
             }
             _ => {
@@ -309,6 +314,7 @@ pub fn phase_rustc(args: impl Iterator<Item = String>, phase: RustcPhase) {
             // Ask rustc for the filename (since that is target-dependent).
             let mut rustc = miri_for_host(); // sysroot doesn't matter for this so we just use the host
             rustc.arg("--print").arg("file-names");
+            rustc.arg("-Zunstable-options"); // needed for JSON targets
             for flag in ["--crate-name", "--crate-type", "--target"] {
                 for val in get_arg_flag_values(flag) {
                     rustc.arg(flag).arg(val);

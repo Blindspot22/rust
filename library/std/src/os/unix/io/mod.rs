@@ -102,8 +102,8 @@ use crate::sys::cvt;
 #[cfg(test)]
 mod tests;
 
-#[unstable(feature = "stdio_swap", issue = "150667", reason = "recently added")]
-pub trait StdioExt: crate::sealed::Sealed {
+#[unstable(feature = "stdio_swap", issue = "150667")]
+pub impl(self) trait StdioExt {
     /// Redirects the stdio file descriptor to point to the file description underpinning `fd`.
     ///
     /// Rust std::io write buffers (if any) are flushed, but other runtimes
@@ -159,7 +159,7 @@ pub trait StdioExt: crate::sealed::Sealed {
 }
 
 macro io_ext_impl($stdio_ty:ty, $stdio_lock_ty:ty, $writer:literal) {
-    #[unstable(feature = "stdio_swap", issue = "150667", reason = "recently added")]
+    #[unstable(feature = "stdio_swap", issue = "150667")]
     impl StdioExt for $stdio_ty {
         fn set_fd<T: Into<OwnedFd>>(&mut self, fd: T) -> io::Result<()> {
             self.lock().set_fd(fd)
@@ -174,7 +174,7 @@ macro io_ext_impl($stdio_ty:ty, $stdio_lock_ty:ty, $writer:literal) {
         }
     }
 
-    #[unstable(feature = "stdio_swap", issue = "150667", reason = "recently added")]
+    #[unstable(feature = "stdio_swap", issue = "150667")]
     impl StdioExt for $stdio_lock_ty {
         fn set_fd<T: Into<OwnedFd>>(&mut self, fd: T) -> io::Result<()> {
             #[cfg($writer)]

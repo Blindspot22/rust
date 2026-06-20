@@ -13,7 +13,7 @@ use rustc_expand::base::{
 };
 use rustc_expand::module::DirOwnership;
 use rustc_parse::lexer::StripTokens;
-use rustc_parse::parser::ForceCollect;
+use rustc_parse::parser::{AllowConstBlockItems, ForceCollect};
 use rustc_parse::{new_parser_from_file, unwrap_or_emit_fatal, utf8_error};
 use rustc_session::lint::builtin::INCOMPLETE_INCLUDE;
 use rustc_session::parse::ParseSess;
@@ -21,7 +21,7 @@ use rustc_span::source_map::SourceMap;
 use rustc_span::{ByteSymbol, Pos, Span, Symbol};
 use smallvec::SmallVec;
 
-use crate::errors;
+use crate::diagnostics;
 use crate::util::{
     check_zero_tts, get_single_str_from_tts, get_single_str_spanned_from_tts, parse_expr,
 };
@@ -153,7 +153,7 @@ pub(crate) fn expand_include<'cx>(
                     INCOMPLETE_INCLUDE,
                     p.token.span,
                     self.node_id,
-                    errors::IncompleteInclude,
+                    diagnostics::IncompleteInclude,
                 );
             }
             Some(expr)
@@ -168,7 +168,7 @@ pub(crate) fn expand_include<'cx>(
             ));
             let mut ret = SmallVec::new();
             loop {
-                match p.parse_item(ForceCollect::No) {
+                match p.parse_item(ForceCollect::No, AllowConstBlockItems::Yes) {
                     Err(err) => {
                         err.emit();
                         break;
@@ -176,7 +176,7 @@ pub(crate) fn expand_include<'cx>(
                     Ok(Some(item)) => ret.push(item),
                     Ok(None) => {
                         if p.token != token::Eof {
-                            p.dcx().emit_err(errors::ExpectedItem {
+                            p.dcx().emit_err(diagnostics::ExpectedItem {
                                 span: p.token.span,
                                 token: &pprust::token_to_string(&p.token),
                             });
@@ -275,7 +275,14 @@ fn load_binary_file(
         }
     };
     match cx.source_map().load_binary_file(&resolved_path) {
-        Ok(data) => Ok(data),
+        Ok(data) => {
+            cx.sess
+                .file_depinfo
+                .borrow_mut()
+                .insert(Symbol::intern(&resolved_path.to_string_lossy()));
+
+            Ok(data)
+        }
         Err(io_err) => {
             let mut err = cx.dcx().struct_span_err(
                 macro_span,

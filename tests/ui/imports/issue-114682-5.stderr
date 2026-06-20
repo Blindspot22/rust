@@ -2,7 +2,9 @@ error[E0432]: unresolved import `issue_114682_5_extern_1::Url`
   --> $DIR/issue-114682-5.rs:10:5
    |
 LL | use issue_114682_5_extern_1::Url;
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `Url` in `types::issue_114682_5_extern_1`
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^---
+   |                              |
+   |                              no `Url` in `types::issue_114682_5_extern_1`
    |
 help: consider importing this struct instead
    |
@@ -32,20 +34,22 @@ error: `issue_114682_5_extern_1` is ambiguous
 LL | use issue_114682_5_extern_1::Url;
    |     ^^^^^^^^^^^^^^^^^^^^^^^ ambiguous name
    |
-   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
-   = note: for more information, see issue #114095 <https://github.com/rust-lang/rust/issues/114095>
    = note: ambiguous because of multiple glob imports of a name in the same module
 note: `issue_114682_5_extern_1` could refer to the module defined here
   --> $DIR/auxiliary/issue-114682-5-extern-2.rs:6:13
    |
 LL |     pub use crate::types::*;
    |             ^^^^^^^^^^^^
+   = help: consider updating this dependency to resolve this error
+   = help: if updating the dependency does not resolve the problem report the problem to the author of the relevant crate
 note: `issue_114682_5_extern_1` could also refer to the crate defined here
   --> $DIR/auxiliary/issue-114682-5-extern-2.rs:7:13
    |
 LL |     pub use crate::*;
    |             ^^^^^
    = help: use `::issue_114682_5_extern_1` to refer to this crate unambiguously
+   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+   = note: for more information, see issue #114095 <https://github.com/rust-lang/rust/issues/114095>
    = note: `#[deny(ambiguous_glob_imports)]` (part of `#[deny(future_incompatible)]`) on by default
 
 error: aborting due to 3 previous errors
@@ -59,19 +63,21 @@ error: `issue_114682_5_extern_1` is ambiguous
 LL | use issue_114682_5_extern_1::Url;
    |     ^^^^^^^^^^^^^^^^^^^^^^^ ambiguous name
    |
-   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
-   = note: for more information, see issue #114095 <https://github.com/rust-lang/rust/issues/114095>
    = note: ambiguous because of multiple glob imports of a name in the same module
 note: `issue_114682_5_extern_1` could refer to the module defined here
   --> $DIR/auxiliary/issue-114682-5-extern-2.rs:6:13
    |
 LL |     pub use crate::types::*;
    |             ^^^^^^^^^^^^
+   = help: consider updating this dependency to resolve this error
+   = help: if updating the dependency does not resolve the problem report the problem to the author of the relevant crate
 note: `issue_114682_5_extern_1` could also refer to the crate defined here
   --> $DIR/auxiliary/issue-114682-5-extern-2.rs:7:13
    |
 LL |     pub use crate::*;
    |             ^^^^^
    = help: use `::issue_114682_5_extern_1` to refer to this crate unambiguously
+   = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+   = note: for more information, see issue #114095 <https://github.com/rust-lang/rust/issues/114095>
    = note: `#[deny(ambiguous_glob_imports)]` (part of `#[deny(future_incompatible)]`) on by default
 

@@ -23,11 +23,13 @@ pub struct IntoIter<T, const N: usize> {
 
 impl<T, const N: usize> IntoIter<T, N> {
     #[inline]
-    fn unsize(&self) -> &InnerUnsized<T> {
+    #[rustc_const_unstable(feature = "const_iter", issue = "92476")]
+    const fn unsize(&self) -> &InnerUnsized<T> {
         self.inner.deref()
     }
     #[inline]
-    fn unsize_mut(&mut self) -> &mut InnerUnsized<T> {
+    #[rustc_const_unstable(feature = "const_iter", issue = "92476")]
+    const fn unsize_mut(&mut self) -> &mut InnerUnsized<T> {
         self.inner.deref_mut()
     }
 }
@@ -66,7 +68,7 @@ impl<T, const N: usize> IntoIterator for [T; N] {
         // FIXME: If normal `transmute` ever gets smart enough to allow this
         // directly, use it instead of `transmute_unchecked`.
         let data: [MaybeUninit<T>; N] = unsafe { transmute_unchecked(self) };
-        // SAFETY: The original array was entirely initialized and the the alive
+        // SAFETY: The original array was entirely initialized and the alive
         // range we're passing here represents that fact.
         let inner = unsafe { InnerSized::new_unchecked(IndexRange::zero_to(N), data) };
         IntoIter { inner: ManuallyDrop::new(inner) }
@@ -219,7 +221,8 @@ impl<T, const N: usize> IntoIter<T, N> {
     /// Returns a mutable slice of all elements that have not been yielded yet.
     #[stable(feature = "array_value_iter", since = "1.51.0")]
     #[inline]
-    pub fn as_mut_slice(&mut self) -> &mut [T] {
+    #[rustc_const_unstable(feature = "const_iter", issue = "92476")]
+    pub const fn as_mut_slice(&mut self) -> &mut [T] {
         self.unsize_mut().as_mut_slice()
     }
 }

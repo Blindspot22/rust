@@ -292,12 +292,13 @@ pub mod consts {
     pub const TAU: f64 = 6.28318530717958647692528676655900577_f64;
 
     /// The golden ratio (φ)
-    #[unstable(feature = "more_float_constants", issue = "146939")]
-    pub const PHI: f64 = 1.618033988749894848204586834365638118_f64;
+    #[doc(alias = "phi")]
+    #[stable(feature = "euler_gamma_golden_ratio", since = "1.94.0")]
+    pub const GOLDEN_RATIO: f64 = 1.618033988749894848204586834365638118_f64;
 
     /// The Euler-Mascheroni constant (γ)
-    #[unstable(feature = "more_float_constants", issue = "146939")]
-    pub const EGAMMA: f64 = 0.577215664901532860606512090082402431_f64;
+    #[stable(feature = "euler_gamma_golden_ratio", since = "1.94.0")]
+    pub const EULER_GAMMA: f64 = 0.577215664901532860606512090082402431_f64;
 
     /// π/2
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -356,6 +357,14 @@ pub mod consts {
     #[unstable(feature = "more_float_constants", issue = "146939")]
     pub const FRAC_1_SQRT_3: f64 = 0.577350269189625764509148780501957456_f64;
 
+    /// sqrt(5)
+    #[unstable(feature = "more_float_constants", issue = "146939")]
+    pub const SQRT_5: f64 = 2.23606797749978969640917366873127623_f64;
+
+    /// 1/sqrt(5)
+    #[unstable(feature = "more_float_constants", issue = "146939")]
+    pub const FRAC_1_SQRT_5: f64 = 0.44721359549995793928183473374625524_f64;
+
     /// Euler's number (e)
     #[stable(feature = "rust1", since = "1.0.0")]
     pub const E: f64 = 2.71828182845904523536028747135266250_f64;
@@ -385,10 +394,15 @@ pub mod consts {
     pub const LN_10: f64 = 2.30258509299404568401799145468436421_f64;
 }
 
+#[doc(test(attr(allow(unused_features))))]
 impl f64 {
     /// The radix or base of the internal representation of `f64`.
     #[stable(feature = "assoc_int_consts", since = "1.43.0")]
     pub const RADIX: u32 = 2;
+
+    /// The size of this float type in bits.
+    #[unstable(feature = "float_bits_const", issue = "151073")]
+    pub const BITS: u32 = 64;
 
     /// Number of significant digits in base 2.
     ///
@@ -500,14 +514,127 @@ impl f64 {
     #[stable(feature = "assoc_int_consts", since = "1.43.0")]
     pub const NEG_INFINITY: f64 = -1.0_f64 / 0.0_f64;
 
-    /// Sign bit
-    pub(crate) const SIGN_MASK: u64 = 0x8000_0000_0000_0000;
+    /// Maximum integer that can be represented exactly in an [`f64`] value,
+    /// with no other integer converting to the same floating point value.
+    ///
+    /// For an integer `x` which satisfies `MIN_EXACT_INTEGER <= x <= MAX_EXACT_INTEGER`,
+    /// there is a "one-to-one" mapping between [`i64`] and [`f64`] values.
+    /// `MAX_EXACT_INTEGER + 1` also converts losslessly to [`f64`] and back to
+    /// [`i64`], but `MAX_EXACT_INTEGER + 2` converts to the same [`f64`] value
+    /// (and back to `MAX_EXACT_INTEGER + 1` as an integer) so there is not a
+    /// "one-to-one" mapping.
+    ///
+    /// [`MAX_EXACT_INTEGER`]: f64::MAX_EXACT_INTEGER
+    /// [`MIN_EXACT_INTEGER`]: f64::MIN_EXACT_INTEGER
+    /// ```
+    /// #![feature(float_exact_integer_constants)]
+    /// # // FIXME(#152635): Float rounding on `i586` does not adhere to IEEE 754
+    /// # #[cfg(not(all(target_arch = "x86", not(target_feature = "sse"))))] {
+    /// let max_exact_int = f64::MAX_EXACT_INTEGER;
+    /// assert_eq!(max_exact_int, max_exact_int as f64 as i64);
+    /// assert_eq!(max_exact_int + 1, (max_exact_int + 1) as f64 as i64);
+    /// assert_ne!(max_exact_int + 2, (max_exact_int + 2) as f64 as i64);
+    ///
+    /// // Beyond `f64::MAX_EXACT_INTEGER`, multiple integers can map to one float value
+    /// assert_eq!((max_exact_int + 1) as f64, (max_exact_int + 2) as f64);
+    /// # }
+    /// ```
+    #[unstable(feature = "float_exact_integer_constants", issue = "152466")]
+    pub const MAX_EXACT_INTEGER: i64 = (1 << Self::MANTISSA_DIGITS) - 1;
 
-    /// Exponent mask
-    pub(crate) const EXP_MASK: u64 = 0x7ff0_0000_0000_0000;
+    /// Minimum integer that can be represented exactly in an [`f64`] value,
+    /// with no other integer converting to the same floating point value.
+    ///
+    /// For an integer `x` which satisfies `MIN_EXACT_INTEGER <= x <= MAX_EXACT_INTEGER`,
+    /// there is a "one-to-one" mapping between [`i64`] and [`f64`] values.
+    /// `MAX_EXACT_INTEGER + 1` also converts losslessly to [`f64`] and back to
+    /// [`i64`], but `MAX_EXACT_INTEGER + 2` converts to the same [`f64`] value
+    /// (and back to `MAX_EXACT_INTEGER + 1` as an integer) so there is not a
+    /// "one-to-one" mapping.
+    ///
+    /// This constant is equivalent to `-MAX_EXACT_INTEGER`.
+    ///
+    /// [`MAX_EXACT_INTEGER`]: f64::MAX_EXACT_INTEGER
+    /// [`MIN_EXACT_INTEGER`]: f64::MIN_EXACT_INTEGER
+    /// ```
+    /// #![feature(float_exact_integer_constants)]
+    /// # // FIXME(#152635): Float rounding on `i586` does not adhere to IEEE 754
+    /// # #[cfg(not(all(target_arch = "x86", not(target_feature = "sse"))))] {
+    /// let min_exact_int = f64::MIN_EXACT_INTEGER;
+    /// assert_eq!(min_exact_int, min_exact_int as f64 as i64);
+    /// assert_eq!(min_exact_int - 1, (min_exact_int - 1) as f64 as i64);
+    /// assert_ne!(min_exact_int - 2, (min_exact_int - 2) as f64 as i64);
+    ///
+    /// // Below `f64::MIN_EXACT_INTEGER`, multiple integers can map to one float value
+    /// assert_eq!((min_exact_int - 1) as f64, (min_exact_int - 2) as f64);
+    /// # }
+    /// ```
+    #[unstable(feature = "float_exact_integer_constants", issue = "152466")]
+    pub const MIN_EXACT_INTEGER: i64 = -Self::MAX_EXACT_INTEGER;
 
-    /// Mantissa mask
-    pub(crate) const MAN_MASK: u64 = 0x000f_ffff_ffff_ffff;
+    /// The mask of the bit used to encode the sign of an [`f64`].
+    ///
+    /// This bit is set when the sign is negative and unset when the sign is
+    /// positive.
+    /// If you only need to check whether a value is positive or negative,
+    /// [`is_sign_positive`] or [`is_sign_negative`] can be used.
+    ///
+    /// [`is_sign_positive`]: f64::is_sign_positive
+    /// [`is_sign_negative`]: f64::is_sign_negative
+    /// ```rust
+    /// #![feature(float_masks)]
+    /// let sign_mask = f64::SIGN_MASK;
+    /// let a = 1.6552f64;
+    /// let a_bits = a.to_bits();
+    ///
+    /// assert_eq!(a_bits & sign_mask, 0x0);
+    /// assert_eq!(f64::from_bits(a_bits ^ sign_mask), -a);
+    /// assert_eq!(sign_mask, (-0.0f64).to_bits());
+    /// ```
+    #[unstable(feature = "float_masks", issue = "154064")]
+    pub const SIGN_MASK: u64 = 0x8000_0000_0000_0000;
+
+    /// The mask of the bits used to encode the exponent of an [`f64`].
+    ///
+    /// Note that the exponent is stored as a biased value, with a bias of 1024 for `f64`.
+    ///
+    /// ```rust
+    /// #![feature(float_masks)]
+    /// fn get_exp(a: f64) -> i64 {
+    ///     let bias = 1023;
+    ///     let biased = a.to_bits() & f64::EXPONENT_MASK;
+    ///     (biased >> (f64::MANTISSA_DIGITS - 1)).cast_signed() - bias
+    /// }
+    ///
+    /// assert_eq!(get_exp(0.5), -1);
+    /// assert_eq!(get_exp(1.0), 0);
+    /// assert_eq!(get_exp(2.0), 1);
+    /// assert_eq!(get_exp(4.0), 2);
+    /// ```
+    #[unstable(feature = "float_masks", issue = "154064")]
+    pub const EXPONENT_MASK: u64 = 0x7ff0_0000_0000_0000;
+
+    /// The mask of the bits used to encode the mantissa of an [`f64`].
+    ///
+    /// ```rust
+    /// #![feature(float_masks)]
+    /// let mantissa_mask = f64::MANTISSA_MASK;
+    ///
+    /// assert_eq!(0f64.to_bits() & mantissa_mask, 0x0);
+    /// assert_eq!(1f64.to_bits() & mantissa_mask, 0x0);
+    ///
+    /// // multiplying a finite value by a power of 2 doesn't change its mantissa
+    /// // unless the result or initial value is not normal.
+    /// let a = 1.6552f64;
+    /// let b = 4.0 * a;
+    /// assert_eq!(a.to_bits() & mantissa_mask, b.to_bits() & mantissa_mask);
+    ///
+    /// // The maximum and minimum values have a saturated significand
+    /// assert_eq!(f64::MAX.to_bits() & f64::MANTISSA_MASK, f64::MANTISSA_MASK);
+    /// assert_eq!(f64::MIN.to_bits() & f64::MANTISSA_MASK, f64::MANTISSA_MASK);
+    /// ```
+    #[unstable(feature = "float_masks", issue = "154064")]
+    pub const MANTISSA_MASK: u64 = 0x000f_ffff_ffff_ffff;
 
     /// Minimum representable positive value (min subnormal)
     const TINY_BITS: u64 = 0x1;
@@ -651,6 +778,7 @@ impl f64 {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_const_stable(feature = "const_float_classify", since = "1.83.0")]
+    #[must_use]
     pub const fn classify(self) -> FpCategory {
         // We used to have complicated logic here that avoids the simple bit-based tests to work
         // around buggy codegen for x87 targets (see
@@ -658,9 +786,9 @@ impl f64 {
         // of our tests is able to find any difference between the complicated and the naive
         // version, so now we are back to the naive version.
         let b = self.to_bits();
-        match (b & Self::MAN_MASK, b & Self::EXP_MASK) {
-            (0, Self::EXP_MASK) => FpCategory::Infinite,
-            (_, Self::EXP_MASK) => FpCategory::Nan,
+        match (b & Self::MANTISSA_MASK, b & Self::EXPONENT_MASK) {
+            (0, Self::EXPONENT_MASK) => FpCategory::Infinite,
+            (_, Self::EXPONENT_MASK) => FpCategory::Nan,
             (0, 0) => FpCategory::Zero,
             (_, 0) => FpCategory::Subnormal,
             _ => FpCategory::Normal,
@@ -692,15 +820,6 @@ impl f64 {
         !self.is_sign_negative()
     }
 
-    #[must_use]
-    #[stable(feature = "rust1", since = "1.0.0")]
-    #[deprecated(since = "1.0.0", note = "renamed to is_sign_positive")]
-    #[inline]
-    #[doc(hidden)]
-    pub fn is_positive(self) -> bool {
-        self.is_sign_positive()
-    }
-
     /// Returns `true` if `self` has a negative sign, including `-0.0`, NaNs with
     /// negative sign bit and negative infinity.
     ///
@@ -726,15 +845,6 @@ impl f64 {
         // IEEE754 says: isSignMinus(x) is true if and only if x has negative sign. isSignMinus
         // applies to zeros and NaNs as well.
         self.to_bits() & Self::SIGN_MASK != 0
-    }
-
-    #[must_use]
-    #[stable(feature = "rust1", since = "1.0.0")]
-    #[deprecated(since = "1.0.0", note = "renamed to is_sign_negative")]
-    #[inline]
-    #[doc(hidden)]
-    pub fn is_negative(self) -> bool {
-        self.is_sign_negative()
     }
 
     /// Returns the least number greater than `self`.
@@ -768,6 +878,7 @@ impl f64 {
     #[doc(alias = "nextUp")]
     #[stable(feature = "float_next_up_down", since = "1.86.0")]
     #[rustc_const_stable(feature = "float_next_up_down", since = "1.86.0")]
+    #[must_use = "method returns a new number and does not mutate the original value"]
     pub const fn next_up(self) -> Self {
         // Some targets violate Rust's assumption of IEEE semantics, e.g. by flushing
         // denormals to zero. This is in general unsound and unsupported, but here
@@ -819,6 +930,7 @@ impl f64 {
     #[doc(alias = "nextDown")]
     #[stable(feature = "float_next_up_down", since = "1.86.0")]
     #[rustc_const_stable(feature = "float_next_up_down", since = "1.86.0")]
+    #[must_use = "method returns a new number and does not mutate the original value"]
     pub const fn next_down(self) -> Self {
         // Some targets violate Rust's assumption of IEEE semantics, e.g. by flushing
         // denormals to zero. This is in general unsound and unsupported, but here
@@ -937,7 +1049,7 @@ impl f64 {
     #[rustc_const_stable(feature = "const_float_methods", since = "1.85.0")]
     #[inline]
     pub const fn max(self, other: f64) -> f64 {
-        intrinsics::maxnumf64(self, other)
+        intrinsics::maximum_number_nsz_f64(self, other)
     }
 
     /// Returns the minimum of the two numbers, ignoring NaN.
@@ -964,7 +1076,7 @@ impl f64 {
     #[rustc_const_stable(feature = "const_float_methods", since = "1.85.0")]
     #[inline]
     pub const fn min(self, other: f64) -> f64 {
-        intrinsics::minnumf64(self, other)
+        intrinsics::minimum_number_nsz_f64(self, other)
     }
 
     /// Returns the maximum of the two numbers, propagating NaN.
@@ -1036,8 +1148,10 @@ impl f64 {
     #[doc(alias = "average")]
     #[stable(feature = "num_midpoint", since = "1.85.0")]
     #[rustc_const_stable(feature = "num_midpoint", since = "1.85.0")]
+    #[must_use = "this returns the result of the operation, \
+                  without modifying the original"]
     pub const fn midpoint(self, other: f64) -> f64 {
-        const HI: f64 = f64::MAX / 2.;
+        const HI: f64 = f64::MAX * 0.5;
 
         let (a, b) = (self, other);
         let abs_a = a.abs();
@@ -1045,9 +1159,9 @@ impl f64 {
 
         if abs_a <= HI && abs_b <= HI {
             // Overflow is impossible
-            (a + b) / 2.
+            (a + b) * 0.5
         } else {
-            (a / 2.) + (b / 2.)
+            (a * 0.5) + (b * 0.5)
         }
     }
 
@@ -1495,7 +1609,7 @@ impl f64 {
     #[rustc_const_stable(feature = "const_float_methods", since = "1.85.0")]
     #[inline]
     pub const fn abs(self) -> f64 {
-        intrinsics::fabsf64(self)
+        intrinsics::fabs(self)
     }
 
     /// Returns a number that represents the sign of `self`.
@@ -1560,8 +1674,8 @@ impl f64 {
     ///
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
-    #[unstable(feature = "float_algebraic", issue = "136469")]
-    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
+    #[stable(feature = "float_algebraic", since = "CURRENT_RUSTC_VERSION")]
+    #[rustc_const_stable(feature = "float_algebraic", since = "CURRENT_RUSTC_VERSION")]
     #[inline]
     pub const fn algebraic_add(self, rhs: f64) -> f64 {
         intrinsics::fadd_algebraic(self, rhs)
@@ -1571,8 +1685,8 @@ impl f64 {
     ///
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
-    #[unstable(feature = "float_algebraic", issue = "136469")]
-    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
+    #[stable(feature = "float_algebraic", since = "CURRENT_RUSTC_VERSION")]
+    #[rustc_const_stable(feature = "float_algebraic", since = "CURRENT_RUSTC_VERSION")]
     #[inline]
     pub const fn algebraic_sub(self, rhs: f64) -> f64 {
         intrinsics::fsub_algebraic(self, rhs)
@@ -1582,8 +1696,8 @@ impl f64 {
     ///
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
-    #[unstable(feature = "float_algebraic", issue = "136469")]
-    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
+    #[stable(feature = "float_algebraic", since = "CURRENT_RUSTC_VERSION")]
+    #[rustc_const_stable(feature = "float_algebraic", since = "CURRENT_RUSTC_VERSION")]
     #[inline]
     pub const fn algebraic_mul(self, rhs: f64) -> f64 {
         intrinsics::fmul_algebraic(self, rhs)
@@ -1593,8 +1707,8 @@ impl f64 {
     ///
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
-    #[unstable(feature = "float_algebraic", issue = "136469")]
-    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
+    #[stable(feature = "float_algebraic", since = "CURRENT_RUSTC_VERSION")]
+    #[rustc_const_stable(feature = "float_algebraic", since = "CURRENT_RUSTC_VERSION")]
     #[inline]
     pub const fn algebraic_div(self, rhs: f64) -> f64 {
         intrinsics::fdiv_algebraic(self, rhs)
@@ -1604,8 +1718,8 @@ impl f64 {
     ///
     /// See [algebraic operators](primitive@f32#algebraic-operators) for more info.
     #[must_use = "method returns a new number and does not mutate the original value"]
-    #[unstable(feature = "float_algebraic", issue = "136469")]
-    #[rustc_const_unstable(feature = "float_algebraic", issue = "136469")]
+    #[stable(feature = "float_algebraic", since = "CURRENT_RUSTC_VERSION")]
+    #[rustc_const_stable(feature = "float_algebraic", since = "CURRENT_RUSTC_VERSION")]
     #[inline]
     pub const fn algebraic_rem(self, rhs: f64) -> f64 {
         intrinsics::frem_algebraic(self, rhs)
@@ -1619,7 +1733,7 @@ impl f64 {
 /// They will be stabilized as inherent methods._
 pub mod math {
     use crate::intrinsics;
-    use crate::num::libm;
+    use crate::num::imp::libm;
 
     /// Experimental version of `floor` in `core`. See [`f64::floor`] for details.
     ///
@@ -1807,6 +1921,7 @@ pub mod math {
     /// # Examples
     ///
     /// ```
+    /// # #![allow(unused_features)]
     /// #![feature(core_float_math)]
     ///
     /// # // FIXME(#140515): mingw has an incorrect fma

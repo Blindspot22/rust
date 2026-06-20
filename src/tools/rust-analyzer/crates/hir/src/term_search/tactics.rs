@@ -10,19 +10,13 @@
 
 use std::iter;
 
-use hir_ty::{
-    db::HirDatabase,
-    mir::BorrowKind,
-    next_solver::{DbInterner, Ty},
-};
+use hir_ty::{db::HirDatabase, mir::BorrowKind};
 use itertools::Itertools;
 use rustc_hash::FxHashSet;
-use rustc_type_ir::inherent::Ty as _;
-use span::Edition;
 
 use crate::{
-    Adt, AssocItem, GenericDef, GenericParam, HasAttrs, HasVisibility, Impl, ModuleDef, ScopeDef,
-    Type, TypeParam, term_search::Expr,
+    Adt, AssocItem, BuiltinType, GenericDef, GenericParam, HasAttrs, HasVisibility, Impl,
+    ModuleDef, ScopeDef, Type, TypeParam, term_search::Expr,
 };
 
 use super::{LookupTable, NewTypesKey, TermSearchCtx};
@@ -42,7 +36,7 @@ use super::{LookupTable, NewTypesKey, TermSearchCtx};
 /// _Note that there is no use of calling this tactic in every iteration as the output does not
 /// depend on the current state of `lookup`_
 pub(super) fn trivial<'a, 'lt, 'db, DB: HirDatabase>(
-    ctx: &'a TermSearchCtx<'db, DB>,
+    ctx: &'a TermSearchCtx<'_, 'db, DB>,
     defs: &'a FxHashSet<ScopeDef>,
     lookup: &'lt mut LookupTable<'db>,
 ) -> impl Iterator<Item = Expr<'db>> + use<'a, 'db, 'lt, DB> {
@@ -54,14 +48,15 @@ pub(super) fn trivial<'a, 'lt, 'db, DB: HirDatabase>(
             ScopeDef::GenericParam(GenericParam::ConstParam(it)) => Some(Expr::ConstParam(*it)),
             ScopeDef::Local(it) => {
                 if ctx.config.enable_borrowcheck {
-                    let borrowck = db.borrowck(it.parent).ok()?;
+                    let borrowck = db.borrowck(it.parent_infer).ok()?;
 
                     let invalid = borrowck.iter().any(|b| {
+                        let mir_body = b.mir_body(ctx.sema.db);
                         b.partially_moved.iter().any(|moved| {
-                            Some(&moved.local) == b.mir_body.binding_locals.get(it.binding_id)
+                            Some(&moved.local) == mir_body.binding_locals.get(it.binding_id)
                         }) || b.borrow_regions.iter().any(|region| {
                             // Shared borrows are fine
-                            Some(&region.local) == b.mir_body.binding_locals.get(it.binding_id)
+                            Some(&region.local) == mir_body.binding_locals.get(it.binding_id)
                                 && region.kind != BorrowKind::Shared
                         })
                     });
@@ -87,7 +82,7 @@ pub(super) fn trivial<'a, 'lt, 'db, DB: HirDatabase>(
             return None;
         }
 
-        ty.could_unify_with_deeply(db, &ctx.goal).then_some(expr)
+        ty.instantiate_with_errors().could_unify_with_deeply(db, &ctx.goal).then_some(expr)
     })
 }
 
@@ -106,7 +101,7 @@ pub(super) fn trivial<'a, 'lt, 'db, DB: HirDatabase>(
 /// _Note that there is no use of calling this tactic in every iteration as the output does not
 /// depend on the current state of `lookup`_
 pub(super) fn assoc_const<'a, 'lt, 'db, DB: HirDatabase>(
-    ctx: &'a TermSearchCtx<'db, DB>,
+    ctx: &'a TermSearchCtx<'_, 'db, DB>,
     defs: &'a FxHashSet<ScopeDef>,
     lookup: &'lt mut LookupTable<'db>,
 ) -> impl Iterator<Item = Expr<'db>> + use<'a, 'db, 'lt, DB> {
@@ -137,7 +132,7 @@ pub(super) fn assoc_const<'a, 'lt, 'db, DB: HirDatabase>(
 
             lookup.insert(ty.clone(), std::iter::once(expr.clone()));
 
-            ty.could_unify_with_deeply(db, &ctx.goal).then_some(expr)
+            ty.instantiate_with_errors().could_unify_with_deeply(db, &ctx.goal).then_some(expr)
         })
 }
 
@@ -154,7 +149,7 @@ pub(super) fn assoc_const<'a, 'lt, 'db, DB: HirDatabase>(
 /// * `lookup` - Lookup table for types
 /// * `should_continue` - Function that indicates when to stop iterating
 pub(super) fn data_constructor<'a, 'lt, 'db, DB: HirDatabase>(
-    ctx: &'a TermSearchCtx<'db, DB>,
+    ctx: &'a TermSearchCtx<'_, 'db, DB>,
     _defs: &'a FxHashSet<ScopeDef>,
     lookup: &'lt mut LookupTable<'db>,
     should_continue: &'a dyn std::ops::Fn() -> bool,
@@ -202,7 +197,9 @@ pub(super) fn data_constructor<'a, 'lt, 'db, DB: HirDatabase>(
                 // Early exit if some param cannot be filled from lookup
                 let param_exprs: Vec<Vec<Expr<'_>>> = fields
                     .into_iter()
-                    .map(|field| lookup.find(db, &field.ty_with_args(db, generics.iter().cloned())))
+                    .map(|field| {
+                        lookup.find(db, &field.ty(db).instantiate(generics.iter().cloned()))
+                    })
                     .collect::<Option<_>>()?;
 
                 // Note that we need special case for 0 param constructors because of multi cartesian
@@ -252,7 +249,7 @@ pub(super) fn data_constructor<'a, 'lt, 'db, DB: HirDatabase>(
                             .fields(db)
                             .into_iter()
                             .map(|field| {
-                                lookup.find(db, &field.ty_with_args(db, generics.iter().cloned()))
+                                lookup.find(db, &field.ty(db).instantiate(generics.iter().cloned()))
                             })
                             .collect::<Option<_>>()?;
 
@@ -285,7 +282,9 @@ pub(super) fn data_constructor<'a, 'lt, 'db, DB: HirDatabase>(
             }
             Adt::Union(_) => None,
         })
-        .filter_map(|(ty, exprs)| ty.could_unify_with_deeply(db, &ctx.goal).then_some(exprs))
+        .filter_map(|(ty, exprs)| {
+            ty.instantiate_with_errors().could_unify_with_deeply(db, &ctx.goal).then_some(exprs)
+        })
         .flatten()
 }
 
@@ -303,7 +302,7 @@ pub(super) fn data_constructor<'a, 'lt, 'db, DB: HirDatabase>(
 /// * `lookup` - Lookup table for types
 /// * `should_continue` - Function that indicates when to stop iterating
 pub(super) fn free_function<'a, 'lt, 'db, DB: HirDatabase>(
-    ctx: &'a TermSearchCtx<'db, DB>,
+    ctx: &'a TermSearchCtx<'_, 'db, DB>,
     defs: &'a FxHashSet<ScopeDef>,
     lookup: &'lt mut LookupTable<'db>,
     should_continue: &'a dyn std::ops::Fn() -> bool,
@@ -364,10 +363,14 @@ pub(super) fn free_function<'a, 'lt, 'db, DB: HirDatabase>(
                             })
                             .collect::<Option<_>>()?;
 
-                        let ret_ty = it.ret_type_with_args(db, generics.iter().cloned());
+                        let ret_ty = it.ret_type(db).instantiate(generics.iter().cloned());
                         // Filter out private and unsafe functions
                         if !it.is_visible_from(db, module)
-                            || it.is_unsafe_to_call(db, None, Edition::CURRENT_FIXME)
+                            || it.is_unsafe_to_call(
+                                db,
+                                None,
+                                crate::Crate::from(ctx.scope.resolver().krate()).edition(db),
+                            )
                             || it.is_unstable(db)
                             || ctx.config.enable_borrowcheck && ret_ty.contains_reference(db)
                             || ret_ty.is_raw_ptr()
@@ -377,10 +380,10 @@ pub(super) fn free_function<'a, 'lt, 'db, DB: HirDatabase>(
 
                         // Early exit if some param cannot be filled from lookup
                         let param_exprs: Vec<Vec<Expr<'_>>> = it
-                            .params_without_self_with_args(db, generics.iter().cloned())
+                            .params_without_self(db)
                             .into_iter()
                             .map(|field| {
-                                let ty = field.ty();
+                                let ty = &field.ty().instantiate(&generics);
                                 match ty.is_mutable_reference() {
                                     true => None,
                                     false => lookup.find_autoref(db, ty),
@@ -414,7 +417,9 @@ pub(super) fn free_function<'a, 'lt, 'db, DB: HirDatabase>(
             _ => None,
         })
         .flatten()
-        .filter_map(|(ty, exprs)| ty.could_unify_with_deeply(db, &ctx.goal).then_some(exprs))
+        .filter_map(|(ty, exprs)| {
+            ty.instantiate_with_errors().could_unify_with_deeply(db, &ctx.goal).then_some(exprs)
+        })
         .flatten()
 }
 
@@ -434,7 +439,7 @@ pub(super) fn free_function<'a, 'lt, 'db, DB: HirDatabase>(
 /// * `lookup` - Lookup table for types
 /// * `should_continue` - Function that indicates when to stop iterating
 pub(super) fn impl_method<'a, 'lt, 'db, DB: HirDatabase>(
-    ctx: &'a TermSearchCtx<'db, DB>,
+    ctx: &'a TermSearchCtx<'_, 'db, DB>,
     _defs: &'a FxHashSet<ScopeDef>,
     lookup: &'lt mut LookupTable<'db>,
     should_continue: &'a dyn std::ops::Fn() -> bool,
@@ -473,7 +478,11 @@ pub(super) fn impl_method<'a, 'lt, 'db, DB: HirDatabase>(
 
             // Filter out private and unsafe functions
             if !it.is_visible_from(db, module)
-                || it.is_unsafe_to_call(db, None, Edition::CURRENT_FIXME)
+                || it.is_unsafe_to_call(
+                    db,
+                    None,
+                    crate::Crate::from(ctx.scope.resolver().krate()).edition(db),
+                )
                 || it.is_unstable(db)
             {
                 return None;
@@ -485,7 +494,7 @@ pub(super) fn impl_method<'a, 'lt, 'db, DB: HirDatabase>(
                 return None;
             }
 
-            let ret_ty = it.ret_type_with_args(db, ty.type_arguments());
+            let ret_ty = it.ret_type(db).instantiate(ty.type_arguments());
             // Filter out functions that return references
             if ctx.config.enable_borrowcheck && ret_ty.contains_reference(db) || ret_ty.is_raw_ptr()
             {
@@ -493,12 +502,12 @@ pub(super) fn impl_method<'a, 'lt, 'db, DB: HirDatabase>(
             }
 
             // Ignore functions that do not change the type
-            if ty.could_unify_with_deeply(db, &ret_ty) {
+            if ty.instantiate_with_errors().could_unify_with_deeply(db, &ret_ty) {
                 return None;
             }
 
             let self_ty =
-                it.self_param(db).expect("No self param").ty_with_args(db, ty.type_arguments());
+                it.self_param(db).expect("No self param").ty(db).instantiate(ty.type_arguments());
 
             // Ignore functions that have different self type
             if !self_ty.autoderef(db).any(|s_ty| ty == s_ty) {
@@ -509,9 +518,9 @@ pub(super) fn impl_method<'a, 'lt, 'db, DB: HirDatabase>(
 
             // Early exit if some param cannot be filled from lookup
             let param_exprs: Vec<Vec<Expr<'_>>> = it
-                .params_without_self_with_args(db, ty.type_arguments())
+                .params_without_self(db)
                 .into_iter()
-                .map(|field| lookup.find_autoref(db, field.ty()))
+                .map(|field| lookup.find_autoref(db, &field.ty().instantiate(ty.type_arguments())))
                 .collect::<Option<_>>()?;
 
             let generics: Vec<_> = ty.type_arguments().collect();
@@ -532,7 +541,9 @@ pub(super) fn impl_method<'a, 'lt, 'db, DB: HirDatabase>(
 
             Some((ret_ty, fn_exprs))
         })
-        .filter_map(|(ty, exprs)| ty.could_unify_with_deeply(db, &ctx.goal).then_some(exprs))
+        .filter_map(|(ty, exprs)| {
+            ty.instantiate_with_errors().could_unify_with_deeply(db, &ctx.goal).then_some(exprs)
+        })
         .flatten()
 }
 
@@ -549,7 +560,7 @@ pub(super) fn impl_method<'a, 'lt, 'db, DB: HirDatabase>(
 /// * `lookup` - Lookup table for types
 /// * `should_continue` - Function that indicates when to stop iterating
 pub(super) fn struct_projection<'a, 'lt, 'db, DB: HirDatabase>(
-    ctx: &'a TermSearchCtx<'db, DB>,
+    ctx: &'a TermSearchCtx<'_, 'db, DB>,
     _defs: &'a FxHashSet<ScopeDef>,
     lookup: &'lt mut LookupTable<'db>,
     should_continue: &'a dyn std::ops::Fn() -> bool,
@@ -573,7 +584,9 @@ pub(super) fn struct_projection<'a, 'lt, 'db, DB: HirDatabase>(
                 Some((filed_ty, exprs))
             })
         })
-        .filter_map(|(ty, exprs)| ty.could_unify_with_deeply(db, &ctx.goal).then_some(exprs))
+        .filter_map(|(ty, exprs)| {
+            ty.instantiate_with_errors().could_unify_with_deeply(db, &ctx.goal).then_some(exprs)
+        })
         .flatten()
 }
 
@@ -591,25 +604,23 @@ pub(super) fn struct_projection<'a, 'lt, 'db, DB: HirDatabase>(
 /// * `defs` - Set of items in scope at term search target location
 /// * `lookup` - Lookup table for types
 pub(super) fn famous_types<'a, 'lt, 'db, DB: HirDatabase>(
-    ctx: &'a TermSearchCtx<'db, DB>,
+    ctx: &'a TermSearchCtx<'_, 'db, DB>,
     _defs: &'a FxHashSet<ScopeDef>,
     lookup: &'lt mut LookupTable<'db>,
 ) -> impl Iterator<Item = Expr<'db>> + use<'a, 'db, 'lt, DB> {
     let db = ctx.sema.db;
-    let module = ctx.scope.module();
-    let interner = DbInterner::new_no_crate(db);
-    let bool_ty = Ty::new_bool(interner);
-    let unit_ty = Ty::new_unit(interner);
+    let bool_ty = BuiltinType::bool().ty(db);
+    let unit_ty = Type::new_unit();
     [
-        Expr::FamousType { ty: Type::new(db, module.id, bool_ty), value: "true" },
-        Expr::FamousType { ty: Type::new(db, module.id, bool_ty), value: "false" },
-        Expr::FamousType { ty: Type::new(db, module.id, unit_ty), value: "()" },
+        Expr::FamousType { ty: bool_ty.clone(), value: "true" },
+        Expr::FamousType { ty: bool_ty, value: "false" },
+        Expr::FamousType { ty: unit_ty, value: "()" },
     ]
     .into_iter()
     .inspect(|exprs| {
         lookup.insert(exprs.ty(db), std::iter::once(exprs.clone()));
     })
-    .filter(|expr| expr.ty(db).could_unify_with_deeply(db, &ctx.goal))
+    .filter(|expr| expr.ty(db).instantiate_with_errors().could_unify_with_deeply(db, &ctx.goal))
 }
 
 /// # Impl static method (without self type) tactic
@@ -625,7 +636,7 @@ pub(super) fn famous_types<'a, 'lt, 'db, DB: HirDatabase>(
 /// * `lookup` - Lookup table for types
 /// * `should_continue` - Function that indicates when to stop iterating
 pub(super) fn impl_static_method<'a, 'lt, 'db, DB: HirDatabase>(
-    ctx: &'a TermSearchCtx<'db, DB>,
+    ctx: &'a TermSearchCtx<'_, 'db, DB>,
     _defs: &'a FxHashSet<ScopeDef>,
     lookup: &'lt mut LookupTable<'db>,
     should_continue: &'a dyn std::ops::Fn() -> bool,
@@ -667,7 +678,11 @@ pub(super) fn impl_static_method<'a, 'lt, 'db, DB: HirDatabase>(
 
             // Filter out private and unsafe functions
             if !it.is_visible_from(db, module)
-                || it.is_unsafe_to_call(db, None, Edition::CURRENT_FIXME)
+                || it.is_unsafe_to_call(
+                    db,
+                    None,
+                    crate::Crate::from(ctx.scope.resolver().krate()).edition(db),
+                )
                 || it.is_unstable(db)
             {
                 return None;
@@ -679,7 +694,7 @@ pub(super) fn impl_static_method<'a, 'lt, 'db, DB: HirDatabase>(
                 return None;
             }
 
-            let ret_ty = it.ret_type_with_args(db, ty.type_arguments());
+            let ret_ty = it.ret_type(db).instantiate(ty.type_arguments());
             // Filter out functions that return references
             if ctx.config.enable_borrowcheck && ret_ty.contains_reference(db) || ret_ty.is_raw_ptr()
             {
@@ -688,9 +703,9 @@ pub(super) fn impl_static_method<'a, 'lt, 'db, DB: HirDatabase>(
 
             // Early exit if some param cannot be filled from lookup
             let param_exprs: Vec<Vec<Expr<'_>>> = it
-                .params_without_self_with_args(db, ty.type_arguments())
+                .params_without_self(db)
                 .into_iter()
-                .map(|field| lookup.find_autoref(db, field.ty()))
+                .map(|field| lookup.find_autoref(db, &field.ty().instantiate(ty.type_arguments())))
                 .collect::<Option<_>>()?;
 
             // Note that we need special case for 0 param constructors because of multi cartesian
@@ -710,7 +725,9 @@ pub(super) fn impl_static_method<'a, 'lt, 'db, DB: HirDatabase>(
 
             Some((ret_ty, fn_exprs))
         })
-        .filter_map(|(ty, exprs)| ty.could_unify_with_deeply(db, &ctx.goal).then_some(exprs))
+        .filter_map(|(ty, exprs)| {
+            ty.instantiate_with_errors().could_unify_with_deeply(db, &ctx.goal).then_some(exprs)
+        })
         .flatten()
 }
 
@@ -727,13 +744,12 @@ pub(super) fn impl_static_method<'a, 'lt, 'db, DB: HirDatabase>(
 /// * `lookup` - Lookup table for types
 /// * `should_continue` - Function that indicates when to stop iterating
 pub(super) fn make_tuple<'a, 'lt, 'db, DB: HirDatabase>(
-    ctx: &'a TermSearchCtx<'db, DB>,
+    ctx: &'a TermSearchCtx<'_, 'db, DB>,
     _defs: &'a FxHashSet<ScopeDef>,
     lookup: &'lt mut LookupTable<'db>,
     should_continue: &'a dyn std::ops::Fn() -> bool,
 ) -> impl Iterator<Item = Expr<'db>> + use<'a, 'db, 'lt, DB> {
     let db = ctx.sema.db;
-    let module = ctx.scope.module();
 
     lookup
         .types_wishlist()
@@ -762,7 +778,7 @@ pub(super) fn make_tuple<'a, 'lt, 'db, DB: HirDatabase>(
                 .filter(|_| should_continue())
                 .map(|params| {
                     let tys: Vec<Type<'_>> = params.iter().map(|it| it.ty(db)).collect();
-                    let tuple_ty = Type::new_tuple(module.krate(db).into(), &tys);
+                    let tuple_ty = Type::new_tuple(db, &tys);
 
                     let expr = Expr::Tuple { ty: tuple_ty.clone(), params };
                     lookup.insert(tuple_ty, iter::once(expr.clone()));
@@ -773,5 +789,10 @@ pub(super) fn make_tuple<'a, 'lt, 'db, DB: HirDatabase>(
             Some(exprs)
         })
         .flatten()
-        .filter_map(|expr| expr.ty(db).could_unify_with_deeply(db, &ctx.goal).then_some(expr))
+        .filter_map(|expr| {
+            expr.ty(db)
+                .instantiate_with_errors()
+                .could_unify_with_deeply(db, &ctx.goal)
+                .then_some(expr)
+        })
 }

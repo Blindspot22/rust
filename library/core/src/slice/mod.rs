@@ -52,7 +52,7 @@ pub use ascii::is_ascii_simple;
 pub use index::SliceIndex;
 #[unstable(feature = "slice_range", issue = "76393")]
 pub use index::{range, try_range};
-#[stable(feature = "array_windows", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "array_windows", since = "1.94.0")]
 pub use iter::ArrayWindows;
 #[stable(feature = "slice_group_by", since = "1.77.0")]
 pub use iter::{ChunkBy, ChunkByMut};
@@ -596,6 +596,7 @@ impl<T> [T] {
     #[inline]
     #[must_use]
     #[rustc_const_unstable(feature = "const_index", issue = "143775")]
+    #[rustc_no_writable]
     pub const fn get_mut<I>(&mut self, index: I) -> Option<&mut I::Output>
     where
         I: [const] SliceIndex<Self>,
@@ -681,6 +682,7 @@ impl<T> [T] {
     #[must_use]
     #[track_caller]
     #[rustc_const_unstable(feature = "const_index", issue = "143775")]
+    #[rustc_no_writable]
     pub const unsafe fn get_unchecked_mut<I>(&mut self, index: I) -> &mut I::Output
     where
         I: [const] SliceIndex<Self>,
@@ -754,6 +756,7 @@ impl<T> [T] {
     #[rustc_as_ptr]
     #[inline(always)]
     #[must_use]
+    #[rustc_no_writable]
     pub const fn as_mut_ptr(&mut self) -> *mut T {
         self as *mut [T] as *mut T
     }
@@ -1639,7 +1642,7 @@ impl<T> [T] {
     /// ```
     ///
     /// [`windows`]: slice::windows
-    #[stable(feature = "array_windows", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "array_windows", since = "1.94.0")]
     #[rustc_const_unstable(feature = "const_slice_make_iter", issue = "137737")]
     #[inline]
     #[track_caller]
@@ -2520,7 +2523,7 @@ impl<T> [T] {
     /// )));
     /// assert_eq!(s.split_once(|&x| x == 0), None);
     /// ```
-    #[unstable(feature = "slice_split_once", reason = "newly added", issue = "112811")]
+    #[unstable(feature = "slice_split_once", issue = "112811")]
     #[inline]
     pub fn split_once<F>(&self, pred: F) -> Option<(&[T], &[T])>
     where
@@ -2548,7 +2551,7 @@ impl<T> [T] {
     /// )));
     /// assert_eq!(s.rsplit_once(|&x| x == 0), None);
     /// ```
-    #[unstable(feature = "slice_split_once", reason = "newly added", issue = "112811")]
+    #[unstable(feature = "slice_split_once", issue = "112811")]
     #[inline]
     pub fn rsplit_once<F>(&self, pred: F) -> Option<(&[T], &[T])>
     where
@@ -2741,8 +2744,6 @@ impl<T> [T] {
     /// # Examples
     ///
     /// ```
-    /// #![feature(strip_circumfix)]
-    ///
     /// let v = &[10, 50, 40, 30];
     /// assert_eq!(v.strip_circumfix(&[10], &[30]), Some(&[50, 40][..]));
     /// assert_eq!(v.strip_circumfix(&[10], &[40, 30]), Some(&[50][..]));
@@ -2753,7 +2754,7 @@ impl<T> [T] {
     /// assert_eq!(v.strip_circumfix(&[10, 50], &[]), Some(&[40, 30][..]));
     /// ```
     #[must_use = "returns the subslice without modifying the original"]
-    #[unstable(feature = "strip_circumfix", issue = "147946")]
+    #[stable(feature = "strip_circumfix", since = "CURRENT_RUSTC_VERSION")]
     pub fn strip_circumfix<S, P>(&self, prefix: &P, suffix: &S) -> Option<&[T]>
     where
         T: PartialEq,
@@ -3939,6 +3940,219 @@ impl<T> [T] {
         }
     }
 
+    /// Moves the elements of this slice `N` places to the left, returning the ones
+    /// that "fall off" the front, and putting `inserted` at the end.
+    ///
+    /// Equivalently, you can think of concatenating `self` and `inserted` into one
+    /// long sequence, then returning the left-most `N` items and the rest into `self`:
+    ///
+    /// ```text
+    ///           self (before)    inserted
+    ///           vvvvvvvvvvvvvvv  vvv
+    ///           [1, 2, 3, 4, 5]  [9]
+    ///        ↙   ↙  ↙  ↙  ↙   ↙
+    ///      [1]  [2, 3, 4, 5, 9]
+    ///      ^^^  ^^^^^^^^^^^^^^^
+    /// returned  self (after)
+    /// ```
+    ///
+    /// See also [`Self::shift_right`] and compare [`Self::rotate_left`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(slice_shift)]
+    ///
+    /// // Same as the diagram above
+    /// let mut a = [1, 2, 3, 4, 5];
+    /// let inserted = [9];
+    /// let returned = a.shift_left(inserted);
+    /// assert_eq!(returned, [1]);
+    /// assert_eq!(a, [2, 3, 4, 5, 9]);
+    ///
+    /// // You can shift multiple items at a time
+    /// let mut a = *b"Hello world";
+    /// assert_eq!(a.shift_left(*b" peace"), *b"Hello ");
+    /// assert_eq!(a, *b"world peace");
+    ///
+    /// // The name comes from this operation's similarity to bitshifts
+    /// let mut a: u8 = 0b10010110;
+    /// a <<= 3;
+    /// assert_eq!(a, 0b10110000_u8);
+    /// let mut a: [_; 8] = [1, 0, 0, 1, 0, 1, 1, 0];
+    /// a.shift_left([0; 3]);
+    /// assert_eq!(a, [1, 0, 1, 1, 0, 0, 0, 0]);
+    ///
+    /// // Remember you can sub-slice to affect less that the whole slice.
+    /// // For example, this is similar to `.remove(1)` + `.insert(4, 'Z')`
+    /// let mut a = ['a', 'b', 'c', 'd', 'e', 'f'];
+    /// assert_eq!(a[1..=4].shift_left(['Z']), ['b']);
+    /// assert_eq!(a, ['a', 'c', 'd', 'e', 'Z', 'f']);
+    ///
+    /// // If the size matches it's equivalent to `mem::replace`
+    /// let mut a = [1, 2, 3];
+    /// assert_eq!(a.shift_left([7, 8, 9]), [1, 2, 3]);
+    /// assert_eq!(a, [7, 8, 9]);
+    ///
+    /// // Some of the "inserted" elements end up returned if the slice is too short
+    /// let mut a = [];
+    /// assert_eq!(a.shift_left([1, 2, 3]), [1, 2, 3]);
+    /// let mut a = [9];
+    /// assert_eq!(a.shift_left([1, 2, 3]), [9, 1, 2]);
+    /// assert_eq!(a, [3]);
+    /// ```
+    #[unstable(feature = "slice_shift", issue = "151772")]
+    pub const fn shift_left<const N: usize>(&mut self, inserted: [T; N]) -> [T; N] {
+        if let Some(shift) = self.len().checked_sub(N) {
+            // SAFETY: Having just checked that the inserted/returned arrays are
+            // shorter than (or the same length as) the slice:
+            // 1. The read for the items to return is in-bounds
+            // 2. We can `memmove` the slice over to cover the items we're returning
+            //    to ensure those aren't double-dropped
+            // 3. Then we write (in-bounds for the same reason as the read) the
+            //    inserted items atop the items of the slice that we just duplicated
+            //
+            // And none of this can panic, so there's no risk of intermediate unwinds.
+            unsafe {
+                let ptr = self.as_mut_ptr();
+                let returned = ptr.cast_array::<N>().read();
+                ptr.copy_from(ptr.add(N), shift);
+                ptr.add(shift).cast_array::<N>().write(inserted);
+                returned
+            }
+        } else {
+            // SAFETY: Having checked that the slice is strictly shorter than the
+            // inserted/returned arrays, it means we'll be copying the whole slice
+            // into the returned array, but that's not enough on its own.  We also
+            // need to copy some of the inserted array into the returned array,
+            // with the rest going into the slice.  Because `&mut` is exclusive
+            // and we own both `inserted` and `returned`, they're all disjoint
+            // allocations from each other as we can use `nonoverlapping` copies.
+            //
+            // We avoid double-frees by `ManuallyDrop`ing the inserted items,
+            // since we always copy them to other locations that will drop them
+            // instead.  Plus nothing in here can panic -- it's just memcpy three
+            // times -- so there's no intermediate unwinds to worry about.
+            unsafe {
+                let len = self.len();
+                let slice = self.as_mut_ptr();
+                let inserted = mem::ManuallyDrop::new(inserted);
+                let inserted = (&raw const inserted).cast::<T>();
+
+                let mut returned = MaybeUninit::<[T; N]>::uninit();
+                let ptr = returned.as_mut_ptr().cast::<T>();
+                ptr.copy_from_nonoverlapping(slice, len);
+                ptr.add(len).copy_from_nonoverlapping(inserted, N - len);
+                slice.copy_from_nonoverlapping(inserted.add(N - len), len);
+                returned.assume_init()
+            }
+        }
+    }
+
+    /// Moves the elements of this slice `N` places to the right, returning the ones
+    /// that "fall off" the back, and putting `inserted` at the beginning.
+    ///
+    /// Equivalently, you can think of concatenating `inserted` and `self` into one
+    /// long sequence, then returning the right-most `N` items and the rest into `self`:
+    ///
+    /// ```text
+    /// inserted  self (before)
+    ///      vvv  vvvvvvvvvvvvvvv
+    ///      [0]  [5, 6, 7, 8, 9]
+    ///        ↘   ↘  ↘  ↘  ↘   ↘
+    ///           [0, 5, 6, 7, 8]  [9]
+    ///           ^^^^^^^^^^^^^^^  ^^^
+    ///           self (after)     returned
+    /// ```
+    ///
+    /// See also [`Self::shift_left`] and compare [`Self::rotate_right`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(slice_shift)]
+    ///
+    /// // Same as the diagram above
+    /// let mut a = [5, 6, 7, 8, 9];
+    /// let inserted = [0];
+    /// let returned = a.shift_right(inserted);
+    /// assert_eq!(returned, [9]);
+    /// assert_eq!(a, [0, 5, 6, 7, 8]);
+    ///
+    /// // The name comes from this operation's similarity to bitshifts
+    /// let mut a: u8 = 0b10010110;
+    /// a >>= 3;
+    /// assert_eq!(a, 0b00010010_u8);
+    /// let mut a: [_; 8] = [1, 0, 0, 1, 0, 1, 1, 0];
+    /// a.shift_right([0; 3]);
+    /// assert_eq!(a, [0, 0, 0, 1, 0, 0, 1, 0]);
+    ///
+    /// // Remember you can sub-slice to affect less that the whole slice.
+    /// // For example, this is similar to `.remove(4)` + `.insert(1, 'Z')`
+    /// let mut a = ['a', 'b', 'c', 'd', 'e', 'f'];
+    /// assert_eq!(a[1..=4].shift_right(['Z']), ['e']);
+    /// assert_eq!(a, ['a', 'Z', 'b', 'c', 'd', 'f']);
+    ///
+    /// // If the size matches it's equivalent to `mem::replace`
+    /// let mut a = [1, 2, 3];
+    /// assert_eq!(a.shift_right([7, 8, 9]), [1, 2, 3]);
+    /// assert_eq!(a, [7, 8, 9]);
+    ///
+    /// // Some of the "inserted" elements end up returned if the slice is too short
+    /// let mut a = [];
+    /// assert_eq!(a.shift_right([1, 2, 3]), [1, 2, 3]);
+    /// let mut a = [9];
+    /// assert_eq!(a.shift_right([1, 2, 3]), [2, 3, 9]);
+    /// assert_eq!(a, [1]);
+    /// ```
+    #[unstable(feature = "slice_shift", issue = "151772")]
+    pub const fn shift_right<const N: usize>(&mut self, inserted: [T; N]) -> [T; N] {
+        if let Some(shift) = self.len().checked_sub(N) {
+            // SAFETY: Having just checked that the inserted/returned arrays are
+            // shorter than (or the same length as) the slice:
+            // 1. The read for the items to return is in-bounds
+            // 2. We can `memmove` the slice over to cover the items we're returning
+            //    to ensure those aren't double-dropped
+            // 3. Then we write (in-bounds for the same reason as the read) the
+            //    inserted items atop the items of the slice that we just duplicated
+            //
+            // And none of this can panic, so there's no risk of intermediate unwinds.
+            unsafe {
+                let ptr = self.as_mut_ptr();
+                let returned = ptr.add(shift).cast_array::<N>().read();
+                ptr.add(N).copy_from(ptr, shift);
+                ptr.cast_array::<N>().write(inserted);
+                returned
+            }
+        } else {
+            // SAFETY: Having checked that the slice is strictly shorter than the
+            // inserted/returned arrays, it means we'll be copying the whole slice
+            // into the returned array, but that's not enough on its own.  We also
+            // need to copy some of the inserted array into the returned array,
+            // with the rest going into the slice.  Because `&mut` is exclusive
+            // and we own both `inserted` and `returned`, they're all disjoint
+            // allocations from each other as we can use `nonoverlapping` copies.
+            //
+            // We avoid double-frees by `ManuallyDrop`ing the inserted items,
+            // since we always copy them to other locations that will drop them
+            // instead.  Plus nothing in here can panic -- it's just memcpy three
+            // times -- so there's no intermediate unwinds to worry about.
+            unsafe {
+                let len = self.len();
+                let slice = self.as_mut_ptr();
+                let inserted = mem::ManuallyDrop::new(inserted);
+                let inserted = (&raw const inserted).cast::<T>();
+
+                let mut returned = MaybeUninit::<[T; N]>::uninit();
+                let ptr = returned.as_mut_ptr().cast::<T>();
+                ptr.add(N - len).copy_from_nonoverlapping(slice, len);
+                ptr.copy_from_nonoverlapping(inserted.add(len), N - len);
+                slice.copy_from_nonoverlapping(inserted, len);
+                returned.assume_init()
+            }
+        }
+    }
+
     /// Fills `self` with elements by cloning `value`.
     ///
     /// # Examples
@@ -4136,6 +4350,7 @@ impl<T> [T] {
     ///
     /// assert_eq!(&bytes, b"Hello, Wello!");
     /// ```
+    #[inline]
     #[stable(feature = "copy_within", since = "1.37.0")]
     #[track_caller]
     pub fn copy_within<R: RangeBounds<usize>>(&mut self, src: R, dest: usize)
@@ -4443,7 +4658,6 @@ impl<T> [T] {
     where
         Simd<T, LANES>: AsRef<[T; LANES]>,
         T: simd::SimdElement,
-        simd::LaneCount<LANES>: simd::SupportedLaneCount,
     {
         // These are expected to always match, as vector types are laid out like
         // arrays per <https://llvm.org/docs/LangRef.html#vector-type>, but we
@@ -4479,7 +4693,6 @@ impl<T> [T] {
     where
         Simd<T, LANES>: AsMut<[T; LANES]>,
         T: simd::SimdElement,
-        simd::LaneCount<LANES>: simd::SupportedLaneCount,
     {
         // These are expected to always match, as vector types are laid out like
         // arrays per <https://llvm.org/docs/LangRef.html#vector-type>, but we
@@ -5045,7 +5258,7 @@ impl<T> [T] {
     /// assert_eq!(arr.element_offset(weird_elm), None); // Points between element 0 and 1
     /// ```
     #[must_use]
-    #[stable(feature = "element_offset", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "element_offset", since = "1.94.0")]
     pub fn element_offset(&self, element: &T) -> Option<usize> {
         if T::IS_ZST {
             panic!("elements are zero-sized");
@@ -5085,7 +5298,7 @@ impl<T> [T] {
     /// # Examples
     /// Basic usage:
     /// ```
-    /// #![feature(substr_range)]
+    /// use core::range::Range;
     ///
     /// let nums = &[0, 5, 10, 0, 0, 5];
     ///
@@ -5093,14 +5306,14 @@ impl<T> [T] {
     ///     .split(|t| *t == 0)
     ///     .map(|n| nums.subslice_range(n).unwrap());
     ///
-    /// assert_eq!(iter.next(), Some(0..0));
-    /// assert_eq!(iter.next(), Some(1..3));
-    /// assert_eq!(iter.next(), Some(4..4));
-    /// assert_eq!(iter.next(), Some(5..6));
+    /// assert_eq!(iter.next(), Some(Range { start: 0, end: 0 }));
+    /// assert_eq!(iter.next(), Some(Range { start: 1, end: 3 }));
+    /// assert_eq!(iter.next(), Some(Range { start: 4, end: 4 }));
+    /// assert_eq!(iter.next(), Some(Range { start: 5, end: 6 }));
     /// ```
     #[must_use]
-    #[unstable(feature = "substr_range", issue = "126769")]
-    pub fn subslice_range(&self, subslice: &[T]) -> Option<Range<usize>> {
+    #[stable(feature = "substr_range", since = "CURRENT_RUSTC_VERSION")]
+    pub fn subslice_range(&self, subslice: &[T]) -> Option<core::range::Range<usize>> {
         if T::IS_ZST {
             panic!("elements are zero-sized");
         }
@@ -5117,7 +5330,11 @@ impl<T> [T] {
         let start = byte_start / size_of::<T>();
         let end = start.wrapping_add(subslice.len());
 
-        if start <= self.len() && end <= self.len() { Some(start..end) } else { None }
+        if start <= self.len() && end <= self.len() {
+            Some(core::range::Range { start, end })
+        } else {
+            None
+        }
     }
 
     /// Returns the same slice `&[T]`.
@@ -5377,7 +5594,7 @@ const trait CloneFromSpec<T> {
 }
 
 #[rustc_const_unstable(feature = "const_clone", issue = "142757")]
-impl<T> const CloneFromSpec<T> for [T]
+const impl<T> CloneFromSpec<T> for [T]
 where
     T: [const] Clone + [const] Destruct,
 {
@@ -5399,7 +5616,7 @@ where
 }
 
 #[rustc_const_unstable(feature = "const_clone", issue = "142757")]
-impl<T> const CloneFromSpec<T> for [T]
+const impl<T> CloneFromSpec<T> for [T]
 where
     T: [const] TrivialClone + [const] Destruct,
 {
@@ -5414,7 +5631,7 @@ where
 
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_const_unstable(feature = "const_default", issue = "143894")]
-impl<T> const Default for &[T] {
+const impl<T> Default for &[T] {
     /// Creates an empty slice.
     fn default() -> Self {
         &[]
@@ -5423,7 +5640,7 @@ impl<T> const Default for &[T] {
 
 #[stable(feature = "mut_slice_default", since = "1.5.0")]
 #[rustc_const_unstable(feature = "const_default", issue = "143894")]
-impl<T> const Default for &mut [T] {
+const impl<T> Default for &mut [T] {
     /// Creates a mutable empty slice.
     fn default() -> Self {
         &mut []
@@ -5522,24 +5739,6 @@ impl fmt::Display for GetDisjointMutError {
     }
 }
 
-mod private_get_disjoint_mut_index {
-    use super::{Range, RangeInclusive, range};
-
-    #[unstable(feature = "get_disjoint_mut_helpers", issue = "none")]
-    pub trait Sealed {}
-
-    #[unstable(feature = "get_disjoint_mut_helpers", issue = "none")]
-    impl Sealed for usize {}
-    #[unstable(feature = "get_disjoint_mut_helpers", issue = "none")]
-    impl Sealed for Range<usize> {}
-    #[unstable(feature = "get_disjoint_mut_helpers", issue = "none")]
-    impl Sealed for RangeInclusive<usize> {}
-    #[unstable(feature = "get_disjoint_mut_helpers", issue = "none")]
-    impl Sealed for range::Range<usize> {}
-    #[unstable(feature = "get_disjoint_mut_helpers", issue = "none")]
-    impl Sealed for range::RangeInclusive<usize> {}
-}
-
 /// A helper trait for `<[T]>::get_disjoint_mut()`.
 ///
 /// # Safety
@@ -5547,9 +5746,7 @@ mod private_get_disjoint_mut_index {
 /// If `is_in_bounds()` returns `true` and `is_overlapping()` returns `false`,
 /// it must be safe to index the slice with the indices.
 #[unstable(feature = "get_disjoint_mut_helpers", issue = "none")]
-pub unsafe trait GetDisjointMutIndex:
-    Clone + private_get_disjoint_mut_index::Sealed
-{
+pub impl(self) unsafe trait GetDisjointMutIndex: Clone {
     /// Returns `true` if `self` is in bounds for `len` slice elements.
     #[unstable(feature = "get_disjoint_mut_helpers", issue = "none")]
     fn is_in_bounds(&self, len: usize) -> bool;

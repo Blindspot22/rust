@@ -17,6 +17,8 @@ declare_with_version! { DEPRECATED(DEPRECATED_VERSION) = [
     ("clippy::assign_ops", "compound operators are harmless and linting on them is not in scope for clippy"),
     #[clippy::version = "pre 1.29.0"]
     ("clippy::extend_from_slice", "`Vec::extend_from_slice` is no longer faster than `Vec::extend` due to specialization"),
+    #[clippy::version = "1.98.0"]
+    ("clippy::from_iter_instead_of_collect", "lint has proved problematic"),
     #[clippy::version = "1.88.0"]
     ("clippy::match_on_vec_items", "`clippy::indexing_slicing` covers indexing and slicing on `Vec<_>`"),
     #[clippy::version = "pre 1.29.0"]
@@ -123,7 +125,7 @@ declare_with_version! { RENAMED(RENAMED_VERSION) = [
     ("clippy::into_iter_on_array", "array_into_iter"),
     #[clippy::version = ""]
     ("clippy::invalid_atomic_ordering", "invalid_atomic_ordering"),
-    #[clippy::version = "CURRENT_RUSTC_VERSION"]
+    #[clippy::version = "1.88.0"]
     ("clippy::invalid_null_ptr_usage", "invalid_null_arguments"),
     #[clippy::version = ""]
     ("clippy::invalid_ref", "invalid_value"),

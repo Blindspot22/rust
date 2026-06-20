@@ -27,6 +27,8 @@
 #![feature(restricted_std)]
 #![feature(rustc_attrs)]
 #![feature(extend_one)]
+#![feature(mem_conjure_zst)]
+#![feature(f16)]
 #![recursion_limit = "256"]
 #![allow(internal_features)]
 #![deny(ffi_unwind_calls)]
@@ -43,7 +45,9 @@ mod diagnostic;
 mod escape;
 mod to_tokens;
 
+use core::convert::From;
 use core::ops::BitOr;
+use std::borrow::Cow;
 use std::ffi::CStr;
 use std::ops::{Range, RangeBounds};
 use std::path::PathBuf;
@@ -52,17 +56,148 @@ use std::{error, fmt};
 
 #[unstable(feature = "proc_macro_diagnostic", issue = "54140")]
 pub use diagnostic::{Diagnostic, Level, MultiSpan};
-#[unstable(feature = "proc_macro_value", issue = "136652")]
-pub use rustc_literal_escaper::EscapeError;
-use rustc_literal_escaper::{MixedUnit, unescape_byte_str, unescape_c_str, unescape_str};
+use rustc_literal_escaper::{
+    MixedUnit, unescape_byte, unescape_byte_str, unescape_c_str, unescape_char, unescape_str,
+};
 #[unstable(feature = "proc_macro_totokens", issue = "130977")]
 pub use to_tokens::ToTokens;
 
+use crate::bridge::client::Methods as BridgeMethods;
 use crate::escape::{EscapeOptions, escape_bytes};
+
+/// Mostly relating to malformed escape sequences, but also a few other problems.
+#[unstable(feature = "proc_macro_value", issue = "136652")]
+#[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EscapeError {
+    /// Expected 1 char, but 0 were found.
+    ZeroChars,
+    /// Expected 1 char, but more than 1 were found.
+    MoreThanOneChar,
+
+    /// Escaped '\' character without continuation.
+    LoneSlash,
+    /// Invalid escape character (e.g. '\z').
+    InvalidEscape,
+    /// Raw '\r' encountered.
+    BareCarriageReturn,
+    /// Raw '\r' encountered in raw string.
+    BareCarriageReturnInRawString,
+    /// Unescaped character that was expected to be escaped (e.g. raw '\t').
+    EscapeOnlyChar,
+
+    /// Numeric character escape is too short (e.g. '\x1').
+    TooShortHexEscape,
+    /// Invalid character in numeric escape (e.g. '\xz')
+    InvalidCharInHexEscape,
+    /// Character code in numeric escape is non-ascii (e.g. '\xFF').
+    OutOfRangeHexEscape,
+
+    /// '\u' not followed by '{'.
+    NoBraceInUnicodeEscape,
+    /// Non-hexadecimal value in '\u{..}'.
+    InvalidCharInUnicodeEscape,
+    /// '\u{}'
+    EmptyUnicodeEscape,
+    /// No closing brace in '\u{..}', e.g. '\u{12'.
+    UnclosedUnicodeEscape,
+    /// '\u{_12}'
+    LeadingUnderscoreUnicodeEscape,
+    /// More than 6 characters in '\u{..}', e.g. '\u{10FFFF_FF}'
+    OverlongUnicodeEscape,
+    /// Invalid in-bound unicode character code, e.g. '\u{DFFF}'.
+    LoneSurrogateUnicodeEscape,
+    /// Out of bounds unicode character code, e.g. '\u{FFFFFF}'.
+    OutOfRangeUnicodeEscape,
+
+    /// Unicode escape code in byte literal.
+    UnicodeEscapeInByte,
+    /// Non-ascii character in byte literal, byte string literal, or raw byte string literal.
+    NonAsciiCharInByte,
+
+    /// `\0` in a C string literal.
+    NulInCStr,
+
+    /// After a line ending with '\', the next line contains whitespace
+    /// characters that are not skipped.
+    UnskippedWhitespaceWarning,
+
+    /// After a line ending with '\', multiple lines are skipped.
+    MultipleSkippedLinesWarning,
+}
+
+#[unstable(feature = "proc_macro_value", issue = "136652")]
+#[doc(hidden)]
+impl From<rustc_literal_escaper::EscapeError> for EscapeError {
+    fn from(value: rustc_literal_escaper::EscapeError) -> Self {
+        use rustc_literal_escaper::EscapeError as EE;
+
+        match value {
+            EE::ZeroChars => Self::ZeroChars,
+            EE::MoreThanOneChar => Self::MoreThanOneChar,
+            EE::LoneSlash => Self::LoneSlash,
+            EE::InvalidEscape => Self::InvalidEscape,
+            EE::BareCarriageReturn => Self::BareCarriageReturn,
+            EE::BareCarriageReturnInRawString => Self::BareCarriageReturnInRawString,
+            EE::EscapeOnlyChar => Self::EscapeOnlyChar,
+            EE::TooShortHexEscape => Self::TooShortHexEscape,
+            EE::InvalidCharInHexEscape => Self::InvalidCharInHexEscape,
+            EE::OutOfRangeHexEscape => Self::OutOfRangeHexEscape,
+            EE::NoBraceInUnicodeEscape => Self::NoBraceInUnicodeEscape,
+            EE::InvalidCharInUnicodeEscape => Self::InvalidCharInUnicodeEscape,
+            EE::EmptyUnicodeEscape => Self::EmptyUnicodeEscape,
+            EE::UnclosedUnicodeEscape => Self::UnclosedUnicodeEscape,
+            EE::LeadingUnderscoreUnicodeEscape => Self::LeadingUnderscoreUnicodeEscape,
+            EE::OverlongUnicodeEscape => Self::OverlongUnicodeEscape,
+            EE::LoneSurrogateUnicodeEscape => Self::LoneSurrogateUnicodeEscape,
+            EE::OutOfRangeUnicodeEscape => Self::OutOfRangeUnicodeEscape,
+            EE::UnicodeEscapeInByte => Self::UnicodeEscapeInByte,
+            EE::NonAsciiCharInByte => Self::NonAsciiCharInByte,
+            EE::NulInCStr => Self::NulInCStr,
+            EE::UnskippedWhitespaceWarning => Self::UnskippedWhitespaceWarning,
+            EE::MultipleSkippedLinesWarning => Self::MultipleSkippedLinesWarning,
+        }
+    }
+}
+
+#[unstable(feature = "proc_macro_value", issue = "136652")]
+impl error::Error for EscapeError {}
+
+#[unstable(feature = "proc_macro_value", issue = "136652")]
+impl fmt::Display for EscapeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ZeroChars => "zero chars",
+            Self::MoreThanOneChar => "more than one char",
+            Self::LoneSlash => "lone slash",
+            Self::InvalidEscape => "invalid escape",
+            Self::BareCarriageReturn => "bare carriage return",
+            Self::BareCarriageReturnInRawString => "bare carriage return in raw string",
+            Self::EscapeOnlyChar => "escape only char",
+            Self::TooShortHexEscape => "too short hex escape",
+            Self::InvalidCharInHexEscape => "invalid char in hex escape",
+            Self::OutOfRangeHexEscape => "out of range hex escape",
+            Self::NoBraceInUnicodeEscape => "no brace in unicode escape",
+            Self::InvalidCharInUnicodeEscape => "invalid char in unicode escape",
+            Self::EmptyUnicodeEscape => "empty unicode escape",
+            Self::UnclosedUnicodeEscape => "unclosed unicode escape",
+            Self::LeadingUnderscoreUnicodeEscape => "leading underscore unicode escape",
+            Self::OverlongUnicodeEscape => "overlong unicode escape",
+            Self::LoneSurrogateUnicodeEscape => "lone surrogate unicode escape",
+            Self::OutOfRangeUnicodeEscape => "out of range unicode escape",
+            Self::UnicodeEscapeInByte => "unicode escape in byte",
+            Self::NonAsciiCharInByte => "non ascii char in byte",
+            Self::NulInCStr => "nul in CStr",
+            Self::UnskippedWhitespaceWarning => "unskipped whitespace warning",
+            Self::MultipleSkippedLinesWarning => "multiple skipped lines warning",
+        })
+    }
+}
 
 /// Errors returned when trying to retrieve a literal unescaped value.
 #[unstable(feature = "proc_macro_value", issue = "136652")]
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConversionErrorKind {
     /// The literal failed to be escaped, take a look at [`EscapeError`] for more information.
     FailedToUnescape(EscapeError),
@@ -106,15 +241,18 @@ impl !Send for TokenStream {}
 impl !Sync for TokenStream {}
 
 /// Error returned from `TokenStream::from_str`.
+///
+/// The contained error message is explicitly not guaranteed to be stable in any way,
+/// and may change between Rust versions or across compilations.
 #[stable(feature = "proc_macro_lib", since = "1.15.0")]
 #[non_exhaustive]
 #[derive(Debug)]
-pub struct LexError;
+pub struct LexError(String);
 
 #[stable(feature = "proc_macro_lexerror_impls", since = "1.44.0")]
 impl fmt::Display for LexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("cannot parse string into token stream")
+        f.write_str(&self.0)
     }
 }
 
@@ -158,7 +296,7 @@ impl TokenStream {
     /// Checks if this `TokenStream` is empty.
     #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
     pub fn is_empty(&self) -> bool {
-        self.0.as_ref().map(|h| h.is_empty()).unwrap_or(true)
+        self.0.as_ref().map(|h| BridgeMethods::ts_is_empty(h)).unwrap_or(true)
     }
 
     /// Parses this `TokenStream` as an expression and attempts to expand any
@@ -174,7 +312,7 @@ impl TokenStream {
     #[unstable(feature = "proc_macro_expand", issue = "90765")]
     pub fn expand_expr(&self) -> Result<TokenStream, ExpandError> {
         let stream = self.0.as_ref().ok_or(ExpandError)?;
-        match bridge::client::TokenStream::expand_expr(stream) {
+        match BridgeMethods::ts_expand_expr(stream) {
             Ok(stream) => Ok(TokenStream(Some(stream))),
             Err(_) => Err(ExpandError),
         }
@@ -193,7 +331,7 @@ impl FromStr for TokenStream {
     type Err = LexError;
 
     fn from_str(src: &str) -> Result<TokenStream, LexError> {
-        Ok(TokenStream(Some(bridge::client::TokenStream::from_str(src))))
+        Ok(TokenStream(Some(BridgeMethods::ts_from_str(src).map_err(LexError)?)))
     }
 }
 
@@ -212,7 +350,7 @@ impl FromStr for TokenStream {
 impl fmt::Display for TokenStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.0 {
-            Some(ts) => write!(f, "{}", ts.to_string()),
+            Some(ts) => write!(f, "{}", BridgeMethods::ts_to_string(ts)),
             None => Ok(()),
         }
     }
@@ -252,7 +390,7 @@ fn tree_to_bridge_tree(
 #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
 impl From<TokenTree> for TokenStream {
     fn from(tree: TokenTree) -> TokenStream {
-        TokenStream(Some(bridge::client::TokenStream::from_token_tree(tree_to_bridge_tree(tree))))
+        TokenStream(Some(BridgeMethods::ts_from_token_tree(tree_to_bridge_tree(tree))))
     }
 }
 
@@ -281,7 +419,7 @@ impl ConcatTreesHelper {
         if self.trees.is_empty() {
             TokenStream(None)
         } else {
-            TokenStream(Some(bridge::client::TokenStream::concat_trees(None, self.trees)))
+            TokenStream(Some(BridgeMethods::ts_concat_trees(None, self.trees)))
         }
     }
 
@@ -289,7 +427,7 @@ impl ConcatTreesHelper {
         if self.trees.is_empty() {
             return;
         }
-        stream.0 = Some(bridge::client::TokenStream::concat_trees(stream.0.take(), self.trees))
+        stream.0 = Some(BridgeMethods::ts_concat_trees(stream.0.take(), self.trees))
     }
 }
 
@@ -314,7 +452,7 @@ impl ConcatStreamsHelper {
         if self.streams.len() <= 1 {
             TokenStream(self.streams.pop())
         } else {
-            TokenStream(Some(bridge::client::TokenStream::concat_streams(None, self.streams)))
+            TokenStream(Some(BridgeMethods::ts_concat_streams(None, self.streams)))
         }
     }
 
@@ -326,7 +464,7 @@ impl ConcatStreamsHelper {
         if base.is_none() && self.streams.len() == 1 {
             stream.0 = self.streams.pop();
         } else {
-            stream.0 = Some(bridge::client::TokenStream::concat_streams(base, self.streams));
+            stream.0 = Some(BridgeMethods::ts_concat_streams(base, self.streams));
         }
     }
 }
@@ -377,7 +515,7 @@ impl Extend<TokenStream> for TokenStream {
 macro_rules! extend_items {
     ($($item:ident)*) => {
         $(
-            #[stable(feature = "token_stream_extend_tt_items", since = "1.92.0")]
+            #[stable(feature = "token_stream_extend_ts_items", since = "1.92.0")]
             impl Extend<$item> for TokenStream {
                 fn extend<T: IntoIterator<Item = $item>>(&mut self, iter: T) {
                     self.extend(iter.into_iter().map(TokenTree::$item));
@@ -392,7 +530,7 @@ extend_items!(Group Literal Punct Ident);
 /// Public implementation details for the `TokenStream` type, such as iterators.
 #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
 pub mod token_stream {
-    use crate::{Group, Ident, Literal, Punct, TokenStream, TokenTree, bridge};
+    use crate::{BridgeMethods, Group, Ident, Literal, Punct, TokenStream, TokenTree, bridge};
 
     /// An iterator over `TokenStream`'s `TokenTree`s.
     /// The iteration is "shallow", e.g., the iterator doesn't recurse into delimited groups,
@@ -437,7 +575,9 @@ pub mod token_stream {
         type IntoIter = IntoIter;
 
         fn into_iter(self) -> IntoIter {
-            IntoIter(self.0.map(|v| v.into_trees()).unwrap_or_default().into_iter())
+            IntoIter(
+                self.0.map(|v| BridgeMethods::ts_into_trees(v)).unwrap_or_default().into_iter(),
+            )
         }
     }
 }
@@ -509,7 +649,7 @@ impl Span {
     /// `self` was generated from, if any.
     #[unstable(feature = "proc_macro_span", issue = "54725")]
     pub fn parent(&self) -> Option<Span> {
-        self.0.parent().map(Span)
+        BridgeMethods::span_parent(self.0).map(Span)
     }
 
     /// The span for the origin source code that `self` was generated from. If
@@ -517,25 +657,25 @@ impl Span {
     /// value is the same as `*self`.
     #[unstable(feature = "proc_macro_span", issue = "54725")]
     pub fn source(&self) -> Span {
-        Span(self.0.source())
+        Span(BridgeMethods::span_source(self.0))
     }
 
     /// Returns the span's byte position range in the source file.
     #[unstable(feature = "proc_macro_span", issue = "54725")]
     pub fn byte_range(&self) -> Range<usize> {
-        self.0.byte_range()
+        BridgeMethods::span_byte_range(self.0)
     }
 
     /// Creates an empty span pointing to directly before this span.
     #[stable(feature = "proc_macro_span_location", since = "1.88.0")]
     pub fn start(&self) -> Span {
-        Span(self.0.start())
+        Span(BridgeMethods::span_start(self.0))
     }
 
     /// Creates an empty span pointing to directly after this span.
     #[stable(feature = "proc_macro_span_location", since = "1.88.0")]
     pub fn end(&self) -> Span {
-        Span(self.0.end())
+        Span(BridgeMethods::span_end(self.0))
     }
 
     /// The one-indexed line of the source file where the span starts.
@@ -543,7 +683,7 @@ impl Span {
     /// To obtain the line of the span's end, use `span.end().line()`.
     #[stable(feature = "proc_macro_span_location", since = "1.88.0")]
     pub fn line(&self) -> usize {
-        self.0.line()
+        BridgeMethods::span_line(self.0)
     }
 
     /// The one-indexed column of the source file where the span starts.
@@ -551,7 +691,7 @@ impl Span {
     /// To obtain the column of the span's end, use `span.end().column()`.
     #[stable(feature = "proc_macro_span_location", since = "1.88.0")]
     pub fn column(&self) -> usize {
-        self.0.column()
+        BridgeMethods::span_column(self.0)
     }
 
     /// The path to the source file in which this span occurs, for display purposes.
@@ -560,7 +700,7 @@ impl Span {
     /// It might be remapped (e.g. `"/src/lib.rs"`) or an artificial path (e.g. `"<command line>"`).
     #[stable(feature = "proc_macro_span_file", since = "1.88.0")]
     pub fn file(&self) -> String {
-        self.0.file()
+        BridgeMethods::span_file(self.0)
     }
 
     /// The path to the source file in which this span occurs on the local file system.
@@ -570,7 +710,7 @@ impl Span {
     /// This path should not be embedded in the output of the macro; prefer `file()` instead.
     #[stable(feature = "proc_macro_span_file", since = "1.88.0")]
     pub fn local_file(&self) -> Option<PathBuf> {
-        self.0.local_file().map(PathBuf::from)
+        BridgeMethods::span_local_file(self.0).map(PathBuf::from)
     }
 
     /// Creates a new span encompassing `self` and `other`.
@@ -578,14 +718,14 @@ impl Span {
     /// Returns `None` if `self` and `other` are from different files.
     #[unstable(feature = "proc_macro_span", issue = "54725")]
     pub fn join(&self, other: Span) -> Option<Span> {
-        self.0.join(other.0).map(Span)
+        BridgeMethods::span_join(self.0, other.0).map(Span)
     }
 
     /// Creates a new span with the same line/column information as `self` but
     /// that resolves symbols as though it were at `other`.
     #[stable(feature = "proc_macro_span_resolved_at", since = "1.45.0")]
     pub fn resolved_at(&self, other: Span) -> Span {
-        Span(self.0.resolved_at(other.0))
+        Span(BridgeMethods::span_resolved_at(self.0, other.0))
     }
 
     /// Creates a new span with the same name resolution behavior as `self` but
@@ -610,21 +750,21 @@ impl Span {
     /// be used for diagnostics only.
     #[stable(feature = "proc_macro_source_text", since = "1.66.0")]
     pub fn source_text(&self) -> Option<String> {
-        self.0.source_text()
+        BridgeMethods::span_source_text(self.0)
     }
 
     // Used by the implementation of `Span::quote`
     #[doc(hidden)]
     #[unstable(feature = "proc_macro_internals", issue = "27812")]
     pub fn save_span(&self) -> usize {
-        self.0.save_span()
+        BridgeMethods::span_save_span(self.0)
     }
 
     // Used by the implementation of `Span::quote`
     #[doc(hidden)]
     #[unstable(feature = "proc_macro_internals", issue = "27812")]
     pub fn recover_proc_macro_span(id: usize) -> Span {
-        Span(bridge::client::Span::recover_proc_macro_span(id))
+        Span(BridgeMethods::span_recover_proc_macro_span(id))
     }
 
     diagnostic_method!(error, Level::Error);
@@ -1174,6 +1314,63 @@ macro_rules! unsuffixed_int_literals {
     )*)
 }
 
+macro_rules! integer_values {
+    ($($nb:ident => $fn_name:ident,)+) => {
+        $(
+            #[doc = concat!(
+                "Returns the unescaped `",
+                stringify!($nb),
+                "` value if the literal is a `",
+                stringify!($nb),
+                "` or if it's an \"unmarked\" integer which doesn't overflow.")]
+            #[unstable(feature = "proc_macro_value", issue = "136652")]
+            pub fn $fn_name(&self) -> Result<$nb, ConversionErrorKind> {
+                if self.0.kind != bridge::LitKind::Integer {
+                    return Err(ConversionErrorKind::InvalidLiteralKind);
+                }
+                self.with_symbol_and_suffix(|symbol, suffix| {
+                    match suffix {
+                        stringify!($nb) | "" => {
+                            let symbol = strip_underscores(symbol);
+                            let (number, base) = parse_number(&symbol);
+                            $nb::from_str_radix(&number, base as u32).map_err(|_| ConversionErrorKind::InvalidLiteralKind)
+                        }
+                        _ => Err(ConversionErrorKind::InvalidLiteralKind),
+                    }
+                })
+            }
+        )+
+    }
+}
+
+macro_rules! float_values {
+    ($($nb:ident => $fn_name:ident,)+) => {
+        $(
+            #[doc = concat!(
+                "Returns the unescaped `",
+                stringify!($nb),
+                "` value if the literal is a `",
+                stringify!($nb),
+                "` or if it's an \"unmarked\" float which doesn't overflow.")]
+            #[unstable(feature = "proc_macro_value", issue = "136652")]
+            pub fn $fn_name(&self) -> Result<$nb, ConversionErrorKind> {
+                if self.0.kind != bridge::LitKind::Float {
+                    return Err(ConversionErrorKind::InvalidLiteralKind);
+                }
+                self.with_symbol_and_suffix(|symbol, suffix| {
+                    match suffix {
+                        stringify!($nb) | "" => {
+                            let number = strip_underscores(symbol);
+                            $nb::from_str(&number).map_err(|_| ConversionErrorKind::InvalidLiteralKind)
+                        }
+                        _ => Err(ConversionErrorKind::InvalidLiteralKind),
+                    }
+                })
+            }
+        )+
+    }
+}
+
 impl Literal {
     fn new(kind: bridge::LitKind, value: &str, suffix: Option<&str>) -> Self {
         Literal(bridge::Literal {
@@ -1389,7 +1586,12 @@ impl Literal {
     // was 'c' or whether it was '\u{63}'.
     #[unstable(feature = "proc_macro_span", issue = "54725")]
     pub fn subspan<R: RangeBounds<usize>>(&self, range: R) -> Option<Span> {
-        self.0.span.subspan(range.start_bound().cloned(), range.end_bound().cloned()).map(Span)
+        BridgeMethods::span_subspan(
+            self.0.span,
+            range.start_bound().cloned(),
+            range.end_bound().cloned(),
+        )
+        .map(Span)
     }
 
     fn with_symbol_and_suffix<R>(&self, f: impl FnOnce(&str, &str) -> R) -> R {
@@ -1443,6 +1645,26 @@ impl Literal {
         })
     }
 
+    /// Returns the unescaped character value if the current literal is a byte character literal.
+    #[unstable(feature = "proc_macro_value", issue = "136652")]
+    pub fn byte_character_value(&self) -> Result<u8, ConversionErrorKind> {
+        self.0.symbol.with(|symbol| match self.0.kind {
+            bridge::LitKind::Byte => unescape_byte(symbol)
+                .map_err(|err| ConversionErrorKind::FailedToUnescape(err.into())),
+            _ => Err(ConversionErrorKind::InvalidLiteralKind),
+        })
+    }
+
+    /// Returns the unescaped character value if the current literal is a character literal.
+    #[unstable(feature = "proc_macro_value", issue = "136652")]
+    pub fn character_value(&self) -> Result<char, ConversionErrorKind> {
+        self.0.symbol.with(|symbol| match self.0.kind {
+            bridge::LitKind::Char => unescape_char(symbol)
+                .map_err(|err| ConversionErrorKind::FailedToUnescape(err.into())),
+            _ => Err(ConversionErrorKind::InvalidLiteralKind),
+        })
+    }
+
     /// Returns the unescaped string value if the current literal is a string or a string literal.
     #[unstable(feature = "proc_macro_value", issue = "136652")]
     pub fn str_value(&self) -> Result<String, ConversionErrorKind> {
@@ -1461,7 +1683,7 @@ impl Literal {
                             Ok(c) => buf.push(c),
                             Err(err) => {
                                 if err.is_fatal() {
-                                    error = Some(ConversionErrorKind::FailedToUnescape(err));
+                                    error = Some(ConversionErrorKind::FailedToUnescape(err.into()));
                                 }
                             }
                         },
@@ -1492,7 +1714,7 @@ impl Literal {
                     Ok(MixedUnit::HighByte(b)) => buf.push(b.get()),
                     Err(err) => {
                         if err.is_fatal() {
-                            error = Some(ConversionErrorKind::FailedToUnescape(err));
+                            error = Some(ConversionErrorKind::FailedToUnescape(err.into()));
                         }
                     }
                 });
@@ -1528,7 +1750,7 @@ impl Literal {
                     Ok(b) => buf.push(b),
                     Err(err) => {
                         if err.is_fatal() {
-                            error = Some(ConversionErrorKind::FailedToUnescape(err));
+                            error = Some(ConversionErrorKind::FailedToUnescape(err.into()));
                         }
                     }
                 });
@@ -1542,6 +1764,82 @@ impl Literal {
             _ => Err(ConversionErrorKind::InvalidLiteralKind),
         })
     }
+
+    integer_values! {
+        u8 => u8_value,
+        u16 => u16_value,
+        u32 => u32_value,
+        u64 => u64_value,
+        u128 => u128_value,
+        i8 => i8_value,
+        i16 => i16_value,
+        i32 => i32_value,
+        i64 => i64_value,
+        i128 => i128_value,
+    }
+
+    float_values! {
+        f16 => f16_value,
+        f32 => f32_value,
+        f64 => f64_value,
+        // FIXME: `f128` doesn't implement `FromStr` for the moment so we cannot obtain it from
+        // a `&str`. To be uncommented when it's added.
+        // f128 => f128_value,
+    }
+}
+
+#[repr(u32)]
+#[derive(PartialEq, Eq)]
+enum Base {
+    Decimal = 10,
+    Binary = 2,
+    Octal = 8,
+    Hexadecimal = 16,
+}
+
+fn parse_number(value: &str) -> (&str, Base) {
+    let mut iter = value.as_bytes().iter().copied();
+    let Some(first_digit) = iter.next() else {
+        return ("0", Base::Decimal);
+    };
+    let Some(second_digit) = iter.next() else {
+        return (value, Base::Decimal);
+    };
+
+    let mut base = Base::Decimal;
+    if first_digit == b'0' {
+        // Attempt to parse encoding base.
+        match second_digit {
+            b'b' => {
+                base = Base::Binary;
+            }
+            b'o' => {
+                base = Base::Octal;
+            }
+            b'x' => {
+                base = Base::Hexadecimal;
+            }
+            _ => {}
+        }
+    }
+
+    let offset = if base == Base::Decimal { 0 } else { 2 };
+
+    (&value[offset..], base)
+}
+
+fn strip_underscores(value_s: &str) -> Cow<'_, str> {
+    let value = value_s.as_bytes();
+    if value.iter().copied().all(|c| c != b'_' && c != b'f') {
+        return Cow::Borrowed(value_s);
+    }
+    let mut output = String::with_capacity(value.len());
+    for c in value.iter().copied() {
+        if c != b'_' {
+            output.push(c as char);
+        }
+    }
+    Cow::Owned(output)
 }
 
 /// Parse a single literal from its stringified representation.
@@ -1559,9 +1857,9 @@ impl FromStr for Literal {
     type Err = LexError;
 
     fn from_str(src: &str) -> Result<Self, LexError> {
-        match bridge::client::FreeFunctions::literal_from_str(src) {
+        match BridgeMethods::literal_from_str(src) {
             Ok(literal) => Ok(Literal(literal)),
-            Err(()) => Err(LexError),
+            Err(msg) => Err(LexError(msg)),
         }
     }
 }
@@ -1601,10 +1899,11 @@ impl fmt::Debug for Literal {
 )]
 /// Functionality for adding environment state to the build dependency info.
 pub mod tracked {
-
     use std::env::{self, VarError};
     use std::ffi::OsStr;
     use std::path::Path;
+
+    use crate::BridgeMethods;
 
     /// Retrieve an environment variable and add it to build dependency info.
     /// The build system executing the compiler will know that the variable was accessed during
@@ -1614,9 +1913,8 @@ pub mod tracked {
     #[unstable(feature = "proc_macro_tracked_env", issue = "99515")]
     pub fn env_var<K: AsRef<OsStr> + AsRef<str>>(key: K) -> Result<String, VarError> {
         let key: &str = key.as_ref();
-        let value = crate::bridge::client::FreeFunctions::injected_env_var(key)
-            .map_or_else(|| env::var(key), Ok);
-        crate::bridge::client::FreeFunctions::track_env_var(key, value.as_deref().ok());
+        let value = BridgeMethods::injected_env_var(key).map_or_else(|| env::var(key), Ok);
+        BridgeMethods::track_env_var(key, value.as_deref().ok());
         value
     }
 
@@ -1626,6 +1924,6 @@ pub mod tracked {
     #[unstable(feature = "proc_macro_tracked_path", issue = "99515")]
     pub fn path<P: AsRef<Path>>(path: P) {
         let path: &str = path.as_ref().to_str().unwrap();
-        crate::bridge::client::FreeFunctions::track_path(path);
+        BridgeMethods::track_path(path);
     }
 }

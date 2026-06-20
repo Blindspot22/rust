@@ -235,34 +235,6 @@ impl AttributeExt for Attribute {
         }
     }
 
-    fn deprecation_note(&self) -> Option<Ident> {
-        match &self.kind {
-            AttrKind::Normal(normal) if normal.item.path == sym::deprecated => {
-                let meta = &normal.item;
-
-                // #[deprecated = "..."]
-                if let Some(s) = meta.value_str() {
-                    return Some(Ident { name: s, span: meta.span() });
-                }
-
-                // #[deprecated(note = "...")]
-                if let Some(list) = meta.meta_item_list() {
-                    for nested in list {
-                        if let Some(mi) = nested.meta_item()
-                            && mi.path == sym::note
-                            && let Some(s) = mi.value_str()
-                        {
-                            return Some(Ident { name: s, span: mi.span });
-                        }
-                    }
-                }
-
-                None
-            }
-            _ => None,
-        }
-    }
-
     fn doc_resolution_scope(&self) -> Option<AttrStyle> {
         match &self.kind {
             AttrKind::DocComment(..) => Some(self.style),
@@ -295,6 +267,10 @@ impl AttributeExt for Attribute {
             }
         }
         false
+    }
+
+    fn is_rustc_doc_primitive(&self) -> bool {
+        self.has_name(sym::rustc_doc_primitive)
     }
 }
 
@@ -335,6 +311,34 @@ impl Attribute {
                 token::DocComment(comment_kind, self.style, data),
                 self.span,
             )],
+        }
+    }
+
+    pub fn deprecation_note(&self) -> Option<Ident> {
+        match &self.kind {
+            AttrKind::Normal(normal) if normal.item.path == sym::deprecated => {
+                let meta = &normal.item;
+
+                // #[deprecated = "..."]
+                if let Some(s) = meta.value_str() {
+                    return Some(Ident { name: s, span: meta.span() });
+                }
+
+                // #[deprecated(note = "...")]
+                if let Some(list) = meta.meta_item_list() {
+                    for nested in list {
+                        if let Some(mi) = nested.meta_item()
+                            && mi.path == sym::note
+                            && let Some(s) = mi.value_str()
+                        {
+                            return Some(Ident { name: s, span: mi.span });
+                        }
+                    }
+                }
+
+                None
+            }
+            _ => None,
         }
     }
 }
@@ -820,19 +824,19 @@ pub fn mk_attr_name_value_str(
     mk_attr(g, style, unsafety, path, args, span)
 }
 
-pub fn filter_by_name<A: AttributeExt>(attrs: &[A], name: Symbol) -> impl Iterator<Item = &A> {
+pub fn filter_by_name(attrs: &[Attribute], name: Symbol) -> impl Iterator<Item = &Attribute> {
     attrs.iter().filter(move |attr| attr.has_name(name))
 }
 
-pub fn find_by_name<A: AttributeExt>(attrs: &[A], name: Symbol) -> Option<&A> {
+pub fn find_by_name(attrs: &[Attribute], name: Symbol) -> Option<&Attribute> {
     filter_by_name(attrs, name).next()
 }
 
-pub fn first_attr_value_str_by_name(attrs: &[impl AttributeExt], name: Symbol) -> Option<Symbol> {
+pub fn first_attr_value_str_by_name(attrs: &[Attribute], name: Symbol) -> Option<Symbol> {
     find_by_name(attrs, name).and_then(|attr| attr.value_str())
 }
 
-pub fn contains_name(attrs: &[impl AttributeExt], name: Symbol) -> bool {
+pub fn contains_name(attrs: &[Attribute], name: Symbol) -> bool {
     find_by_name(attrs, name).is_some()
 }
 
@@ -841,7 +845,7 @@ pub fn list_contains_name(items: &[MetaItemInner], name: Symbol) -> bool {
 }
 
 impl MetaItemLit {
-    pub fn value_str(&self) -> Option<Symbol> {
+    pub fn value_as_str(&self) -> Option<Symbol> {
         LitKind::from_token_lit(self.as_token_lit()).ok().and_then(|lit| lit.str())
     }
 }
@@ -872,11 +876,15 @@ pub trait AttributeExt: Debug {
     /// a doc comment) will return `false`.
     fn is_doc_comment(&self) -> Option<Span>;
 
+    /// Returns true if the attribute's first *and only* path segment is equal to the passed-in
+    /// symbol.
     #[inline]
     fn has_name(&self, name: Symbol) -> bool {
         self.name().map(|x| x == name).unwrap_or(false)
     }
 
+    /// Returns true if the attribute's first *and only* path segment is any of the passed-in
+    /// symbols.
     #[inline]
     fn has_any_name(&self, names: &[Symbol]) -> bool {
         names.iter().any(|&name| self.has_name(name))
@@ -885,6 +893,7 @@ pub trait AttributeExt: Debug {
     /// get the span of the entire attribute
     fn span(&self) -> Span;
 
+    /// Returns whether the attribute is a path, without any arguments.
     fn is_word(&self) -> bool;
 
     fn path(&self) -> SmallVec<[Symbol; 1]> {
@@ -902,16 +911,14 @@ pub trait AttributeExt: Debug {
     /// * `#[doc(...)]` returns `None`.
     fn doc_str(&self) -> Option<Symbol>;
 
-    /// Returns the deprecation note if this is deprecation attribute.
-    /// * `#[deprecated = "note"]` returns `Some("note")`.
-    /// * `#[deprecated(note = "note", ...)]` returns `Some("note")`.
-    fn deprecation_note(&self) -> Option<Ident>;
-
+    /// Returns whether this attribute is any of the proc macro attributes.
+    /// i.e. `proc_macro`, `proc_macro_attribute` or `proc_macro_derive`.
     fn is_proc_macro_attr(&self) -> bool {
         [sym::proc_macro, sym::proc_macro_attribute, sym::proc_macro_derive]
             .iter()
             .any(|kind| self.has_name(*kind))
     }
+    /// Returns true if this attribute is `#[automatically_deived]`.
     fn is_automatically_derived_attr(&self) -> bool;
 
     /// Returns the documentation and its kind if this is a doc comment or a sugared doc comment.
@@ -935,6 +942,9 @@ pub trait AttributeExt: Debug {
 
     /// Returns `true` is this attribute contains `doc(keyword)` or `doc(attribute)`.
     fn is_doc_keyword_or_attribute(&self) -> bool;
+
+    /// Returns `true` if this is a `#[rustc_doc_primitive]` attribute.
+    fn is_rustc_doc_primitive(&self) -> bool;
 }
 
 // FIXME(fn_delegation): use function delegation instead of manually forwarding

@@ -1243,6 +1243,39 @@ impl Bar for Foo {
 }
 
 #[test]
+fn no_flyimports_type_anchor() {
+    check(
+        r#"
+mod m {
+    pub fn foo() {}
+}
+struct Bar;
+trait Foo {}
+impl Foo for Bar {}
+fn main() {
+    <Bar as Foo>::foo$0
+}
+    "#,
+        expect![[r#""#]],
+    );
+
+    check(
+        r#"
+mod m {
+    pub fn foo() {}
+}
+struct Bar;
+trait Foo {}
+impl Foo for Bar {}
+fn main() {
+    <Bar>::foo$0
+}
+    "#,
+        expect![[r#""#]],
+    );
+}
+
+#[test]
 fn no_inherent_candidates_proposed() {
     check(
         r#"
@@ -1739,7 +1772,7 @@ fn function() {
 "#,
         expect![[r#"
             st FooStruct (use outer::FooStruct) BarStruct
-            md foo (use outer::foo)
+            md foo:: (use outer::foo)
             fn foo_fun() (use outer::foo_fun)        fn()
         "#]],
     );
@@ -1776,9 +1809,8 @@ fn intrinsics() {
         r#"
     //- /core.rs crate:core
     pub mod intrinsics {
-        extern "rust-intrinsic" {
-            pub fn transmute<Src, Dst>(src: Src) -> Dst;
-        }
+        #[rustc_intrinsic]
+        pub unsafe fn transmute<Src, Dst>(src: Src) -> Dst;
     }
     pub mod mem {
         pub use crate::intrinsics::transmute;
@@ -1796,9 +1828,8 @@ fn intrinsics() {
         r#"
 //- /core.rs crate:core
 pub mod intrinsics {
-    extern "rust-intrinsic" {
-        pub fn transmute<Src, Dst>(src: Src) -> Dst;
-    }
+    #[rustc_intrinsic]
+    pub unsafe fn transmute<Src, Dst>(src: Src) -> Dst;
 }
 pub mod mem {
     pub use crate::intrinsics::transmute;
@@ -1974,5 +2005,88 @@ fn main() {
             fn _var() (use foo::env) fn()
             fn var() (use foo::env)  fn()
         "#]],
+    );
+}
+
+#[test]
+fn trait_method_import_across_multiple_crates() {
+    let fixture = r#"
+        //- /lib.rs crate:test-trait
+        pub trait TestTrait {
+            fn test_function(&self) -> u32;
+        }
+
+        //- /lib.rs crate:test-implementation deps:test-trait
+        pub struct TestStruct(pub usize);
+
+        impl test_trait::TestTrait for TestStruct {
+            fn test_function(&self) -> u32 {
+                1
+            }
+        }
+
+        //- /main.rs crate:main deps:test-implementation,test-trait
+        use test_implementation::TestStruct;
+
+        fn main() {
+            let test = TestStruct(42);
+            test.test_f$0
+        }
+    "#;
+
+    check(
+        fixture,
+        expect![[r#"
+            me test_function() (use test_trait::TestTrait) fn(&self) -> u32
+        "#]],
+    );
+
+    check_edit(
+        "test_function",
+        fixture,
+        r#"
+use test_implementation::TestStruct;
+use test_trait::TestTrait;
+
+fn main() {
+    let test = TestStruct(42);
+    test.test_function()$0
+}
+"#,
+    );
+}
+
+#[test]
+fn prefer_underscore_import() {
+    check_edit(
+        "bar",
+        r#"
+mod foo {
+    #[rust_analyzer::prefer_underscore_import]
+    pub trait Ext {
+        fn bar(&self) {}
+    }
+    impl<T> Ext for T {}
+}
+
+fn baz() {
+    1.bar$0
+}
+    "#,
+        r#"
+use foo::Ext as _;
+
+mod foo {
+    #[rust_analyzer::prefer_underscore_import]
+    pub trait Ext {
+        fn bar(&self) {}
+    }
+    impl<T> Ext for T {}
+}
+
+fn baz() {
+    1.bar();$0
+}
+    "#,
     );
 }

@@ -231,6 +231,7 @@ impl<'a> Sugg<'a> {
             | ast::ExprKind::Loop(..)
             | ast::ExprKind::MacCall(..)
             | ast::ExprKind::MethodCall(..)
+            | ast::ExprKind::Move(..)
             | ast::ExprKind::Paren(..)
             | ast::ExprKind::Underscore
             | ast::ExprKind::Path(..)
@@ -335,6 +336,11 @@ impl<'a> Sugg<'a> {
         Sugg::NonParen(Cow::Owned(format!("{{ {self} }}")))
     }
 
+    /// Convenience method to wrap the expression in an `unsafe` block.
+    pub fn unsafeify(self) -> Sugg<'static> {
+        Sugg::NonParen(Cow::Owned(format!("unsafe {{ {self} }}")))
+    }
+
     /// Convenience method to prefix the expression with the `async` keyword.
     /// Can be used after `blockify` to create an async block.
     pub fn asyncify(self) -> Sugg<'static> {
@@ -367,6 +373,20 @@ impl<'a> Sugg<'a> {
                 Sugg::NonParen(format!("({sugg})").into())
             },
             Sugg::UnOp(op, inner) => Sugg::NonParen(format!("({}{})", op.as_str(), inner.maybe_inner_paren()).into()),
+        }
+    }
+
+    /// Strip enclosing parentheses if present. This method must be called when
+    /// it is known that removing those will not change the meaning. For example,
+    /// if `self` is known to represent a reference and the suggestion will be
+    /// used as the argument of a function call, it is safe to remove the enclosing
+    /// parentheses. It would not be safe to do so for an expression that might
+    /// represent a tuple.
+    #[must_use]
+    pub fn strip_paren(self) -> Self {
+        match self {
+            Sugg::NonParen(s) | Sugg::MaybeParen(s) => Sugg::NonParen(strip_enclosing_paren(s)),
+            sugg => sugg,
         }
     }
 
@@ -427,6 +447,22 @@ pub fn has_enclosing_paren(sugg: impl AsRef<str>) -> bool {
         chars.next().is_none()
     } else {
         false
+    }
+}
+
+/// Strip enclosing parentheses from a snippet if present.
+fn strip_enclosing_paren(snippet: Cow<'_, str>) -> Cow<'_, str> {
+    if has_enclosing_paren(&snippet) {
+        match snippet {
+            Cow::Borrowed(s) => Cow::Borrowed(&s[1..s.len() - 1]),
+            Cow::Owned(mut s) => {
+                s.pop();
+                s.remove(0);
+                Cow::Owned(s)
+            },
+        }
+    } else {
+        snippet
     }
 }
 
@@ -861,7 +897,14 @@ impl<'tcx> DerefDelegate<'_, 'tcx> {
                     .cx
                     .typeck_results()
                     .type_dependent_def_id(parent_expr.hir_id)
-                    .map(|did| self.cx.tcx.fn_sig(did).instantiate_identity().skip_binder())
+                    .map(|did| {
+                        self.cx
+                            .tcx
+                            .fn_sig(did)
+                            .instantiate_identity()
+                            .skip_norm_wip()
+                            .skip_binder()
+                    })
                 {
                     std::iter::once(receiver)
                         .chain(call_args.iter())

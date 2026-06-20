@@ -1,3 +1,6 @@
+# This Dockerfile builds sysroot with the LLVM backend and then runs tests
+# with the GCC backend.
+
 FROM ubuntu:22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -31,15 +34,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY scripts/sccache.sh /scripts/
 RUN sh /scripts/sccache.sh
 
-ENV NO_DEBUG_ASSERTIONS 1
-ENV RUST_CONFIGURE_ARGS \
- --build=x86_64-unknown-linux-gnu \
+ENV NO_DEBUG_ASSERTIONS="1"
+ENV RUST_CONFIGURE_ARGS="--build=x86_64-unknown-linux-gnu \
  --enable-sanitizers \
  --enable-profiler \
  --enable-compiler-docs \
- --set llvm.libzstd=true \
- --set 'rust.codegen-backends=[\"llvm\",\"gcc\"]'
-ENV SCRIPT python3 ../x.py \
+ --set llvm.libzstd=true"
+ENV SCRIPT="python3 ../x.py \
   --stage 2 \
   test tests \
   --test-codegen-backend gcc \
@@ -50,5 +51,4 @@ ENV SCRIPT python3 ../x.py \
   --skip tests/rustdoc-js \
   --skip tests/rustdoc-js-std \
   --skip tests/rustdoc-json \
-  --skip tests/rustdoc-ui \
-  --set 'rust.codegen-backends=[\"llvm\",\"gcc\"]'
+  --skip tests/rustdoc-ui"

@@ -24,7 +24,7 @@ static REGEX_IGNORE_END: LazyLock<Regex> =
 static REGEX_IGNORE_LINK_TARGETS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\[.+\]: ").unwrap());
 static REGEX_SPLIT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"([^\.\d\-\*]\.|[^r]\?|!)\s").unwrap());
+    LazyLock::new(|| Regex::new(r"([^\.\d\-\*]\.|[^r\~]\?|!)\s").unwrap());
 // list elements, numbered (1.) or not  (- and *)
 static REGEX_LIST_ENTRY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*(\d\.|\-|\*|\d\))\s+").unwrap());
@@ -45,14 +45,16 @@ fn main() -> Result<()> {
                 continue;
             }
             let old = fs::read_to_string(&path)?;
-            let new = lengthen_lines(&comply(&old), cli.line_length_limit);
+            let new = comply(&old);
             if new == old {
                 compliant.push(path.clone());
-            } else if cli.overwrite {
-                fs::write(&path, new)?;
-                made_compliant.push(path.clone());
             } else {
-                not_compliant.push(path.clone());
+                if cli.overwrite {
+                    fs::write(&path, lengthen_lines(&new, cli.line_length_limit))?;
+                    made_compliant.push(path.clone());
+                } else {
+                    not_compliant.push(path.clone());
+                }
             }
         }
     }
@@ -83,6 +85,8 @@ fn ignore(line: &str, in_code_block: bool) -> bool {
         || line.contains(" etc.")
         || line.contains("i.e.")
         || line.contains("et. al")
+        || line.contains("<!--")
+        || line.contains("-->")
         || line.contains('|')
         || line.trim_start().starts_with('>')
         || line.starts_with('#')
@@ -157,6 +161,9 @@ fn lengthen_lines(content: &str, limit: usize) -> String {
         if in_html_div {
             continue;
         }
+        if line.trim_end().ends_with("<br>") {
+            continue;
+        }
         if ignore(line, in_code_block) || REGEX_SPLIT.is_match(line) {
             continue;
         }
@@ -204,6 +211,7 @@ git log main.. compiler
 o? whatever
 r? @reviewer
  r? @reviewer
+~? diagnostic
 ";
     let expected = "
 # some. heading
@@ -236,6 +244,7 @@ o?
 whatever
 r? @reviewer
  r? @reviewer
+~? diagnostic
 ";
     assert_eq!(expected, comply(original));
 }
@@ -263,6 +272,11 @@ leave the
 text alone
 ```
 
+<!-- ignore
+html comment opening
+--> ignore
+html comment closing
+
  handle the
  indented well
 
@@ -288,6 +302,11 @@ do not mess with code block chars
 leave the
 text alone
 ```
+
+<!-- ignore
+html comment opening
+--> ignore
+html comment closing
 
  handle the indented well
 

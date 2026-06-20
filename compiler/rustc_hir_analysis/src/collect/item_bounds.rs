@@ -143,9 +143,12 @@ fn remap_gat_vars_and_recurse_into_nested_projections<'tcx>(
     };
 
     let gat_vars = loop {
-        if let ty::Alias(ty::Projection, alias_ty) = *clause_ty.kind() {
+        if let ty::Alias(
+            alias_ty @ ty::AliasTy { kind: ty::Projection { def_id: alias_ty_def_id }, .. },
+        ) = *clause_ty.kind()
+        {
             if alias_ty.trait_ref(tcx) == item_trait_ref
-                && alias_ty.def_id == assoc_item_def_id.to_def_id()
+                && alias_ty_def_id == assoc_item_def_id.to_def_id()
             {
                 // We have found the GAT in question...
                 // Return the vars, since we may need to remap them.
@@ -241,7 +244,7 @@ struct MapAndCompressBoundVars<'tcx> {
     binder: ty::DebruijnIndex,
     /// List of bound vars that remain unsubstituted because they were not
     /// mentioned in the GAT's args.
-    still_bound_vars: Vec<ty::BoundVariableKind>,
+    still_bound_vars: Vec<ty::BoundVariableKind<'tcx>>,
     /// Subtle invariant: If the `GenericArg` is bound, then it should be
     /// stored with the debruijn index of `INNERMOST` so it can be shifted
     /// correctly during substitution.
@@ -330,7 +333,8 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for MapAndCompressBoundVars<'tcx> {
             } else {
                 let var = ty::BoundVar::from_usize(self.still_bound_vars.len());
                 self.still_bound_vars.push(ty::BoundVariableKind::Const);
-                let mapped = ty::Const::new_bound(self.tcx, ty::INNERMOST, ty::BoundConst { var });
+                let mapped =
+                    ty::Const::new_bound(self.tcx, ty::INNERMOST, ty::BoundConst::new(var));
                 self.mapping.insert(old_bound.var, mapped.into());
                 mapped
             };
@@ -545,12 +549,16 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for AssocTyToOpaque<'tcx> {
     }
 
     fn fold_ty(&mut self, ty: Ty<'tcx>) -> Ty<'tcx> {
-        if let ty::Alias(ty::Projection, projection_ty) = ty.kind()
+        if let &ty::Alias(ty::AliasTy {
+            kind: ty::Projection { def_id: projection_ty_def_id },
+            args,
+            ..
+        }) = ty.kind()
             && let Some(ty::ImplTraitInTraitData::Trait { fn_def_id, .. }) =
-                self.tcx.opt_rpitit_info(projection_ty.def_id)
+                self.tcx.opt_rpitit_info(projection_ty_def_id)
             && fn_def_id == self.fn_def_id
         {
-            self.tcx.type_of(projection_ty.def_id).instantiate(self.tcx, projection_ty.args)
+            self.tcx.type_of(projection_ty_def_id).instantiate(self.tcx, args).skip_norm_wip()
         } else {
             ty.super_fold_with(self)
         }

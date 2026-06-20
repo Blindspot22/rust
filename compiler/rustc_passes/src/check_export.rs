@@ -4,7 +4,6 @@ use std::ops::ControlFlow;
 use rustc_abi::ExternAbi;
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_hir as hir;
-use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::find_attr;
@@ -13,12 +12,12 @@ use rustc_middle::hir::nested_filter;
 use rustc_middle::middle::privacy::{EffectiveVisibility, Level};
 use rustc_middle::query::{LocalCrate, Providers};
 use rustc_middle::ty::{
-    self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitor, Visibility,
+    self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitor, Unnormalized, Visibility,
 };
 use rustc_session::config::CrateType;
 use rustc_span::Span;
 
-use crate::errors::UnexportableItem;
+use crate::diagnostics::UnexportableItem;
 
 struct ExportableItemCollector<'tcx> {
     tcx: TyCtxt<'tcx>,
@@ -46,7 +45,7 @@ impl<'tcx> ExportableItemCollector<'tcx> {
     }
 
     fn item_is_exportable(&self, def_id: LocalDefId) -> bool {
-        let has_attr = find_attr!(self.tcx.get_all_attrs(def_id), AttributeKind::ExportStable);
+        let has_attr = find_attr!(self.tcx, def_id, ExportStable);
         if !self.in_exportable_mod && !has_attr {
             return false;
         }
@@ -82,7 +81,7 @@ impl<'tcx> ExportableItemCollector<'tcx> {
     fn walk_item_with_mod(&mut self, item: &'tcx hir::Item<'tcx>) {
         let def_id = item.hir_id().owner.def_id;
         let old_exportable_mod = self.in_exportable_mod;
-        if find_attr!(self.tcx.get_all_attrs(def_id), AttributeKind::ExportStable) {
+        if find_attr!(self.tcx, def_id, ExportStable) {
             self.in_exportable_mod = true;
         }
         let old_seen_exportable_in_mod = std::mem::replace(&mut self.seen_exportable_in_mod, false);
@@ -205,14 +204,17 @@ impl<'tcx, 'a> ExportableItemsChecker<'tcx, 'a> {
         }
 
         let sig = self.tcx.fn_sig(def_id).instantiate_identity().skip_binder();
-        if !matches!(sig.abi, ExternAbi::C { .. }) {
+        if !matches!(sig.abi(), ExternAbi::C { .. }) {
             self.tcx.dcx().emit_err(UnexportableItem::FnAbi(span));
             return;
         }
 
         let sig = self
             .tcx
-            .try_normalize_erasing_regions(ty::TypingEnv::non_body_analysis(self.tcx, def_id), sig)
+            .try_normalize_erasing_regions(
+                ty::TypingEnv::non_body_analysis(self.tcx, def_id),
+                Unnormalized::new_wip(sig),
+            )
             .unwrap_or(sig);
 
         let hir_id = self.tcx.local_def_id_to_hir_id(def_id);
@@ -281,7 +283,8 @@ impl<'tcx, 'a> TypeVisitor<TyCtxt<'tcx>> for ExportableItemsChecker<'tcx, 'a> {
                 }
                 for variant in adt_def.variants() {
                     for field in &variant.fields {
-                        let field_ty = self.tcx.type_of(field.did).instantiate_identity();
+                        let field_ty =
+                            self.tcx.type_of(field.did).instantiate_identity().skip_norm_wip();
                         field_ty.visit_with(self)?;
                     }
                 }
@@ -309,7 +312,7 @@ impl<'tcx, 'a> TypeVisitor<TyCtxt<'tcx>> for ExportableItemsChecker<'tcx, 'a> {
             | ty::CoroutineWitness(_, _)
             | ty::Never
             | ty::UnsafeBinder(_)
-            | ty::Alias(ty::AliasTyKind::Opaque, _) => {
+            | ty::Alias(ty::AliasTy { kind: ty::AliasTyKind::Opaque { .. }, .. }) => {
                 return ControlFlow::Break(ty);
             }
 

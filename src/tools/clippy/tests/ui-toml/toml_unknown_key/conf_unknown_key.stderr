@@ -18,6 +18,7 @@ error: error reading Clippy's configuration file: unknown field `foobar`, expect
            allow-renamed-params-for
            allow-unwrap-in-consts
            allow-unwrap-in-tests
+           allow-unwrap-types
            allow-useless-vec-in-tests
            allowed-dotfiles
            allowed-duplicate-crates
@@ -37,6 +38,7 @@ error: error reading Clippy's configuration file: unknown field `foobar`, expect
            check-private-items
            cognitive-complexity-threshold
            const-literal-digits-threshold
+           disallowed-fields
            disallowed-macros
            disallowed-methods
            disallowed-names
@@ -68,6 +70,7 @@ error: error reading Clippy's configuration file: unknown field `foobar`, expect
            module-items-ordered-within-groupings
            msrv
            pass-by-value-size-limit
+           profiles
            pub-underscore-fields-behavior
            recursive-self-in-type-definitions
            semicolon-inside-block-ignore-singleline
@@ -117,6 +120,7 @@ error: error reading Clippy's configuration file: unknown field `barfoo`, expect
            allow-renamed-params-for
            allow-unwrap-in-consts
            allow-unwrap-in-tests
+           allow-unwrap-types
            allow-useless-vec-in-tests
            allowed-dotfiles
            allowed-duplicate-crates
@@ -136,6 +140,7 @@ error: error reading Clippy's configuration file: unknown field `barfoo`, expect
            check-private-items
            cognitive-complexity-threshold
            const-literal-digits-threshold
+           disallowed-fields
            disallowed-macros
            disallowed-methods
            disallowed-names
@@ -167,6 +172,7 @@ error: error reading Clippy's configuration file: unknown field `barfoo`, expect
            module-items-ordered-within-groupings
            msrv
            pass-by-value-size-limit
+           profiles
            pub-underscore-fields-behavior
            recursive-self-in-type-definitions
            semicolon-inside-block-ignore-singleline
@@ -216,6 +222,7 @@ error: error reading Clippy's configuration file: unknown field `allow_mixed_uni
            allow-renamed-params-for
            allow-unwrap-in-consts
            allow-unwrap-in-tests
+           allow-unwrap-types
            allow-useless-vec-in-tests
            allowed-dotfiles
            allowed-duplicate-crates
@@ -235,6 +242,7 @@ error: error reading Clippy's configuration file: unknown field `allow_mixed_uni
            check-private-items
            cognitive-complexity-threshold
            const-literal-digits-threshold
+           disallowed-fields
            disallowed-macros
            disallowed-methods
            disallowed-names
@@ -266,6 +274,7 @@ error: error reading Clippy's configuration file: unknown field `allow_mixed_uni
            module-items-ordered-within-groupings
            msrv
            pass-by-value-size-limit
+           profiles
            pub-underscore-fields-behavior
            recursive-self-in-type-definitions
            semicolon-inside-block-ignore-singleline
