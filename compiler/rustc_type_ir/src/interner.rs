@@ -9,6 +9,7 @@ use rustc_index::bit_set::DenseBitSet;
 
 use crate::fold::TypeFoldable;
 use crate::inherent::*;
+use crate::intern::Interned;
 use crate::ir_print::IrPrint;
 use crate::lang_items::{SolverAdtLangItem, SolverProjectionLangItem, SolverTraitLangItem};
 use crate::relate::Relate;
@@ -16,7 +17,10 @@ use crate::solve::{
     AccessedOpaques, CanonicalInput, Certainty, ExternalConstraintsData, QueryResult, inspect,
 };
 use crate::visit::{Flags, TypeVisitable};
-use crate::{self as ty, CanonicalParamEnvCacheEntry, search_graph};
+use crate::{
+    self as ty, BoundRegion, BoundVar, CanonicalParamEnvCacheEntry, DebruijnIndex, Region,
+    RegionKind, TraitRef, search_graph,
+};
 
 #[cfg_attr(feature = "nightly", rustc_diagnostic_item = "type_ir_interner")]
 pub trait Interner:
@@ -56,13 +60,12 @@ pub trait Interner:
     type CoroutineId: SpecificDefId<Self>;
     type AdtId: SpecificDefId<Self>;
     type ImplId: SpecificDefId<Self>;
-    type UnevaluatedConstId: SpecificDefId<Self>;
+    type AnonConstId: SpecificDefId<Self>;
     type TraitAssocTyId: SpecificDefId<Self>
         + Into<Self::TraitAssocTermId>
         + TryFrom<Self::TraitAssocTermId>;
     type TraitAssocConstId: SpecificDefId<Self>
         + Into<Self::TraitAssocTermId>
-        + Into<Self::UnevaluatedConstId>
         + TryFrom<Self::TraitAssocTermId>;
     type TraitAssocTermId: SpecificDefId<Self>;
     type OpaqueTyId: SpecificDefId<Self, Self::LocalOpaqueTyId>;
@@ -75,19 +78,13 @@ pub trait Interner:
         + Into<Self::DefId>
         + TypeFoldable<Self>;
     type FreeTyAliasId: SpecificDefId<Self> + Into<Self::FreeTermAliasId>;
-    type FreeConstAliasId: SpecificDefId<Self>
-        + Into<Self::UnevaluatedConstId>
-        + Into<Self::FreeTermAliasId>;
+    type FreeConstAliasId: SpecificDefId<Self> + Into<Self::FreeTermAliasId>;
     type FreeTermAliasId: SpecificDefId<Self>;
     type ImplOrTraitAssocTyId: SpecificDefId<Self> + Into<Self::ImplOrTraitAssocTermId>;
-    type ImplOrTraitAssocConstId: SpecificDefId<Self>
-        + Into<Self::UnevaluatedConstId>
-        + Into<Self::ImplOrTraitAssocTermId>;
+    type ImplOrTraitAssocConstId: SpecificDefId<Self> + Into<Self::ImplOrTraitAssocTermId>;
     type ImplOrTraitAssocTermId: SpecificDefId<Self>;
     type InherentAssocTyId: SpecificDefId<Self> + Into<Self::InherentAssocTermId>;
-    type InherentAssocConstId: SpecificDefId<Self>
-        + Into<Self::UnevaluatedConstId>
-        + Into<Self::InherentAssocTermId>;
+    type InherentAssocConstId: SpecificDefId<Self> + Into<Self::InherentAssocTermId>;
     type InherentAssocTermId: SpecificDefId<Self>;
     type Span: Span<Self>;
 
@@ -187,9 +184,10 @@ pub trait Interner:
     type ScalarInt: Copy + Debug + Hash + Eq;
 
     // Kinds of regions
-    type Region: Region<Self>;
     type EarlyParamRegion: ParamLike;
     type LateParamRegion: Copy + Debug + Hash + Eq;
+
+    type InternedRegionKind: Interned<Self, Value = RegionKind<Self>>;
 
     type RegionAssumptions: Copy
         + Debug
@@ -244,10 +242,7 @@ pub trait Interner:
     type AdtDef: AdtDef<Self>;
     fn adt_def(self, adt_def_id: Self::AdtId) -> Self::AdtDef;
 
-    fn unevaluated_const_kind_from_def_id(
-        self,
-        def_id: Self::DefId,
-    ) -> ty::UnevaluatedConstKind<Self>;
+    fn alias_const_kind_from_def_id(self, def_id: Self::DefId) -> ty::AliasConstKind<Self>;
 
     // FIXME: remove in favor of explicit construction
     fn alias_term_kind_from_def_id(self, def_id: Self::DefId) -> ty::AliasTermKind<Self>;
@@ -292,6 +287,8 @@ pub trait Interner:
 
     fn assumptions_on_binders(self) -> bool;
 
+    fn renormalize_rigid_aliases(self) -> bool;
+
     fn coroutine_hidden_types(
         self,
         def_id: Self::CoroutineId,
@@ -323,22 +320,22 @@ pub trait Interner:
         def_id: Self::DefId,
     ) -> ty::EarlyBinder<Self, impl IntoIterator<Item = Self::Clause>>;
 
-    fn predicates_of(
+    fn clauses_of(
         self,
         def_id: Self::DefId,
     ) -> ty::EarlyBinder<Self, impl IntoIterator<Item = Self::Clause>>;
 
-    fn own_predicates_of(
+    fn own_clauses_of(
         self,
         def_id: Self::DefId,
     ) -> ty::EarlyBinder<Self, impl IntoIterator<Item = Self::Clause>>;
 
-    fn explicit_super_predicates_of(
+    fn explicit_super_clauses_of(
         self,
         def_id: Self::TraitId,
     ) -> ty::EarlyBinder<Self, impl IntoIterator<Item = (Self::Clause, Self::Span)>>;
 
-    fn explicit_implied_predicates_of(
+    fn explicit_implied_clauses_of(
         self,
         def_id: Self::DefId,
     ) -> ty::EarlyBinder<Self, impl IntoIterator<Item = (Self::Clause, Self::Span)>>;
@@ -406,8 +403,7 @@ pub trait Interner:
 
     fn for_each_relevant_impl<R: VisitorResult>(
         self,
-        trait_def_id: Self::TraitId,
-        self_ty: Self::Ty,
+        trait_ref: TraitRef<Self>,
         f: impl FnMut(Self::ImplId) -> R,
     ) -> R;
     fn for_each_blanket_impl<R: VisitorResult>(
@@ -426,6 +422,8 @@ pub trait Interner:
     -> ty::EarlyBinder<Self, ty::TraitRef<Self>>;
 
     fn impl_polarity(self, impl_def_id: Self::ImplId) -> ty::ImplPolarity;
+
+    fn is_fully_generic_for_reflection(self, impl_def_id: Self::ImplId) -> bool;
 
     fn trait_is_auto(self, trait_def_id: Self::TraitId) -> bool;
 
@@ -469,9 +467,28 @@ pub trait Interner:
     fn evaluate_root_goal_for_proof_tree_raw(
         self,
         canonical_goal: CanonicalInput<Self>,
+        root_depth: usize,
     ) -> (QueryResult<Self>, Self::Probe);
 
+    fn emit_next_solver_overflow_fcw(self, predicate: Self::Predicate, span: Self::Span);
+
     fn item_name(self, item_index: Self::DefId) -> Self::Symbol;
+
+    fn get_anon_re_bounds_lifetime(self, idx: usize, var_idx: usize) -> Option<Region<Self>>;
+
+    fn get_anon_re_canonical_bounds_lifetime(self, idx: usize) -> Option<Region<Self>>;
+
+    fn get_re_static_lifetime(self) -> Region<Self>;
+
+    fn intern_region(self, region_kind: RegionKind<Self>) -> Region<Self>;
+
+    fn intern_bound_region(
+        self,
+        debruijn: DebruijnIndex,
+        bound_region: BoundRegion<Self>,
+    ) -> Region<Self>;
+
+    fn intern_canonical_bound(self, var: BoundVar) -> Region<Self>;
 }
 
 macro_rules! declare_lift_into {
@@ -498,16 +515,19 @@ declare_lift_into! {
     BoundVarKinds,
     Const,
     DefId,
+    EarlyParamRegion,
+    ErrorGuaranteed,
     FreeConstAliasId,
     FreeTyAliasId,
     GenericArg,
     GenericArgs,
     InherentAssocConstId,
     InherentAssocTyId,
+    InternedRegionKind,
+    LateParamRegion,
     OpaqueTyId,
     ParamEnv,
     PatList,
-    Region,
     RegionAssumptions,
     Symbol,
     Term,
@@ -517,7 +537,7 @@ declare_lift_into! {
     TraitId,
     Ty,
     Tys,
-    UnevaluatedConstId,
+    AnonConstId,
 }
 
 /// Imagine you have a function `F: FnOnce(&[T]) -> R`, plus an iterator `iter`
@@ -663,7 +683,7 @@ impl<T, R, E> CollectAndApply<T, R> for Result<T, E> {
 impl<I: Interner> search_graph::Cx for I {
     type Input = CanonicalInput<I>;
     type Result = (QueryResult<I>, AccessedOpaques<I>);
-    type AmbiguityInfo = Certainty;
+    type AmbiguityKind = Certainty;
 
     type DepNodeIndex = I::DepNodeIndex;
     type Tracked<T: Debug + Clone> = I::Tracked<T>;

@@ -5,13 +5,14 @@ use std::path::PathBuf;
 pub use ReprAttr::*;
 use rustc_abi::Align;
 pub use rustc_ast::attr::data_structures::*;
+pub use rustc_ast::attr::version::RustcVersion;
 use rustc_ast::expand::autodiff_attrs::{DiffActivity, DiffMode};
 use rustc_ast::expand::typetree::TypeTree;
 use rustc_ast::token::DocFragmentKind;
 use rustc_ast::{AttrStyle, Path, ast};
+use rustc_data_structures::Limit;
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_error_messages::{DiagArgValue, IntoDiagArg};
-use rustc_hir::LangItem;
 use rustc_macros::{Decodable, Encodable, PrintAttribute, StableHash};
 use rustc_span::def_id::DefId;
 use rustc_span::hygiene::Transparency;
@@ -19,10 +20,10 @@ use rustc_span::{ErrorGuaranteed, Ident, Span, Symbol};
 pub use rustc_target::spec::SanitizerSet;
 use thin_vec::ThinVec;
 
+pub use crate::attrs::canonical_symbols::{CanonicalSymbol, CanonicalSymbols};
 use crate::attrs::diagnostic::*;
 use crate::attrs::pretty_printing::PrintAttribute;
-use crate::limit::Limit;
-use crate::{DefaultBodyStability, PartialConstStability, RustcVersion, Stability};
+use crate::{DefaultBodyStability, LangItem, PartialConstStability, Stability};
 
 #[derive(Copy, Clone, Debug, StableHash, Encodable, Decodable, PrintAttribute)]
 pub enum EiiImplResolution {
@@ -31,8 +32,8 @@ pub enum EiiImplResolution {
     /// what foreign item its associated with.
     Macro(DefId),
     /// Sometimes though, we already know statically and can skip some name resolution.
-    /// Stored together with the eii's name for diagnostics.
-    Known(EiiDecl),
+    /// DefId of the extern item that the EII implementation implements.
+    Known(DefId),
     /// For when resolution failed, but we want to continue compilation
     Error(ErrorGuaranteed),
 }
@@ -40,7 +41,7 @@ pub enum EiiImplResolution {
 #[derive(Copy, Clone, Debug, StableHash, Encodable, Decodable, PrintAttribute)]
 pub struct EiiImpl {
     pub resolution: EiiImplResolution,
-    pub impl_marked_unsafe: bool,
+    pub impl_unsafe_span: Option<Span>,
     pub span: Span,
     pub inner_span: Span,
     pub is_default: bool,
@@ -370,19 +371,8 @@ pub enum PeImportNameType {
     Undecorated,
 }
 
-#[derive(
-    Copy,
-    Clone,
-    Debug,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Encodable,
-    Decodable,
-    PrintAttribute
-)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Encodable, Decodable, PrintAttribute)]
 #[derive(StableHash)]
 pub enum NativeLibKind {
     /// Static library (e.g. `libfoo.a` on Linux or `foo.lib` on Windows/MSVC)
@@ -515,19 +505,66 @@ pub enum HideOrShow {
     Show,
 }
 
-#[derive(Clone, Debug, StableHash, Encodable, Decodable, PrintAttribute)]
-pub struct CfgInfo {
-    pub name: Symbol,
-    pub name_span: Span,
-    pub value: Option<(Symbol, Span)>,
+#[derive(Clone, Copy, Debug, StableHash, Encodable, Decodable, PrintAttribute, PartialEq)]
+pub struct DocCfgHideShowValue {
+    pub span: Span,
+    /// If `value` is `None`, then it's a `none()` value.
+    pub value: Option<Symbol>,
 }
 
-impl CfgInfo {
-    pub fn span_for_name_and_value(&self) -> Span {
-        if let Some((_, value_span)) = self.value {
-            self.name_span.with_hi(value_span.hi())
-        } else {
-            self.name_span
+impl DocCfgHideShowValue {
+    pub fn new(value: Symbol, span: Span) -> Self {
+        Self { span, value: Some(value) }
+    }
+
+    pub fn new_none(span: Span) -> Self {
+        Self { span, value: None }
+    }
+}
+
+#[derive(Clone, Debug, StableHash, Encodable, Decodable, PrintAttribute, PartialEq)]
+pub enum DocCfgHideShow {
+    Any(Span),
+    List(ThinVec<DocCfgHideShowValue>),
+}
+
+impl DocCfgHideShow {
+    pub fn new() -> Self {
+        Self::List(ThinVec::new())
+    }
+
+    pub fn new_with_only_key(span: Span) -> Self {
+        let mut values = ThinVec::with_capacity(1);
+        values.push(DocCfgHideShowValue { span, value: None });
+        Self::List(values)
+    }
+
+    pub fn push_none(&mut self, span: Span) {
+        if let Self::List(values) = self
+            && !values.iter().any(|v| v.value.is_none())
+        {
+            values.push(DocCfgHideShowValue { span, value: None });
+        }
+    }
+
+    pub fn merge_with(&mut self, other: &Self) {
+        match (self, other) {
+            (Self::Any(_), Self::Any(_) | Self::List(_)) => {
+                // Nothing to do.
+            }
+            (s, Self::Any(span)) => {
+                // We "upgrade" the list values to "all".
+                *s = Self::Any(*span);
+            }
+            (Self::List(values), Self::List(other_values)) => {
+                // Having duplicates is not an issue, we simply ignore them. Would be more
+                // convenient to have a `set` type though. T_T
+                for other in other_values {
+                    if !values.iter().any(|value| value.value == other.value) {
+                        values.push(*other);
+                    }
+                }
+            }
         }
     }
 }
@@ -535,7 +572,7 @@ impl CfgInfo {
 #[derive(Clone, Debug, StableHash, Encodable, Decodable, PrintAttribute)]
 pub struct CfgHideShow {
     pub kind: HideOrShow,
-    pub values: ThinVec<CfgInfo>,
+    pub values: FxIndexMap<Symbol, DocCfgHideShow>,
 }
 
 #[derive(Clone, Debug, Default, StableHash, Decodable, PrintAttribute)]
@@ -762,6 +799,7 @@ pub enum RustcDumpLayoutKind {
     BackendRepr,
     Debug,
     HomogenousAggregate,
+    LargestNiche,
     Size,
 }
 
@@ -964,7 +1002,7 @@ pub enum AttributeKind {
     AutomaticallyDerived,
 
     /// Represents the trace attribute of `#[cfg_attr]`
-    CfgAttrTrace,
+    CfgAttrTrace(ThinVec<(CfgEntry, Span)>),
 
     /// Represents the trace attribute of `#[cfg]`
     CfgTrace(ThinVec<(CfgEntry, Span)>),
@@ -1038,7 +1076,7 @@ pub enum AttributeKind {
     EiiDeclaration(EiiDecl),
 
     /// Implementation detail of `#[eii]`
-    EiiImpls(ThinVec<EiiImpl>),
+    EiiImpl(Box<EiiImpl>),
 
     /// Represents [`#[export_name]`](https://doc.rust-lang.org/reference/abi.html#the-export_name-attribute).
     ExportName {
@@ -1182,6 +1220,7 @@ pub enum AttributeKind {
 
     /// Represents `#[diagnostic::on_const]`.
     OnConst {
+        /// The attribute path span.
         span: Span,
         /// None if the directive was malformed in some way.
         directive: Option<Box<Directive>>,
@@ -1216,6 +1255,9 @@ pub enum AttributeKind {
         directive: Option<Box<Directive>>,
     },
 
+    /// Represents `#[diagnostic::opaque]`.
+    Opaque,
+
     /// Represents `#[optimize(size|speed)]`
     Optimize(OptimizeAttr, Span),
 
@@ -1224,8 +1266,9 @@ pub enum AttributeKind {
 
     /// Represents `#[patchable_function_entry]`
     PatchableFunctionEntry {
-        prefix: u8,
-        entry: u8,
+        prefix: Option<u8>,
+        entry: Option<u8>,
+        section: Option<Symbol>,
     },
 
     /// Represents `#[path]`
@@ -1265,8 +1308,11 @@ pub enum AttributeKind {
     /// Represents `#[reexport_test_harness_main]`
     ReexportTestHarnessMain(Symbol),
 
-    /// Represents `#[register_tool]`
-    RegisterTool(ThinVec<Ident>),
+    /// Represents `#[register_attribute_tool]`, `#[register_lint_tool]` and `#[register_tool]`
+    RegisterTool {
+        attr_tools: ThinVec<Ident>,
+        lint_tools: ThinVec<Ident>,
+    },
 
     /// Represents [`#[repr]`](https://doc.rust-lang.org/stable/reference/type-layout.html#representations).
     Repr {
@@ -1321,6 +1367,10 @@ pub enum AttributeKind {
         builtin_name: Option<Symbol>,
         helper_attrs: ThinVec<Symbol>,
     },
+
+    /// Represents `#[rustc_canonical_symbol]`
+    RustcCanonicalSymbol,
+
     /// Represents `#[rustc_capture_analysis]`
     RustcCaptureAnalysis,
 
@@ -1346,7 +1396,8 @@ pub enum AttributeKind {
     /// Represents `#[rustc_const_stable]` and `#[rustc_const_unstable]`.
     RustcConstStability {
         stability: PartialConstStability,
-        /// Span of the `#[rustc_const_stable(...)]` or `#[rustc_const_unstable(...)]` attribute
+        /// Path span of the `#[rustc_const_stable(...)]` or `#[rustc_const_unstable(...)]`
+        /// attribute.
         span: Span,
     },
 
@@ -1533,6 +1584,9 @@ pub enum AttributeKind {
     /// Represents `#[rustc_offload_kernel]`
     RustcOffloadKernel,
 
+    /// Represents `#[rustc_panics_when_zero]` (used for linting).
+    RustcPanicsWhenZero,
+
     /// Represents `#[rustc_paren_sugar]`.
     RustcParenSugar,
 
@@ -1588,6 +1642,9 @@ pub enum AttributeKind {
     /// Represents `#[rustc_strict_coherence]`.
     RustcStrictCoherence(Span),
 
+    /// Represents `#[rustc_test_entrypoint_marker]`
+    RustcTestEntrypointMarker,
+
     /// Represents `#[rustc_test_marker]`
     RustcTestMarker(Symbol),
 
@@ -1617,7 +1674,7 @@ pub enum AttributeKind {
         reason: Option<Symbol>,
     },
 
-    /// Represents `#[splat]`
+    /// Represents `#[rustc_splat]`
     Splat(Span),
 
     /// Represents `#[stable]`, `#[unstable]` and `#[rustc_allowed_through_unstable_modules]`.

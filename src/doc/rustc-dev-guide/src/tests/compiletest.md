@@ -96,10 +96,11 @@ The following test suites are available, with links for more information:
 | [`rustdoc-json`][rustdoc-json-tests] | Check JSON output of `rustdoc`                                           |
 | `rustdoc-ui`                         | Check terminal output of `rustdoc` ([see also](ui.md))                   |
 
-Some rustdoc-specific tests can also be found in `ui/rustdoc/`.
+`ui/rustdoc/` also contains some rustdoc-specific tests.
 These tests ensure that certain lints that are emitted as part of executing rustdoc
 are also run when executing rustc.
-Run-make tests pertaining to rustdoc are typically named `run-make/rustdoc-*/`.
+
+`run-make/rustdoc/` contains run-make tests pertaining to rustdoc.
 
 [rustdoc-html-tests]: ../rustdoc-internals/rustdoc-html-test-suite.md
 [rustdoc-gui-tests]: ../rustdoc-internals/rustdoc-gui-test-suite.md
@@ -279,15 +280,25 @@ the debugger currently being used:
 By passing the `--debugger` option to compiletest, you can specify a single debugger to run tests with.
 For example, `./x test tests/debuginfo -- --debugger gdb` will only test GDB commands.
 
-> **Note on running lldb debuginfo tests locally**
+> **Note on running lldb debuginfo tests locally with a prebuilt lldb
+> distribution**
 >
 > If you want to run lldb debuginfo tests locally, then currently on Windows it
 > is required that:
+>
+> # LLDB 21
 >
 > - You have Python 3.10 installed.
 > - You have `python310.dll` available in your `PATH` env var. This is not
 >   provided by the standard Python installer you obtain from `python.org`; you
 >   need to add this to `PATH` manually.
+>
+> # LLDB 22
+>
+> - You have Python 3.11 installed.
+> - You have `python311.dll` available in your `PATH`.
+> - It is recommended that you acquire a Python installation via `pymanager`,
+>   which has follow-up installer scripts to help you configure `PATH`.
 >
 > Otherwise the lldb debuginfo tests can produce crashes in mysterious ways.
 

@@ -96,7 +96,9 @@ impl<'cx, 'tcx> VerifyBoundCx<'cx, 'tcx> {
         &self,
         alias_ty: ty::AliasTy<'tcx>,
     ) -> Vec<ty::PolyTypeOutlivesPredicate<'tcx>> {
-        let erased_alias_ty = self.tcx.erase_and_anonymize_regions(alias_ty.to_ty(self.tcx));
+        let erased_alias_ty = self.tcx.erase_and_anonymize_regions(
+            alias_ty.to_ty(self.tcx, ty::IsRigid::yes_if_next_solver(self.tcx)),
+        );
         self.declared_generic_bounds_from_env_for_erased_ty(erased_alias_ty)
     }
 
@@ -104,8 +106,9 @@ impl<'cx, 'tcx> VerifyBoundCx<'cx, 'tcx> {
     pub(crate) fn alias_bound(&self, alias_ty: ty::AliasTy<'tcx>) -> VerifyBound<'tcx> {
         // Search the env for where clauses like `P: 'a`.
         let env_bounds = self.approx_declared_bounds_from_env(alias_ty).into_iter().map(|binder| {
+            // FIXME(#155345): We probably want to assert the alias is rigid here.
             if let Some(ty::OutlivesPredicate(ty, r)) = binder.no_bound_vars()
-                && let ty::Alias(alias_ty_from_bound) = *ty.kind()
+                && let ty::Alias(_, alias_ty_from_bound) = *ty.kind()
                 && alias_ty_from_bound == alias_ty
             {
                 // Micro-optimize if this is an exact match (this
@@ -159,7 +162,8 @@ impl<'cx, 'tcx> VerifyBoundCx<'cx, 'tcx> {
             Component::Placeholder(placeholder_ty) => {
                 self.param_or_placeholder_bound(Ty::new_placeholder(self.tcx, placeholder_ty))
             }
-            Component::Alias(alias_ty) => self.alias_bound(alias_ty),
+            // `type_must_outlive` already asserted that it's rigid in the next solver.
+            Component::Alias(_, alias_ty) => self.alias_bound(alias_ty),
             Component::EscapingAlias(ref components) => self.bound_from_components(components),
             Component::UnresolvedInferenceVariable(v) => {
                 // Ignore this, we presume it will yield an error later, since
@@ -236,7 +240,8 @@ impl<'cx, 'tcx> VerifyBoundCx<'cx, 'tcx> {
                 // And therefore we can safely use structural equality for alias types.
                 (GenericKind::Param(p1), ty::Param(p2)) if p1 == p2 => {}
                 (GenericKind::Placeholder(p1), ty::Placeholder(p2)) if p1 == p2 => {}
-                (GenericKind::Alias(a1), ty::Alias(a2)) if a1.kind.def_id() == a2.kind.def_id() => {
+                (GenericKind::Alias(a1), ty::Alias(is_rigid, a2)) if a1.kind == a2.kind => {
+                    debug_assert_eq!(*is_rigid, ty::IsRigid::yes_if_next_solver(self.tcx));
                 }
                 _ => return None,
             }

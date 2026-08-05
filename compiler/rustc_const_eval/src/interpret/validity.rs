@@ -32,7 +32,6 @@ use super::machine::AllocMap;
 use super::{
     AllocId, CheckInAllocMsg, GlobalAlloc, ImmTy, Immediate, InterpCx, InterpResult, MPlaceTy,
     Machine, MemPlaceMeta, PlaceTy, Pointer, Projectable, Scalar, ValueVisitor, err_ub,
-    format_interp_error,
 };
 use crate::enter_trace_span;
 
@@ -345,55 +344,7 @@ fn write_path(out: &mut String, path: &[PathElem<'_>]) {
     }
 }
 
-/// Represents a set of `Size` values as a sorted list of ranges.
-// These are (offset, length) pairs, and they are sorted and mutually disjoint,
-// and never adjacent (i.e. there's always a gap between two of them).
-#[derive(Debug, Clone)]
-pub struct RangeSet(Vec<(Size, Size)>);
-
-impl RangeSet {
-    fn add_range(&mut self, offset: Size, size: Size) {
-        if size.bytes() == 0 {
-            // No need to track empty ranges.
-            return;
-        }
-        let v = &mut self.0;
-        // We scan for a partition point where the left partition is all the elements that end
-        // strictly before we start. Those are elements that are too "low" to merge with us.
-        let idx =
-            v.partition_point(|&(other_offset, other_size)| other_offset + other_size < offset);
-        // Now we want to either merge with the first element of the second partition, or insert ourselves before that.
-        if let Some(&(other_offset, other_size)) = v.get(idx)
-            && offset + size >= other_offset
-        {
-            // Their end is >= our start (otherwise it would not be in the 2nd partition) and
-            // our end is >= their start. This means we can merge the ranges.
-            let new_start = other_offset.min(offset);
-            let mut new_end = (other_offset + other_size).max(offset + size);
-            // We grew to the right, so merge with overlapping/adjacent elements.
-            // (We also may have grown to the left, but that can never make us adjacent with
-            // anything there since we selected the first such candidate via `partition_point`.)
-            let mut scan_right = 1;
-            while let Some(&(next_offset, next_size)) = v.get(idx + scan_right)
-                && new_end >= next_offset
-            {
-                // Increase our size to absorb the next element.
-                new_end = new_end.max(next_offset + next_size);
-                // Look at the next element.
-                scan_right += 1;
-            }
-            // Update the element we grew.
-            v[idx] = (new_start, new_end - new_start);
-            // Remove the elements we absorbed (if any).
-            if scan_right > 1 {
-                drop(v.drain((idx + 1)..(idx + scan_right)));
-            }
-        } else {
-            // Insert new element.
-            v.insert(idx, (offset, size));
-        }
-    }
-}
+pub type RangeSet = rustc_data_structures::range_set::RangeSet<Size>;
 
 struct ValidityVisitor<'rt, 'tcx, M: Machine<'tcx>> {
     /// The `path` may be pushed to, but the part that is present when a function
@@ -411,7 +362,7 @@ struct ValidityVisitor<'rt, 'tcx, M: Machine<'tcx>> {
     /// we only store a (range) set of offsets -- the base pointer is the same throughout the entire
     /// visit, after all.
     /// If this is `Some`, then `reset_provenance_and_padding` must be true (but not vice versa:
-    /// we might not track data vs padding bytes if the operand isn't stored in memory anyway).
+    /// we might not track data vs padding bytes if the place isn't stored in memory anyway).
     data_bytes: Option<RangeSet>,
     /// True if we are inside of `MaybeDangling`. This disables pointer access checks.
     may_dangle: bool,
@@ -613,6 +564,8 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValidityVisitor<'rt, 'tcx, M> {
         ty: Ty<'tcx>,
         ptr_kind: PtrKind,
     ) -> InterpResult<'tcx> {
+        // Note that some of those checks (those that encode the basic validity invariant of
+        // pointers) are duplicated in `place_deref`, so changes here might need updates there.
         let ptr = self.read_immediate(value, ptr_kind.into())?;
         if self.reset_provenance_and_padding {
             // There's no padding in a pointer.
@@ -652,7 +605,7 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValidityVisitor<'rt, 'tcx, M> {
                 self.ecx.check_ptr_access(
                     place.ptr(),
                     size,
-                    CheckInAllocMsg::Dereferenceable, // will anyway be replaced by validity message
+                    CheckInAllocMsg::Dereferenceable("pointer"), // will anyway be replaced by validity message
                 ),
                 self.path,
                 Ub(DanglingIntPointer { addr: 0, .. }) =>
@@ -734,11 +687,11 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValidityVisitor<'rt, 'tcx, M> {
             )
         }
         // Do not allow references to uninhabited types.
-        if place.layout.is_uninhabited() {
+        if !place.layout.ty.is_opsem_inhabited(*self.ecx.tcx, self.ecx.typing_env) {
             let ty = place.layout.ty;
             throw_validation_failure!(
                 self.path,
-                format!("encountered a {ptr_kind} pointing to uninhabited type {ty}")
+                format!("encountered a {ptr_kind} pointing to uninhabited type `{ty}`")
             )
         }
 
@@ -995,7 +948,7 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValidityVisitor<'rt, 'tcx, M> {
                 // Nothing to check.
                 interp_ok(true)
             }
-            ty::UnsafeBinder(_) => todo!("FIXME(unsafe_binder)"),
+            ty::UnsafeBinder(_) => unimplemented!("FIXME(unsafe_binder)"),
             // The above should be all the primitive types. The rest is compound, we
             // check them by visiting their fields/variants.
             ty::Adt(..)
@@ -1194,7 +1147,7 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValidityVisitor<'rt, 'tcx, M> {
         assert!(layout.is_sized(), "there are no unsized unions");
         let layout_cx = LayoutCx::new(*ecx.tcx, ecx.typing_env);
         return M::cached_union_data_range(ecx, layout.ty, || {
-            let mut out = RangeSet(Vec::new());
+            let mut out = RangeSet::new();
             union_data_range_uncached(&layout_cx, layout, Size::ZERO, &mut out);
             out
         });
@@ -1445,7 +1398,7 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValueVisitor<'tcx, M> for ValidityVisitor<'rt,
                                 self.path,
                                 Uninit { expected }
                             ),
-                        Immediate::Scalar(..) | Immediate::ScalarPair(..) =>
+                        Immediate::Scalar(..) | Immediate::ScalarPair { .. } =>
                             bug!("arrays/slices can never have Scalar/ScalarPair layout"),
                     }
                 };
@@ -1534,7 +1487,7 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValueVisitor<'tcx, M> for ValidityVisitor<'rt,
                             self.visit_scalar(scalar, scalar_layout)?;
                         }
                     }
-                    BackendRepr::ScalarPair(a_layout, b_layout) => {
+                    BackendRepr::ScalarPair { a: a_layout, b: b_layout, b_offset: _ } => {
                         // We can only proceed if *both* scalars need to be initialized.
                         // FIXME: find a way to also check ScalarPair when one side can be uninit but
                         // the other must be init.
@@ -1572,8 +1525,9 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValueVisitor<'tcx, M> for ValidityVisitor<'rt,
         }
 
         // Assert that we checked everything there is to check about this type.
+        // `is_opsem_inhabited` implies that the layout is inhabited (checked by layout invariants).
         assert!(
-            !val.layout.is_uninhabited(),
+            val.layout.ty.is_opsem_inhabited(*self.ecx.tcx, self.ecx.typing_env),
             "a value of type `{}` passed validation but that type is uninhabited",
             val.layout.ty
         );
@@ -1593,7 +1547,7 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValueVisitor<'tcx, M> for ValidityVisitor<'rt,
                             .expect("the above checks should have fully handled this situation");
                     }
                 }
-                BackendRepr::ScalarPair(a_layout, b_layout) => {
+                BackendRepr::ScalarPair { a: a_layout, b: b_layout, b_offset: _ } => {
                     // We can only proceed if *both* scalars need to be initialized.
                     // FIXME: find a way to also check ScalarPair when one side can be uninit but
                     // the other must be init.
@@ -1620,7 +1574,7 @@ impl<'rt, 'tcx, M: Machine<'tcx>> ValueVisitor<'tcx, M> for ValidityVisitor<'rt,
 
 impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     /// The internal core entry point for all validation operations.
-    fn validate_operand_internal(
+    fn validate_place_internal(
         &mut self,
         val: &PlaceTy<'tcx, M::Provenance>,
         path: Path<'tcx>,
@@ -1629,7 +1583,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         reset_provenance_and_padding: bool,
         start_in_may_dangle: bool,
     ) -> InterpResult<'tcx> {
-        trace!("validate_operand_internal: {:?}, {:?}", *val, val.layout.ty);
+        trace!("validate_place_internal: {:?}, {:?}", *val, val.layout.ty);
 
         // Run the visitor.
         self.run_for_validation_mut(|ecx| {
@@ -1644,14 +1598,14 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 ctfe_mode,
                 ecx,
                 reset_provenance_and_padding,
-                data_bytes: reset_padding.then_some(RangeSet(Vec::new())),
+                data_bytes: reset_padding.then_some(RangeSet::new()),
                 may_dangle: start_in_may_dangle,
             };
             v.visit_value(val)?;
             v.reset_padding(val)?;
             interp_ok(())
         })
-        .map_err_info(|err| {
+        .inspect_err_info(|err| {
             if !matches!(
                 err.kind(),
                 InterpErrorKind::UndefinedBehavior(ValidationError { .. })
@@ -1661,14 +1615,13 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 // during validation.
                 | InterpErrorKind::MachineStop(_)
             ) {
-                bug!("Unexpected error during validation: {}", format_interp_error(err));
+                bug!("Unexpected error during validation: {}", err.to_string());
             }
-            err
         })
     }
 
     /// This function checks the data at `val` to be const-valid.
-    /// `val` is assumed to cover valid memory if it is an indirect operand.
+    /// `val` is assumed to cover valid memory.
     /// It will error if the bits at the destination do not match the ones described by the layout.
     ///
     /// `ref_tracking` is used to record references that we encounter so that they
@@ -1678,14 +1631,14 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     /// - no pointers to statics.
     /// - no `UnsafeCell` or non-ZST `&mut`.
     #[inline(always)]
-    pub(crate) fn const_validate_operand(
+    pub(crate) fn const_validate_place(
         &mut self,
         val: &PlaceTy<'tcx, M::Provenance>,
         path: Path<'tcx>,
         ref_tracking: &mut RefTracking<MPlaceTy<'tcx, M::Provenance>, Path<'tcx>>,
         ctfe_mode: CtfeValidationMode,
     ) -> InterpResult<'tcx> {
-        self.validate_operand_internal(
+        self.validate_place_internal(
             val,
             path,
             Some(ref_tracking),
@@ -1696,27 +1649,22 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     }
 
     /// This function checks the data at `val` to be runtime-valid.
-    /// `val` is assumed to cover valid memory if it is an indirect operand.
+    /// `val` is assumed to cover valid memory.
     /// It will error if the bits at the destination do not match the ones described by the layout.
     #[inline(always)]
-    pub fn validate_operand(
+    pub fn validate_place(
         &mut self,
         val: &PlaceTy<'tcx, M::Provenance>,
         recursive: bool,
         reset_provenance_and_padding: bool,
     ) -> InterpResult<'tcx> {
-        let _trace = enter_trace_span!(
-            M,
-            "validate_operand",
-            recursive,
-            reset_provenance_and_padding,
-            ?val,
-        );
+        let _trace =
+            enter_trace_span!(M, "validate_place", recursive, reset_provenance_and_padding, ?val,);
         // Note that we *could* actually be in CTFE here with `-Zextra-const-ub-checks`, but it's
         // still correct to not use `ctfe_mode`: that mode is for validation of the final constant
         // value, it rules out things like `UnsafeCell` in awkward places.
         if !recursive {
-            return self.validate_operand_internal(
+            return self.validate_place_internal(
                 val,
                 Path::new(val.layout.ty),
                 None,
@@ -1727,7 +1675,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         }
         // Do a recursive check.
         let mut ref_tracking = RefTracking::empty();
-        self.validate_operand_internal(
+        self.validate_place_internal(
             val,
             Path::new(val.layout.ty),
             Some(&mut ref_tracking),
@@ -1739,7 +1687,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             // Things behind reference do *not* have the provenance reset. In fact
             // we treat the entire thing as being inside MaybeDangling, i.e., references
             // do not have to be dereferenceable.
-            self.validate_operand_internal(
+            self.validate_place_internal(
                 &mplace.into(),
                 path,
                 None, // no further recursion

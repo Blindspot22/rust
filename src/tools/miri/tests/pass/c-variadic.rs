@@ -1,5 +1,4 @@
 //@run-native
-#![feature(c_variadic)]
 
 use std::ffi::{CStr, VaList, c_char, c_double, c_int, c_long};
 
@@ -106,14 +105,21 @@ fn various_types() {
     }
 }
 
-fn clone() {
-    if cfg!(force_intrinsic_fallback) {
-        // Skip this test when we use the fallback bodies. The fallback body does
-        // not hook into the Miri allocation bookkeeping for variable argument lists
-        // and would would falsely report UB.
-        return;
+fn equal_up_to_free_lifetime() {
+    // Types are considered equal up to free lifetimes: `*const &'static str`
+    // is the same as `*const &'a str`.
+    // Bound lifetimes (using e.g. `for<'_>`) are different.
+    #[expect(improper_ctypes_definitions)]
+    pub unsafe extern "C" fn foo(mut args: ...) -> &'static str {
+        unsafe { *args.next_arg::<*const &'static str>() }
     }
 
+    let data = String::from("abc");
+    let x: &str = data.as_str();
+    assert_eq!(unsafe { foo(&raw const x) }, "abc");
+}
+
+fn clone() {
     unsafe extern "C" fn clone_the_va_list(args: ...) {
         // The implicit `drop` will catch a `VaList` that isn't properly initialized.
         let _ = args.clone();
@@ -123,13 +129,6 @@ fn clone() {
 }
 
 fn clone_and_advance() {
-    if cfg!(force_intrinsic_fallback) {
-        // Skip this test when we use the fallback bodies. The fallback body does
-        // not hook into the Miri allocation bookkeeping for variable argument lists
-        // and would would falsely report UB.
-        return;
-    }
-
     unsafe extern "C" fn variadic(mut a: ...) {
         unsafe {
             let mut b = a.clone();
@@ -170,6 +169,7 @@ fn main() {
     forward_by_ref();
     nested();
     various_types();
+    equal_up_to_free_lifetime();
     clone();
     clone_and_advance();
 }

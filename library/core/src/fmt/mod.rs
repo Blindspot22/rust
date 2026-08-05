@@ -36,7 +36,7 @@ pub enum Alignment {
     Center,
 }
 
-#[stable(feature = "int_format_into", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "int_format_into", since = "1.98.0")]
 pub use num_buffer::NumBuffer;
 #[unstable(feature = "fmt_internals", issue = "none")]
 pub use num_buffer::NumBufferTrait;
@@ -332,9 +332,7 @@ mod flags {
 }
 
 impl FormattingOptions {
-    /// Construct a new `FormatterBuilder` with the supplied `Write` trait
-    /// object for output that is equivalent to the `{}` formatting
-    /// specifier:
+    /// Construct a new `FormattingOptions` representing the plain `{}` formatting specifier:
     ///
     /// - no flags,
     /// - filled with spaces,
@@ -518,7 +516,7 @@ impl FormattingOptions {
     pub const fn get_precision(&self) -> Option<u16> {
         if self.flags & flags::PRECISION_FLAG != 0 { Some(self.precision) } else { None }
     }
-    /// Returns the current precision.
+    /// Returns the current `x?` or `X?` flag.
     #[unstable(feature = "formatting_options", issue = "118117")]
     pub const fn get_debug_as_hex(&self) -> Option<DebugAsHex> {
         if self.flags & flags::DEBUG_LOWER_HEX_FLAG != 0 {
@@ -2577,6 +2575,21 @@ impl<'a> Formatter<'a> {
             builder.field(name, value);
         }
         builder.finish()
+    }
+
+    /// Shrinks `derive(Debug)` code, for faster compilation and smaller binaries.
+    /// For C-like enums with concatenated variant name strings.
+    #[doc(hidden)]
+    #[unstable(feature = "fmt_helpers_for_derive", issue = "none")]
+    pub fn debug_c_like_enum_write_str<'b>(
+        &'b mut self,
+        names: &str,
+        offset: &[usize],
+        discr: usize,
+    ) -> Result {
+        let start = offset[discr];
+        let end = offset[discr + 1];
+        self.write_str(&names[start..end])
     }
 
     /// Creates a `DebugTuple` builder designed to assist with creation of

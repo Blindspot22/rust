@@ -7,24 +7,12 @@ use tracing::{instrument, trace};
 use crate::error::{ExpectedFound, TypeError};
 use crate::fold::TypeFoldable;
 use crate::inherent::*;
-use crate::{self as ty, Interner};
+use crate::{self as ty, Interner, Region};
 
 pub mod combine;
 pub mod solver_relating;
 
 pub type RelateResult<I, T> = Result<T, TypeError<I>>;
-
-/// Whether aliases should be related structurally or not. Used
-/// to adjust the behavior of generalization and combine.
-///
-/// This should always be `No` unless in a few special-cases when
-/// instantiating canonical responses and in the new solver. Each
-/// such case should have a comment explaining why it is used.
-#[derive(Debug, Copy, Clone)]
-pub enum StructurallyRelateAliases {
-    Yes,
-    No,
-}
 
 /// Extra information about why we ended up with a particular variance.
 /// This is only used to add more information to error messages, and
@@ -78,8 +66,8 @@ pub trait TypeRelation<I: Interner>: Sized {
         a_ty: I::Ty,
         b_ty: I::Ty,
         ty_def_id: I::DefId,
-        a_arg: I::GenericArgs,
-        b_arg: I::GenericArgs,
+        a_args: I::GenericArgs,
+        b_args: I::GenericArgs,
         mk: impl FnOnce(I::GenericArgs) -> I::Ty,
     ) -> RelateResult<I, I::Ty>;
 
@@ -100,7 +88,7 @@ pub trait TypeRelation<I: Interner>: Sized {
 
     fn tys(&mut self, a: I::Ty, b: I::Ty) -> RelateResult<I, I::Ty>;
 
-    fn regions(&mut self, a: I::Region, b: I::Region) -> RelateResult<I, I::Region>;
+    fn regions(&mut self, a: Region<I>, b: Region<I>) -> RelateResult<I, Region<I>>;
 
     fn consts(&mut self, a: I::Const, b: I::Const) -> RelateResult<I, I::Const>;
 
@@ -169,6 +157,10 @@ impl<I: Interner> Relate<I> for ty::FnSig<I> {
             return Err(TypeError::AbiMismatch(ExpectedFound::new(a.abi(), b.abi())));
         };
 
+        if a.splatted() != b.splatted() {
+            return Err(TypeError::SplatMismatch(ExpectedFound::new(a.splatted(), b.splatted())));
+        }
+
         let a_inputs = a.inputs();
         let b_inputs = b.inputs();
         if a_inputs.len() != b_inputs.len() {
@@ -213,7 +205,7 @@ impl<I: Interner> Relate<I> for ty::AliasTy<I> {
         a: ty::AliasTy<I>,
         b: ty::AliasTy<I>,
     ) -> RelateResult<I, ty::AliasTy<I>> {
-        if a.kind.def_id() != b.kind.def_id() {
+        if a.kind != b.kind {
             Err(TypeError::ProjectionMismatched(ExpectedFound::new(a.kind.into(), b.kind.into())))
         } else {
             let cx = relation.cx();
@@ -222,22 +214,22 @@ impl<I: Interner> Relate<I> for ty::AliasTy<I> {
             } else {
                 relate_args_invariantly(relation, a.args, b.args)?
             };
-            Ok(ty::AliasTy::new_from_args(cx, a.kind, args))
+            Ok(ty::AliasTy::new_from_args(relation.cx(), a.kind, args))
         }
     }
 }
 
-impl<I: Interner> Relate<I> for ty::UnevaluatedConst<I> {
+impl<I: Interner> Relate<I> for ty::AliasConst<I> {
     fn relate<R: TypeRelation<I>>(
         relation: &mut R,
-        a: ty::UnevaluatedConst<I>,
-        b: ty::UnevaluatedConst<I>,
-    ) -> RelateResult<I, ty::UnevaluatedConst<I>> {
+        a: ty::AliasConst<I>,
+        b: ty::AliasConst<I>,
+    ) -> RelateResult<I, ty::AliasConst<I>> {
         let cx = relation.cx();
         if a.kind != b.kind {
             Err(TypeError::ConstMismatch(ExpectedFound::new(
-                Const::new_unevaluated(cx, a),
-                Const::new_unevaluated(cx, b),
+                Const::new_alias(cx, ty::IsRigid::yes_if_next_solver(cx), a),
+                Const::new_alias(cx, ty::IsRigid::yes_if_next_solver(cx), b),
             )))
         } else {
             // FIXME(mgca): remove this
@@ -245,7 +237,7 @@ impl<I: Interner> Relate<I> for ty::UnevaluatedConst<I> {
 
             let args = relate_args_invariantly(relation, a.args, b.args)?;
 
-            Ok(ty::UnevaluatedConst::new(cx, a.kind, args))
+            Ok(ty::AliasConst::new(cx, a.kind, args))
         }
     }
 }
@@ -508,12 +500,20 @@ pub fn structurally_relate_tys<I: Interner, R: TypeRelation<I>>(
         }
 
         (ty::FnDef(a_def_id, a_args), ty::FnDef(b_def_id, b_args)) if a_def_id == b_def_id => {
-            if a_args.is_empty() {
+            if a_args.skip_binder().is_empty() {
                 Ok(a)
             } else {
-                relation.relate_ty_args(a, b, a_def_id.into(), a_args, b_args, |args| {
-                    Ty::new_fn_def(cx, a_def_id, args)
-                })
+                // FIXME: this behavior is wrong; relations with binders needs fixing.
+                //        need to relate the bound vars first.
+                let x = relation.relate_ty_args(
+                    a,
+                    b,
+                    a_def_id.into(),
+                    a_args.skip_binder(),
+                    b_args.skip_binder(),
+                    |args| Ty::new_fn_def(cx, a_def_id, a_args.rebind(args)),
+                );
+                x
             }
         }
 
@@ -523,9 +523,12 @@ pub fn structurally_relate_tys<I: Interner, R: TypeRelation<I>>(
         }
 
         // Alias tend to mostly already be handled downstream due to normalization.
-        (ty::Alias(a), ty::Alias(b)) => {
-            let alias_ty = relation.relate(a, b)?;
-            Ok(Ty::new_alias(cx, alias_ty))
+        (ty::Alias(is_rigid_a, alias_a), ty::Alias(is_rigid_b, alias_b)) => {
+            // Users shouldn't know about this so the mismatch should be caught
+            // during development rather than presented as type error.
+            debug_assert_eq!(is_rigid_a, is_rigid_b, "{a:?} != {b:?}");
+            let alias_ty = relation.relate(alias_a, alias_b)?;
+            Ok(Ty::new_alias(cx, is_rigid_a, alias_ty))
         }
 
         (ty::Pat(a_ty, a_pat), ty::Pat(b_ty, b_pat)) => {
@@ -543,7 +546,7 @@ pub fn structurally_relate_tys<I: Interner, R: TypeRelation<I>>(
 }
 
 /// Relates `a` and `b` structurally, calling the relation for all nested values.
-/// Any semantic equality, e.g. of unevaluated consts, and inference variables have
+/// Any semantic equality, e.g. of alias consts, and inference variables have
 /// to be handled by the caller.
 ///
 /// FIXME: This is not totally structural, which probably should be fixed.
@@ -611,8 +614,11 @@ pub fn structurally_relate_consts<I: Interner, R: TypeRelation<I>>(
         // While this is slightly incorrect, it shouldn't matter for `min_const_generics`
         // and is the better alternative to waiting until `generic_const_exprs` can
         // be stabilized.
-        (ty::ConstKind::Unevaluated(au), ty::ConstKind::Unevaluated(bu)) => {
-            return Ok(Const::new_unevaluated(cx, relation.relate(au, bu)?));
+        (ty::ConstKind::Alias(is_rigid_a, au), ty::ConstKind::Alias(is_rigid_b, bu)) => {
+            // Users shouldn't know about this so the mismatch should be caught
+            // during development rather than presented as type error.
+            debug_assert_eq!(is_rigid_a, is_rigid_b, "{a:?} != {b:?}");
+            return Ok(Const::new_alias(cx, is_rigid_a, relation.relate(au, bu)?));
         }
         (ty::ConstKind::Expr(ae), ty::ConstKind::Expr(be)) => {
             let expr = relation.relate(ae, be)?;

@@ -315,7 +315,8 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             self.storage_live_dyn(local, meta)?;
         }
         // Now we can finally actually evaluate the callee place.
-        let callee_arg = self.eval_place(*callee_arg)?;
+        let callee_arg =
+            self.eval_place(*callee_arg, /* skip_validity_for_simple_deref */ false)?;
         // We allow some transmutes here.
         // FIXME: Depending on the PassMode, this should reset some padding to uninitialized. (This
         // is true for all `copy_op`, but there are a lot of special cases for argument passing
@@ -428,7 +429,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         // Determine whether this is a non-capturing closure. That's relevant as their first
         // argument can be skipped (and that's the only kind of argument skipping we allow).
         let is_non_capturing_closure =
-            (matches!(instance.def, ty::InstanceKind::ClosureOnceShim { .. })
+            (matches!(instance.def, ty::InstanceKind::Shim(ty::ShimKind::ClosureOnce { .. }))
                 || self.tcx.is_closure_like(def_id))
                 && {
                     let arg = &callee_fn_abi.args[0];
@@ -498,7 +499,8 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                     // This argument is a VaList holding the remaining caller-side arguments.
                     ecx.storage_live(local)?;
 
-                    let place = ecx.eval_place(dest)?;
+                    let place =
+                        ecx.eval_place(dest, /* skip_validity_for_simple_deref */ false)?;
                     let mplace = ecx.force_allocation(&place)?;
 
                     // Consume the remaining arguments by putting them into the variable argument
@@ -652,18 +654,28 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                     interp_ok(())
                 }
             }
-            ty::InstanceKind::VTableShim(..)
-            | ty::InstanceKind::ReifyShim(..)
-            | ty::InstanceKind::ClosureOnceShim { .. }
-            | ty::InstanceKind::ConstructCoroutineInClosureShim { .. }
-            | ty::InstanceKind::FnPtrShim(..)
-            | ty::InstanceKind::DropGlue(..)
-            | ty::InstanceKind::CloneShim(..)
-            | ty::InstanceKind::FnPtrAddrShim(..)
-            | ty::InstanceKind::ThreadLocalShim(..)
-            | ty::InstanceKind::AsyncDropGlueCtorShim(..)
-            | ty::InstanceKind::AsyncDropGlue(..)
-            | ty::InstanceKind::FutureDropPollShim(..)
+            ty::InstanceKind::LlvmIntrinsic(_) => {
+                // FIXME: Should `InPlace` arguments be reset to uninit?
+                M::call_llvm_intrinsic(
+                    self,
+                    instance,
+                    &Self::copy_fn_args(args),
+                    destination,
+                    target,
+                )
+            }
+            ty::InstanceKind::Shim(ty::ShimKind::VTable(..))
+            | ty::InstanceKind::Shim(ty::ShimKind::Reify(..))
+            | ty::InstanceKind::Shim(ty::ShimKind::ClosureOnce { .. })
+            | ty::InstanceKind::Shim(ty::ShimKind::ConstructCoroutineInClosure { .. })
+            | ty::InstanceKind::Shim(ty::ShimKind::FnPtr(..))
+            | ty::InstanceKind::Shim(ty::ShimKind::DropGlue(..))
+            | ty::InstanceKind::Shim(ty::ShimKind::Clone(..))
+            | ty::InstanceKind::Shim(ty::ShimKind::FnPtrAddr(..))
+            | ty::InstanceKind::Shim(ty::ShimKind::ThreadLocal(..))
+            | ty::InstanceKind::Shim(ty::ShimKind::AsyncDropGlueCtor(..))
+            | ty::InstanceKind::Shim(ty::ShimKind::AsyncDropGlue(..))
+            | ty::InstanceKind::Shim(ty::ShimKind::FutureDropPoll(..))
             | ty::InstanceKind::Item(_) => {
                 // We need MIR for this fn.
                 // Note that this can be an intrinsic, if we are executing its fallback body.
@@ -681,6 +693,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 };
 
                 // Special handling for the closure ABI: untuple the last argument.
+                // FIXME(splat): un-tuple splatted arguments that were tupled in typecheck
                 let args: Cow<'_, [FnArg<'tcx, M::Provenance>]> =
                     if caller_abi == ExternAbi::RustCall && !args.is_empty() {
                         // Untuple

@@ -10,7 +10,7 @@
 //! return `ToolBuildResult` and should never prepare `cargo` invocations manually.
 
 use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use crate::core::build_steps::compile::is_lto_stage;
@@ -18,9 +18,10 @@ use crate::core::build_steps::toolstate::ToolState;
 use crate::core::build_steps::{compile, llvm};
 use crate::core::builder;
 use crate::core::builder::{
-    Builder, Cargo as CargoCommand, RunConfig, ShouldRun, Step, StepMetadata, cargo_profile_var,
+    Builder, Cargo as CargoCommand, CommandLineStep, RunConfig, ShouldRun, Step, StepMetadata,
+    apply_pgo, cargo_profile_var,
 };
-use crate::core::config::{DebuginfoLevel, RustcLto, TargetSelection};
+use crate::core::config::{Allocator, DebuginfoLevel, RustcLto, TargetSelection};
 use crate::utils::exec::{BootstrapCommand, command};
 use crate::utils::helpers::{add_dylib_path, exe, t};
 use crate::{Compiler, FileType, Kind, Mode};
@@ -67,10 +68,6 @@ pub struct ToolBuildResult {
 
 impl Step for ToolBuild {
     type Output = ToolBuildResult;
-
-    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.never()
-    }
 
     /// Builds a tool in `src/tools`
     ///
@@ -135,6 +132,15 @@ impl Step for ToolBuild {
             if let Some(lto) = lto {
                 cargo.env(cargo_profile_var("LTO", &builder.config, self.mode), lto);
             }
+        }
+
+        let pgo_config = match self.path {
+            "src/tools/rustdoc" => Some(&builder.config.rustdoc_pgo),
+            "src/tools/cargo" => Some(&builder.config.cargo_pgo),
+            _ => None,
+        };
+        if let Some(pgo_config) = pgo_config {
+            apply_pgo(builder, &mut cargo, self.build_compiler, pgo_config);
         }
 
         if !self.allow_features.is_empty() {
@@ -235,7 +241,9 @@ pub fn prepare_tool_cargo(
     cargo.env("LZMA_API_STATIC", "1");
 
     // See also the "JEMALLOC_SYS_WITH_LG_PAGE" setting in the compile build step.
-    if builder.config.jemalloc(target) && env::var_os("JEMALLOC_SYS_WITH_LG_PAGE").is_none() {
+    if builder.config.allocator(target) == Allocator::Jemalloc
+        && env::var_os("JEMALLOC_SYS_WITH_LG_PAGE").is_none()
+    {
         // Build jemalloc on AArch64 with support for page sizes up to 64K
         // See: https://github.com/rust-lang/rust/pull/135081
         if target.starts_with("aarch64") {
@@ -420,7 +428,7 @@ macro_rules! bootstrap_tool {
             pub target: TargetSelection,
         }
 
-        impl Step for $name {
+        impl CommandLineStep for $name {
             type Output = ToolBuildResult;
 
             fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -508,6 +516,7 @@ bootstrap_tool!(
     FeaturesStatusDump, "src/tools/features-status-dump", "features-status-dump";
     OptimizedDist, "src/tools/opt-dist", "opt-dist", submodules = &["src/tools/rustc-perf"];
     RunMakeSupport, "src/tools/run-make-support", "run_make_support", artifact_kind = ToolArtifactKind::Library;
+    IntrinsicTest, "library/stdarch/crates/intrinsic-test", "intrinsic-test";
 );
 
 /// These are the submodules that are required for rustbook to work due to
@@ -522,7 +531,7 @@ pub struct RustcPerf {
     pub target: TargetSelection,
 }
 
-impl Step for RustcPerf {
+impl CommandLineStep for RustcPerf {
     /// Path to the built `collector` binary.
     type Output = ToolBuildResult;
 
@@ -583,7 +592,7 @@ impl ErrorIndex {
     }
 }
 
-impl Step for ErrorIndex {
+impl CommandLineStep for ErrorIndex {
     type Output = ToolBuildResult;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -640,7 +649,7 @@ pub struct RemoteTestServer {
     pub target: TargetSelection,
 }
 
-impl Step for RemoteTestServer {
+impl CommandLineStep for RemoteTestServer {
     type Output = ToolBuildResult;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -688,14 +697,14 @@ pub struct Rustdoc {
     pub target_compiler: Compiler,
 }
 
-impl Step for Rustdoc {
+impl CommandLineStep for Rustdoc {
     /// Path to the built rustdoc binary.
     type Output = PathBuf;
 
     const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.selectors(&["src/tools/rustdoc", "src/librustdoc"])
+        run.multi_path(&["src/tools/rustdoc", "src/librustdoc"])
     }
 
     fn is_default_step(_builder: &Builder<'_>) -> bool {
@@ -756,10 +765,9 @@ impl Step for Rustdoc {
         // they'll be linked to those libraries). As such, don't explicitly `ensure` any additional
         // libraries here. The intuition here is that If we've built a compiler, we should be able
         // to build rustdoc.
-        //
         let mut extra_features = Vec::new();
-        if builder.config.jemalloc(target) {
-            extra_features.push("jemalloc".to_string());
+        if !builder.config.rust_debug_logging {
+            extra_features.push("max_level_info".to_string())
         }
 
         let compilers = RustcPrivateCompilers::from_target_compiler(builder, target_compiler);
@@ -815,7 +823,7 @@ impl Cargo {
     }
 }
 
-impl Step for Cargo {
+impl CommandLineStep for Cargo {
     type Output = ToolBuildResult;
     const IS_HOST: bool = true;
 
@@ -893,7 +901,7 @@ impl LldWrapper {
     }
 }
 
-impl Step for LldWrapper {
+impl CommandLineStep for LldWrapper {
     type Output = BuiltLldWrapper;
 
     const IS_HOST: bool = true;
@@ -985,7 +993,7 @@ impl WasmComponentLd {
     }
 }
 
-impl Step for WasmComponentLd {
+impl CommandLineStep for WasmComponentLd {
     type Output = ToolBuildResult;
 
     const IS_HOST: bool = true;
@@ -1039,7 +1047,7 @@ impl RustAnalyzer {
     pub const ALLOW_FEATURES: &'static str = "rustc_private,proc_macro_internals,proc_macro_diagnostic,proc_macro_span,proc_macro_span_shrink,proc_macro_def_site,new_zeroed_alloc";
 }
 
-impl Step for RustAnalyzer {
+impl CommandLineStep for RustAnalyzer {
     type Output = ToolBuildResult;
     const IS_HOST: bool = true;
 
@@ -1093,7 +1101,7 @@ impl RustAnalyzerProcMacroSrv {
     }
 }
 
-impl Step for RustAnalyzerProcMacroSrv {
+impl CommandLineStep for RustAnalyzerProcMacroSrv {
     type Output = ToolBuildResult;
     const IS_HOST: bool = true;
 
@@ -1182,7 +1190,7 @@ impl LlvmBitcodeLinker {
     }
 }
 
-impl Step for LlvmBitcodeLinker {
+impl CommandLineStep for LlvmBitcodeLinker {
     type Output = ToolBuildResult;
     const IS_HOST: bool = true;
 
@@ -1235,15 +1243,6 @@ pub enum LibcxxVersion {
 
 impl Step for LibcxxVersionTool {
     type Output = LibcxxVersion;
-    const IS_HOST: bool = true;
-
-    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.never()
-    }
-
-    fn is_default_step(_builder: &Builder<'_>) -> bool {
-        false
-    }
 
     fn run(self, builder: &Builder<'_>) -> LibcxxVersion {
         let out_dir = builder.out.join(self.target.to_string()).join("libcxx-version");
@@ -1299,7 +1298,7 @@ impl BuildManifest {
     }
 }
 
-impl Step for BuildManifest {
+impl CommandLineStep for BuildManifest {
     type Output = ToolBuildResult;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -1425,7 +1424,6 @@ macro_rules! tool_rustc_extended {
             tool_name: $tool_name:expr,
             stable: $stable:expr
             $( , add_bins_to_sysroot: $add_bins_to_sysroot:expr )?
-            $( , add_features: $add_features:expr )?
             $( , cargo_args: $cargo_args:expr )?
             $( , )?
         }
@@ -1443,7 +1441,7 @@ macro_rules! tool_rustc_extended {
             }
         }
 
-        impl Step for $name {
+        impl CommandLineStep for $name {
             type Output = ToolBuildResult;
             const IS_HOST: bool = true;
 
@@ -1476,7 +1474,6 @@ macro_rules! tool_rustc_extended {
                     $tool_name,
                     $path,
                     None $( .or(Some(&$add_bins_to_sysroot)) )?,
-                    None $( .or(Some($add_features)) )?,
                     None $( .or(Some($cargo_args)) )?,
                 )
             }
@@ -1521,15 +1518,9 @@ fn build_extended_rustc_tool(
     tool_name: &'static str,
     path: &'static str,
     add_bins_to_sysroot: Option<&[&str]>,
-    add_features: Option<fn(&Builder<'_>, TargetSelection, &mut Vec<String>)>,
     cargo_args: Option<&[&'static str]>,
 ) -> ToolBuildResult {
     let target = compilers.target();
-    let mut extra_features = Vec::new();
-    if let Some(func) = add_features {
-        func(builder, target, &mut extra_features);
-    }
-
     let build_compiler = compilers.build_compiler;
     let ToolBuildResult { tool_path, .. } = builder.ensure(ToolBuild {
         build_compiler,
@@ -1537,7 +1528,7 @@ fn build_extended_rustc_tool(
         tool: tool_name,
         mode: Mode::ToolRustcPrivate,
         path,
-        extra_features,
+        extra_features: Vec::new(),
         source_type: SourceType::InTree,
         allow_features: "",
         cargo_args: cargo_args.unwrap_or_default().iter().map(|s| String::from(*s)).collect(),
@@ -1580,23 +1571,13 @@ tool_rustc_extended!(Clippy {
     path: "src/tools/clippy",
     tool_name: "clippy-driver",
     stable: true,
-    add_bins_to_sysroot: ["clippy-driver"],
-    add_features: |builder, target, features| {
-        if builder.config.jemalloc(target) {
-            features.push("jemalloc".to_string());
-        }
-    }
+    add_bins_to_sysroot: ["clippy-driver"]
 });
 tool_rustc_extended!(Miri {
     path: "src/tools/miri",
     tool_name: "miri",
     stable: false,
     add_bins_to_sysroot: ["miri"],
-    add_features: |builder, target, features| {
-        if builder.config.jemalloc(target) {
-            features.push("jemalloc".to_string());
-        }
-    },
     // Always compile also tests when building miri. Otherwise feature unification can cause rebuilds between building and testing miri.
     cargo_args: &["--all-targets"],
 });
@@ -1628,8 +1609,9 @@ impl Builder<'_> {
         //
         // Notably this munges the dynamic library lookup path to point to the
         // right location to run `compiler`.
-        let mut lib_paths: Vec<PathBuf> =
-            vec![self.cargo_out(compiler, Mode::ToolBootstrap, *host).join("deps")];
+        let mut lib_paths: Vec<PathBuf> = discover_out_dirs_with_dylibs(
+            self.cargo_out(compiler, Mode::ToolBootstrap, *host).join("build"),
+        );
 
         // On MSVC a tool may invoke a C compiler (e.g., compiletest in run-make
         // mode) and that C compiler may need some extra PATH modification. Do
@@ -1656,4 +1638,24 @@ impl Builder<'_> {
 
         cmd
     }
+}
+
+/// Gets all of the `out` dirs in a given Cargo `build-dir/<profile>/build` dir.
+fn discover_out_dirs_with_dylibs(dir: PathBuf) -> Vec<PathBuf> {
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let read_dir = |path: &Path| path.read_dir().ok().into_iter().flatten().filter_map(Result::ok);
+    let has_dylib = |path: &Path| {
+        read_dir(path)
+            .any(|e| e.path().extension().is_some_and(|ext| ext == std::env::consts::DLL_EXTENSION))
+    };
+    dir.read_dir()
+        .unwrap_or_else(|e| panic!("Couldn't read {}: {}", dir.display(), e))
+        .map(|e| e.unwrap())
+        .flat_map(|e| read_dir(&e.path()))
+        .flat_map(|e| read_dir(&e.path()))
+        .map(|e| e.path())
+        .filter(|path| path.ends_with("out") && has_dylib(path))
+        .collect::<Vec<_>>()
 }

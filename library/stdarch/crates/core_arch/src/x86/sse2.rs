@@ -1445,7 +1445,7 @@ pub unsafe fn _mm_stream_si128(mem_addr: *mut __m128i, a: __m128i) {
     );
 }
 
-/// Stores a 32-bit integer value in the specified memory location.
+/// Stores a 32-bit integer value in a 4-byte aligned memory location.
 /// To minimize caching, the data is flagged as non-temporal (unlikely to be
 /// used again soon).
 ///
@@ -3242,7 +3242,7 @@ pub const fn _mm_unpacklo_pd(a: __m128d, b: __m128d) -> __m128d {
 }
 
 #[allow(improper_ctypes)]
-unsafe extern "C" {
+unsafe extern "unadjusted" {
     #[link_name = "llvm.x86.sse2.pause"]
     fn pause();
     #[link_name = "llvm.x86.sse2.clflush"]

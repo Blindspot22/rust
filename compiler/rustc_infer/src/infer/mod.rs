@@ -10,11 +10,11 @@ pub use opaque_types::{OpaqueTypeStorage, OpaqueTypeStorageEntries, OpaqueTypeTa
 use region_constraints::{
     GenericKind, RegionConstraintCollector, RegionConstraintStorage, VarInfos, VerifyBound,
 };
-pub use relate::StructurallyRelateAliases;
 pub use relate::combine::PredicateEmittingRelation;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
+use rustc_data_structures::snapshot_vec as sv;
 use rustc_data_structures::undo_log::{Rollback, UndoLogs};
-use rustc_data_structures::unify as ut;
+use rustc_data_structures::unify::{self as ut, UnifyKey, UnifyValue};
 use rustc_errors::{DiagCtxtHandle, ErrorGuaranteed};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::{self as hir, HirId};
@@ -30,7 +30,7 @@ use rustc_middle::ty::error::{ExpectedFound, TypeError};
 use rustc_middle::ty::{
     self, BoundVarReplacerDelegate, ConstVid, FloatVid, GenericArg, GenericArgKind, GenericArgs,
     GenericArgsRef, GenericParamDefKind, InferConst, IntVid, OpaqueTypeKey, ProvisionalHiddenType,
-    PseudoCanonicalInput, Term, TermKind, Ty, TyCtxt, TyVid, TypeFoldable, TypeFolder,
+    PseudoCanonicalInput, RegionExt, Term, TermKind, Ty, TyCtxt, TyVid, TypeFoldable, TypeFolder,
     TypeSuperFoldable, TypeVisitable, TypeVisitableExt, TypingEnv, TypingMode, fold_regions,
 };
 use rustc_span::{DUMMY_SP, Span, Symbol};
@@ -40,7 +40,7 @@ use tracing::{debug, instrument};
 use type_variable::TypeVariableOrigin;
 
 use crate::infer::snapshot::undo_log::UndoLog;
-use crate::infer::type_variable::FloatVariableOrigin;
+use crate::infer::type_variable::{FloatVariableOrigin, TypeVariableValue};
 use crate::infer::unify_key::{ConstVariableOrigin, ConstVariableValue, ConstVidKey};
 use crate::traits::{
     self, ObligationCause, ObligationInspector, PredicateObligation, PredicateObligations,
@@ -198,10 +198,7 @@ impl<'tcx> InferCtxtInner<'tcx> {
     }
 
     #[inline]
-    fn try_type_variables_probe_ref(
-        &self,
-        vid: ty::TyVid,
-    ) -> Option<&type_variable::TypeVariableValue<'tcx>> {
+    fn try_type_variables_probe_ref(&self, vid: ty::TyVid) -> Option<&TypeVariableValue<'tcx>> {
         // Uses a read-only view of the unification table, this way we don't
         // need an undo log.
         self.type_variable_storage.eq_relations_ref().try_probe_value(vid)
@@ -338,6 +335,13 @@ pub struct InferCtxt<'tcx> {
 
     next_trait_solver: bool,
 
+    /// We have a `recursion_depth_exceeding_limit` FCW to mitigate breakages
+    /// caused by enabling the next solver globally. But the next solver is
+    /// already used by default in some places so we know they won't have
+    /// additional breakages. We also don't want spurious result in coherence
+    /// checking so we disable the FCW there as well.
+    enable_next_solver_overflow_fcw: bool,
+
     pub obligation_inspector: Cell<Option<ObligationInspector<'tcx>>>,
 }
 
@@ -348,12 +352,13 @@ impl<'tcx> Drop for InferCtxt<'tcx> {
 
         // No need for the drop bomb when we're in `TypingMode::PostTypeckUntilBorrowck`, and the `InferCtxt`
         // doesn't consider regions. This is okay since after typeck, the only reason we care about opaques is
-        // in relation to regions. In some places *after* typeck that aren't borrowck, like in lints we use
+        // in relation to regions. In some places *after* typeck that aren't borrowck, we use
         // `TypingMode::PostTypeckUntilBorrowck` to prevent defining opaque types and we simply don't care about regions.
         match self.typing_mode_raw() {
             TypingMode::Coherence
             | TypingMode::Typeck { .. }
             | TypingMode::PostBorrowck { .. }
+            | TypingMode::Reflection
             | TypingMode::PostAnalysis
             | TypingMode::Codegen => {}
             // In erased mode, the opaque type storage is always empty
@@ -578,6 +583,7 @@ pub struct InferCtxtBuilder<'tcx> {
     /// Whether we should use the new trait solver in the local inference context,
     /// which affects things like which solver is used in `predicate_may_hold`.
     next_trait_solver: bool,
+    enable_next_solver_overflow_fcw: bool,
 }
 
 #[extension(pub trait TyCtxtInferExt<'tcx>)]
@@ -589,6 +595,7 @@ impl<'tcx> TyCtxt<'tcx> {
             in_hir_typeck: false,
             skip_leak_check: false,
             next_trait_solver: self.next_trait_solver_globally(),
+            enable_next_solver_overflow_fcw: true,
         }
     }
 }
@@ -596,6 +603,14 @@ impl<'tcx> TyCtxt<'tcx> {
 impl<'tcx> InferCtxtBuilder<'tcx> {
     pub fn with_next_trait_solver(mut self, next_trait_solver: bool) -> Self {
         self.next_trait_solver = next_trait_solver;
+        self
+    }
+
+    pub fn enable_next_solver_overflow_fcw(
+        mut self,
+        enable_next_solver_overflow_fcw: bool,
+    ) -> Self {
+        self.enable_next_solver_overflow_fcw = enable_next_solver_overflow_fcw;
         self
     }
 
@@ -648,6 +663,7 @@ impl<'tcx> InferCtxtBuilder<'tcx> {
             in_hir_typeck,
             skip_leak_check,
             next_trait_solver,
+            enable_next_solver_overflow_fcw,
         } = *self;
         InferCtxt {
             tcx,
@@ -665,6 +681,7 @@ impl<'tcx> InferCtxtBuilder<'tcx> {
             universe: Cell::new(ty::UniverseIndex::ROOT),
             placeholder_assumptions_for_next_solver: RefCell::new(Default::default()),
             next_trait_solver,
+            enable_next_solver_overflow_fcw,
             obligation_inspector: Cell::new(None),
         }
     }
@@ -752,27 +769,22 @@ impl<'tcx> InferCtxt<'tcx> {
         }
     }
 
-    pub fn unresolved_variables(&self) -> Vec<Ty<'tcx>> {
+    pub fn unresolved_root_variables(&self) -> (Vec<TyVid>, Vec<ty::IntVid>, Vec<ty::FloatVid>) {
         let mut inner = self.inner.borrow_mut();
-        let mut vars: Vec<Ty<'_>> = inner
-            .type_variables()
-            .unresolved_variables()
-            .into_iter()
-            .map(|t| Ty::new_var(self.tcx, t))
-            .collect();
-        vars.extend(
-            (0..inner.int_unification_table().len())
-                .map(|i| ty::IntVid::from_usize(i))
-                .filter(|&vid| inner.int_unification_table().probe_value(vid).is_unknown())
-                .map(|v| Ty::new_int_var(self.tcx, v)),
+
+        let ty = inner.type_variables().unresolved_root_variables();
+
+        let int = unresolved_root_variables_of(
+            inner.int_unification_table(),
+            ty::IntVarValue::is_unknown,
         );
-        vars.extend(
-            (0..inner.float_unification_table().len())
-                .map(|i| ty::FloatVid::from_usize(i))
-                .filter(|&vid| inner.float_unification_table().probe_value(vid).is_unknown())
-                .map(|v| Ty::new_float_var(self.tcx, v)),
+
+        let float = unresolved_root_variables_of(
+            inner.float_unification_table(),
+            ty::FloatVarValue::is_unknown,
         );
-        vars
+
+        (ty, int, float)
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -960,10 +972,20 @@ impl<'tcx> InferCtxt<'tcx> {
         ty::Region::new_var(self.tcx, region_var)
     }
 
-    pub fn next_term_var_of_kind(&self, term: ty::Term<'tcx>, span: Span) -> ty::Term<'tcx> {
-        match term.kind() {
-            ty::TermKind::Ty(_) => self.next_ty_var(span).into(),
-            ty::TermKind::Const(_) => self.next_const_var(span).into(),
+    pub fn next_term_var_of_alias_kind(
+        &self,
+        alias_term: ty::AliasTerm<'tcx>,
+        span: Span,
+    ) -> ty::Term<'tcx> {
+        match alias_term.kind {
+            ty::AliasTermKind::ProjectionTy { .. }
+            | ty::AliasTermKind::InherentTy { .. }
+            | ty::AliasTermKind::OpaqueTy { .. }
+            | ty::AliasTermKind::FreeTy { .. } => self.next_ty_var(span).into(),
+            ty::AliasTermKind::FreeConst { .. }
+            | ty::AliasTermKind::InherentConst { .. }
+            | ty::AliasTermKind::AnonConst { .. }
+            | ty::AliasTermKind::ProjectionConst { .. } => self.next_const_var(span).into(),
         }
     }
 
@@ -1115,7 +1137,10 @@ impl<'tcx> InferCtxt<'tcx> {
     /// Searches for an opaque type key whose hidden type is related to `ty_vid`.
     ///
     /// This only checks for a subtype relation, it does not require equality.
-    pub fn opaques_with_sub_unified_hidden_type(&self, ty_vid: TyVid) -> Vec<ty::AliasTy<'tcx>> {
+    pub fn opaques_with_sub_unified_hidden_type(
+        &self,
+        ty_vid: TyVid,
+    ) -> Vec<ty::OpaqueAliasTy<'tcx>> {
         // Avoid accidentally allowing more code to compile with the old solver.
         if !self.next_trait_solver() {
             return vec![];
@@ -1133,9 +1158,9 @@ impl<'tcx> InferCtxt<'tcx> {
                 if let ty::Infer(ty::TyVar(hidden_vid)) = *hidden_ty.ty.kind() {
                     let opaque_sub_vid = type_variables.sub_unification_table_root_var(hidden_vid);
                     if opaque_sub_vid == ty_sub_vid {
-                        return Some(ty::AliasTy::new_from_args(
+                        return Some(ty::OpaqueAliasTy::new_opaque_from_args(
                             self.tcx,
-                            ty::Opaque { def_id: key.def_id.into() },
+                            key.def_id.into(),
                             key.args,
                         ));
                     }
@@ -1158,6 +1183,7 @@ impl<'tcx> InferCtxt<'tcx> {
             // and post-borrowck analysis mode. We may need to modify its uses
             // to support PostBorrowck in the old solver as well.
             TypingMode::Coherence
+            | TypingMode::Reflection
             | TypingMode::PostBorrowck { .. }
             | TypingMode::PostAnalysis
             | TypingMode::Codegen => false,
@@ -1192,6 +1218,16 @@ impl<'tcx> InferCtxt<'tcx> {
         match self.inner.borrow_mut().type_variables().probe(vid) {
             TypeVariableValue::Known { value } => Ok(value),
             TypeVariableValue::Unknown { universe } => Err(universe),
+        }
+    }
+
+    /// If `vid` resolves to a type, return that type. Otherwise return the root variable id for `vid`.
+    pub fn shallow_resolve_ty_var_or_get_root(&self, vid: TyVid) -> Result<Ty<'tcx>, TyVid> {
+        let (root, value) = self.inner.borrow_mut().type_variables().probe_with_root_vid(vid);
+
+        match value {
+            TypeVariableValue::Known { value } => Ok(value),
+            TypeVariableValue::Unknown { universe: _ } => Err(root),
         }
     }
 
@@ -1249,10 +1285,11 @@ impl<'tcx> InferCtxt<'tcx> {
                     .unwrap_or(ct),
                 InferConst::Fresh(_) => ct,
             },
+
             ty::ConstKind::Param(_)
             | ty::ConstKind::Bound(_, _)
             | ty::ConstKind::Placeholder(_)
-            | ty::ConstKind::Unevaluated(_)
+            | ty::ConstKind::Alias(_, _)
             | ty::ConstKind::Value(_)
             | ty::ConstKind::Error(_)
             | ty::ConstKind::Expr(_) => ct,
@@ -1491,6 +1528,7 @@ impl<'tcx> InferCtxt<'tcx> {
             mode @ (ty::TypingMode::Coherence
             | ty::TypingMode::PostBorrowck { .. }
             | ty::TypingMode::PostAnalysis
+            | ty::TypingMode::Reflection
             | ty::TypingMode::Codegen) => mode,
             ty::TypingMode::ErasedNotCoherence(MayBeErased) => unreachable!(),
         };
@@ -1859,4 +1897,24 @@ impl<'tcx> SolverRegionConstraintStorage<'tcx> {
             self.0 = constraint;
         }
     }
+}
+
+/// Returns unresolved root variables from `table`, according to `is_unresolved`.
+fn unresolved_root_variables_of<V: UnifyKey>(
+    mut table: UnificationTable<'_, '_, V>,
+    is_unresolved: impl Fn(V::Value) -> bool,
+) -> Vec<V>
+where
+    V: Eq,
+    V::Value: UnifyValue,
+    for<'a> UndoLog<'a>: From<sv::UndoLog<ut::Delegate<V>>>,
+{
+    (0..table.len() as u32)
+        .map(V::from_index)
+        .filter(|&vid| {
+            // NB: as of writing this `ena` doesn't provide a non-inlined `probe_key_value`...
+            let (root, value) = table.inlined_probe_key_value(vid);
+            root == vid && is_unresolved(value)
+        })
+        .collect()
 }

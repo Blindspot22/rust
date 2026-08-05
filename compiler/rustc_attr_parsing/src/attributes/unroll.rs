@@ -7,7 +7,7 @@ use super::prelude::*;
 pub(crate) struct UnrollParser;
 impl SingleAttributeParser for UnrollParser {
     const PATH: &[Symbol] = &[sym::unroll];
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[
         Allow(Target::Loop),
         Allow(Target::ForLoop),
         Allow(Target::While),
@@ -47,7 +47,7 @@ impl SingleAttributeParser for UnrollParser {
             ArgParser::NameValue(_) => {
                 let inner_span = cx.inner_span;
                 cx.adcx().expected_list_or_no_args(inner_span);
-                return None;
+                None
             }
         }
     }

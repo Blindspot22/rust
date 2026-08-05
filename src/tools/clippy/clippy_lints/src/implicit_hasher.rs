@@ -13,7 +13,7 @@ use rustc_session::declare_lint_pass;
 use rustc_span::Span;
 
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::source::{IntoSpan, SpanRangeExt, snippet, snippet_with_context};
+use clippy_utils::source::{IntoSpan, SpanExt, snippet, snippet_with_context};
 use clippy_utils::sym;
 
 declare_clippy_lint! {
@@ -303,7 +303,7 @@ impl<'a, 'b, 'tcx> ImplicitHasherConstructorVisitor<'a, 'b, 'tcx> {
     fn new(cx: &'a LateContext<'tcx>, target: &'b ImplicitHasherType<'tcx>) -> Self {
         Self {
             cx,
-            maybe_typeck_results: cx.maybe_typeck_results(),
+            maybe_typeck_results: cx.typeck_results,
             target,
             suggestions: BTreeMap::new(),
         }

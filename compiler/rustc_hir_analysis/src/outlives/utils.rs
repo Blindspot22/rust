@@ -11,6 +11,7 @@ pub(crate) type RequiredPredicates<'tcx> = FxIndexMap<ty::ArgOutlivesPredicate<'
 
 /// Given a requirement `T: 'a` or `'b: 'a`, deduce the
 /// outlives_component and add it to `required_predicates`
+// FIXME: change this function's signature and docs to mention clauses instead of predicates
 pub(crate) fn insert_outlives_predicate<'tcx>(
     tcx: TyCtxt<'tcx>,
     arg: GenericArg<'tcx>,
@@ -83,7 +84,7 @@ pub(crate) fn insert_outlives_predicate<'tcx>(
                         span_bug!(span, "Should not deduce placeholder outlives component");
                     }
 
-                    Component::Alias(alias_ty) => {
+                    Component::Alias(is_rigid, alias_ty) => {
                         // This would either arise from something like:
                         //
                         // ```
@@ -102,7 +103,7 @@ pub(crate) fn insert_outlives_predicate<'tcx>(
                         //
                         // Here we want to add an explicit `where <T as Iterator>::Item: 'a`
                         // or `Opaque<T>: 'a` depending on the alias kind.
-                        let ty = alias_ty.to_ty(tcx);
+                        let ty = alias_ty.to_ty(tcx, is_rigid);
                         required_predicates
                             .entry(ty::OutlivesPredicate(ty.into(), outlived_region))
                             .or_insert(span);

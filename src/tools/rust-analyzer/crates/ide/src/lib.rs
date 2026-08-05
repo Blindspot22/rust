@@ -60,6 +60,7 @@ mod view_mir;
 mod view_syntax_tree;
 
 use std::panic::{AssertUnwindSafe, UnwindSafe};
+use std::time::Duration;
 
 use cfg::CfgOptions;
 use fetch_crates::CrateInfo;
@@ -197,8 +198,8 @@ impl AnalysisHost {
 
     /// Applies changes to the current state of the world. If there are
     /// outstanding snapshots, they will be canceled.
-    pub fn apply_change(&mut self, change: ChangeWithProcMacros) {
-        self.db.apply_change(change);
+    pub fn apply_change(&mut self, change: ChangeWithProcMacros) -> Duration {
+        self.db.apply_change(change)
     }
 
     /// NB: this clears the database
@@ -332,11 +333,21 @@ impl Analysis {
         })
     }
 
-    pub fn parallel_prime_caches<F>(&self, num_worker_threads: usize, cb: F) -> Cancellable<()>
+    /// Warm caches for the given `scope`. `scope` must be closed under
+    /// transitive dependencies; callers that want to prime everything pass
+    /// `&base_db::all_crates(db)`.
+    pub fn parallel_prime_caches<F>(
+        &self,
+        scope: &[Crate],
+        num_worker_threads: usize,
+        cb: F,
+    ) -> Cancellable<()>
     where
         F: Fn(ParallelPrimeCachesProgress) + Sync + std::panic::UnwindSafe,
     {
-        self.with_db(move |db| prime_caches::parallel_prime_caches(db, num_worker_threads, &cb))
+        self.with_db(move |db| {
+            prime_caches::parallel_prime_caches(db, scope, num_worker_threads, &cb)
+        })
     }
 
     /// Gets the text of the source file.

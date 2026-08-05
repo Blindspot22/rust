@@ -44,6 +44,9 @@ pub fn extract_verify_if_eq<'tcx>(
     assert!(!verify_if_eq_b.has_escaping_bound_vars());
     let mut m = MatchAgainstHigherRankedOutlives::new(tcx);
     let verify_if_eq = verify_if_eq_b.skip_binder();
+    debug_assert!(
+        !tcx.next_trait_solver_globally() || !(verify_if_eq.ty, test_ty).has_non_rigid_aliases()
+    );
     m.relate(verify_if_eq.ty, test_ty).ok()?;
 
     if let ty::RegionKind::ReBound(index_kind, br) = verify_if_eq.bound.kind() {

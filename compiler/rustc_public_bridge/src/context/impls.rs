@@ -201,6 +201,11 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
         self.tcx.trait_impls_in_crate(crate_num).iter().map(|impl_def_id| *impl_def_id).collect()
     }
 
+    /// Returns the inherent implementations of the given definition.
+    pub fn inherent_impls(&self, def_id: DefId) -> Vec<DefId> {
+        self.tcx.inherent_impls(def_id).iter().copied().collect()
+    }
+
     pub fn trait_impl(&self, impl_def: DefId) -> EarlyBinder<'tcx, TraitRef<'tcx>> {
         self.tcx.impl_trait_ref(impl_def)
     }
@@ -209,31 +214,22 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
         self.tcx.generics_of(def_id)
     }
 
-    pub fn predicates_of(
-        &self,
-        def_id: DefId,
-    ) -> (Option<DefId>, Vec<(ty::PredicateKind<'tcx>, Span)>) {
-        let ty::GenericPredicates { parent, predicates } = self.tcx.predicates_of(def_id);
+    pub fn clauses_of(&self, def_id: DefId) -> (Option<DefId>, Vec<(ty::ClauseKind<'tcx>, Span)>) {
+        let ty::GenericClauses { parent, clauses } = self.tcx.clauses_of(def_id);
         (
             parent,
-            predicates
-                .iter()
-                .map(|(clause, span)| (clause.as_predicate().kind().skip_binder(), *span))
-                .collect(),
+            clauses.iter().map(|(clause, span)| (clause.kind().skip_binder(), *span)).collect(),
         )
     }
 
-    pub fn explicit_predicates_of(
+    pub fn explicit_clauses_of(
         &self,
         def_id: DefId,
-    ) -> (Option<DefId>, Vec<(ty::PredicateKind<'tcx>, Span)>) {
-        let ty::GenericPredicates { parent, predicates } = self.tcx.explicit_predicates_of(def_id);
+    ) -> (Option<DefId>, Vec<(ty::ClauseKind<'tcx>, Span)>) {
+        let ty::GenericClauses { parent, clauses } = self.tcx.explicit_clauses_of(def_id);
         (
             parent,
-            predicates
-                .iter()
-                .map(|(clause, span)| (clause.as_predicate().kind().skip_binder(), *span))
-                .collect(),
+            clauses.iter().map(|(clause, span)| (clause.kind().skip_binder(), *span)).collect(),
         )
     }
 
@@ -485,6 +481,16 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
         ty::Const::zero_sized(self.tcx, ty_internal)
     }
 
+    /// Create a caller location constant from a span.
+    ///
+    /// This produces a `&'static core::panic::Location<'static>` constant,
+    /// which is the implicit extra argument for `#[track_caller]` functions.
+    pub fn span_as_caller_location(&self, span: Span) -> MirConst<'tcx> {
+        let val = self.tcx.span_as_caller_location(span);
+        let ty = self.tcx.caller_location_ty();
+        MirConst::from_value(val, ty)
+    }
+
     /// Create a new constant that represents the given string value.
     pub fn new_const_str(&self, value: &str) -> MirConst<'tcx> {
         let ty = Ty::new_static_str(self.tcx);
@@ -645,7 +651,16 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
 
     /// Check if this is an empty DropGlue shim.
     pub fn is_empty_drop_shim(&self, instance: ty::Instance<'tcx>) -> bool {
-        matches!(instance.def, ty::InstanceKind::DropGlue(_, None))
+        matches!(instance.def, ty::InstanceKind::Shim(ty::ShimKind::DropGlue(_, None)))
+    }
+
+    /// Check if this instance requires a caller location argument.
+    ///
+    /// Functions with `#[track_caller]` have an implicit extra
+    /// `&'static core::panic::Location<'static>` argument appended to their ABI,
+    /// which is not visible in their MIR body signature.
+    pub fn instance_requires_caller_location(&self, instance: ty::Instance<'tcx>) -> bool {
+        instance.def.requires_caller_location(self.tcx)
     }
 
     /// Convert a non-generic crate item into an instance.
@@ -776,6 +791,11 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
                 .collect()
         };
         assoc_items
+    }
+
+    /// Returns the associated item of the given `DefId`, or `None` if it is not an associated item.
+    pub fn associated_item(&self, def_id: DefId) -> Option<AssocItem> {
+        self.tcx.opt_associated_item(def_id)
     }
 
     /// Get all vtable entries of a trait.

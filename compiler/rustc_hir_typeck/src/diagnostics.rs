@@ -19,6 +19,13 @@ use rustc_span::{Ident, Span, Spanned, Symbol};
 use crate::FnCtxt;
 
 #[derive(Diagnostic)]
+#[diag("using pointers in asm `const` operand is experimental")]
+pub(crate) struct AsmConstPtrUnstable {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
 #[diag("base expression required after `..`", code = E0797)]
 pub(crate) struct BaseExpressionDoubleDot {
     #[primary_span]
@@ -100,6 +107,7 @@ impl IntoDiagArg for ReturnLikeStatementKind {
     }
 }
 
+// FIXME(splat): add "non-splatted" to all 4 instances of this error message
 #[derive(Diagnostic)]
 #[diag("functions with the \"rust-call\" ABI must take a single non-self tuple argument")]
 pub(crate) struct RustCallIncorrectArgs {

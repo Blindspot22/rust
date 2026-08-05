@@ -8,7 +8,7 @@ use tracing::{debug, instrument};
 use crate::solve::NextSolverError;
 use crate::traits::query::NoSolution;
 use crate::traits::query::normalize::QueryNormalizeExt;
-use crate::traits::{FromSolverError, Normalized, ObligationCause, ObligationCtxt};
+use crate::traits::{FromSolverError, Normalized, ObligationCause, ObligationCtxt, OldSolverError};
 
 /// This returns true if the type `ty` is "trivial" for
 /// dropck-outlives -- that is, if it doesn't require any types to
@@ -106,7 +106,7 @@ pub fn compute_dropck_outlives_with_errors<'tcx, E>(
     span: Span,
 ) -> Result<DropckOutlivesResult<'tcx>, Vec<E>>
 where
-    E: FromSolverError<'tcx, NextSolverError<'tcx>>,
+    E: FromSolverError<'tcx, NextSolverError<'tcx>> + FromSolverError<'tcx, OldSolverError<'tcx>>,
 {
     let tcx = ocx.infcx.tcx;
     let ParamEnvAnd { param_env, value: DropckOutlives { dropped_ty } } = goal;
@@ -391,17 +391,17 @@ pub fn dtorck_constraint_for_ty_inner<'tcx>(
             constraints.dtorck_types.extend(
                 dtorck_types
                     .iter()
-                    .map(|t| EarlyBinder::bind(*t).instantiate(tcx, args).skip_norm_wip()),
+                    .map(|t| EarlyBinder::bind(tcx, *t).instantiate(tcx, args).skip_norm_wip()),
             );
             constraints.outlives.extend(
                 outlives
                     .iter()
-                    .map(|t| EarlyBinder::bind(*t).instantiate(tcx, args).skip_norm_wip()),
+                    .map(|t| EarlyBinder::bind(tcx, *t).instantiate(tcx, args).skip_norm_wip()),
             );
             constraints.overflows.extend(
                 overflows
                     .iter()
-                    .map(|t| EarlyBinder::bind(*t).instantiate(tcx, args).skip_norm_wip()),
+                    .map(|t| EarlyBinder::bind(tcx, *t).instantiate(tcx, args).skip_norm_wip()),
             );
         }
 

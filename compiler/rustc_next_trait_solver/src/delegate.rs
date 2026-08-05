@@ -1,7 +1,8 @@
 use std::ops::Deref;
 
 use rustc_type_ir::solve::{
-    Certainty, FetchEligibleAssocItemResponse, Goal, NoSolution, VisibleForLeakCheck,
+    Certainty, ComputeGoalFastPathOutcome, FetchEligibleAssocItemResponse, Goal, NoSolution,
+    VisibleForLeakCheck,
 };
 use rustc_type_ir::{self as ty, InferCtxtLike, Interner, TypeFoldable};
 
@@ -23,7 +24,7 @@ pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
         &self,
         goal: Goal<Self::Interner, <Self::Interner as Interner>::Predicate>,
         span: <Self::Interner as Interner>::Span,
-    ) -> Option<Certainty>;
+    ) -> ComputeGoalFastPathOutcome<Self::Interner>;
 
     fn fresh_var_for_kind_with_span(
         &self,
@@ -37,7 +38,7 @@ pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
     fn evaluate_const(
         &self,
         param_env: <Self::Interner as Interner>::ParamEnv,
-        uv: ty::UnevaluatedConst<Self::Interner>,
+        alias_const: ty::AliasConst<Self::Interner>,
     ) -> Option<<Self::Interner as Interner>::Const>;
 
     // FIXME: This only is here because `wf::obligations` is in `rustc_trait_selection`!

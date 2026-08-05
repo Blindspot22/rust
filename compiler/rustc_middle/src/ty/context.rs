@@ -17,10 +17,8 @@ use std::{fmt, iter, mem};
 
 use rustc_abi::{ExternAbi, FieldIdx, Layout, LayoutData, TargetDataLayout, VariantIdx};
 use rustc_ast as ast;
-use rustc_data_structures::defer;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::intern::Interned;
-use rustc_data_structures::jobserver::Proxy;
 use rustc_data_structures::profiling::SelfProfilerRef;
 use rustc_data_structures::sharded::{IntoPointer, ShardedHashMap};
 use rustc_data_structures::stable_hash::StableHash;
@@ -28,13 +26,13 @@ use rustc_data_structures::steal::Steal;
 use rustc_data_structures::sync::{
     self, DynSend, DynSync, FreezeReadGuard, Lock, RwLock, WorkerLocal,
 };
+use rustc_data_structures::{Limit, defer};
 use rustc_errors::{Applicability, Diag, DiagCtxtHandle, Diagnostic, MultiSpan};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{CrateNum, DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::definitions::{DefPathData, Definitions, PerParentDisambiguatorState};
 use rustc_hir::intravisit::VisitorExt;
 use rustc_hir::lang_items::LangItem;
-use rustc_hir::limit::Limit;
 use rustc_hir::{self as hir, CRATE_HIR_ID, HirId, Node, TraitCandidate, find_attr};
 use rustc_index::IndexVec;
 use rustc_macros::Diagnostic;
@@ -66,6 +64,7 @@ use crate::thir::Thir;
 use crate::traits;
 use crate::traits::solve::{ExternalConstraints, ExternalConstraintsData, PredefinedOpaques};
 use crate::ty::predicate::ExistentialPredicateStableCmpExt as _;
+use crate::ty::region::RegionExt;
 use crate::ty::{
     self, AdtDef, AdtDefData, AdtKind, Binder, Clause, Clauses, Const, FnSigKind, GenericArg,
     GenericArgs, GenericArgsRef, GenericParamDefKind, List, ListWithCachedTypeInfo, ParamConst,
@@ -602,6 +601,7 @@ impl<'tcx> TyCtxt<'tcx> {
     /// to the only allowed case.
     pub fn feed_anon_const_type(self, key: LocalDefId, value: ty::EarlyBinder<'tcx, Ty<'tcx>>) {
         debug_assert_eq!(self.def_kind(key), DefKind::AnonConst);
+        debug_assert!(self.anon_const_kind(key) != ty::AnonConstKind::NonTypeSystemInline);
         TyCtxtFeed { tcx: self, key }.type_of(value)
     }
 
@@ -619,7 +619,7 @@ impl<'tcx> TyCtxt<'tcx> {
                 other => bug!("{key:?} is not an assoc item of a trait impl: {other:?}"),
             }
         }
-        TyCtxtFeed { tcx: self, key }.visibility(vis.to_def_id())
+        TyCtxtFeed { tcx: self, key }.visibility(vis.to_mod_id())
     }
 }
 
@@ -766,9 +766,6 @@ pub struct GlobalCtxt<'tcx> {
     pub(crate) alloc_map: interpret::AllocMap<'tcx>,
 
     current_gcx: CurrentGcx,
-
-    /// A jobserver reference used to release then acquire a token while waiting on a query.
-    pub jobserver_proxy: Arc<Proxy>,
 }
 
 impl<'tcx> GlobalCtxt<'tcx> {
@@ -848,7 +845,6 @@ impl<'tcx> TyCtxt<'tcx> {
             DefKind::AnonConst
                 | DefKind::AssocConst { .. }
                 | DefKind::Const { .. }
-                | DefKind::InlineConst
                 | DefKind::GlobalAsm
         ) {
             CodegenFnAttrs::EMPTY
@@ -944,7 +940,6 @@ impl<'tcx> TyCtxt<'tcx> {
         query_system: QuerySystem<'tcx>,
         hooks: crate::hooks::Providers,
         current_gcx: CurrentGcx,
-        jobserver_proxy: Arc<Proxy>,
         f: impl FnOnce(TyCtxt<'tcx>) -> T,
     ) -> T {
         let data_layout = sess.target.parse_data_layout().unwrap_or_else(|err| {
@@ -982,7 +977,6 @@ impl<'tcx> TyCtxt<'tcx> {
             data_layout,
             alloc_map: interpret::AllocMap::new(),
             current_gcx,
-            jobserver_proxy,
         });
 
         // This is a separate function to work around a crash with parallel rustc (#135870)
@@ -1324,8 +1318,8 @@ impl<'tcx> TyCtxt<'tcx> {
         // Visibilities for opaque types are meaningless, but still provided
         // so that all items have visibilities.
         if matches!(def_kind, DefKind::Closure | DefKind::OpaqueTy) {
-            let parent_mod = self.parent_module_from_def_id(def_id).to_def_id();
-            feed.visibility(ty::Visibility::Restricted(parent_mod));
+            let parent_mod = self.parent_module_from_def_id(def_id);
+            feed.visibility(ty::Visibility::Restricted(parent_mod.to_mod_id()));
         }
 
         feed
@@ -1706,7 +1700,6 @@ macro_rules! nop_list_lift {
 }
 
 nop_lift! { type_; Ty<'a> => Ty<'tcx> }
-nop_lift! { region; Region<'a> => Region<'tcx> }
 nop_lift! { const_; Const<'a> => Const<'tcx> }
 nop_lift! { pat; Pattern<'a> => Pattern<'tcx> }
 nop_lift! { const_allocation; ConstAllocation<'a> => ConstAllocation<'tcx> }
@@ -1714,6 +1707,18 @@ nop_lift! { predicate; Predicate<'a> => Predicate<'tcx> }
 nop_lift! { predicate; Clause<'a> => Clause<'tcx> }
 nop_lift! { layout; Layout<'a> => Layout<'tcx> }
 nop_lift! { valtree; ValTree<'a> => ValTree<'tcx> }
+
+impl<'a, 'tcx> Lift<TyCtxt<'tcx>> for Interned<'a, RegionKind<'a>> {
+    type Lifted = Interned<'tcx, RegionKind<'tcx>>;
+
+    #[track_caller]
+    fn lift_to_interner(self, tcx: TyCtxt<'tcx>) -> Self::Lifted {
+        assert!(tcx.interners.region.contains_pointer_to(&InternedInSet(&*self.0)));
+        // SAFETY: we just checked that `self` is interned in this `TyCtxt`, so
+        // its pointee is valid for the entire lifetime of the target `TyCtxt`.
+        unsafe { mem::transmute(self) }
+    }
+}
 
 nop_list_lift! { type_lists; Ty<'a> => Ty<'tcx> }
 nop_list_lift! { clauses: ListWithCachedTypeInfo; Clause<'a> => Clause<'tcx> }
@@ -1731,9 +1736,7 @@ nop_list_lift! { args; GenericArg<'a> => GenericArg<'tcx> }
 
 macro_rules! sty_debug_print {
     ($fmt: expr, $ctxt: expr, $($variant: ident),*) => {{
-        // Curious inner module to allow variant names to be used as
-        // variable names.
-        #[allow(non_snake_case)]
+        #[allow(non_snake_case, reason = "we're using variant names as local variables")]
         mod inner {
             use crate::ty::{self, TyCtxt};
             use crate::ty::context::InternedInSet;
@@ -2058,7 +2061,7 @@ impl<'tcx> TyCtxt<'tcx> {
 
     /// Given a `ty`, return whether it's an `impl Future<...>`.
     pub fn ty_is_opaque_future(self, ty: Ty<'_>) -> bool {
-        let ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id }, .. }) = *ty.kind() else {
+        let ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id }, .. }) = *ty.kind() else {
             return false;
         };
         let future_trait = self.require_lang_item(LangItem::Future, DUMMY_SP);
@@ -2085,6 +2088,8 @@ impl<'tcx> TyCtxt<'tcx> {
                 ty::Tuple(params) => *params,
                 _ => bug!(),
             };
+            // Ignore splatting, it is unsupported on closures.
+            assert!(s.splatted().is_none());
             self.mk_fn_sig(
                 params,
                 s.output(),
@@ -2690,6 +2695,14 @@ impl<'tcx> TyCtxt<'tcx> {
         self.sess.opts.unstable_opts.disable_fast_paths
     }
 
+    pub fn disable_param_env_normalization_hack(self) -> bool {
+        self.sess.opts.unstable_opts.disable_param_env_normalization_hack
+    }
+
+    pub fn renormalize_rigid_aliases(self) -> bool {
+        self.sess.opts.unstable_opts.renormalize_rigid_aliases
+    }
+
     #[allow(rustc::bad_opt_access)]
     pub fn use_typing_mode_post_typeck_until_borrowck(self) -> bool {
         self.next_trait_solver_globally()
@@ -2702,6 +2715,39 @@ impl<'tcx> TyCtxt<'tcx> {
 
     pub fn is_impl_trait_in_trait(self, def_id: DefId) -> bool {
         self.opt_rpitit_info(def_id).is_some()
+    }
+
+    pub fn get_impl_future_output_ty(self, ty: Ty<'tcx>) -> Option<Ty<'tcx>> {
+        let (def_id, args) = match *ty.kind() {
+            ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) => (def_id, args),
+            ty::Alias(_, ty::AliasTy { kind: ty::Projection { def_id }, args, .. })
+                if self.is_impl_trait_in_trait(def_id) =>
+            {
+                (def_id, args)
+            }
+            _ => return None,
+        };
+
+        let future_trait = self.require_lang_item(LangItem::Future, DUMMY_SP);
+        let item_def_id = self.associated_item_def_ids(future_trait)[0];
+
+        self.explicit_item_self_bounds(def_id)
+            .iter_instantiated_copied(self, args)
+            .map(ty::Unnormalized::skip_norm_wip)
+            .find_map(|(predicate, _)| {
+                predicate
+                    .kind()
+                    .map_bound(|kind| match kind {
+                        ty::ClauseKind::Projection(projection_predicate)
+                            if projection_predicate.def_id() == item_def_id =>
+                        {
+                            projection_predicate.term.as_type()
+                        }
+                        _ => None,
+                    })
+                    .no_bound_vars()
+                    .flatten()
+            })
     }
 
     /// Named module children from all kinds of items, including imports.

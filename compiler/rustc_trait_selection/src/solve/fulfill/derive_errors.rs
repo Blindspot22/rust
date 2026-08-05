@@ -34,7 +34,9 @@ pub(super) fn fulfillment_error_for_no_solution<'tcx>(
         }
         ty::PredicateKind::Clause(ty::ClauseKind::ConstArgHasType(ct, expected_ty)) => {
             let ct_ty = match ct.kind() {
-                ty::ConstKind::Unevaluated(uv) => uv.type_of(infcx.tcx).skip_norm_wip(),
+                ty::ConstKind::Alias(_, alias_const) => {
+                    alias_const.type_of(infcx.tcx).skip_norm_wip()
+                }
                 ty::ConstKind::Param(param_ct) => {
                     param_ct.find_const_ty_from_env(obligation.param_env)
                 }
@@ -49,9 +51,6 @@ pub(super) fn fulfillment_error_for_no_solution<'tcx>(
                 ct_ty,
                 expected_ty,
             })
-        }
-        ty::PredicateKind::AliasRelate(_, _, _) => {
-            FulfillmentErrorCode::Project(MismatchedProjectionTypes { err: TypeError::Mismatch })
         }
         ty::PredicateKind::Subtype(pred) => {
             let (a, b) = infcx.enter_forall_and_leak_universe(
@@ -259,11 +258,11 @@ impl<'tcx> BestObligation<'tcx> {
     ) -> ControlFlow<PredicateObligation<'tcx>> {
         let infcx = candidate.goal().infcx();
         let param_env = candidate.goal().goal().param_env;
-        let body_id = self.obligation.cause.body_id;
+        let body_def_id = self.obligation.cause.body_def_id;
 
-        for obligation in wf::unnormalized_obligations(infcx, param_env, term, self.span(), body_id)
-            .into_iter()
-            .flatten()
+        for obligation in
+            wf::unnormalized_obligations(infcx, param_env, term, self.span(), body_def_id)
+                .into_flat_iter()
         {
             let nested_goal = candidate.instantiate_proof_tree_for_nested_goal(
                 GoalSource::Misc,
@@ -300,7 +299,7 @@ impl<'tcx> BestObligation<'tcx> {
     ) -> ControlFlow<PredicateObligation<'tcx>> {
         assert!(!self.consider_ambiguities);
         let tcx = goal.infcx().tcx;
-        if let ty::Alias(alias) = *self_ty.kind() {
+        if let ty::Alias(_, alias) = *self_ty.kind() {
             let infer_term = goal.infcx().next_ty_var(self.obligation.cause.span);
             let pred =
                 ty::ProjectionPredicate { projection_term: alias.into(), term: infer_term.into() };
@@ -542,21 +541,6 @@ impl<'tcx> ProofTreeVisitor<'tcx> for BestObligation<'tcx> {
             self.with_derived_obligation(obligation, |this| nested_goal.visit_with(this))?;
         }
 
-        // alias-relate may fail because the lhs or rhs can't be normalized,
-        // and therefore is treated as rigid.
-        if let Some(ty::PredicateKind::AliasRelate(lhs, rhs, _)) = pred.kind().no_bound_vars() {
-            goal.infcx().visit_proof_tree_at_depth(
-                goal.goal().with(tcx, ty::ClauseKind::WellFormed(lhs)),
-                goal.depth() + 1,
-                self,
-            )?;
-            goal.infcx().visit_proof_tree_at_depth(
-                goal.goal().with(tcx, ty::ClauseKind::WellFormed(rhs)),
-                goal.depth() + 1,
-                self,
-            )?;
-        }
-
         self.detect_trait_error_in_higher_ranked_projection(goal)?;
 
         ControlFlow::Break(self.obligation.clone())
@@ -592,13 +576,13 @@ fn derive_cause<'tcx>(
             result: _,
         } => {
             if let Some((_, span)) =
-                tcx.predicates_of(impl_def_id).instantiate_identity(tcx).iter().nth(idx)
+                tcx.clauses_of(impl_def_id).instantiate_identity(tcx).iter().nth(idx)
             {
                 cause = cause.derived_cause(parent_trait_pred, |derived| {
                     ObligationCauseCode::ImplDerived(Box::new(traits::ImplDerivedCause {
                         derived,
                         impl_or_alias_def_id: impl_def_id,
-                        impl_def_predicate_index: Some(idx),
+                        impl_def_clause_index: Some(idx),
                         span,
                     }))
                 })
@@ -628,7 +612,7 @@ fn derive_host_cause<'tcx>(
             result: _,
         } => {
             if let Some((_, span)) = tcx
-                .predicates_of(impl_def_id)
+                .clauses_of(impl_def_id)
                 .instantiate_identity(tcx)
                 .into_iter()
                 .chain(tcx.const_conditions(impl_def_id).instantiate_identity(tcx).into_iter().map(

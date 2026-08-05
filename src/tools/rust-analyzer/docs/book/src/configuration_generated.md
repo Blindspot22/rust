@@ -142,6 +142,15 @@ To enable a name with a value, use `"key=value"`.
 To disable, prefix the entry with a `!`.
 
 
+## rust-analyzer.cargo.configPath {#cargo.configPath}
+
+Default: `null`
+
+Path to a `.cargo/config.toml` style file to pass to cargo via `--config`
+for every cargo invocation (metadata, build scripts, config discovery).
+Useful to give rust-analyzer a consistent view of the project configuration.
+
+
 ## rust-analyzer.cargo.extraArgs {#cargo.extraArgs}
 
 Default: `[]`
@@ -446,8 +455,11 @@ verbose form `{ "path": "path::to::item", type: "always" }`.
 For traits the type "methods" can be used to only exclude the methods but not the trait
 itself.
 
-For modules the type "subItems" can be used to only exclude the all items in it but not the module
+For modules the type "sub_items" can be used to only exclude the all items in it but not the module
 itself. This does not include items defined in nested modules.
+
+For enums the type "variants" can be used to only exclude the all variants in it but not the enum
+itself.
 
 This setting also inherits `#rust-analyzer.completion.excludeTraits#`.
 
@@ -979,7 +991,7 @@ to always show them).
 
 Default: `false`
 
-Show inlay hints for closure captures.
+Show inlay hints for closure and coroutine captures.
 
 
 ## rust-analyzer.inlayHints.closureReturnTypeHints.enable {#inlayHints.closureReturnTypeHints.enable}
@@ -1356,7 +1368,7 @@ This config takes a map of crate names with the exported proc-macro names to ign
 
 ## rust-analyzer.procMacro.processes {#procMacro.processes}
 
-Default: `1`
+Default: `2`
 
 Number of proc-macro server processes to spawn.
 
@@ -1757,9 +1769,9 @@ will likely be useful:
 
 **Warning**: This format is provisional and subject to change.
 
-The discover command should output JSON objects, one per
-line (JSONL format). These objects should correspond to
-this Rust data type:
+The discover command should output JSON objects to stdout,
+one per line (JSONL format). These objects should correspond
+to this Rust data type:
 
 ```norun
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1799,6 +1811,9 @@ commented for readability):
 Only the finished event is required, but the other
 variants are encouraged to give users more feedback about
 progress or errors.
+
+Stderr is not parsed as JSONL. It is treated as command log
+output and forwarded to rust-analyzer's own logs.
 
 
 ## rust-analyzer.workspace.symbol.search.excludeImports {#workspace.symbol.search.excludeImports}

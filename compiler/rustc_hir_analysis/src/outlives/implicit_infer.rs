@@ -56,7 +56,7 @@ pub(super) fn infer_predicates(
                     }
                 }
 
-                DefKind::TyAlias if tcx.type_alias_is_lazy(item_did) => {
+                DefKind::TyAlias if tcx.type_alias_is_checked(item_did) => {
                     insert_required_predicates_to_be_wf(
                         tcx,
                         tcx.type_of(item_did).instantiate_identity().skip_norm_wip(),
@@ -81,8 +81,10 @@ pub(super) fn infer_predicates(
                 .map_or(0, |p| p.as_ref().skip_binder().len());
             if item_required_predicates.len() > item_predicates_len {
                 predicates_added.push(item_did);
-                global_inferred_outlives
-                    .insert(item_did.to_def_id(), ty::EarlyBinder::bind(item_required_predicates));
+                global_inferred_outlives.insert(
+                    item_did.to_def_id(),
+                    ty::EarlyBinder::bind_iter(item_required_predicates),
+                );
             }
         }
 
@@ -154,7 +156,7 @@ fn insert_required_predicates_to_be_wf<'tcx>(
                 );
             }
 
-            ty::Alias(ty::AliasTy { kind: ty::Free { def_id }, args, .. }) => {
+            ty::Alias(_, ty::AliasTy { kind: ty::Free { def_id }, args, .. }) => {
                 // This corresponds to a type like `Type<'a, T>`.
                 // We check inferred and explicit predicates.
                 debug!("Free");
@@ -204,7 +206,7 @@ fn insert_required_predicates_to_be_wf<'tcx>(
                 }
             }
 
-            ty::Alias(ty::AliasTy { kind: ty::Projection { def_id }, args, .. }) => {
+            ty::Alias(_, ty::AliasTy { kind: ty::Projection { def_id }, args, .. }) => {
                 // This corresponds to a type like `<() as Trait<'a, T>>::Type`.
                 // We only use the explicit predicates of the trait but
                 // not the ones of the associated type itself.
@@ -220,7 +222,7 @@ fn insert_required_predicates_to_be_wf<'tcx>(
             }
 
             // FIXME(inherent_associated_types): Use the explicit predicates from the parent impl.
-            ty::Alias(ty::AliasTy { kind: ty::Inherent { .. }, .. }) => {}
+            ty::Alias(_, ty::AliasTy { kind: ty::Inherent { .. }, .. }) => {}
 
             _ => {}
         }
@@ -244,6 +246,7 @@ fn insert_required_predicates_to_be_wf<'tcx>(
 /// will give us `U: 'static` and `U: Outer`. The latter we
 /// can ignore, but we will want to process `U: 'static`,
 /// applying the instantiation as above.
+// FIXME: change this function's signature and docs to mention clauses instead of predicates
 #[tracing::instrument(level = "debug", skip(tcx))]
 fn check_explicit_predicates<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -253,23 +256,22 @@ fn check_explicit_predicates<'tcx>(
     explicit_map: &mut ExplicitPredicatesMap<'tcx>,
     ignore_preds_refing_self: IgnorePredicatesReferencingSelf,
 ) {
-    let explicit_predicates = explicit_map.explicit_predicates_of(tcx, def_id);
+    let explicit_clauses = explicit_map.explicit_clauses_of(tcx, def_id);
 
-    for (&predicate @ ty::OutlivesPredicate(arg, _), &span) in
-        explicit_predicates.as_ref().skip_binder()
+    for (&clause @ ty::OutlivesPredicate(arg, _), &span) in explicit_clauses.as_ref().skip_binder()
     {
-        debug!(?predicate);
+        debug!(?clause);
 
         if let IgnorePredicatesReferencingSelf::Yes = ignore_preds_refing_self
             && arg.walk().any(|arg| arg == tcx.types.self_param.into())
         {
-            debug!("ignoring predicate since it references `Self`");
+            debug!("ignoring clause since it references `Self`");
             continue;
         }
 
-        let predicate @ ty::OutlivesPredicate(arg, region) =
-            explicit_predicates.rebind(predicate).instantiate(tcx, args).skip_norm_wip();
-        debug!(?predicate);
+        let clause @ ty::OutlivesPredicate(arg, region) =
+            explicit_clauses.rebind(clause).instantiate(tcx, args).skip_norm_wip();
+        debug!(?clause);
 
         insert_outlives_predicate(tcx, arg, region, span, required_predicates);
     }

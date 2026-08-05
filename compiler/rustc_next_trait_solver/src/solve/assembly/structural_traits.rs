@@ -8,7 +8,7 @@ use rustc_type_ir::lang_items::{SolverProjectionLangItem, SolverTraitLangItem};
 use rustc_type_ir::solve::SizedTraitKind;
 use rustc_type_ir::solve::inspect::ProbeKind;
 use rustc_type_ir::{
-    self as ty, Binder, FallibleTypeFolder, Interner, Movability, Mutability, TypeFoldable,
+    self as ty, Binder, FallibleTypeFolder, Interner, Movability, Mutability, Region, TypeFoldable,
     TypeSuperFoldable, Unnormalized, Upcast as _, elaborate,
 };
 use rustc_type_ir_macros::{TypeFoldable_Generic, TypeVisitable_Generic};
@@ -49,11 +49,14 @@ where
 
         ty::Dynamic(..)
         | ty::Param(..)
-        | ty::Alias(ty::AliasTy {
-            kind: ty::Projection { .. } | ty::Inherent { .. } | ty::Free { .. },
-            ..
-        })
+        | ty::Alias(
+            ty::IsRigid::Yes,
+            ty::AliasTy {
+                kind: ty::Projection { .. } | ty::Inherent { .. } | ty::Free { .. }, ..
+            },
+        )
         | ty::Placeholder(..)
+        | ty::Alias(ty::IsRigid::No, _)
         | ty::Bound(..)
         | ty::Infer(_) => {
             panic!("unexpected type `{ty:?}`")
@@ -102,7 +105,7 @@ where
                 .collect(),
         )),
 
-        ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) => {
+        ty::Alias(ty::IsRigid::Yes, ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) => {
             // We can resolve the `impl Trait` to its concrete type,
             // which enforces a DAG between the functions requiring
             // the auto trait bounds in question.
@@ -227,14 +230,9 @@ where
         | ty::Foreign(..)
         | ty::Ref(_, _, Mutability::Mut)
         | ty::Adt(_, _)
-        | ty::Alias(_)
+        | ty::Alias(ty::IsRigid::Yes, _)
         | ty::Param(_)
         | ty::Placeholder(..) => Err(NoSolution),
-
-        ty::Bound(..)
-        | ty::Infer(ty::TyVar(_) | ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_)) => {
-            panic!("unexpected type `{ty:?}`")
-        }
 
         // impl Copy/Clone for (T1, T2, .., Tn) where T1: Copy/Clone, T2: Copy/Clone, .. Tn: Copy/Clone
         ty::Tuple(tys) => Ok(ty::Binder::dummy(tys.to_vec())),
@@ -272,6 +270,12 @@ where
             .instantiate(ecx.cx(), args)
             .skip_norm_wip()
             .map_bound(|bound| bound.types.to_vec())),
+
+        ty::Infer(ty::TyVar(_) | ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_))
+        | ty::Alias(ty::IsRigid::No, _)
+        | ty::Bound(..) => {
+            panic!("unexpected type `{ty:?}`")
+        }
     }
 }
 
@@ -287,7 +291,7 @@ pub(in crate::solve) fn extract_tupled_inputs_and_output_from_callable<I: Intern
             let sig = cx.fn_sig(def_id);
             if sig.skip_binder().is_fn_trait_compatible() && !cx.has_target_features(def_id) {
                 Ok(Some(
-                    sig.instantiate(cx, args)
+                    sig.instantiate(cx, args.no_bound_vars().unwrap())
                         .skip_norm_wip()
                         .map_bound(|sig| (Ty::new_tup(cx, sig.inputs().as_slice()), sig.output())),
                 ))
@@ -401,14 +405,15 @@ pub(in crate::solve) fn extract_tupled_inputs_and_output_from_callable<I: Intern
         | ty::Tuple(_)
         | ty::Pat(_, _)
         | ty::UnsafeBinder(_)
-        | ty::Alias(_)
+        | ty::Alias(ty::IsRigid::Yes, _)
         | ty::Param(_)
         | ty::Placeholder(..)
         | ty::Infer(ty::IntVar(_) | ty::FloatVar(_))
         | ty::Error(_) => Err(NoSolution),
 
-        ty::Bound(..)
-        | ty::Infer(ty::TyVar(_) | ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_)) => {
+        ty::Infer(ty::TyVar(_) | ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_))
+        | ty::Alias(ty::IsRigid::No, _)
+        | ty::Bound(..) => {
             panic!("unexpected type `{self_ty:?}`")
         }
     }
@@ -437,7 +442,7 @@ pub(in crate::solve) fn extract_tupled_inputs_and_output_from_async_callable<I: 
     cx: I,
     self_ty: I::Ty,
     goal_kind: ty::ClosureKind,
-    env_region: I::Region,
+    env_region: Region<I>,
 ) -> Result<(ty::Binder<I, AsyncCallableRelevantTypes<I>>, Vec<I::Predicate>), NoSolution> {
     match self_ty.kind() {
         ty::CoroutineClosure(def_id, args) => {
@@ -545,7 +550,8 @@ pub(in crate::solve) fn extract_tupled_inputs_and_output_from_async_callable<I: 
 
             let future_output_def_id =
                 cx.require_projection_lang_item(SolverProjectionLangItem::FutureOutput);
-            let future_output_ty = Ty::new_projection(cx, future_output_def_id, [sig.output()]);
+            let future_output_ty =
+                Ty::new_projection(cx, ty::IsRigid::No, future_output_def_id, [sig.output()]);
             Ok((
                 bound_sig.rebind(AsyncCallableRelevantTypes {
                     tupled_inputs_ty: sig.inputs().get(0).unwrap(),
@@ -575,14 +581,15 @@ pub(in crate::solve) fn extract_tupled_inputs_and_output_from_async_callable<I: 
         | ty::Never
         | ty::UnsafeBinder(_)
         | ty::Tuple(_)
-        | ty::Alias(_)
+        | ty::Alias(ty::IsRigid::Yes, _)
         | ty::Param(_)
         | ty::Placeholder(..)
         | ty::Infer(ty::IntVar(_) | ty::FloatVar(_))
         | ty::Error(_) => Err(NoSolution),
 
-        ty::Bound(..)
-        | ty::Infer(ty::TyVar(_) | ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_)) => {
+        ty::Infer(ty::TyVar(_) | ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_))
+        | ty::Alias(ty::IsRigid::No, _)
+        | ty::Bound(..) => {
             panic!("unexpected type `{self_ty:?}`")
         }
     }
@@ -601,7 +608,8 @@ fn fn_item_to_async_callable<I: Interner>(
     ];
     let future_output_def_id =
         cx.require_projection_lang_item(SolverProjectionLangItem::FutureOutput);
-    let future_output_ty = Ty::new_projection(cx, future_output_def_id, [sig.output()]);
+    let future_output_ty =
+        Ty::new_projection(cx, ty::IsRigid::No, future_output_def_id, [sig.output()]);
     Ok((
         bound_sig.rebind(AsyncCallableRelevantTypes {
             tupled_inputs_ty: Ty::new_tup(cx, sig.inputs().as_slice()),
@@ -617,7 +625,7 @@ fn fn_item_to_async_callable<I: Interner>(
 fn coroutine_closure_to_certain_coroutine<I: Interner>(
     cx: I,
     goal_kind: ty::ClosureKind,
-    goal_region: I::Region,
+    goal_region: Region<I>,
     def_id: I::CoroutineClosureId,
     args: ty::CoroutineClosureArgs<I>,
     sig: ty::CoroutineClosureSignature<I>,
@@ -641,7 +649,7 @@ fn coroutine_closure_to_certain_coroutine<I: Interner>(
 fn coroutine_closure_to_ambiguous_coroutine<I: Interner>(
     cx: I,
     goal_kind: ty::ClosureKind,
-    goal_region: I::Region,
+    goal_region: Region<I>,
     def_id: I::CoroutineClosureId,
     args: ty::CoroutineClosureArgs<I>,
     sig: ty::CoroutineClosureSignature<I>,
@@ -650,6 +658,7 @@ fn coroutine_closure_to_ambiguous_coroutine<I: Interner>(
         cx.require_projection_lang_item(SolverProjectionLangItem::AsyncFnKindUpvars);
     let tupled_upvars_ty = Ty::new_projection(
         cx,
+        ty::IsRigid::No,
         upvars_projection_def_id,
         [
             I::GenericArg::from(args.kind_ty()),
@@ -682,6 +691,9 @@ pub(in crate::solve) fn extract_fn_def_from_const_callable<I: Interner>(
 ) -> Result<(ty::Binder<I, (I::Ty, I::Ty)>, I::DefId, I::GenericArgs), NoSolution> {
     match self_ty.kind() {
         ty::FnDef(def_id, args) => {
+            // FIXME
+            let args = args.no_bound_vars().unwrap();
+
             let sig = cx.fn_sig(def_id);
             if sig.skip_binder().is_fn_trait_compatible()
                 && !cx.has_target_features(def_id)
@@ -739,15 +751,16 @@ pub(in crate::solve) fn extract_fn_def_from_const_callable<I: Interner>(
         | ty::Never
         | ty::Tuple(_)
         | ty::Pat(_, _)
-        | ty::Alias(_)
+        | ty::Alias(ty::IsRigid::Yes, _)
         | ty::Param(_)
         | ty::Placeholder(..)
         | ty::Infer(ty::IntVar(_) | ty::FloatVar(_))
         | ty::Error(_)
         | ty::UnsafeBinder(_) => return Err(NoSolution),
 
-        ty::Bound(..)
-        | ty::Infer(ty::TyVar(_) | ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_)) => {
+        ty::Infer(ty::TyVar(_) | ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_))
+        | ty::Alias(ty::IsRigid::No, _)
+        | ty::Bound(..) => {
             panic!("unexpected type `{self_ty:?}`")
         }
     }
@@ -895,7 +908,7 @@ where
     // make impls coinductive always, since they'll always need to prove their supertraits.
     requirements.extend(elaborate::elaborate(
         cx,
-        cx.explicit_super_predicates_of(trait_ref.def_id)
+        cx.explicit_super_clauses_of(trait_ref.def_id)
             .iter_instantiated(cx, trait_ref.args)
             .map(Unnormalized::skip_norm_wip)
             .map(|(pred, _)| pred),
@@ -1035,7 +1048,7 @@ where
     }
 
     fn try_fold_ty(&mut self, ty: I::Ty) -> Result<I::Ty, Ambiguous> {
-        if let ty::Alias(alias_ty @ ty::AliasTy { kind: ty::Projection { .. }, .. }) = ty.kind()
+        if let ty::Alias(_, alias_ty @ ty::AliasTy { kind: ty::Projection { .. }, .. }) = ty.kind()
             && let Some(term) = self.try_eagerly_replace_alias(alias_ty.into())?
         {
             Ok(term.expect_ty())

@@ -178,6 +178,7 @@ where
             TypingMode::Coherence
             | TypingMode::PostTypeckUntilBorrowck { defining_opaque_types: _ }
             | TypingMode::PostBorrowck { defined_opaque_types: _ }
+            | TypingMode::Reflection
             | TypingMode::PostAnalysis
             | TypingMode::Codegen => return Default::default(),
         };
@@ -406,7 +407,7 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                 obligation.param_env,
                 obligation.cause.clone(),
                 obligation.recursion_depth + 1,
-                obligation.predicate,
+                ty::Unnormalized::new_wip(obligation.predicate),
                 &mut obligations,
             );
             if predicate != obligation.predicate {
@@ -460,9 +461,6 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                 ty::PredicateKind::Ambiguous => ProcessResult::Unchanged,
                 ty::PredicateKind::NormalizesTo(..) => {
                     bug!("NormalizesTo is only used by the new solver")
-                }
-                ty::PredicateKind::AliasRelate(..) => {
-                    bug!("AliasRelate is only used by the new solver")
                 }
                 ty::PredicateKind::Clause(ty::ClauseKind::UnstableFeature(_)) => {
                     unreachable!("unexpected higher ranked `UnstableFeature` goal")
@@ -535,9 +533,6 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                 ty::PredicateKind::NormalizesTo(..) => {
                     bug!("NormalizesTo is only used by the new solver")
                 }
-                ty::PredicateKind::AliasRelate(..) => {
-                    bug!("AliasRelate is only used by the new solver")
-                }
                 // Compute `ConstArgHasType` above the overflow check below.
                 // This is because this is not ever a useful obligation to report
                 // as the cause of an overflow.
@@ -559,7 +554,9 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                             return ProcessResult::Changed(PendingPredicateObligations::new());
                         }
                         ty::ConstKind::Value(cv) => cv.ty,
-                        ty::ConstKind::Unevaluated(uv) => uv.type_of(infcx.tcx).skip_norm_wip(),
+                        ty::ConstKind::Alias(_, alias_const) => {
+                            alias_const.type_of(infcx.tcx).skip_norm_wip()
+                        }
                         // FIXME(generic_const_exprs): we should construct an alias like
                         // `<lhs_ty as Add<rhs_ty>>::Output` when this is an `Expr` representing
                         // `lhs + rhs`.
@@ -615,7 +612,7 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                     match wf::obligations(
                         self.selcx.infcx,
                         obligation.param_env,
-                        obligation.cause.body_id,
+                        obligation.cause.body_def_id,
                         obligation.recursion_depth + 1,
                         term,
                         obligation.cause.span,
@@ -677,10 +674,10 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                     }
                 }
 
-                ty::PredicateKind::Clause(ty::ClauseKind::ConstEvaluatable(uv)) => {
+                ty::PredicateKind::Clause(ty::ClauseKind::ConstEvaluatable(alias_const)) => {
                     match const_evaluatable::is_const_evaluatable(
                         self.selcx.infcx,
-                        uv,
+                        alias_const,
                         obligation.param_env,
                         obligation.cause.span,
                     ) {
@@ -688,7 +685,9 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                         Err(NotConstEvaluatable::MentionsInfer) => {
                             pending_obligation.stalled_on.clear();
                             pending_obligation.stalled_on.extend(
-                                uv.walk().filter_map(TyOrConstInferVar::maybe_from_generic_arg),
+                                alias_const
+                                    .walk()
+                                    .filter_map(TyOrConstInferVar::maybe_from_generic_arg),
                             );
                             ProcessResult::Unchanged
                         }
@@ -717,12 +716,12 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                         debug!("equating consts:\nc1= {:?}\nc2= {:?}", c1, c2);
 
                         match (c1.kind(), c2.kind()) {
-                            (ty::ConstKind::Unevaluated(a), ty::ConstKind::Unevaluated(b))
+                            (ty::ConstKind::Alias(_, a), ty::ConstKind::Alias(_, b))
                                 if a.kind == b.kind
                                     && matches!(
                                         a.kind,
-                                        ty::UnevaluatedConstKind::Projection { .. }
-                                            | ty::UnevaluatedConstKind::Inherent { .. }
+                                        ty::AliasConstKind::Projection { .. }
+                                            | ty::AliasConstKind::Inherent { .. }
                                     ) =>
                             {
                                 if let Ok(new_obligations) = infcx
@@ -741,8 +740,7 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                                     ));
                                 }
                             }
-                            (_, ty::ConstKind::Unevaluated(_))
-                            | (ty::ConstKind::Unevaluated(_), _) => (),
+                            (_, ty::ConstKind::Alias(_, _)) | (ty::ConstKind::Alias(_, _), _) => (),
                             (_, _) => {
                                 if let Ok(new_obligations) = infcx
                                     .at(&obligation.cause, obligation.param_env)
@@ -762,7 +760,7 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                     let stalled_on = &mut pending_obligation.stalled_on;
 
                     let mut evaluate = |c: Const<'tcx>| {
-                        if let ty::ConstKind::Unevaluated(unevaluated) = c.kind() {
+                        if let ty::ConstKind::Alias(_, alias_const) = c.kind() {
                             match super::try_evaluate_const(
                                 self.selcx.infcx,
                                 c,
@@ -771,7 +769,7 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                                 Ok(val) => Ok(val),
                                 e @ Err(EvaluateConstErr::HasGenericsOrInfers) => {
                                     stalled_on.extend(
-                                        unevaluated
+                                        alias_const
                                             .args
                                             .iter()
                                             .filter_map(TyOrConstInferVar::maybe_from_generic_arg),
@@ -953,7 +951,35 @@ impl<'a, 'tcx> FulfillProcessor<'a, 'tcx> {
         }
 
         match project::poly_project_and_unify_term(&mut self.selcx, &project_obligation) {
-            ProjectAndUnifyResult::Holds(os) => ProcessResult::Changed(mk_pending(obligation, os)),
+            ProjectAndUnifyResult::Holds(os) if os.is_empty() => {
+                ProcessResult::Changed(mk_pending(obligation, os))
+            }
+            ProjectAndUnifyResult::Holds(os) => {
+                let input_projection_term = infcx
+                    .resolve_vars_if_possible(project_obligation.predicate)
+                    .map_bound(|p| p.projection_term);
+                let all_same_projection_term = os.iter().all(|o| {
+                    let Some(proj_clause) = o.predicate.as_projection_clause() else {
+                        return false;
+                    };
+                    infcx.resolve_vars_if_possible(proj_clause).map_bound(|p| p.projection_term)
+                        == input_projection_term
+                });
+                if all_same_projection_term {
+                    // Every nested obligation has the same projection term as the obligation
+                    // we are processing, so registering would make fulfillment process the same
+                    // obligation forever. This happens when unifying the projection with the
+                    // predicate's term spawns a delayed copy of the predicate itself, see
+                    // `InferCtxt::instantiate_var`. E.g. in Issue #159750, processing
+                    // `<_ as Queryable>::Output == ?0` returns `Holds` with the single nested
+                    // obligation `<_ as Queryable>::Output == ?1` where `?1` is merely unioned
+                    // with `?0`.
+                    // Since at this point the code will not compile, error immediately.
+                    ProcessResult::Error(FulfillmentErrorCode::Ambiguity { overflow: None })
+                } else {
+                    ProcessResult::Changed(mk_pending(obligation, os))
+                }
+            }
             ProjectAndUnifyResult::FailedNormalization => {
                 stalled_on.clear();
                 stalled_on.extend(args_infer_vars(

@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use rustc_type_ir::data_structures::ensure_sufficient_stack;
 use rustc_type_ir::search_graph::{self, PathKind};
 use rustc_type_ir::solve::{
-    AccessedOpaques, CanonicalInput, Certainty, NoSolution, NoSolutionOrRerunNonErased, QueryResult,
+    AccessedOpaques, CanonicalInput, Certainty, NoSolution, QueryResult, RerunResultExt,
 };
 use rustc_type_ir::{Interner, MayBeErased, TypingMode};
 
@@ -70,6 +70,7 @@ where
                 }
                 TypingMode::Typeck { .. }
                 | TypingMode::PostTypeckUntilBorrowck { .. }
+                | TypingMode::Reflection
                 | TypingMode::PostBorrowck { .. }
                 | TypingMode::PostAnalysis
                 | TypingMode::Codegen
@@ -106,6 +107,7 @@ where
         response_no_constraints(cx, input, Certainty::overflow(true))
     }
 
+    const FIXPOINT_OVERFLOW_AMBIGUITY_KIND: Certainty = Certainty::overflow(false);
     fn fixpoint_overflow_result(
         cx: I,
         input: CanonicalInput<I>,
@@ -125,14 +127,6 @@ where
         })
     }
 
-    fn propagate_ambiguity(
-        cx: I,
-        for_input: CanonicalInput<I>,
-        certainty: Certainty,
-    ) -> (QueryResult<I>, AccessedOpaques<I>) {
-        response_no_constraints(cx, for_input, certainty)
-    }
-
     fn compute_goal(
         search_graph: &mut SearchGraph<D>,
         cx: I,
@@ -141,17 +135,8 @@ where
     ) -> (QueryResult<I>, AccessedOpaques<I>) {
         ensure_sufficient_stack(|| {
             EvalCtxt::enter_canonical(cx, search_graph, input, inspect, |ecx, goal| {
-                let result = ecx.compute_goal(goal);
-
-                // if we're in `RerunNonErased`, don't even bother with inspect,
-                // and immediately return
-                let result = match result {
-                    Ok(i) => Ok(i),
-                    Err(NoSolutionOrRerunNonErased::NoSolution(NoSolution)) => Err(NoSolution),
-                    Err(NoSolutionOrRerunNonErased::RerunNonErased(e)) => {
-                        return Err(e.into());
-                    }
-                };
+                // if we're in `RerunNonErased`, don't even bother with inspect, and immediately return
+                let result = ecx.compute_goal(goal).map_err_to_rerun()?;
 
                 ecx.inspect.query_result(result);
                 result.map_err(Into::into)

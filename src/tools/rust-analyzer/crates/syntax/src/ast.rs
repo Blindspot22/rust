@@ -1,7 +1,6 @@
 //! Abstract Syntax Tree, layered on top of untyped `SyntaxNode`s
 
 pub mod edit;
-pub mod edit_in_place;
 mod expr_ext;
 mod generated;
 pub mod make;
@@ -62,12 +61,6 @@ pub trait AstNode {
         Self: Sized;
 
     fn syntax(&self) -> &SyntaxNode;
-    fn clone_for_update(&self) -> Self
-    where
-        Self: Sized,
-    {
-        Self::cast(self.syntax().clone_for_update()).unwrap()
-    }
     fn clone_subtree(&self) -> Self
     where
         Self: Sized,

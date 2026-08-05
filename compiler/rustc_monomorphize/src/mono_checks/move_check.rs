@@ -1,7 +1,7 @@
 use rustc_abi::Size;
+use rustc_data_structures::Limit;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
-use rustc_hir::limit::Limit;
 use rustc_middle::mir::visit::Visitor as MirVisitor;
 use rustc_middle::mir::{self, Location, traversal};
 use rustc_middle::ty::{self, Instance, Ty, TyCtxt, TypeFoldable};
@@ -60,7 +60,7 @@ impl<'tcx> MoveCheckVisitor<'tcx> {
         self.instance.instantiate_mir_and_normalize_erasing_regions(
             self.tcx,
             ty::TypingEnv::fully_monomorphized(),
-            ty::EarlyBinder::bind(value),
+            ty::EarlyBinder::bind(self.tcx, value),
         )
     }
 

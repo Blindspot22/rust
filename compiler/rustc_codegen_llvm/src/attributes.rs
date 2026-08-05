@@ -7,14 +7,17 @@ use rustc_middle::middle::codegen_fn_attrs::{
     TargetFeature,
 };
 use rustc_middle::ty::{self, Instance, TyCtxt};
-use rustc_session::config::{BranchProtection, FunctionReturn, OptLevel, PAuthKey, PacRet};
+use rustc_session::config::{
+    BranchProtection, FunctionReturn, InstrumentMcount, InstrumentMcountOpts, OptLevel, PAuthKey,
+    PacRet,
+};
 use rustc_span::sym;
 use rustc_symbol_mangling::mangle_internal_symbol;
 use rustc_target::spec::{Arch, FramePointer, SanitizerSet, StackProbeType, StackProtector};
 use smallvec::SmallVec;
 
 use crate::context::SimpleCx;
-use crate::errors::{PackedStackBackchainNeedsSoftfloat, SanitizerMemtagRequiresMte};
+use crate::diagnostics::{PackedStackBackchainNeedsSoftfloat, SanitizerMemtagRequiresMte};
 use crate::llvm::AttributePlace::Function;
 use crate::llvm::{
     self, AllocKindFlags, Attribute, AttributeKind, AttributePlace, MemoryEffects, Value,
@@ -84,11 +87,26 @@ fn patchable_function_entry_attrs<'ll>(
     attr: Option<PatchableFunctionEntry>,
 ) -> SmallVec<[&'ll Attribute; 2]> {
     let mut attrs = SmallVec::new();
-    let patchable_spec = attr.unwrap_or_else(|| {
-        PatchableFunctionEntry::from_config(sess.opts.unstable_opts.patchable_function_entry)
-    });
-    let entry = patchable_spec.entry();
-    let prefix = patchable_spec.prefix();
+
+    let mut entry = sess.opts.unstable_opts.patchable_function_entry.entry();
+    let mut prefix = sess.opts.unstable_opts.patchable_function_entry.prefix();
+    let mut section = sess.opts.unstable_opts.patchable_function_entry.section();
+    let section_sym;
+
+    // Apply attribute specified overrides, if any.
+    if let Some(patchable_spec) = attr {
+        if let Some(sym) = patchable_spec.section() {
+            section_sym = sym;
+            section = Some(section_sym.as_str());
+        }
+        // Override the nop counts if either is present. If only one is present, the
+        // other count is implied to be 0.
+        if patchable_spec.entry().is_some() || patchable_spec.prefix().is_some() {
+            entry = patchable_spec.entry().unwrap_or(0);
+            prefix = patchable_spec.prefix().unwrap_or(0);
+        }
+    }
+
     if entry > 0 {
         attrs.push(llvm::CreateAttrStringValue(
             cx.llcx,
@@ -101,6 +119,13 @@ fn patchable_function_entry_attrs<'ll>(
             cx.llcx,
             "patchable-function-prefix",
             &format!("{}", prefix),
+        ));
+    }
+    if let Some(section) = section {
+        attrs.push(llvm::CreateAttrStringValue(
+            cx.llcx,
+            "patchable-function-entry-section",
+            section,
         ));
     }
     attrs
@@ -177,7 +202,7 @@ pub(crate) fn frame_pointer(sess: &Session) -> FramePointer {
     let opts = &sess.opts;
     // "mcount" function relies on stack pointer.
     // See <https://sourceware.org/binutils/docs/gprof/Implementation.html>.
-    if opts.unstable_opts.instrument_mcount {
+    if let InstrumentMcount::Mcount(_) = opts.unstable_opts.instrument_mcount {
         fp.ratchet(FramePointer::Always);
     }
     fp.ratchet(opts.cg.force_frame_pointers);
@@ -214,7 +239,7 @@ fn instrument_function_attr<'ll>(
     instrument_fn: InstrumentFnAttr,
 ) -> SmallVec<[&'ll Attribute; 4]> {
     let mut attrs = SmallVec::new();
-    if sess.opts.unstable_opts.instrument_mcount {
+    if sess.opts.unstable_opts.instrument_mcount != InstrumentMcount::Disabled {
         // Similar to `clang -pg` behavior. Handled by the
         // `post-inline-ee-instrument` LLVM pass.
 
@@ -224,18 +249,35 @@ fn instrument_function_attr<'ll>(
         };
 
         if instrument_entry {
-            // The function name varies on platforms.
-            // See test/CodeGen/mcount.c in clang.
-            let mcount_name = match &sess.target.llvm_mcount_intrinsic {
-                Some(llvm_mcount_intrinsic) => llvm_mcount_intrinsic.as_ref(),
-                None => sess.target.mcount.as_ref(),
-            };
+            let mut opts = InstrumentMcountOpts::default();
+            match sess.opts.unstable_opts.instrument_mcount {
+                InstrumentMcount::Mcount(mopts) => {
+                    // The function name varies on platforms.
+                    // See test/CodeGen/mcount.c in clang.
+                    let mcount_name = match &sess.target.llvm_mcount_intrinsic {
+                        Some(llvm_mcount_intrinsic) => llvm_mcount_intrinsic.as_ref(),
+                        None => sess.target.mcount.as_ref(),
+                    };
 
-            attrs.push(llvm::CreateAttrStringValue(
-                cx.llcx,
-                "instrument-function-entry-inlined",
-                mcount_name,
-            ));
+                    attrs.push(llvm::CreateAttrStringValue(
+                        cx.llcx,
+                        "instrument-function-entry-inlined",
+                        mcount_name,
+                    ));
+                    opts = mopts;
+                }
+                InstrumentMcount::Fentry(fopts) => {
+                    attrs.push(llvm::CreateAttrStringValue(cx.llcx, "fentry-call", "true"));
+                    opts = fopts;
+                }
+                InstrumentMcount::Disabled => {}
+            }
+            if opts.no_call {
+                attrs.push(llvm::CreateAttrString(cx.llcx, "mnop-mcount"));
+            }
+            if opts.record {
+                attrs.push(llvm::CreateAttrString(cx.llcx, "mrecord-mcount"));
+            }
         }
     }
     if let Some(options) = &sess.opts.unstable_opts.instrument_xray {
@@ -498,9 +540,7 @@ pub(crate) fn llfn_attrs_from_instance<'ll, 'tcx>(
         to_add.extend(sanitize_attrs(cx, tcx, codegen_fn_attrs.sanitizers));
 
         // For non-naked functions, set branch protection attributes on aarch64.
-        if let Some(BranchProtection { bti, pac_ret, gcs }) =
-            sess.opts.unstable_opts.branch_protection
-        {
+        if let Some(BranchProtection { bti, pac_ret, gcs }) = sess.branch_protection() {
             assert!(sess.target.arch == Arch::AArch64);
             if bti {
                 to_add.push(llvm::CreateAttrString(cx.llcx, "branch-target-enforcement"));
@@ -630,6 +670,13 @@ pub(crate) fn llfn_attrs_from_instance<'ll, 'tcx>(
                 codegen_fn_attrs.symbol_name.unwrap_or_else(|| tcx.item_name(instance.def_id()));
             let name = name.as_str();
             to_add.push(llvm::CreateAttrStringValue(cx.llcx, "wasm-import-name", name));
+        }
+    }
+
+    if sess.pointer_authentication() {
+        let cfg = sess.pointer_auth_config.as_ref().unwrap();
+        for ptrauth_attr in cfg.fn_attrs() {
+            to_add.push(llvm::CreateAttrString(cx.llcx, ptrauth_attr));
         }
     }
 

@@ -3,6 +3,8 @@
 #![feature(iter_intersperse)]
 #![feature(iter_order_by)]
 #![feature(never_type)]
+#![feature(option_into_flat_iter)]
+#![feature(option_reference_flattening)]
 #![feature(trim_prefix_suffix)]
 // tidy-alphabetical-end
 
@@ -41,16 +43,16 @@ pub use coercion::can_coerce;
 use fn_ctxt::FnCtxt;
 use rustc_data_structures::unord::UnordSet;
 use rustc_errors::codes::*;
-use rustc_errors::{Applicability, Diag, ErrorGuaranteed, pluralize, struct_span_code_err};
+use rustc_errors::{Applicability, Diag, ErrorGuaranteed, struct_span_code_err};
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::{HirId, HirIdMap, Node};
 use rustc_hir_analysis::check::{check_abi, check_custom_abi};
 use rustc_hir_analysis::hir_ty_lowering::HirTyLowerer;
-use rustc_infer::traits::{ObligationCauseCode, ObligationInspector, WellFormedLoc};
+use rustc_infer::traits::{ObligationCauseCode, ObligationInspector, TraitEngine, WellFormedLoc};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::query::Providers;
-use rustc_middle::ty::{self, Ty, TyCtxt, Unnormalized};
+use rustc_middle::ty::{self, FnSigKind, Ty, TyCtxt, Unnormalized};
 use rustc_middle::{bug, span_bug};
 use rustc_session::config;
 use rustc_span::Span;
@@ -376,7 +378,7 @@ fn extend_err_with_const_context(
 
 fn infer_type_if_missing<'tcx>(fcx: &FnCtxt<'_, 'tcx>, node: Node<'tcx>) -> Option<Ty<'tcx>> {
     let tcx = fcx.tcx;
-    let def_id = fcx.body_id;
+    let def_id = fcx.body_def_id;
     let expected_type = if let Some(&hir::Ty { kind: hir::TyKind::Infer(()), span, .. }) = node.ty()
     {
         if let Some(item) = tcx.opt_associated_item(def_id.into())
@@ -481,6 +483,7 @@ fn report_unexpected_variant_res(
     tcx: TyCtxt<'_>,
     res: Res,
     expr: Option<&hir::Expr<'_>>,
+    sub_pats: &[hir::Pat<'_>],
     qpath: &hir::QPath<'_>,
     span: Span,
     err_code: ErrCode,
@@ -560,19 +563,35 @@ fn report_unexpected_variant_res(
             let fields = &tcx.expect_variant_res(res).fields.raw;
             let span = qpath.span().shrink_to_hi().to(span.shrink_to_hi());
             let (msg, sugg) = if fields.is_empty() {
-                ("use the struct variant pattern syntax".to_string(), " {}".to_string())
+                ("use the struct variant pattern syntax", " {}".to_string())
             } else {
-                let msg = format!(
-                    "the struct variant's field{s} {are} being ignored",
-                    s = pluralize!(fields.len()),
-                    are = pluralize!("is", fields.len())
-                );
-                let fields = fields
+                let msg = if fields.is_empty() {
+                    "use struct variant pattern syntax"
+                } else {
+                    "add the names to match a struct variant's fields"
+                };
+                let fields_sugg = fields
                     .iter()
-                    .map(|field| format!("{}: _", field.ident(tcx)))
+                    .enumerate()
+                    .map(|(i, field)| {
+                        let field_name = field.ident(tcx).to_string();
+
+                        let pat_snippet = sub_pats
+                            .get(i)
+                            .and_then(|sub_pat| {
+                                tcx.sess.source_map().span_to_snippet(sub_pat.span).ok()
+                            })
+                            .unwrap_or_else(|| "_".to_string());
+
+                        if field_name == pat_snippet {
+                            field_name
+                        } else {
+                            format!("{field_name}: {pat_snippet}")
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
-                let sugg = format!(" {{ {} }}", fields);
+                let sugg = format!(" {{ {} }}", fields_sugg);
                 (msg, sugg)
             };
 
@@ -589,12 +608,10 @@ fn report_unexpected_variant_res(
     .emit()
 }
 
-/// Controls whether the arguments are tupled. This is used for the call
-/// operator.
+/// Controls whether all arguments are tupled. This is used for the call operator only.
 ///
-/// Tupling means that all call-side arguments are packed into a tuple and
-/// passed as a single parameter. For example, if tupling is enabled, this
-/// function:
+/// Tupling means that all call-side arguments are packed into a tuple and passed as a single
+/// parameter. For example, if tupling is enabled, this function:
 /// ```
 /// fn f(x: (isize, isize)) {}
 /// ```
@@ -608,10 +625,72 @@ fn report_unexpected_variant_res(
 /// # fn f(x: (isize, isize)) {}
 /// f((1, 2));
 /// ```
-#[derive(Copy, Clone, Eq, PartialEq)]
+///
+/// Note: splatted arguments are handled separately.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum TupleArgumentsFlag {
+    /// Arguments are typechecked unchanged.
     DontTupleArguments,
-    TupleArguments,
+    /// This is a call operator: all caller arguments are tupled before typechecking.
+    /// Set based on the "rust-call" ABI and Fn* traits.
+    TupleAllCallArgs,
+    /// The `self` method argument is splatted, so `Self` should be tupled before typechecking.
+    TupleSplattedSelfArg,
+    /// A non-self argument is splatted, so that argument should be tupled before typechecking.
+    TupleSplattedArg(u8),
+}
+
+impl TupleArgumentsFlag {
+    /// Returns the TupleArgumentsFlag for a known RustCall function.
+    fn rust_fn_trait_call() -> Self {
+        Self::TupleAllCallArgs
+    }
+
+    /// Returns the appropriate TupleArgumentsFlag for the given FnSigKind and method flag.
+    fn with_fn_sig_kind<'tcx>(fn_sig_kind: FnSigKind<'tcx>, is_method: bool) -> Self {
+        if let Some(splatted_arg_index) = fn_sig_kind.splatted() {
+            if is_method {
+                if let Some(splatted_arg_index) = splatted_arg_index.checked_sub(1) {
+                    return Self::TupleSplattedArg(splatted_arg_index);
+                } else {
+                    // In `check_argument_types`, this is effectively `TupleSplattedArg(-1)`
+                    return Self::TupleSplattedSelfArg;
+                }
+            }
+
+            return Self::TupleSplattedArg(splatted_arg_index);
+        }
+
+        Self::DontTupleArguments
+    }
+
+    /// Returns true if the arguments are tupled through "rust-call" or splatting.
+    fn is_tupled(self) -> bool {
+        match self {
+            Self::DontTupleArguments => false,
+            Self::TupleAllCallArgs | Self::TupleSplattedSelfArg | Self::TupleSplattedArg(_) => true,
+        }
+    }
+
+    /// Returns true if the arguments are tupled through splatting.
+    /// (But false if they are "rust-call" or not tupled.)
+    fn is_splatted(self) -> bool {
+        match self {
+            Self::TupleSplattedSelfArg | Self::TupleSplattedArg(_) => true,
+            Self::DontTupleArguments | Self::TupleAllCallArgs => false,
+        }
+    }
+
+    /// Returns the tupled argument index, and whether the `self` argument is splatted.
+    /// Returns `None` if the arguments are not tupled, or if the `self` argument is splatted.
+    fn tupled_arg_index(self) -> (Option<u16>, bool /* is_self_splatted */) {
+        match self {
+            Self::TupleSplattedArg(index) => (Some(u16::from(index)), false),
+            Self::TupleAllCallArgs => (Some(0), false),
+            Self::TupleSplattedSelfArg => (None, true),
+            Self::DontTupleArguments => (None, false),
+        }
+    }
 }
 
 fn fatally_break_rust(tcx: TyCtxt<'_>, span: Span) -> ! {
@@ -642,6 +721,7 @@ pub fn provide(providers: &mut Providers) {
         typeck_root,
         used_trait_imports,
         check_transmutes: intrinsicck::check_transmutes,
+        check_offloads: intrinsicck::check_offloads,
         ..*providers
     };
 }

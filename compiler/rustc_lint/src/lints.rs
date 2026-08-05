@@ -1,4 +1,4 @@
-// ignore-tidy-filelength
+// ignore-tidy-file-filelength
 
 use std::num::NonZero;
 
@@ -266,7 +266,7 @@ impl<'a> Diagnostic<'a, ()> for BuiltinUngatedAsyncFnTrackCaller<'_> {
     fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, ()> {
         let mut diag = Diag::new(dcx, level, "`#[track_caller]` on async functions is a no-op")
             .with_span_label(self.label, "this function will not propagate the caller location");
-        rustc_session::errors::add_feature_diagnostics(
+        rustc_session::diagnostics::add_feature_diagnostics(
             &mut diag,
             self.session,
             sym::async_fn_track_caller,
@@ -319,7 +319,7 @@ impl<'a> Diagnostic<'a, ()> for BuiltinTypeAliasBounds<'_> {
                 see issue #112792 <https://github.com/rust-lang/rust/issues/112792> for more information"
             ));
         if self.enable_feat_help {
-            diag.help(msg!("add `#![feature(lazy_type_alias)]` to the crate attributes to enable the desired semantics"));
+            diag.help(msg!("add `#![feature(checked_type_aliases)]` to the crate attributes to enable the desired semantics"));
         }
 
         // We perform the walk in here instead of in `<TypeAliasBounds as LateLintPass>` to
@@ -384,12 +384,10 @@ impl<'a> Diagnostic<'a, ()> for BuiltinTypeAliasBounds<'_> {
 }
 
 #[derive(Diagnostic)]
-#[diag(
-    "{$predicate_kind_name} bound {$predicate} does not depend on any type or lifetime parameters"
-)]
+#[diag("{$clause_kind_name} bound {$clause} does not depend on any type or lifetime parameters")]
 pub(crate) struct BuiltinTrivialBounds<'a> {
-    pub predicate_kind_name: &'a str,
-    pub predicate: Clause<'a>,
+    pub clause_kind_name: &'a str,
+    pub clause: Clause<'a>,
 }
 
 #[derive(Diagnostic)]
@@ -601,8 +599,6 @@ pub(crate) struct BuiltinDerefNullptr {
     pub label: Span,
 }
 
-// FIXME: migrate fluent::lint::builtin_asm_labels
-
 #[derive(Diagnostic)]
 pub(crate) enum BuiltinSpecialModuleNameUsed {
     #[diag("found module declaration for lib.rs")]
@@ -612,6 +608,33 @@ pub(crate) enum BuiltinSpecialModuleNameUsed {
     #[diag("found module declaration for main.rs")]
     #[note("a binary crate cannot be used as library")]
     Main,
+}
+
+// c_void_return.rs
+#[derive(Diagnostic)]
+#[diag("`c_void` should not be used as a return type")]
+#[help("returning `()` in Rust is equivalent to returning `void` in C")]
+pub(crate) struct CVoidReturn {
+    #[suggestion(
+        "remove the return type to implicitly return `()`",
+        code = "",
+        applicability = "maybe-incorrect"
+    )]
+    pub suggestion: Span,
+}
+
+// c_void_return.rs
+#[derive(Diagnostic)]
+#[diag("declarations returning `c_void` are not compatible with C functions returning `void`")]
+#[help("returning `()` in Rust is equivalent to returning `void` in C")]
+#[note("`c_void` is only used through raw pointers for compatibility with `void` pointers")]
+pub(crate) struct ExternCVoidReturn {
+    #[suggestion(
+        "remove the return type to implicitly return `()`",
+        code = "",
+        applicability = "maybe-incorrect"
+    )]
+    pub suggestion: Span,
 }
 
 // deref_into_dyn_supertrait.rs
@@ -808,6 +831,34 @@ pub(crate) enum UseLetUnderscoreIgnoreSuggestion {
     },
 }
 
+// runtime_symbols.rs
+#[derive(Diagnostic)]
+pub(crate) enum RedefiningRuntimeSymbolsDiag<'tcx> {
+    #[diag(
+        "invalid definition of the runtime `{$symbol_name}` symbol used by the standard library"
+    )]
+    #[note(
+        "expected `{$expected_fn_sig}` (for the current target)
+    found    `{$found_fn_sig}`"
+    )]
+    #[help(
+        "either fix the signature or remove any attributes like `#[unsafe(no_mangle)]`, `#[unsafe(export_name = \"{$symbol_name}\")]`, or `#[link_name = \"{$symbol_name}\"]`"
+    )]
+    Invalid { symbol_name: String, expected_fn_sig: Ty<'tcx>, found_fn_sig: Ty<'tcx> },
+    #[diag(
+        "suspicious definition of the runtime `{$symbol_name}` symbol used by the standard library"
+    )]
+    #[note(
+        "expected `{$expected_fn_sig}` (for the current target)
+    found    `{$found_fn_sig}`"
+    )]
+    #[help(
+        "either fix the signature or remove any attributes like `#[unsafe(no_mangle)]`, `#[unsafe(export_name = \"{$symbol_name}\")]`, or `#[link_name = \"{$symbol_name}\"]`"
+    )]
+    #[help("allow this lint if the signature is compatible")]
+    Suspicious { symbol_name: String, expected_fn_sig: Ty<'tcx>, found_fn_sig: Ty<'tcx> },
+}
+
 // drop_forget_useless.rs
 #[derive(Diagnostic)]
 #[diag("calls to `std::mem::drop` with a reference instead of an owned value does nothing")]
@@ -940,10 +991,6 @@ pub(crate) enum InvalidReferenceCastingDiag<'tcx> {
     BorrowAsMut {
         #[label("casting happened here")]
         orig_cast: Option<Span>,
-        #[note(
-            "even for types with interior mutability, the only legal way to obtain a mutable pointer from a shared reference is through `UnsafeCell::get`"
-        )]
-        ty_has_interior_mutability: bool,
     },
     #[diag("assigning to `&T` is undefined behavior, consider using an `UnsafeCell`")]
     #[note(
@@ -952,10 +999,6 @@ pub(crate) enum InvalidReferenceCastingDiag<'tcx> {
     AssignToRef {
         #[label("casting happened here")]
         orig_cast: Option<Span>,
-        #[note(
-            "even for types with interior mutability, the only legal way to obtain a mutable pointer from a shared reference is through `UnsafeCell::get`"
-        )]
-        ty_has_interior_mutability: bool,
     },
     #[diag(
         "casting references to a bigger memory layout than the backing allocation is undefined behavior, even if the reference is unused"
@@ -1835,7 +1878,7 @@ pub(crate) struct RedundantSemicolonsSuggestion {
 
 // traits.rs
 pub(crate) struct DropTraitConstraintsDiag<'a> {
-    pub predicate: Clause<'a>,
+    pub clause: Clause<'a>,
     pub tcx: TyCtxt<'a>,
     pub def_id: DefId,
 }
@@ -1843,8 +1886,8 @@ pub(crate) struct DropTraitConstraintsDiag<'a> {
 // Needed for def_path_str
 impl<'a> Diagnostic<'a, ()> for DropTraitConstraintsDiag<'_> {
     fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, ()> {
-        Diag::new(dcx, level, msg!("bounds on `{$predicate}` are most likely incorrect, consider instead using `{$needs_drop}` to detect whether a type can be trivially dropped"))
-            .with_arg("predicate", self.predicate)
+        Diag::new(dcx, level, msg!("bounds on `{$clause}` are most likely incorrect, consider instead using `{$needs_drop}` to detect whether a type can be trivially dropped"))
+            .with_arg("clause", self.clause)
             .with_arg("needs_drop", self.tcx.def_path_str(self.def_id))
     }
 }
@@ -2662,7 +2705,7 @@ pub(crate) enum MutRefSugg {
 
 #[derive(Subdiagnostic)]
 #[suggestion(
-    "this type already provides \"interior mutability\", so its binding doesn't need to be declared as mutable",
+    "this type already provides \"interior mutability\", so its binding doesn't need to be declared as mutable when borrowed with a shared reference",
     style = "verbose",
     applicability = "maybe-incorrect",
     code = ""
@@ -2895,23 +2938,24 @@ impl Subdiagnostic for MismatchedLifetimeSyntaxesSuggestion {
 pub(crate) struct EqInternalMethodImplemented;
 
 #[derive(Diagnostic)]
-#[diag("strict provenance disallows casting integer `{$expr_ty}` to pointer `{$cast_ty}`")]
+#[diag("cast from `{$expr_ty}` to `{$cast_ty}` implicitly relies on exposed provenance")]
 #[help(
-    "if you can't comply with strict provenance and don't have a pointer with the correct provenance you can use `std::ptr::with_exposed_provenance()` instead"
+    "if conforming to strict provenance is not possible, use `std::ptr::with_exposed_provenance()`"
 )]
-pub(crate) struct LossyProvenanceInt2Ptr<'tcx> {
+#[note("for more information, visit <https://doc.rust-lang.org/std/ptr/index.html#provenance>")]
+pub(crate) struct ImplicitProvenanceCastsInt2Ptr<'tcx> {
     pub expr_ty: Ty<'tcx>,
     pub cast_ty: Ty<'tcx>,
     #[subdiagnostic]
-    pub sugg: Option<LossyProvenanceInt2PtrSuggestion>,
+    pub sugg: Option<Int2PtrSuggestion>,
 }
 
 #[derive(Subdiagnostic)]
 #[multipart_suggestion(
-    "use `.with_addr()` to adjust a valid pointer in the same allocation, to this address",
+    "use `.with_addr()` to adjust the address of a valid pointer in the same allocation",
     applicability = "has-placeholders"
 )]
-pub(crate) struct LossyProvenanceInt2PtrSuggestion {
+pub(crate) struct Int2PtrSuggestion {
     #[suggestion_part(code = "(...).with_addr(")]
     pub lo: Span,
     #[suggestion_part(code = ")")]
@@ -2919,21 +2963,18 @@ pub(crate) struct LossyProvenanceInt2PtrSuggestion {
 }
 
 #[derive(Diagnostic)]
-#[diag(
-    "under strict provenance it is considered bad style to cast pointer `{$cast_from_ty}` to integer `{$cast_to_ty}`"
-)]
-#[help(
-    "if you can't comply with strict provenance and need to expose the pointer provenance you can use `.expose_provenance()` instead"
-)]
-pub(crate) struct LossyProvenancePtr2Int<'tcx> {
+#[diag("cast from `{$cast_from_ty}` to `{$cast_to_ty}` implicitly exposes pointer provenance")]
+#[help("if conforming to strict provenance is not possible, use `.expose_provenance()`")]
+#[note("for more information, visit <https://doc.rust-lang.org/std/ptr/index.html#provenance>")]
+pub(crate) struct ImplicitProvenanceCastsPtr2Int<'tcx> {
     pub cast_from_ty: Ty<'tcx>,
     pub cast_to_ty: Ty<'tcx>,
     #[subdiagnostic]
-    pub sugg: Option<LossyProvenancePtr2IntSuggestion<'tcx>>,
+    pub sugg: Option<Ptr2IntSuggestion<'tcx>>,
 }
 
 #[derive(Subdiagnostic)]
-pub(crate) enum LossyProvenancePtr2IntSuggestion<'tcx> {
+pub(crate) enum Ptr2IntSuggestion<'tcx> {
     #[multipart_suggestion(
         "use `.addr()` to obtain the address of a pointer",
         applicability = "maybe-incorrect"
@@ -2974,4 +3015,30 @@ pub(crate) enum LossyProvenancePtr2IntSuggestion<'tcx> {
         #[primary_span]
         cast_span: Span,
     },
+}
+
+#[derive(Diagnostic)]
+#[diag(
+    "creating an intermediate reference implies aliasing requirements even when immediately cast to a raw pointers"
+)]
+pub(crate) struct RawBorrowViaReference<'a> {
+    #[subdiagnostic]
+    pub suggestion: RawBorrowViaReferenceSuggestion<'a>,
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum RawBorrowViaReferenceSuggestion<'a> {
+    #[multipart_suggestion(
+        "consider using `&raw {$mutbl}` for a safer and more explicit raw pointer",
+        applicability = "machine-applicable"
+    )]
+    Spanful {
+        #[suggestion_part(code = "&raw {mutbl} ")]
+        left: Span,
+        #[suggestion_part(code = "")]
+        right: Span,
+        mutbl: &'a str,
+    },
+    #[help("consider using `&raw {$mutbl}` for a safer and more explicit raw pointer")]
+    Spanless { mutbl: &'a str },
 }

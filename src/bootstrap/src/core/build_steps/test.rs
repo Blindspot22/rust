@@ -4,15 +4,16 @@
 //! However, this contains ~all test parts we expect people to be able to build and run locally.
 
 // (This file should be split up, but having tidy block all changes is not helpful.)
-// ignore-tidy-filelength
+// ignore-tidy-file-filelength
 
 use std::collections::HashSet;
 use std::env::split_paths;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::{env, fs, iter};
 
-use build_helper::exit;
+use build_helper::git::get_closest_upstream_commit;
 
 use crate::core::build_steps::compile::{ArtifactKeepMode, Std, run_cargo};
 use crate::core::build_steps::doc::{DocumentationFormat, prepare_doc_compiler};
@@ -29,8 +30,8 @@ use crate::core::build_steps::tool::{
 use crate::core::build_steps::toolstate::ToolState;
 use crate::core::build_steps::{compile, dist, llvm};
 use crate::core::builder::{
-    self, Alias, Builder, Compiler, Kind, RunConfig, ShouldRun, Step, StepMetadata,
-    crate_description,
+    self, Alias, Builder, CommandLineStep, Compiler, Kind, RunConfig, ShouldRun, Step,
+    StepMetadata, crate_description,
 };
 use crate::core::config::TargetSelection;
 use crate::core::config::flags::{Subcommand, get_completion, top_level_help};
@@ -43,7 +44,7 @@ use crate::utils::helpers::{
     up_to_date,
 };
 use crate::utils::render_tests::{add_flags_and_try_run_tests, try_run_tests};
-use crate::{CLang, CodegenBackendKind, GitRepo, Mode, PathSet, TestTarget, envify};
+use crate::{CLang, CodegenBackendKind, GitRepo, Mode, PathSet, TestTarget, envify, exit};
 
 mod compiletest;
 pub mod failed_tests;
@@ -55,7 +56,7 @@ pub struct CrateBootstrap {
     host: TargetSelection,
 }
 
-impl Step for CrateBootstrap {
+impl CommandLineStep for CrateBootstrap {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -124,7 +125,7 @@ pub struct Linkcheck {
     host: TargetSelection,
 }
 
-impl Step for Linkcheck {
+impl CommandLineStep for Linkcheck {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -223,7 +224,7 @@ pub struct HtmlCheck {
     target: TargetSelection,
 }
 
-impl Step for HtmlCheck {
+impl CommandLineStep for HtmlCheck {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -276,7 +277,7 @@ pub struct Cargotest {
     host: TargetSelection,
 }
 
-impl Step for Cargotest {
+impl CommandLineStep for Cargotest {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -353,7 +354,7 @@ impl Cargo {
     const CRATE_PATH: &str = "src/tools/cargo";
 }
 
-impl Step for Cargo {
+impl CommandLineStep for Cargo {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -455,7 +456,7 @@ pub struct RustAnalyzer {
     compilers: RustcPrivateCompilers,
 }
 
-impl Step for RustAnalyzer {
+impl CommandLineStep for RustAnalyzer {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -579,7 +580,7 @@ pub struct Rustfmt {
     compilers: RustcPrivateCompilers,
 }
 
-impl Step for Rustfmt {
+impl CommandLineStep for Rustfmt {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -684,7 +685,7 @@ impl Miri {
     }
 }
 
-impl Step for Miri {
+impl CommandLineStep for Miri {
     type Output = ();
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -802,7 +803,7 @@ pub struct CargoMiri {
     target: TargetSelection,
 }
 
-impl Step for CargoMiri {
+impl CommandLineStep for CargoMiri {
     type Output = ();
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -840,6 +841,10 @@ impl Step for CargoMiri {
             SourceType::Submodule,
             &[],
         );
+        // Run subcrate tests as well.
+        cargo.arg("--workspace");
+        // Some tests need isolation disabled.
+        cargo.env("MIRIFLAGS", "-Zmiri-disable-isolation");
 
         // If we are testing stage 2+ cargo miri, make sure that it works with the in-tree cargo.
         // We want to do this *somewhere* to ensure that Miri + nightly cargo actually works.
@@ -882,7 +887,7 @@ pub struct CompiletestTest {
     host: TargetSelection,
 }
 
-impl Step for CompiletestTest {
+impl CommandLineStep for CompiletestTest {
     type Output = ();
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -948,7 +953,7 @@ NOTE: if you're sure you want to do this, please open an issue as to why. In the
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StdarchVerify;
 
-impl Step for StdarchVerify {
+impl CommandLineStep for StdarchVerify {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -992,12 +997,180 @@ impl Step for StdarchVerify {
     }
 }
 
+/// Runs stdarch's intrinsic-test binary crate to verify that Rust's `core::arch`
+/// SIMD intrinsics produce the same results as their C counterparts.
+///
+/// First runs the `intrinsic-test` binary, which generates C wrapper programs
+/// and a Rust Cargo workspace. Then runs `cargo test` on that workspace
+/// which compiles both versions and compares their outputs on random inputs.
+///
+/// On `x86_64`, it requires a very recent version of GCC (e.g. GCC 15+)
+/// as well as the Intel SDE emulator to successfully run the tests.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IntrinsicTest {
+    host: TargetSelection,
+}
+
+impl CommandLineStep for IntrinsicTest {
+    type Output = ();
+    const IS_HOST: bool = true;
+
+    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
+        run.alias("intrinsic-test")
+    }
+
+    fn is_default_step(_builder: &Builder<'_>) -> bool {
+        true
+    }
+
+    fn make_run(run: RunConfig<'_>) {
+        let target = run.target;
+        let builder = run.builder;
+
+        let is_explicit =
+            builder.config.paths.iter().any(|p| p.to_string_lossy() == "intrinsic-test");
+
+        if target.contains("x86_64-unknown-linux") && builder.config.sde.is_none() && is_explicit {
+            panic!(
+                "SDE is required to run intrinsic-test. Please configure `build.sde` in config.toml."
+            );
+        }
+
+        builder.ensure(IntrinsicTest { host: target });
+    }
+
+    fn run(self, builder: &Builder<'_>) {
+        let host = self.host;
+        if cfg!(test)
+            || (!host.contains("aarch64-unknown-linux") && !host.contains("x86_64-unknown-linux"))
+        {
+            builder.info(&format!("Skipping intrinsic-test, as it is not available for {host}"));
+            return;
+        }
+
+        let (input_file, skip_file, cflags, sde_runner) = if host.contains("x86_64-unknown-linux") {
+            let Some(sde) = &builder.config.sde else {
+                builder.info("Skipping intrinsic-test because `build.sde` is not configured");
+                return;
+            };
+
+            let cpuid_def =
+                builder.src.join("library/stdarch/ci/docker/x86_64-unknown-linux-gnu/cpuid.def");
+            let sde_runner = format!(
+                "{} -cpuid-in {} -rtm-mode full -tsx --",
+                sde.display(),
+                cpuid_def.display()
+            );
+
+            (
+                builder.src.join("library/stdarch/intrinsics_data/x86-intel.xml"),
+                [
+                    builder
+                        .src
+                        .join("library/stdarch/crates/intrinsic-test/missing_x86_common.txt"),
+                    builder.src.join("library/stdarch/crates/intrinsic-test/missing_x86_gcc.txt"),
+                ],
+                "-I/usr/include/x86_64-linux-gnu/",
+                Some(sde_runner),
+            )
+        } else if host.contains("aarch64-unknown-linux") {
+            (
+                builder.src.join("library/stdarch/intrinsics_data/arm_intrinsics.json"),
+                [
+                    builder
+                        .src
+                        .join("library/stdarch/crates/intrinsic-test/missing_aarch64_common.txt"),
+                    builder
+                        .src
+                        .join("library/stdarch/crates/intrinsic-test/missing_aarch64_gcc.txt"),
+                ],
+                "-I/usr/aarch64-linux-gnu/include/",
+                None,
+            )
+        } else {
+            panic!("intrinsic-test only supports aarch64/x86_64 Linux, got {host}");
+        };
+
+        let out_dir = builder.out.join(host).join("intrinsic-test");
+        t!(fs::create_dir_all(&out_dir));
+
+        let crates_link = out_dir.join("crates");
+        if !crates_link.exists() {
+            t!(
+                helpers::symlink_dir(
+                    &builder.config,
+                    &builder.src.join("library/stdarch/crates"),
+                    &crates_link
+                ),
+                format!("failed to symlink stdarch crates into {}", crates_link.display())
+            );
+        }
+
+        let mut cmd = builder.tool_cmd(Tool::IntrinsicTest);
+        cmd.current_dir(&out_dir);
+        cmd.arg(&input_file);
+        cmd.arg("--target").arg(&*host.triple);
+        for skip in &skip_file {
+            cmd.arg("--skip").arg(skip);
+        }
+        cmd.arg("--sample-percentage").arg("100");
+        cmd.arg("--cc-arg-style").arg("gcc");
+        cmd.env("CC", builder.cc(host));
+        cmd.env("CFLAGS", cflags);
+        // intrinsic-test shells out to `cargo` and `rustfmt` make bootstrap's
+        // managed binaries findable by prepending their dirs to PATH.
+        let Some(rustfmt_path) = builder.config.initial_rustfmt.clone() else {
+            eprintln!(
+                "WARNING: intrinsic-test skipped because rustfmt is required but not available on this channel"
+            );
+            return;
+        };
+
+        let mut path_dirs: Vec<PathBuf> = Vec::new();
+        if let Some(cargo_dir) = builder.initial_cargo.parent() {
+            path_dirs.push(cargo_dir.to_path_buf());
+        }
+        if let Some(rustfmt_dir) = rustfmt_path.parent() {
+            path_dirs.push(rustfmt_dir.to_path_buf());
+        }
+        let old_path = env::var_os("PATH").unwrap_or_default();
+        let new_path = env::join_paths(path_dirs.into_iter().chain(env::split_paths(&old_path)))
+            .expect("could not build PATH for intrinsic-test");
+        cmd.env("PATH", new_path);
+        cmd.run(builder);
+
+        let tested_compiler = builder.compiler(builder.top_stage, host);
+        builder.std(tested_compiler, host);
+        let rustc = builder.rustc(tested_compiler);
+
+        let manifest = out_dir.join("rust_programs/Cargo.toml");
+        let mut cargo = command(&builder.initial_cargo);
+        cargo.arg("test");
+        cargo.arg("--tests");
+        cargo.arg("--manifest-path").arg(&manifest);
+        cargo.arg("--target").arg(&*host.triple);
+        cargo.arg("--profile").arg("release");
+        cargo.env("CC", builder.cc(host));
+        cargo.env("CFLAGS", cflags);
+        cargo.env("RUSTC", rustc);
+        cargo.env("RUSTC_BOOTSTRAP", "1");
+        if let Some(runner) = sde_runner {
+            cargo.env("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER", runner);
+        }
+        cargo.run(builder);
+    }
+
+    fn metadata(&self) -> Option<StepMetadata> {
+        Some(StepMetadata::test("intrinsic-test", self.host))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Clippy {
     compilers: RustcPrivateCompilers,
 }
 
-impl Step for Clippy {
+impl CommandLineStep for Clippy {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -1114,7 +1287,7 @@ pub struct RustdocTheme {
     test_compiler: Compiler,
 }
 
-impl Step for RustdocTheme {
+impl CommandLineStep for RustdocTheme {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -1167,7 +1340,7 @@ pub struct RustdocJSStd {
     target: TargetSelection,
 }
 
-impl Step for RustdocJSStd {
+impl CommandLineStep for RustdocJSStd {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -1244,7 +1417,7 @@ pub struct RustdocJSNotStd {
     pub compiler: Compiler,
 }
 
-impl Step for RustdocJSNotStd {
+impl CommandLineStep for RustdocJSNotStd {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -1312,7 +1485,7 @@ pub struct RustdocGUI {
     target: TargetSelection,
 }
 
-impl Step for RustdocGUI {
+impl CommandLineStep for RustdocGUI {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -1417,7 +1590,7 @@ impl Step for RustdocGUI {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Tidy;
 
-impl Step for Tidy {
+impl CommandLineStep for Tidy {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -1554,7 +1727,7 @@ pub struct CrateRunMakeSupport {
     host: TargetSelection,
 }
 
-impl Step for CrateRunMakeSupport {
+impl CommandLineStep for CrateRunMakeSupport {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -1600,7 +1773,7 @@ pub struct CrateBuildHelper {
     host: TargetSelection,
 }
 
-impl Step for CrateBuildHelper {
+impl CommandLineStep for CrateBuildHelper {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -1666,7 +1839,7 @@ macro_rules! test {
             target: TargetSelection,
         }
 
-        impl Step for $name {
+        impl CommandLineStep for $name {
             type Output = ();
             const IS_HOST: bool = (const {
                 #[allow(unused_assignments, unused_mut)]
@@ -1827,7 +2000,7 @@ impl Coverage {
         &[CompiletestMode::CoverageMap, CompiletestMode::CoverageRun];
 }
 
-impl Step for Coverage {
+impl CommandLineStep for Coverage {
     type Output = ();
     /// Compiletest will automatically skip the "coverage-run" tests if necessary.
     const IS_HOST: bool = false;
@@ -1842,6 +2015,12 @@ impl Step for Coverage {
         for mode in Self::ALL_MODES {
             run = run.alias(mode.as_str());
         }
+
+        // Allow `./x test --skip=tests` to properly skip the coverage tests,
+        // by not treating the `coverage-map` and `coverage-run` aliases as
+        // implied command-line arguments.
+        run = run.default_to_suites_only();
+
         run
     }
 
@@ -1883,13 +2062,6 @@ impl Step for Coverage {
             !run.builder.config.skip.iter().any(|skip| skip == Path::new(mode.as_str()))
         });
 
-        // FIXME(Zalathar): Make these commands skip all coverage tests, as expected:
-        // - `./x test --skip=tests`
-        // - `./x test --skip=tests/coverage`
-        // - `./x test --skip=coverage`
-        // Skip handling currently doesn't have a way to know that skipping the coverage
-        // suite should also skip the `coverage-map` and `coverage-run` aliases.
-
         for mode in modes {
             run.builder.ensure(Coverage { compiler, target, mode });
         }
@@ -1925,7 +2097,7 @@ pub struct MirOpt {
     pub target: TargetSelection,
 }
 
-impl Step for MirOpt {
+impl CommandLineStep for MirOpt {
     type Output = ();
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -1997,10 +2169,6 @@ struct Compiletest {
 
 impl Step for Compiletest {
     type Output = ();
-
-    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.never()
-    }
 
     fn run(self, builder: &Builder<'_>) {
         if builder.test_target == TestTarget::DocOnly {
@@ -2340,7 +2508,13 @@ Please disable assertions with `rust.debug-assertions = false`.
                 "-Lnative={}",
                 builder.test_helpers_out(test_compiler.host).display()
             ));
-            targetflags.push(format!("-Lnative={}", builder.test_helpers_out(target).display()));
+            let target_helpers = builder.test_helpers_out(target);
+            targetflags.push(format!("-Lnative={}", target_helpers.display()));
+            if target.is_pauthtest() {
+                // For the pauthtest target, embed an rpath to the directory containing the helper
+                // dynamic library.
+                targetflags.push(format!("-Clink-arg=-Wl,-rpath,{}", target_helpers.display()));
+            }
         }
 
         for flag in hostflags {
@@ -2372,7 +2546,7 @@ Please disable assertions with `rust.debug-assertions = false`.
 
             if let Some(debuggers::Gdb { gdb }) = debuggers::discover_gdb(builder, android.as_ref())
             {
-                cmd.arg("--gdb").arg(gdb.as_ref());
+                cmd.arg("--gdb").arg(gdb);
             }
 
             if let Some(debuggers::Lldb { lldb_exe, lldb_version }) =
@@ -2541,9 +2715,9 @@ Please disable assertions with `rust.debug-assertions = false`.
         // Only pass correct values for these flags for the `run-make` suite as it
         // requires that a C++ compiler was configured which isn't always the case.
         if !builder.config.dry_run() && mode == CompiletestMode::RunMake {
-            let mut cflags = builder.cc_handled_clags(target, CLang::C);
+            let mut cflags = builder.cc_handled_cflags(target, CLang::C);
             cflags.extend(builder.cc_unhandled_cflags(target, GitRepo::Rustc, CLang::C));
-            let mut cxxflags = builder.cc_handled_clags(target, CLang::Cxx);
+            let mut cxxflags = builder.cc_handled_cflags(target, CLang::Cxx);
             cxxflags.extend(builder.cc_unhandled_cflags(target, GitRepo::Rustc, CLang::Cxx));
             cmd.arg("--cc")
                 .arg(builder.cc(target))
@@ -2716,11 +2890,6 @@ struct BookTest {
 
 impl Step for BookTest {
     type Output = ();
-    const IS_HOST: bool = true;
-
-    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.never()
-    }
 
     fn run(self, builder: &Builder<'_>) {
         // External docs are different from local because:
@@ -2879,7 +3048,7 @@ macro_rules! test_book {
                 test_compiler: Compiler,
             }
 
-            impl Step for $name {
+            impl CommandLineStep for $name {
                 type Output = ();
                 const IS_HOST: bool = true;
 
@@ -2942,7 +3111,7 @@ pub struct ErrorIndex {
     compilers: RustcPrivateCompilers,
 }
 
-impl Step for ErrorIndex {
+impl CommandLineStep for ErrorIndex {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -3036,7 +3205,7 @@ pub struct CrateLibrustc {
     crates: Vec<String>,
 }
 
-impl Step for CrateLibrustc {
+impl CommandLineStep for CrateLibrustc {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -3197,7 +3366,7 @@ pub struct Crate {
     crates: Vec<String>,
 }
 
-impl Step for Crate {
+impl CommandLineStep for Crate {
     type Output = ();
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -3345,12 +3514,12 @@ pub struct CrateRustdoc {
     host: TargetSelection,
 }
 
-impl Step for CrateRustdoc {
+impl CommandLineStep for CrateRustdoc {
     type Output = ();
     const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.selectors(&["src/librustdoc", "src/tools/rustdoc"])
+        run.multi_path(&["src/librustdoc", "src/tools/rustdoc"])
     }
 
     fn is_default_step(_builder: &Builder<'_>) -> bool {
@@ -3450,7 +3619,7 @@ pub struct CrateRustdocJsonTypes {
     target: TargetSelection,
 }
 
-impl Step for CrateRustdocJsonTypes {
+impl CommandLineStep for CrateRustdocJsonTypes {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -3526,10 +3695,6 @@ pub struct RemoteCopyLibs {
 impl Step for RemoteCopyLibs {
     type Output = ();
 
-    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.never()
-    }
-
     fn run(self, builder: &Builder<'_>) {
         let build_compiler = self.build_compiler;
         let target = self.target;
@@ -3568,7 +3733,7 @@ impl Step for RemoteCopyLibs {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Distcheck;
 
-impl Step for Distcheck {
+impl CommandLineStep for Distcheck {
     type Output = ();
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -3692,7 +3857,7 @@ fn distcheck_rustc_dev(builder: &Builder<'_>, dir: &Path) {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct BootstrapPy;
 
-impl Step for BootstrapPy {
+impl CommandLineStep for BootstrapPy {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -3731,7 +3896,7 @@ impl Step for BootstrapPy {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Bootstrap;
 
-impl Step for Bootstrap {
+impl CommandLineStep for Bootstrap {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -3801,7 +3966,7 @@ pub struct TierCheck {
     test_compiler: Compiler,
 }
 
-impl Step for TierCheck {
+impl CommandLineStep for TierCheck {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -3853,7 +4018,7 @@ pub struct LintDocs {
     target: TargetSelection,
 }
 
-impl Step for LintDocs {
+impl CommandLineStep for LintDocs {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -3899,7 +4064,7 @@ impl Step for LintDocs {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RustInstaller;
 
-impl Step for RustInstaller {
+impl CommandLineStep for RustInstaller {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -3959,7 +4124,7 @@ pub struct TestHelpers {
     pub target: TargetSelection,
 }
 
-impl Step for TestHelpers {
+impl CommandLineStep for TestHelpers {
     type Output = ();
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -3986,32 +4151,54 @@ impl Step for TestHelpers {
         };
         let dst = builder.test_helpers_out(target);
         let src = builder.src.join("tests/auxiliary/rust_test_helpers.c");
-        if up_to_date(&src, &dst.join("librust_test_helpers.a")) {
-            return;
-        }
-
         let _guard = builder.msg_unstaged(Kind::Build, "test helpers", target);
         t!(fs::create_dir_all(&dst));
-        let mut cfg = cc::Build::new();
 
-        // We may have found various cross-compilers a little differently due to our
-        // extra configuration, so inform cc of these compilers. Note, though, that
-        // on MSVC we still need cc's detection of env vars (ugh).
-        if !target.is_msvc() {
-            if let Some(ar) = builder.ar(target) {
-                cfg.archiver(ar);
+        if !up_to_date(&src, &dst.join("librust_test_helpers.a")) {
+            let mut cfg = cc::Build::new();
+
+            // We may have found various cross-compilers a little differently due to our
+            // extra configuration, so inform cc of these compilers. Note, though, that
+            // on MSVC we still need cc's detection of env vars (ugh).
+            if !target.is_msvc() {
+                if let Some(ar) = builder.ar(target) {
+                    cfg.archiver(ar);
+                }
+                cfg.compiler(builder.cc(target));
             }
-            cfg.compiler(builder.cc(target));
+            cfg.cargo_metadata(false)
+                .out_dir(&dst)
+                .target(&target.triple)
+                .host(&builder.config.host_target.triple)
+                .opt_level(0)
+                .warnings(false)
+                .debug(false)
+                .file(builder.src.join("tests/auxiliary/rust_test_helpers.c"))
+                .compile("rust_test_helpers");
         }
-        cfg.cargo_metadata(false)
-            .out_dir(&dst)
-            .target(&target.triple)
-            .host(&builder.config.host_target.triple)
-            .opt_level(0)
-            .warnings(false)
-            .debug(false)
-            .file(builder.src.join("tests/auxiliary/rust_test_helpers.c"))
-            .compile("rust_test_helpers");
+        if target.is_pauthtest() {
+            let so = dst.join("librust_test_helpers.so");
+            if up_to_date(&src, &so) {
+                return;
+            }
+
+            let status = Command::new(builder.cc(target))
+                .arg("-target")
+                .arg(target.triple)
+                .arg("-march=armv8.3-a+pauth")
+                .arg("-fPIC")
+                .arg("-shared")
+                .arg("-O0") // Use O0 to match what static library is compiled at.
+                .arg("-o")
+                .arg(&so)
+                .arg(&src)
+                .status()
+                .unwrap_or_else(|_| panic!("Failed to run clang for {} toolchain", target.triple));
+
+            if !status.success() {
+                panic!("Linking of librust_test_helpers.so failed (target: {})", target.triple);
+            }
+        }
     }
 }
 
@@ -4021,7 +4208,7 @@ pub struct CodegenCranelift {
     target: TargetSelection,
 }
 
-impl Step for CodegenCranelift {
+impl CommandLineStep for CodegenCranelift {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -4142,7 +4329,7 @@ pub struct CodegenGCC {
     target: TargetSelection,
 }
 
-impl Step for CodegenGCC {
+impl CommandLineStep for CodegenGCC {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -4273,7 +4460,7 @@ pub struct TestFloatParse {
     target: TargetSelection,
 }
 
-impl Step for TestFloatParse {
+impl CommandLineStep for TestFloatParse {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -4351,7 +4538,7 @@ impl Step for TestFloatParse {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct CollectLicenseMetadata;
 
-impl Step for CollectLicenseMetadata {
+impl CommandLineStep for CollectLicenseMetadata {
     type Output = PathBuf;
     const IS_HOST: bool = true;
 
@@ -4385,7 +4572,7 @@ pub struct RemoteTestClientTests {
     host: TargetSelection,
 }
 
-impl Step for RemoteTestClientTests {
+impl CommandLineStep for RemoteTestClientTests {
     type Output = ();
     const IS_HOST: bool = true;
 
@@ -4426,5 +4613,92 @@ impl Step for RemoteTestClientTests {
             builder,
             record_failed_tests,
         );
+    }
+}
+
+fn check_if_cargo_semver_checks_is_installed(builder: &Builder<'_>) -> bool {
+    command("cargo")
+        .allow_failure()
+        .arg("semver-checks")
+        .arg("--version")
+        // Cache the output to avoid running this command more than once (per builder).
+        .cached()
+        .run_capture_stdout(builder)
+        .is_success()
+}
+
+/// Run cargo-semver-checks on the standard library and compare its API
+/// versus a previous baseline, using rustdoc JSON data.
+///
+/// Fails if a semver-breaking change is detected.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StdSemverCheck {
+    build_compiler: Compiler,
+    target: TargetSelection,
+    /// The baseline commit that we are comparing the local stdlib API against.
+    commit: String,
+}
+
+impl CommandLineStep for StdSemverCheck {
+    type Output = ();
+
+    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
+        run.alias("std-semver-check")
+    }
+
+    fn make_run(run: RunConfig<'_>) {
+        if !check_if_cargo_semver_checks_is_installed(run.builder) {
+            panic!("cargo-semver-checks was not found, please install it");
+        }
+
+        let baseline_commit = match get_closest_upstream_commit(
+            Some(&run.builder.config.src),
+            &run.builder.config.git_config(),
+            run.builder.config.ci_env,
+        ) {
+            Ok(Some(commit)) => commit,
+            Ok(None) => {
+                panic!("No baseline parent commit found for std-semver-check");
+            }
+            Err(error) => {
+                panic!("Cannot get baseline parent commit for std-semver-check: {error:?}");
+            }
+        };
+
+        run.builder.ensure(Self {
+            build_compiler: run.builder.compiler_for_std(run.builder.top_stage),
+            target: run.target,
+            commit: baseline_commit,
+        });
+    }
+
+    fn run(self, builder: &Builder<'_>) {
+        let Some(docs_dir) = builder.config.download_std_json_docs(self.target, &self.commit)
+        else {
+            return;
+        };
+
+        let directory = builder.ensure(crate::core::build_steps::doc::Std::from_build_compiler(
+            self.build_compiler,
+            self.target,
+            DocumentationFormat::Json,
+        ));
+        let baseline_dir = docs_dir.join("share").join("doc").join("rust").join("json");
+
+        for library in ["core", "alloc", "std"] {
+            println!("Checking semver compatibility of {library}");
+            let mut cmd = command("cargo");
+            cmd.arg("semver-checks")
+                .arg("-Z")
+                .arg("unstable-options")
+                .arg("--stability-aware")
+                .arg("--release-type")
+                .arg("minor")
+                .arg("--current-rustdoc")
+                .arg(directory.join(format!("{library}.json")))
+                .arg("--baseline-rustdoc")
+                .arg(baseline_dir.join(format!("{library}.json")));
+            cmd.run(builder);
+        }
     }
 }

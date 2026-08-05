@@ -4,18 +4,14 @@
 
 use std::env;
 use std::path::PathBuf;
-use std::process::Command;
 
-use shared_helpers::{
-    dylib_path, dylib_path_var, maybe_dump, parse_rustc_stage, parse_rustc_verbose,
-    parse_value_from_args,
+use shim_utils::{
+    ArgFileCommand, collect_args, dylib_path, dylib_path_var, maybe_dump, parse_rustc_stage,
+    parse_rustc_verbose, parse_value_from_args,
 };
 
-#[path = "../utils/shared_helpers.rs"]
-mod shared_helpers;
-
 fn main() {
-    let args = env::args_os().skip(1).collect::<Vec<_>>();
+    let args = collect_args();
 
     let stage = parse_rustc_stage();
     let verbose = parse_rustc_verbose();
@@ -31,7 +27,7 @@ fn main() {
     let mut dylib_path = dylib_path();
     dylib_path.insert(0, PathBuf::from(libdir.clone()));
 
-    let mut cmd = Command::new(rustdoc);
+    let mut cmd = ArgFileCommand::new(rustdoc);
 
     if target.is_some() {
         // The stage0 compiler has a special sysroot distinct from what we
@@ -81,6 +77,7 @@ fn main() {
         }
     }
 
+    let (mut cmd, arg_file) = cmd.build().unwrap();
     maybe_dump(format!("stage{}-rustdoc", stage + 1), &cmd);
 
     if verbose > 1 {
@@ -94,7 +91,10 @@ fn main() {
         eprintln!("libdir: {libdir:?}");
     }
 
-    std::process::exit(match cmd.status() {
+    let status = cmd.status();
+    drop(arg_file);
+
+    std::process::exit(match status {
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => panic!("\n\nfailed to run {cmd:?}: {e}\n\n"),
     })

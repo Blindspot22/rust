@@ -1,7 +1,7 @@
-use rustc_errors::{Applicability, DiagArgValue, E0232, MultiSpan};
+use rustc_errors::{Applicability, DiagArgValue, E0264, MultiSpan};
 use rustc_hir::AttrPath;
 use rustc_macros::{Diagnostic, Subdiagnostic};
-use rustc_span::{Span, Symbol};
+use rustc_span::{Ident, Span, Symbol};
 
 #[derive(Diagnostic)]
 #[diag("`{$name}` attribute cannot be used at crate level")]
@@ -60,6 +60,14 @@ pub(crate) struct MustBeNameOfAssociatedFunction {
 }
 
 #[derive(Diagnostic)]
+#[diag("functions names are duplicated")]
+#[note("all `#[rustc_must_implement_one_of]` arguments must be unique")]
+pub(crate) struct FunctionNamesDuplicated {
+    #[primary_span]
+    pub spans: Vec<Span>,
+}
+
+#[derive(Diagnostic)]
 #[diag("unsafe attribute used without unsafe")]
 pub(crate) struct UnsafeAttrOutsideUnsafeLint {
     #[label("usage of unsafe attribute")]
@@ -94,7 +102,7 @@ impl IllFormedAttributeInput {
         Self {
             num_suggestions: suggestions.len(),
             suggestions: DiagArgValue::StrListSepByAnd(
-                suggestions.into_iter().map(|s| format!("`{s}`").into()).collect(),
+                suggestions.iter().map(|s| format!("`{s}`").into()).collect(),
             ),
             has_docs: docs.is_some(),
             docs: docs.unwrap_or(""),
@@ -169,10 +177,21 @@ pub(crate) struct DocAutoCfgExpectsHideOrShow;
 pub(crate) struct AmbiguousDeriveHelpers;
 
 #[derive(Diagnostic)]
-#[diag("`#![doc(auto_cfg({$attr_name}(...)))]` only accepts identifiers or key/value items")]
+#[diag("`#![doc(auto_cfg({$attr_name}(...)))]` only accepts identifiers or `values(...)`")]
 pub(crate) struct DocAutoCfgHideShowUnexpectedItem {
     pub attr_name: Symbol,
 }
+
+#[derive(Diagnostic)]
+#[diag("`any()` was used when other values were provided")]
+pub(crate) struct DocAutoCfgHideShowValuesMix {
+    #[label("value declared here")]
+    pub value_span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("unexpected item after `values()`")]
+pub(crate) struct DocAutoCfgHideShowUnexpectedItemAfterValues;
 
 #[derive(Diagnostic)]
 #[diag("`#![doc(auto_cfg({$attr_name}(...)))]` expects a list of items")]
@@ -240,6 +259,10 @@ pub(crate) struct DocUnknownAny {
 pub(crate) struct DocAutoCfgWrongLiteral;
 
 #[derive(Diagnostic)]
+#[diag("there must be at least one identifier before `values(...)`")]
+pub(crate) struct DocAutoCfgHideShowNoIdentBeforeValues;
+
+#[derive(Diagnostic)]
 #[diag("`#[doc(test(...)]` takes a list of attributes")]
 pub(crate) struct DocTestTakesList;
 
@@ -265,6 +288,10 @@ pub(crate) struct AttrCrateLevelOnly;
 pub(crate) struct DoNotRecommendDoesNotExpectArgs;
 
 #[derive(Diagnostic)]
+#[diag("`#[diagnostic::opaque]` does not expect any arguments")]
+pub(crate) struct OpaqueDoesNotExpectArgs;
+
+#[derive(Diagnostic)]
 #[diag("invalid `crate_type` value")]
 pub(crate) struct UnknownCrateTypes {
     #[subdiagnostic]
@@ -277,45 +304,6 @@ pub(crate) struct UnknownCrateTypesSuggestion {
     #[primary_span]
     pub span: Span,
     pub snippet: Symbol,
-}
-
-#[derive(Diagnostic)]
-#[diag("`#[diagnostic::on_const]` can only be applied to non-const trait implementations")]
-pub(crate) struct DiagnosticOnConstOnlyForTraitImpls {
-    #[label("not a trait implementation")]
-    pub target_span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("`#[diagnostic::on_move]` can only be applied to enums, structs or unions")]
-pub(crate) struct DiagnosticOnMoveOnlyForAdt;
-
-#[derive(Diagnostic)]
-#[diag("`#[diagnostic::on_unimplemented]` can only be applied to trait definitions")]
-pub(crate) struct DiagnosticOnUnimplementedOnlyForTraits;
-
-#[derive(Diagnostic)]
-#[diag(
-    "`#[diagnostic::on_unknown]` can only be applied to `use` statements and module declarations"
-)]
-pub(crate) struct DiagnosticOnUnknownInvalidTarget {
-    #[label("not an import or module")]
-    pub target_span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("`#[diagnostic::on_unmatched_args]` can only be applied to macro definitions")]
-pub(crate) struct DiagnosticOnUnmatchedArgsOnlyForMacros;
-
-#[derive(Diagnostic)]
-#[diag("`#[diagnostic::on_type_error]` can only be applied to enums, structs or unions")]
-pub(crate) struct DiagnosticOnTypeErrorOnlyForAdt;
-
-#[derive(Diagnostic)]
-#[diag("`#[diagnostic::do_not_recommend]` can only be placed on trait implementations")]
-pub(crate) struct IncorrectDoNotRecommendLocation {
-    #[label("not a trait implementation")]
-    pub target_span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -784,39 +772,39 @@ pub(crate) mod unexpected_cfg_value {
 
 #[derive(Diagnostic)]
 pub(crate) enum InvalidOnClause {
-    #[diag("empty `on`-clause in `#[rustc_on_unimplemented]`", code = E0232)]
+    #[diag("empty `on`-clause in `#[rustc_on_unimplemented]`")]
     Empty {
         #[primary_span]
         #[label("empty `on`-clause here")]
         span: Span,
     },
-    #[diag("expected a single predicate in `not(..)`", code = E0232)]
+    #[diag("expected a single predicate in `not(..)`")]
     ExpectedOnePredInNot {
         #[primary_span]
         #[label("unexpected quantity of predicates here")]
         span: Span,
     },
-    #[diag("literals inside `on`-clauses are not supported", code = E0232)]
+    #[diag("literals inside `on`-clauses are not supported")]
     UnsupportedLiteral {
         #[primary_span]
         #[label("unexpected literal here")]
         span: Span,
     },
-    #[diag("expected an identifier inside this `on`-clause", code = E0232)]
+    #[diag("expected an identifier inside this `on`-clause")]
     ExpectedIdentifier {
         #[primary_span]
         #[label("expected an identifier here, not `{$path}`")]
         span: Span,
         path: AttrPath,
     },
-    #[diag("this predicate is invalid", code = E0232)]
+    #[diag("this predicate is invalid")]
     InvalidPredicate {
         #[primary_span]
         #[label("expected one of `any`, `all` or `not` here, not `{$invalid_pred}`")]
         span: Span,
         invalid_pred: Symbol,
     },
-    #[diag("invalid flag in `on`-clause", code = E0232)]
+    #[diag("invalid flag in `on`-clause")]
     InvalidFlag {
         #[primary_span]
         #[label(
@@ -828,15 +816,35 @@ pub(crate) enum InvalidOnClause {
 }
 
 #[derive(Diagnostic)]
-#[diag(
-    "using multiple `rustc_on_unimplemented` (or mixing it with `diagnostic::on_unimplemented`) is not supported"
-)]
-pub(crate) struct DupesNotAllowed;
-
-#[derive(Diagnostic)]
-#[diag("usage of the unsafe `#[{$attr_path}]` attribute")]
+#[diag("usage of the unsafe `{$attr_path}` attribute")]
 #[note("{$note}")]
 pub(crate) struct UnsafeAttribute {
     pub attr_path: AttrPath,
     pub note: &'static str,
+}
+
+#[derive(Diagnostic)]
+#[diag("unknown external lang item: `{$lang_item}`", code = E0264)]
+pub(crate) struct UnknownExternLangItem {
+    #[primary_span]
+    pub span: Span,
+    pub lang_item: Symbol,
+}
+
+#[derive(Diagnostic)]
+#[diag("duplicate tool `{$tool}` registered")]
+pub(crate) struct DuplicateTool {
+    #[primary_span]
+    pub(crate) span: Span,
+    pub(crate) tool: Ident,
+    #[label("already registered here")]
+    pub(crate) old_ident_span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("tool `{$tool}` is reserved and cannot be registered")]
+pub(crate) struct ToolReserved {
+    #[primary_span]
+    pub(crate) span: Span,
+    pub(crate) tool: Ident,
 }

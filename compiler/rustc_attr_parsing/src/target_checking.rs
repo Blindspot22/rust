@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use rustc_ast::AttrStyle;
+use rustc_ast::{AttrStyle, Safety};
 use rustc_errors::{DiagArgValue, MultiSpan, StashKey};
 use rustc_feature::Features;
 use rustc_hir::attrs::AttributeKind;
@@ -16,9 +16,9 @@ use crate::target_checking::Policy::Allow;
 use crate::{AttributeParser, ShouldEmit};
 
 #[derive(Debug)]
-pub(crate) enum AllowedTargets {
-    AllowList(&'static [Policy]),
-    AllowListWarnRest(&'static [Policy]),
+pub(crate) enum AllowedTargets<'a> {
+    AllowList(&'a [Policy]),
+    AllowListWarnRest(&'a [Policy]),
     /// This is useful for argument-dependent target checking.
     /// If debug assertions are enabled,
     /// this emits a delayed bug if the `cx.check_target(...)` method is not called during attribute parsing.
@@ -31,7 +31,7 @@ pub(crate) enum AllowedResult {
     Error,
 }
 
-impl AllowedTargets {
+impl AllowedTargets<'_> {
     pub(crate) fn is_allowed(&self, target: Target) -> AllowedResult {
         match self {
             AllowedTargets::AllowList(list) => {
@@ -62,16 +62,13 @@ impl AllowedTargets {
 
     pub(crate) fn allowed_targets(&self) -> Vec<Target> {
         match self {
-            AllowedTargets::AllowList(list) => list,
-            AllowedTargets::AllowListWarnRest(list) => list,
+            AllowedTargets::AllowList(list) | AllowedTargets::AllowListWarnRest(list) => list,
             AllowedTargets::ManuallyChecked => unreachable!(),
         }
         .iter()
         .filter_map(|target| match target {
             Policy::Allow(target) => Some(*target),
-            Policy::AllowSilent(_) => None, // Not listed in possible targets
-            Policy::Warn(_) => None,
-            Policy::Error(_) => None,
+            Policy::AllowSilent(_) | Policy::Warn(_) | Policy::Error(_) => None,
         })
         .collect()
     }
@@ -94,8 +91,8 @@ pub(crate) enum Policy {
 
 impl<'sess> AttributeParser<'sess> {
     pub(crate) fn check_target(
-        allowed_targets: &AllowedTargets,
-        attribute_args: &'static str,
+        allowed_targets: &AllowedTargets<'_>,
+        attribute_args: &str,
         cx: &mut AcceptContext<'_, 'sess>,
     ) {
         if matches!(cx.should_emit, ShouldEmit::Nothing) {
@@ -129,16 +126,30 @@ impl<'sess> AttributeParser<'sess> {
 
         let allowed_targets = allowed_targets.allowed_targets();
         let (applied, only) = allowed_targets_applied(allowed_targets, cx.target, cx.features);
+        let is_diagnostic_attr = cx.attr_path.segments[0] == sym::diagnostic;
 
         let diag = InvalidTarget {
-            span: cx.attr_span.clone(),
+            span: if attribute_args.is_empty() {
+                // Example: for the attribute `#[inline]`, name+attribute_args gives "inline",
+                // and the path span covers `inline` which is just what we want.
+                cx.attr_path.span
+            } else {
+                // Example 1: for the attribute `#[repr(C)]`, name+attribute_args gives
+                // "repr(C)", and the inner span covers `repr(C)` which is just what we want.
+                //
+                // Example 2: for the attribute `#[repr(C, packed)]`, name+attribute_args gives
+                // "repr(C)", and the inner span covers `repr(C, packed)` which doesn't match
+                // exactly but is as close as we can get.
+                cx.inner_span
+            },
+            attr_span: cx.attr_span,
             name: cx.attr_path.clone(),
             target: cx.target.plural_name(),
             only: if only { "only " } else { "" },
             applied: DiagArgValue::StrListSepByAnd(applied.into_iter().map(Cow::Owned).collect()),
-            attribute_args,
+            attribute_args: attribute_args.to_string(),
             help: Self::target_checking_help(attribute_args, cx),
-            previously_accepted: matches!(result, AllowedResult::Warn),
+            previously_accepted: matches!(result, AllowedResult::Warn) && !is_diagnostic_attr,
             on_macro_call: matches!(cx.target, Target::MacroCall),
         };
 
@@ -156,11 +167,13 @@ impl<'sess> AttributeParser<'sess> {
                     .contains(&cx.target)
                 {
                     rustc_session::lint::builtin::USELESS_DEPRECATED
+                } else if is_diagnostic_attr {
+                    rustc_session::lint::builtin::MISPLACED_DIAGNOSTIC_ATTRIBUTES
                 } else {
                     rustc_session::lint::builtin::UNUSED_ATTRIBUTES
                 };
 
-                let attr_span = cx.attr_span.clone();
+                let attr_span = cx.attr_span;
                 cx.emit_lint(lint, diag, attr_span);
             }
             AllowedResult::Error => {
@@ -170,10 +183,19 @@ impl<'sess> AttributeParser<'sess> {
     }
 
     fn target_checking_help(
-        attribute_args: &'static str,
+        attribute_args: &str,
         cx: &AcceptContext<'_, '_>,
     ) -> Option<InvalidTargetHelp> {
         match &*cx.attr_path.segments {
+            [sym::link_name] if cx.target == Target::Static => {
+                let needs_unsafe_wrapper = matches!(cx.attr_safety, Safety::Default);
+
+                Some(InvalidTargetHelp::UseExportName {
+                    unsafe_open: needs_unsafe_wrapper.then(|| cx.inner_span.shrink_to_lo()),
+                    name: cx.attr_path.span,
+                    unsafe_close: needs_unsafe_wrapper.then(|| cx.inner_span.shrink_to_hi()),
+                })
+            }
             [sym::repr] if attribute_args == "(align(...))" => match cx.target {
                 Target::Fn | Target::Method(..) if cx.features().fn_align() => {
                     Some(InvalidTargetHelp::UseRustcAlign)
@@ -413,6 +435,7 @@ pub(crate) fn allowed_targets_applied(
 
     // ensure a consistent order
     target_strings.sort();
+    target_strings.dedup();
 
     // If there is now only 1 target left, show that as the only possible target
     let only_target = target_strings.len() == 1;
@@ -440,8 +463,8 @@ fn filter_targets(
 impl<'f, 'sess> AcceptContext<'f, 'sess> {
     pub(crate) fn check_target(
         &mut self,
-        attribute_args: &'static str,
-        allowed_targets: &AllowedTargets,
+        attribute_args: &str,
+        allowed_targets: &AllowedTargets<'_>,
     ) {
         self.ignore_target_checks();
         AttributeParser::check_target(allowed_targets, attribute_args, self);
@@ -459,7 +482,7 @@ impl<'f, 'sess> AcceptContext<'f, 'sess> {
 /// This is used for:
 /// - `rustc_dummy`, which can be applied to all targets
 /// - Attributes that are not parted to the new target system yet can use this list as a placeholder
-pub(crate) const ALL_TARGETS: &'static [Policy] = {
+pub(crate) const ALL_TARGETS: &[Policy] = {
     use Policy::Allow;
     &[
         Allow(Target::ExternCrate),

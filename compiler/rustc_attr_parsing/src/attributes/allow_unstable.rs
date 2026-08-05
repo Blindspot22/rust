@@ -2,6 +2,7 @@ use std::iter;
 
 use rustc_feature::AttributeStability;
 
+use super::macro_attrs::check_macro_only;
 use super::prelude::*;
 use crate::session_diagnostics;
 
@@ -11,7 +12,7 @@ impl CombineAttributeParser for AllowInternalUnstableParser {
     type Item = (Symbol, Span);
     const CONVERT: ConvertFn<Self::Item> =
         |items, span| AttributeKind::AllowInternalUnstable(items, span);
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[
         Allow(Target::MacroDef),
         Allow(Target::Fn),
         Warn(Target::Field),
@@ -28,6 +29,10 @@ impl CombineAttributeParser for AllowInternalUnstableParser {
             .into_iter()
             .zip(iter::repeat(cx.attr_span))
     }
+
+    fn finalize_check(cx: &FinalizeCheckContext<'_, '_>, attr_span: Span) {
+        check_macro_only(cx, attr_span);
+    }
 }
 
 pub(crate) struct UnstableFeatureBoundParser;
@@ -36,7 +41,7 @@ impl CombineAttributeParser for UnstableFeatureBoundParser {
     type Item = (Symbol, Span);
     const CONVERT: ConvertFn<Self::Item> = |items, _| AttributeKind::UnstableFeatureBound(items);
     const STABILITY: AttributeStability = unstable!(staged_api);
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[
         Allow(Target::Fn),
         Allow(Target::Impl { of_trait: true }),
         Allow(Target::Trait),
@@ -59,7 +64,7 @@ impl CombineAttributeParser for RustcAllowConstFnUnstableParser {
     type Item = Symbol;
     const CONVERT: ConvertFn<Self::Item> =
         |items, first_span| AttributeKind::RustcAllowConstFnUnstable(items, first_span);
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[
         Allow(Target::Fn),
         Allow(Target::Method(MethodKind::Inherent)),
         Allow(Target::Method(MethodKind::Trait { body: true })),

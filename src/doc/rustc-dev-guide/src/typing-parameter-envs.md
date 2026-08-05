@@ -1,6 +1,6 @@
-# Typing/Parameter Environments
+# Typing/Parameter environments
 
-## Typing Environments
+## Typing environments
 
 When interacting with the type system there are a few variables to consider that can affect the results of trait solving.
 The set of in-scope where clauses, and what phase of the compiler type system operations are being performed in (the [`ParamEnv`][penv] and [`TypingMode`][tmode] structs respectively).
@@ -14,13 +14,13 @@ whereas different `ParamEnv`s can be used on a per-goal basis.
 [ocx]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_trait_selection/traits/struct.ObligationCtxt.html
 [fnctxt]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_hir_typeck/fn_ctxt/struct.FnCtxt.html
 
-## Parameter Environments
+## Parameter environments
 
 ### What is a `ParamEnv`
 
 The [`ParamEnv`][penv] is a list of in-scope where-clauses,
 it typically corresponds to a specific item's where clauses.
-Some clauses are not explicitly written but are instead implicitly added in the [`predicates_of`][predicates_of] query,
+Some clauses are not explicitly written but are instead implicitly added in the [`clauses_of`][clauses_of] query,
 such as `ConstArgHasType` or (some) implied bounds.
 
 In most cases `ParamEnv`s are initially created via the [`param_env` query][query] which returns a `ParamEnv` derived from the provided item's where clauses.
@@ -75,7 +75,7 @@ fn foo2<T>(a: T) {
 }
 ```
 
-[predicates_of]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_hir_analysis/collect/predicates_of/fn.predicates_of.html
+[clauses_of]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_hir_analysis/collect/clauses_of/fn.clauses_of.html
 [method_pred_entailment]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_hir_analysis/check/compare_impl_item/fn.compare_method_predicate_entailment.html
 [query]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/context/struct.TyCtxt.html#method.param_env
 [normalization]: normalization.md
@@ -197,7 +197,7 @@ impl<T> Other for T {
 
 // `foo`'s unnormalized `ParamEnv` would be:
 // `[T: Sized, U: Sized, U: Trait<T::Bar>]`
-fn foo<T, U>(a: U) 
+fn foo<T, U>(a: U)
 where
     U: Trait<<T as Other>::Bar>,
 {
@@ -222,7 +222,7 @@ In the next-gen trait solver the requirement for all where clauses in the `Param
 [pe]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/ty/struct.ParamEnv.html
 [normalize_env_or_error]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_trait_selection/traits/fn.normalize_param_env_or_error.html
 
-## Typing Modes
+## Typing modes
 
 Depending on what context we are performing type system operations in,
 different behaviour may be required.
