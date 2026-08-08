@@ -229,7 +229,7 @@ impl StepMetadata {
         Self::new(name, target, Kind::Run)
     }
 
-    fn new(name: &str, target: TargetSelection, kind: Kind) -> Self {
+    pub fn new(name: &str, target: TargetSelection, kind: Kind) -> Self {
         Self { name: name.to_string(), kind, target, built_by: None, stage: None, metadata: None }
     }
 
@@ -524,13 +524,11 @@ pub struct ShouldRun<'a> {
 
     // use a BTreeSet to maintain sort order
     paths: BTreeSet<PathSet>,
-
-    default_to_suites_only: bool,
 }
 
 impl<'a> ShouldRun<'a> {
     fn new(builder: &'a Builder<'_>, kind: Kind) -> ShouldRun<'a> {
-        ShouldRun { builder, kind, paths: BTreeSet::new(), default_to_suites_only: false }
+        ShouldRun { builder, kind, paths: BTreeSet::new() }
     }
 
     /// The corresponding step should run if the bootstrap command-line selects
@@ -643,26 +641,10 @@ impl<'a> ShouldRun<'a> {
         sets
     }
 
-    /// When generating pathsets for a step that is being run "by default"
-    /// (i.e. when running bootstrap without an explicit command-line path),
-    /// discard any paths that were not registered as test suites.
-    ///
-    /// This is basically a hack to make path-based skipping work properly for
-    /// coverage tests, since otherwise the `coverage-map` and `coverage-run`
-    /// aliases would prevent `./x test --skip=tests` from skipping them.
-    pub(crate) fn default_to_suites_only(mut self) -> Self {
-        self.default_to_suites_only = true;
-        self
-    }
-
     /// When the corresponding step is run "by default" (without explicit command-line paths),
     /// act as though the user had explicitly specified these paths.
     fn default_pathsets(&self) -> Vec<PathSet> {
-        let mut default_pathsets = self.paths.iter().cloned().collect::<Vec<_>>();
-        if self.default_to_suites_only {
-            default_pathsets.retain(|p| matches!(p, PathSet::Suite(_)));
-        }
-        default_pathsets
+        self.paths.iter().cloned().collect::<Vec<_>>()
     }
 }
 
@@ -823,6 +805,7 @@ impl<'a> Builder<'a> {
                 tool::CargoMiri,
                 llvm::Lld,
                 llvm::Enzyme,
+                llvm::RustOffload,
                 llvm::CrtBeginEnd,
                 tool::RustdocGUITest,
                 tool::OptimizedDist,
@@ -898,6 +881,7 @@ impl<'a> Builder<'a> {
                 test::Ui,
                 test::Crashes,
                 test::Coverage,
+                test::CoverageModeAlias,
                 test::MirOpt,
                 test::CodegenLlvm,
                 test::CodegenUnits,

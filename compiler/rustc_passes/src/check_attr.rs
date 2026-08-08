@@ -46,7 +46,7 @@ use rustc_span::edition::Edition;
 use rustc_span::{DUMMY_SP, Ident, Span, Symbol, sym};
 use rustc_trait_selection::error_reporting::InferCtxtErrorExt;
 use rustc_trait_selection::infer::{TyCtxtInferExt, ValuePairs};
-use rustc_trait_selection::traits::ObligationCtxt;
+use rustc_trait_selection::traits::{ObligationCtxt, TraitErrors};
 
 use crate::diagnostics;
 
@@ -304,6 +304,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
             AttributeKind::RustcAllocatorZeroed => (),
             AttributeKind::RustcAllocatorZeroedVariant { .. } => (),
             AttributeKind::RustcAllowIncoherentImpl(..) => (),
+            AttributeKind::RustcAllowLifetimeDependentSpecialization => (),
             AttributeKind::RustcAsPtr => (),
             AttributeKind::RustcAutodiff(..) => (),
             AttributeKind::RustcBodyStability { .. } => (),
@@ -384,6 +385,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
             AttributeKind::RustcShouldNotBeCalledOnConstItems => (),
             AttributeKind::RustcSimdMonomorphizeLaneLimit(..) => (),
             AttributeKind::RustcSkipDuringMethodDispatch { .. } => (),
+
             AttributeKind::RustcSpecializationTrait => (),
             AttributeKind::RustcStdInternalSymbol => (),
             AttributeKind::RustcStrictCoherence(..) => (),
@@ -391,7 +393,6 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
             AttributeKind::RustcTestMarker(..) => (),
             AttributeKind::RustcThenThisWouldNeed(..) => (),
             AttributeKind::RustcTrivialFieldReads => (),
-            AttributeKind::RustcUnsafeSpecializationMarker => (),
             AttributeKind::Sanitize { .. } => {}
             AttributeKind::ShouldPanic { .. } => (),
             AttributeKind::Splat(..) => (),
@@ -1428,7 +1429,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
 
         // proc macro is not WF.
         let errors = ocx.try_evaluate_obligations();
-        if !errors.is_empty() {
+        if !errors.no_errors() {
             return;
         }
 
@@ -1495,7 +1496,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
         }
 
         let errors = ocx.evaluate_obligations_error_on_ambiguity();
-        if !errors.is_empty() {
+        if let TraitErrors::HasErrors(errors) = errors {
             infcx.err_ctxt().report_fulfillment_errors(errors);
             self.abort.set(true);
         }
