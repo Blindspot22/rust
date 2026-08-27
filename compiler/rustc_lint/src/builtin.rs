@@ -1,7 +1,7 @@
 //! Lints in the Rust compiler.
 //!
 //! This contains lints which can feasibly be implemented as their own
-//! AST visitor. Also see `rustc_session::lint::builtin`, which contains the
+//! AST visitor. Also see `rustc_lint_defs::builtin`, which contains the
 //! definitions of lints that are emitted directly inside the main compiler.
 //!
 //! To add a new lint to rustc, declare it here using [`declare_lint!`].
@@ -24,21 +24,21 @@ use rustc_ast_pretty::pprust::expr_to_string;
 use rustc_attr_parsing::AttributeParser;
 use rustc_errors::{Applicability, Diagnostic, msg};
 use rustc_feature::GateIssue;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::attrs::{AttributeKind, DocAttribute};
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LocalDefId};
 use rustc_hir::intravisit::FnKind as HirFnKind;
 use rustc_hir::{self as hir, Body, FnDecl, ImplItemImplKind, PatKind, PredicateOrigin, find_attr};
+// Lints from rustc_lint_defs
+pub use rustc_lint_defs::builtin::*;
+use rustc_lint_defs::{declare_lint, declare_lint_pass, fcw, impl_lint_pass};
 use rustc_middle::bug;
 use rustc_middle::ty::layout::LayoutOf;
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{
     self, AssocContainer, Ty, TyCtxt, TypeVisitableExt, Unnormalized, Upcast, VariantDef,
 };
-// hardwired lints from rustc_lint_defs
-pub use rustc_session::lint::builtin::*;
-use rustc_session::lint::fcw;
-use rustc_session::{declare_lint, declare_lint_pass, impl_lint_pass};
 use rustc_span::edition::Edition;
 use rustc_span::{DUMMY_SP, Ident, InnerSpan, Span, Spanned, Symbol, kw, sym};
 use rustc_target::asm::InlineAsmArch;
@@ -47,18 +47,18 @@ use rustc_trait_selection::traits;
 use rustc_trait_selection::traits::misc::type_allowed_to_implement_copy;
 use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt as _;
 
-use crate::diagnostics::BuiltinEllipsisInclusiveRangePatterns;
-use crate::lints::{
+use crate::diagnostics::{
     BuiltinAnonymousParams, BuiltinConstNoMangle, BuiltinDerefNullptr, BuiltinDoubleNegations,
-    BuiltinDoubleNegationsAddParens, BuiltinEllipsisInclusiveRangePatternsLint,
-    BuiltinExplicitOutlives, BuiltinExplicitOutlivesSuggestion, BuiltinFeatureIssueNote,
-    BuiltinIncompleteFeatures, BuiltinIncompleteFeaturesHelp, BuiltinInternalFeatures,
-    BuiltinKeywordIdents, BuiltinMissingCopyImpl, BuiltinMissingDebugImpl, BuiltinMissingDoc,
-    BuiltinMutablesTransmutes, BuiltinNonShorthandFieldPatterns, BuiltinSpecialModuleNameUsed,
-    BuiltinTrivialBounds, BuiltinTypeAliasBounds, BuiltinUngatedAsyncFnTrackCaller,
-    BuiltinUnpermittedTypeInit, BuiltinUnpermittedTypeInitSub, BuiltinUnreachablePub,
-    BuiltinUnsafe, BuiltinUnstableFeatures, BuiltinUnusedDocComment, BuiltinUnusedDocCommentSub,
-    BuiltinWhileTrue, EqInternalMethodImplemented, InvalidAsmLabel,
+    BuiltinDoubleNegationsAddParens, BuiltinEllipsisInclusiveRangePatterns,
+    BuiltinEllipsisInclusiveRangePatternsLint, BuiltinExplicitOutlives,
+    BuiltinExplicitOutlivesSuggestion, BuiltinFeatureIssueNote, BuiltinIncompleteFeatures,
+    BuiltinIncompleteFeaturesHelp, BuiltinInternalFeatures, BuiltinKeywordIdents,
+    BuiltinMissingCopyImpl, BuiltinMissingDebugImpl, BuiltinMissingDoc, BuiltinMutablesTransmutes,
+    BuiltinNonShorthandFieldPatterns, BuiltinSpecialModuleNameUsed, BuiltinTrivialBounds,
+    BuiltinTypeAliasBounds, BuiltinUngatedAsyncFnTrackCaller, BuiltinUnpermittedTypeInit,
+    BuiltinUnpermittedTypeInitSub, BuiltinUnreachablePub, BuiltinUnsafe, BuiltinUnstableFeatures,
+    BuiltinUnusedDocComment, BuiltinUnusedDocCommentSub, BuiltinWhileTrue,
+    EqInternalMethodImplemented, InvalidAsmLabel,
 };
 use crate::{EarlyContext, EarlyLintPass, LateContext, LateLintPass, LintContext};
 
@@ -555,9 +555,8 @@ fn type_implements_negative_copy_modulo_regions<'tcx>(
     typing_env: ty::TypingEnv<'tcx>,
 ) -> bool {
     let (infcx, param_env) = tcx.infer_ctxt().build_with_typing_env(typing_env);
-    let trait_ref =
-        ty::TraitRef::new(tcx, tcx.require_lang_item(hir::LangItem::Copy, DUMMY_SP), [ty]);
-    let pred = ty::TraitPredicate { trait_ref, polarity: ty::PredicatePolarity::Negative };
+    let trait_ref = ty::TraitRef::new(tcx, tcx.require_lang_item(LangItem::Copy, DUMMY_SP), [ty]);
+    let pred = ty::TraitClause { trait_ref, polarity: ty::ClausePolarity::Negative };
     let obligation = traits::Obligation {
         cause: traits::ObligationCause::dummy(),
         param_env,

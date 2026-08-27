@@ -91,7 +91,7 @@ fn disable_error_reporting<F: FnOnce() -> R, R>(f: F) -> R {
 }
 
 /// The platform-specific library name
-fn get_lib_name(name: &str, aux_type: AuxType) -> Option<String> {
+fn get_lib_name(name: &str, aux_type: AuxType, wasm_proc_macros: bool) -> Option<String> {
     match aux_type {
         AuxType::Bin => None,
         // In some cases (e.g. MUSL), we build a static
@@ -99,6 +99,8 @@ fn get_lib_name(name: &str, aux_type: AuxType) -> Option<String> {
         // In this case, the only path we can pass
         // with '--extern-meta' is the '.rlib' file
         AuxType::Lib => Some(format!("lib{name}.rlib")),
+        // FIXME maybe use `rustc --print file-names` instead?
+        AuxType::ProcMacro if wasm_proc_macros => Some(format!("{name}.wasm")),
         AuxType::Dylib | AuxType::ProcMacro => Some(dylib_name(name)),
     }
 }
@@ -1038,14 +1040,25 @@ impl<'test> TestCx<'test> {
             .arg(file_to_doc)
             .arg("-A")
             .arg("internal_features")
+            // FIXME(#160895): While the new solver is enabled by default on nightly,
+            // we don't want to use it in our tests for now.
+            .arg("-Znext-solver=coherence")
             .args(&self.props.compile_flags)
             .args(&self.props.doc_flags);
 
         match kind {
             DocKind::Html => {}
             DocKind::Json => {
-                rustdoc.arg("--output-format").arg("json").arg("-Zunstable-options");
+                rustdoc.arg("--output-format").arg("json");
             }
+        }
+
+        // Both JSON output and `--disable-minification` are unstable rustdoc options.
+        if matches!(kind, DocKind::Json) || self.config.disable_minification {
+            rustdoc.arg("-Zunstable-options");
+        }
+        if self.config.disable_minification {
+            rustdoc.arg("--disable-minification");
         }
 
         if let Some(ref linker) = self.config.target_linker {
@@ -1248,7 +1261,8 @@ impl<'test> TestCx<'test> {
                           aux_name: &str,
                           aux_path: &str,
                           aux_type: AuxType| {
-            let lib_name = get_lib_name(&path_to_crate_name(aux_path), aux_type);
+            let lib_name =
+                get_lib_name(&path_to_crate_name(aux_path), aux_type, self.config.wasm_proc_macros);
             if let Some(lib_name) = lib_name {
                 let modifiers_and_name = match extern_modifiers {
                     Some(modifiers) => format!("{modifiers}:{aux_name}"),
@@ -1279,7 +1293,11 @@ impl<'test> TestCx<'test> {
         // to `-Zcodegen-backend` when compiling the test file.
         if let Some(aux_file) = &self.props.aux.codegen_backend {
             let aux_type = self.build_auxiliary(aux_file, aux_dir, None);
-            if let Some(lib_name) = get_lib_name(aux_file.trim_end_matches(".rs"), aux_type) {
+            if let Some(lib_name) = get_lib_name(
+                aux_file.trim_end_matches(".rs"),
+                aux_type,
+                self.config.wasm_proc_macros,
+            ) {
                 let lib_path = aux_dir.join(&lib_name);
                 rustc.arg(format!("-Zcodegen-backend={}", lib_path));
             }
@@ -1351,7 +1369,27 @@ impl<'test> TestCx<'test> {
         let mut aux_props =
             self.props.from_aux_file(&aux_path, self.variant.revision(), self.config);
         if aux_type == Some(AuxType::ProcMacro) {
-            aux_props.force_host = true;
+            if self.config.wasm_proc_macros {
+                aux_props.compile_flags.push("--target=wasm32-wasip2".to_owned());
+                // Override any earlier linkers for now, otherwise we fail to build since compiletest
+                // thinks we're building for a different target and passes its linker (if one is
+                // configured).
+                //
+                // wasm32-wasip2 should in principle always be able to link with wasm-component-ld +
+                // wasm-ld. This does mean that rust.lld needs to be enabled to build wasm-ld wrapper
+                // around rust-lld.
+                aux_props.compile_flags.push("-Clinker=wasm-component-ld".to_owned());
+                aux_props.compile_flags.push(format!(
+                    "-Clink-arg=--wasm-ld-path={}",
+                    self.config
+                        .sysroot_base
+                        .join("lib/rustlib")
+                        .join(&self.config.host)
+                        .join("bin/gcc-ld/wasm-ld")
+                ));
+            } else {
+                aux_props.force_host = true;
+            }
         }
         let mut aux_dir = aux_dir.to_path_buf();
         if aux_type == Some(AuxType::Bin) {
@@ -1575,6 +1613,20 @@ impl<'test> TestCx<'test> {
             }
         };
         compiler.arg(input_file);
+
+        // Enable wasm proc macros.
+        if self.config.wasm_proc_macros {
+            compiler.arg("-Zwasm-proc-macros");
+        }
+
+        // `--disable-minification` is an unstable rustdoc option. Rustdoc UI tests intentionally
+        // exercise diagnostics for unstable options, so don't enable them for that suite.
+        if compiler_kind == CompilerKind::Rustdoc
+            && self.config.disable_minification
+            && self.config.mode != TestMode::Ui
+        {
+            compiler.arg("-Zunstable-options").arg("--disable-minification");
+        }
 
         // Hide libstd sources from ui tests to make sure we generate the stderr
         // output that users will see.
@@ -1847,6 +1899,10 @@ impl<'test> TestCx<'test> {
                 }
             },
         }
+
+        // FIXME(#160895): While the new solver is enabled by default on nightly,
+        // we don't want to use it in our tests for now.
+        compiler.args(["-Znext-solver=coherence"]);
 
         match self.config.compare_mode {
             Some(CompareMode::Polonius) => {

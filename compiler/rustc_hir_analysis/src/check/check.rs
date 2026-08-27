@@ -7,11 +7,12 @@ use rustc_errors::codes::*;
 use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, EmissionGuarantee, Level, MultiSpan};
 use rustc_hir as hir;
 use rustc_hir::attrs::ReprAttr::ReprPacked;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::{CtorKind, DefKind};
-use rustc_hir::{LangItem, Node, find_attr, intravisit};
+use rustc_hir::{Node, find_attr, intravisit};
 use rustc_infer::infer::{RegionVariableOrigin, TyCtxtInferExt};
 use rustc_infer::traits::{Obligation, ObligationCauseCode, TraitErrors, WellFormedLoc};
-use rustc_lint_defs::builtin::UNSUPPORTED_CALLING_CONVENTIONS;
+use rustc_lint_defs::builtin::{DEAD_CODE, UNINHABITED_STATIC, UNSUPPORTED_CALLING_CONVENTIONS};
 use rustc_macros::Diagnostic;
 use rustc_middle::hir::nested_filter;
 use rustc_middle::middle::resolve_bound_vars::ResolvedArg;
@@ -20,10 +21,9 @@ use rustc_middle::ty::error::TypeErrorToStringExt;
 use rustc_middle::ty::layout::LayoutError;
 use rustc_middle::ty::util::Discr;
 use rustc_middle::ty::{
-    AdtDef, BottomUpFolder, FnSig, GenericArgKind, RegionKind, TypeFoldable, TypeSuperVisitable,
+    AdtDef, BottomUpFolder, GenericArgKind, RegionKind, TypeFoldable, TypeSuperVisitable,
     TypeVisitable, TypeVisitableExt, Unnormalized, fold_regions,
 };
-use rustc_session::lint::builtin::UNINHABITED_STATIC;
 use rustc_span::sym;
 use rustc_target::spec::{AbiMap, AbiMapping};
 use rustc_trait_selection::error_reporting::InferCtxtErrorExt;
@@ -38,6 +38,7 @@ use crate::check::wfcheck::{
     check_associated_item, check_trait_item, check_type_defn, check_variances_for_type_defn,
     check_where_clauses, enter_wf_checking_ctxt,
 };
+use crate::collect::ItemCtxt;
 use crate::diagnostics;
 
 fn add_abi_diag_help<T: EmissionGuarantee>(abi: ExternAbi, diag: &mut Diag<'_, T>) {
@@ -88,18 +89,6 @@ pub fn check_abi(tcx: TyCtxt<'_>, hir_id: hir::HirId, span: Span, abi: ExternAbi
                 span,
                 UnsupportedCallingConventions { abi },
             );
-        }
-    }
-}
-
-pub fn check_custom_abi(tcx: TyCtxt<'_>, def_id: LocalDefId, fn_sig: FnSig<'_>, fn_sig_span: Span) {
-    if fn_sig.abi() == ExternAbi::Custom {
-        // Function definitions that use `extern "custom"` must be naked functions.
-        if !find_attr!(tcx, def_id, Naked(_)) {
-            tcx.dcx().emit_err(crate::diagnostics::AbiCustomClothedFunction {
-                span: fn_sig_span,
-                naked_span: tcx.def_span(def_id).shrink_to_lo(),
-            });
         }
     }
 }
@@ -414,6 +403,12 @@ fn check_opaque_meets_bounds<'tcx>(
         return Err(guar);
     }
 
+    // FIXME(impl_trait_in_assoc_type): This computes the implied bounds
+    // while being able to normalize opaque types. This is unsound if checking that the
+    // opaque type is well-formed relies on an implied bound mentioning that opaque type.
+    // This should only affect TAIT as this function is not soundness critical for RPITs.
+    //
+    // cc trait-system-refactor-initiative#159
     let wf_tys = ocx.assumed_wf_types_and_report_errors(param_env, defining_use_anchor)?;
     ocx.resolve_regions_and_report_errors(defining_use_anchor, param_env, wf_tys)?;
 
@@ -1168,6 +1163,19 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
             // avoids this query from having a direct dependency edge on the HIR
             return res;
         }
+        DefKind::TestBinderConstraints => {
+            tcx.ensure_ok().generics_of(def_id);
+            tcx.ensure_ok().clauses_of(def_id);
+            let (_, body) =
+                tcx.hir_node_by_def_id(def_id).expect_item().expect_test_binder_constraints();
+            let icx = ItemCtxt::new(tcx, def_id);
+            let lowered = icx.lower_test_binder_body(body);
+            res = res.and(enter_wf_checking_ctxt(tcx, def_id, |wfcx| {
+                wfcx.check_test_binder_body(lowered);
+                Ok(())
+            }));
+            return res;
+        }
 
         // These have no wf checks
         DefKind::AnonConst
@@ -1176,7 +1184,16 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
         | DefKind::Use
         | DefKind::GlobalAsm
         | DefKind::Mod => return res,
-        _ => {}
+
+        DefKind::ForeignTy => {}
+
+        DefKind::Variant
+        | DefKind::TyParam
+        | DefKind::ConstParam
+        | DefKind::Ctor(..)
+        | DefKind::Field
+        | DefKind::LifetimeParam
+        | DefKind::SyntheticCoroutineBody => unreachable!("{def_id:?}: {:?}", tcx.def_kind(def_id)),
     }
     let node = tcx.hir_node_by_def_id(def_id);
     res.and(match node {
@@ -1279,7 +1296,7 @@ fn check_impl_items_against_trait<'tcx>(
 
     // Negative impls are not expected to have any items
     match impl_trait_header.polarity {
-        ty::ImplPolarity::Reservation | ty::ImplPolarity::Positive => {}
+        ty::ImplPolarity::Positive => {}
         ty::ImplPolarity::Negative => {
             if let [first_item_ref, ..] = *impl_item_refs {
                 let first_item_span = tcx.def_span(first_item_ref);
@@ -1326,7 +1343,7 @@ fn check_impl_items_against_trait<'tcx>(
 
         if self_is_guaranteed_unsize_self && tcx.generics_require_sized_self(ty_trait_item.def_id) {
             tcx.emit_node_span_lint(
-                rustc_lint_defs::builtin::DEAD_CODE,
+                DEAD_CODE,
                 tcx.local_def_id_to_hir_id(ty_impl_item.def_id.expect_local()),
                 tcx.def_span(ty_impl_item.def_id),
                 diagnostics::UselessImplItem,
@@ -1377,7 +1394,7 @@ fn check_impl_items_against_trait<'tcx>(
                     // instead of `Drop::drop` is unstable that might be confusing.
                     EvalResult::Deny { .. }
                         if !tcx.features().pin_ergonomics()
-                            && tcx.is_lang_item(trait_ref.def_id, hir::LangItem::Drop)
+                            && tcx.is_lang_item(trait_ref.def_id, LangItem::Drop)
                             && tcx.item_name(trait_item_id) == sym::drop =>
                     {
                         missing_items.push(tcx.associated_item(trait_item_id));

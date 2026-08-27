@@ -1,18 +1,18 @@
 use std::ops::Range;
 
 use rustc_ast::PathSegment;
-use rustc_errors::{Diagnostic, MultiSpan};
-use rustc_hir::attrs::diagnostic::{
+use rustc_attr_ir::diagnostic::{
     Directive, Filter, FilterFormatString, Flag, FormatArg, FormatString, LitOrArg, Name,
     NameValue, Piece, Predicate,
 };
+use rustc_errors::{Diagnostic, MultiSpan};
 use rustc_lint_defs::LintId;
-use rustc_parse_format::{
-    Argument, FormatSpec, ParseError, ParseMode, Parser, Piece as RpfPiece, Position,
-};
-use rustc_session::lint::builtin::{
+use rustc_lint_defs::builtin::{
     MALFORMED_DIAGNOSTIC_ATTRIBUTES, MALFORMED_DIAGNOSTIC_FILTERS,
     MALFORMED_DIAGNOSTIC_FORMAT_LITERALS, UNKNOWN_DIAGNOSTIC_ATTRIBUTES,
+};
+use rustc_parse_format::{
+    Argument, FormatSpec, ParseError, ParseMode, Parser, Piece as RpfPiece, Position,
 };
 use rustc_span::edit_distance::find_best_match_for_name;
 use rustc_span::{Ident, InnerSpan, Span, Symbol, kw, sym};

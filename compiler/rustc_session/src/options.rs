@@ -11,11 +11,11 @@ use rustc_data_structures::stable_hash::StableHasher;
 use rustc_errors::{ColorConfig, TerminalUrl};
 use rustc_feature::UnstableFeatures;
 use rustc_hashes::Hash64;
-use rustc_hir::attrs::CollapseMacroDebuginfo;
 use rustc_macros::{BlobDecodable, Encodable};
 use rustc_span::edit_distance::edit_distance;
 use rustc_span::edition::Edition;
 use rustc_span::{RealFileName, RemapPathScopeComponents, SourceFileHashAlgorithm};
+use rustc_structures::{CollapseMacroDebuginfo, CrateType};
 use rustc_target::spec::{
     CodeModel, FramePointer, LinkerFlavorCli, MergeFunctions, OnBrokenPipe, PanicStrategy,
     RelocModel, RelroLevel, SanitizerSet, SplitDebuginfo, StackProtector, SymbolVisibility,
@@ -90,12 +90,16 @@ pub mod mitigation_coverage;
 
 mod target_modifier_consistency_check {
     use super::*;
-    pub(super) fn sanitizer(l: &TargetModifier, r: Option<&TargetModifier>) -> bool {
-        let mut lparsed: SanitizerSet = Default::default();
+    pub(super) fn sanitizer(
+        sess: &Session,
+        l: &TargetModifier,
+        r: Option<&TargetModifier>,
+    ) -> bool {
+        let mut lparsed: SanitizerSet = sess.target.options.default_sanitizers;
         let lval = if l.value_name.is_empty() { None } else { Some(l.value_name.as_str()) };
         parse::parse_sanitizers(&mut lparsed, lval);
 
-        let mut rparsed: SanitizerSet = Default::default();
+        let mut rparsed: SanitizerSet = sess.target.options.default_sanitizers;
         let rval = r.filter(|v| !v.value_name.is_empty()).map(|v| v.value_name.as_str());
         parse::parse_sanitizers(&mut rparsed, rval);
 
@@ -166,7 +170,7 @@ impl TargetModifier {
         match self.opt {
             OptionsTargetModifiers::UnstableOptions(unstable) => match unstable {
                 UnstableOptionsTargetModifiers::Sanitizer => {
-                    return target_modifier_consistency_check::sanitizer(self, other);
+                    return target_modifier_consistency_check::sanitizer(sess, self, other);
                 }
                 UnstableOptionsTargetModifiers::SanitizerCfiNormalizeIntegers => {
                     return target_modifier_consistency_check::sanitizer_cfi_normalize_integers(
@@ -819,8 +823,7 @@ mod desc {
         "a comma-separated list of strings, with elements beginning with + or -";
     pub(crate) const parse_pointer_authentication_list_with_polarity: &str = "a comma-separated list of options, each of the form `+<name>` or `-<name>`, where `<name>` is one of: `aarch64-jump-table-hardening`, `auth-traps`, `calls`, `elf-got`, `function-pointer-type-discrimination`, `indirect-gotos`, `init-fini`, `init-fini-address-discrimination`, `intrinsics`, `return-addresses`, `typeinfo-vt-ptr-discrimination`, `vt-ptr-addr-discrimination` or `vt-ptr-type-discrimination`";
     pub(crate) const parse_autodiff: &str = "a comma separated list of settings: `Enable`, `PrintSteps`, `PrintTA`, `PrintTAFn`, `PrintAA`, `PrintPerf`, `PrintModBefore`, `PrintModAfter`, `PrintModFinal`, `PrintPasses`, `NoPostopt`, `LooseTypes`, `Inline`, `NoTT`";
-    pub(crate) const parse_offload: &str =
-        "a comma separated list of settings: `Host=<Absolute-Path>`, `Device`, `Test`";
+    pub(crate) const parse_offload: &str = "a comma separated list of settings: `Host=<Absolute-Path>`, `HostMetadata=<Absolute-Path>`, `Device` (empty manifest) or `Device=<Absolute-Path>`, `Test`";
     pub(crate) const parse_comma_list: &str = "a comma-separated list of strings";
     pub(crate) const parse_opt_comma_list: &str = parse_comma_list;
     pub(crate) const parse_number: &str = "a number";
@@ -1514,12 +1517,17 @@ pub mod parse {
                         return false;
                     }
                 }
-                "Device" => {
-                    if let Some(_) = arg {
-                        // Device does not accept a value
+                "HostMetadata" => {
+                    if let Some(p) = arg {
+                        Offload::HostMetadata(p.to_string())
+                    } else {
                         return false;
                     }
-                    Offload::Device
+                }
+                "Device" => {
+                    // Without an argument, `Device` uses an empty manifest and all kernel
+                    // instantiations are discovered via monomorphization.
+                    Offload::Device(arg.unwrap_or_default().to_string())
                 }
                 "Test" => {
                     if let Some(_) = arg {
@@ -2298,6 +2306,8 @@ options! {
     profile_generate: SwitchWithOptPath = (SwitchWithOptPath::Disabled,
         parse_switch_with_opt_path, [TRACKED],
         "compile the program with profiling instrumentation"),
+    profile_sample_use: Option<PathBuf> = (None, parse_opt_pathbuf, [TRACKED],
+        "use the given `.prof` file for sample-based profile-guided optimization"),
     profile_use: Option<PathBuf> = (None, parse_opt_pathbuf, [TRACKED],
         "use the given `.profdata` file for profile-guided optimization"),
     #[rustc_lint_opt_deny_field_access("use `Session::relocation_model` instead of this field")]
@@ -2325,10 +2335,12 @@ options! {
         parse_symbol_mangling_version, [TRACKED],
         "which mangling version to use for symbol names ('legacy', 'v0' (default), or 'hashed')"),
     target_cpu: Option<String> = (None, parse_opt_string, [TRACKED] { TARGET_MODIFIER: TargetCpu },
-        "select target processor (`rustc --print target-cpus` for details)"),
+        "select target processor (`rustc --print target-cpus` for details) \
+        The resulting binary must only be executed on CPUs that have all the features \
+        of the given CPU."),
     target_feature: String = (String::new(), parse_target_feature, [TRACKED],
-        "target specific attributes. (`rustc --print target-features` for details). \
-        This feature is unsafe."),
+        "target-specific attributes (`rustc --print target-features` for details). \
+        The resulting binary must only be executed on CPUs that have all the given features."),
     unsafe_allow_abi_mismatch: Vec<String> = (Vec::new(), parse_comma_list, [UNTRACKED],
         "Allow incompatible target modifiers in dependency crates (comma separated list)"),
     // tidy-alphabetical-end
@@ -2422,7 +2434,7 @@ options! {
     debuginfo_compression: DebugInfoCompression = (DebugInfoCompression::None, parse_debuginfo_compression, [TRACKED],
         "compress debug info sections (none, zlib, zstd, default: none)"),
     debuginfo_for_profiling: bool = (false, parse_bool, [TRACKED],
-        "emit discriminators and other data necessary for AutoFDO"),
+        "emit extra debug info to make sample profile more accurate"),
     deduplicate_diagnostics: bool = (true, parse_bool, [UNTRACKED],
         "deduplicate identical diagnostics (default: yes)"),
     default_visibility: Option<SymbolVisibility> = (None, parse_opt_symbol_visibility, [TRACKED],
@@ -2443,7 +2455,7 @@ options! {
     dual_proc_macros: bool = (false, parse_bool, [TRACKED],
         "load proc macros for both target and host, but only link to the target (default: no)"),
     dump_dep_graph: bool = (false, parse_bool, [UNTRACKED],
-        "dump the dependency graph to $RUST_DEP_GRAPH (default: /tmp/dep_graph.gv) \
+        "dump the dependency graph to `$RUST_DEP_GRAPH` as both a text file and a GraphViz dot file (default: ./dep_graph.{dot, txt}) \
         (default: no)"),
     dump_mir: Option<String> = (None, parse_opt_string, [UNTRACKED],
         "dump MIR state to file.
@@ -2766,8 +2778,6 @@ options! {
         "how to run proc-macro code (default: same-thread)"),
     profile_closures: bool = (false, parse_no_value, [UNTRACKED],
         "profile size of closures"),
-    profile_sample_use: Option<PathBuf> = (None, parse_opt_pathbuf, [TRACKED],
-        "use the given `.prof` file for sampled profile-guided optimization (also known as AutoFDO)"),
     profiler_runtime: String = (String::from("profiler_builtins"), parse_string, [TRACKED],
         "name of the profiler runtime crate to automatically inject (default: `profiler_builtins`)"),
     query_dep_graph: bool = (false, parse_bool, [UNTRACKED],
@@ -2979,6 +2989,8 @@ written to standard error output)"),
     // FIXME remove this after a couple releases
     wasm_c_abi: () = ((), parse_wasm_c_abi, [TRACKED],
         "use spec-compliant C ABI for `wasm32-unknown-unknown` (deprecated, always enabled)"),
+    wasm_proc_macros: bool = (false, parse_bool, [TRACKED],
+        "enable support for compiling and loading wasm proc macros"),
     write_long_types_to_disk: bool = (true, parse_bool, [UNTRACKED],
         "whether long type names should be written to files instead of being printed in errors"),
     // tidy-alphabetical-end

@@ -5,7 +5,7 @@ use core::ops::{Bound, ControlFlow};
 
 use ast::mut_visit::{self, MutVisitor};
 use ast::token::IdentIsRaw;
-use ast::{CoroutineKind, ForLoopKind, GenBlockKind, MatchKind, Pat, Path, PathSegment, Recovered};
+use ast::{ForLoopKind, MatchKind, Pat, Path, PathSegment, Recovered};
 use rustc_ast::token::{self, Delimiter, InvisibleOrigin, MetaVarKind, Token, TokenKind};
 use rustc_ast::util::case::Case;
 use rustc_ast::util::classify;
@@ -13,16 +13,15 @@ use rustc_ast::util::parser::{AssocOp, ExprPrecedence, Fixity, prec_let_scrutine
 use rustc_ast::visit::{Visitor, walk_expr};
 use rustc_ast::{
     self as ast, AnonConst, Arm, AssignOp, AssignOpKind, AttrStyle, AttrVec, BinOp, BinOpKind,
-    BlockCheckMode, CaptureBy, ClosureBinder, DUMMY_NODE_ID, Expr, ExprField, ExprKind, FnDecl,
-    FnRetTy, ForLoop, Guard, Label, MacCall, MetaItemLit, Movability, Param, RangeLimits, StmtKind,
-    Ty, TyKind, UnOp, UnsafeBinderCastKind, YieldKind,
+    BlockCheckMode, CaptureBy, ClosureBinder, CoroutineKind, DUMMY_NODE_ID, Expr, ExprField,
+    ExprKind, FnDecl, FnRetTy, ForLoop, Guard, Label, MacCall, MetaItemLit, Movability, Param,
+    RangeLimits, StmtKind, Ty, TyKind, UnOp, UnsafeBinderCastKind, YieldKind,
 };
 use rustc_ast_pretty::pprust;
-use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_errors::{Applicability, Diag, PResult, StashKey, Subdiagnostic};
+use rustc_lint_defs::builtin::BREAK_WITH_LABEL_AND_LOOP;
 use rustc_literal_escaper::unescape_char;
-use rustc_session::diagnostics::{ExprParenthesesNeeded, report_lit_error};
-use rustc_session::lint::builtin::BREAK_WITH_LABEL_AND_LOOP;
+use rustc_session::diagnostics::report_lit_error;
 use rustc_span::edition::Edition;
 use rustc_span::{BytePos, ErrorGuaranteed, Ident, Pos, Span, Spanned, Symbol, kw, respan, sym};
 use thin_vec::{ThinVec, thin_vec};
@@ -35,6 +34,7 @@ use super::{
     AttrWrapper, BlockMode, ClosureSpans, ExpTokenPair, ForceCollect, Parser, PathStyle,
     Restrictions, SemiColonMode, SeqSep, TokenType, Trailing, UsePreAttrPos,
 };
+use crate::diagnostics::ExprParenthesesNeeded;
 use crate::{diagnostics, exp, maybe_recover_from_interpolated_ty_qpath};
 
 #[derive(Debug)]
@@ -85,30 +85,9 @@ impl<'a> Parser<'a> {
         self.parse_expr().map(|value| AnonConst { id: DUMMY_NODE_ID, value })
     }
 
-    fn parse_expr_catch_underscore(
-        &mut self,
-        restrictions: Restrictions,
-    ) -> PResult<'a, Box<Expr>> {
-        match self.parse_expr_res(restrictions) {
-            Ok(expr) => Ok(expr),
-            Err(err) => match self.token.ident() {
-                Some((Ident { name: kw::Underscore, .. }, IdentIsRaw::No))
-                    if self.may_recover() && self.look_ahead(1, |t| t == &token::Comma) =>
-                {
-                    // Special-case handling of `foo(_, _, _)`
-                    let guar = err.emit();
-                    self.bump();
-                    Ok(self.mk_expr(self.prev_token.span, ExprKind::Err(guar)))
-                }
-                _ => Err(err),
-            },
-        }
-    }
-
     /// Parses a sequence of expressions delimited by parentheses.
     fn parse_expr_paren_seq(&mut self) -> PResult<'a, ThinVec<Box<Expr>>> {
-        self.parse_paren_comma_seq(|p| p.parse_expr_catch_underscore(Restrictions::empty()))
-            .map(|(r, _)| r)
+        self.parse_paren_comma_seq(Self::parse_expr).map(|(r, _)| r)
     }
 
     /// Parses an expression, subject to the given restrictions.
@@ -911,49 +890,46 @@ impl<'a> Parser<'a> {
         mut e: Box<Expr>,
         lo: Span,
     ) -> PResult<'a, Box<Expr>> {
-        let mut res = ensure_sufficient_stack(|| {
-            loop {
-                let has_question =
-                    if self.prev_token == TokenKind::Ident(kw::Return, IdentIsRaw::No) {
-                        // We are using noexpect here because we don't expect a `?` directly after
-                        // a `return` which could be suggested otherwise.
-                        self.eat_noexpect(&token::Question)
-                    } else {
-                        self.eat(exp!(Question))
-                    };
-                if has_question {
-                    // `expr?`
-                    e = self.mk_expr(lo.to(self.prev_token.span), ExprKind::Try(e));
-                    continue;
-                }
-                let has_dot = if self.prev_token == TokenKind::Ident(kw::Return, IdentIsRaw::No) {
-                    // We are using noexpect here because we don't expect a `.` directly after
-                    // a `return` which could be suggested otherwise.
-                    self.eat_noexpect(&token::Dot)
-                } else if self.token == TokenKind::RArrow && self.may_recover() {
-                    // Recovery for `expr->suffix`.
-                    self.bump();
-                    let span = self.prev_token.span;
-                    self.dcx().emit_err(diagnostics::ExprRArrowCall { span });
-                    true
-                } else {
-                    self.eat(exp!(Dot))
-                };
-                if has_dot {
-                    // expr.f
-                    e = self.parse_dot_suffix_expr(lo, e)?;
-                    continue;
-                }
-                if self.expr_is_complete(&e) {
-                    return Ok(e);
-                }
-                e = match self.token.kind {
-                    token::OpenParen => self.parse_expr_fn_call(lo, e),
-                    token::OpenBracket => self.parse_expr_index(lo, e)?,
-                    _ => return Ok(e),
-                }
+        let mut res = loop {
+            let has_question = if self.prev_token == TokenKind::Ident(kw::Return, IdentIsRaw::No) {
+                // We are using noexpect here because we don't expect a `?` directly after
+                // a `return` which could be suggested otherwise.
+                self.eat_noexpect(&token::Question)
+            } else {
+                self.eat(exp!(Question))
+            };
+            if has_question {
+                // `expr?`
+                e = self.mk_expr(lo.to(self.prev_token.span), ExprKind::Try(e));
+                continue;
             }
-        });
+            let has_dot = if self.prev_token == TokenKind::Ident(kw::Return, IdentIsRaw::No) {
+                // We are using noexpect here because we don't expect a `.` directly after
+                // a `return` which could be suggested otherwise.
+                self.eat_noexpect(&token::Dot)
+            } else if self.token == TokenKind::RArrow && self.may_recover() {
+                // Recovery for `expr->suffix`.
+                self.bump();
+                let span = self.prev_token.span;
+                self.dcx().emit_err(diagnostics::ExprRArrowCall { span });
+                true
+            } else {
+                self.eat(exp!(Dot))
+            };
+            if has_dot {
+                // expr.f
+                e = self.parse_dot_suffix_expr(lo, e)?;
+                continue;
+            }
+            if self.expr_is_complete(&e) {
+                break Ok(e);
+            }
+            e = match self.token.kind {
+                token::OpenParen => self.parse_expr_fn_call(lo, e),
+                token::OpenBracket => self.parse_expr_index(lo, e)?,
+                _ => break Ok(e),
+            }
+        };
 
         // Stitch the list of outer attributes onto the return value. A little
         // bit ugly, but the best way given the current code structure.
@@ -1647,7 +1623,7 @@ impl<'a> Parser<'a> {
         let (es, trailing_comma) = match self.parse_seq_to_end(
             exp!(CloseParen),
             SeqSep::trailing_allowed(exp!(Comma)),
-            |p| p.parse_expr_catch_underscore(restrictions.intersection(Restrictions::ALLOW_LET)),
+            |p| p.parse_expr_res(restrictions.intersection(Restrictions::ALLOW_LET)),
         ) {
             Ok(x) => x,
             Err(err) => {
@@ -2482,14 +2458,14 @@ impl<'a> Parser<'a> {
             Movability::Movable
         };
 
-        let coroutine_kind = if self.token_uninterpolated_span().at_least_rust_2018() {
-            self.parse_coroutine_kind(Case::Sensitive)
+        let coroutine_marker = if self.token_uninterpolated_span().at_least_rust_2018() {
+            self.parse_coroutine_marker(Case::Sensitive)
         } else {
             None
         };
 
         if let ClosureBinder::NotPresent = binder
-            && coroutine_kind.is_some()
+            && coroutine_marker.is_some()
         {
             // coroutine closures and generators can have the same qualifiers, so we might end up
             // in here if there is a missing `|` but also no `{`. Adjust the expectations in that case.
@@ -2515,14 +2491,12 @@ impl<'a> Parser<'a> {
             FnRetTy::Ty(ty) => self.parse_closure_block_body(ty.span)?,
         };
 
-        match coroutine_kind {
-            Some(CoroutineKind::Async { .. }) => {}
-            Some(CoroutineKind::Gen { span, .. }) | Some(CoroutineKind::AsyncGen { span, .. }) => {
-                // Feature-gate `gen ||` and `async gen ||` closures.
-                // FIXME(gen_blocks): This perhaps should be a different gate.
-                self.psess.gated_spans.gate(sym::gen_blocks, span);
-            }
-            None => {}
+        if let Some(coroutine_marker) = coroutine_marker
+            && coroutine_marker.kind.is_gen()
+        {
+            // Feature-gate `gen ||` and `async gen ||` closures.
+            // FIXME(gen_blocks): This perhaps should be a different gate.
+            self.psess.gated_spans.gate(sym::gen_blocks, coroutine_marker.span);
         }
 
         if self.token == TokenKind::Semi
@@ -2546,7 +2520,7 @@ impl<'a> Parser<'a> {
                 binder,
                 capture_clause,
                 constness,
-                coroutine_kind,
+                coroutine_marker,
                 movability,
                 fn_decl,
                 body,
@@ -2780,6 +2754,17 @@ impl<'a> Parser<'a> {
                                 "you likely meant to continue parsing the let-chain starting here",
                             );
                         } else {
+                            if self.prev_token == token::Semi
+                                && (self.token == token::OpenBrace || AssocOp::from_token(&self.token).is_some())
+                            {
+                                err.span_suggestion_verbose(
+                                    self.prev_token.span,
+                                    "remove this semicolon",
+                                    "",
+                                    Applicability::MaybeIncorrect,
+                                );
+                            }
+
                             // Look for usages of '=>' where '>=' might be intended
                             if maybe_fatarrow == token::FatArrow {
                                 err.span_suggestion_verbose(
@@ -2871,7 +2856,7 @@ impl<'a> Parser<'a> {
         let else_span = self.prev_token.span; // `else`
         let attrs = self.parse_outer_attributes()?; // For recovery.
         let expr = if self.eat_keyword(exp!(If)) {
-            ensure_sufficient_stack(|| self.parse_expr_if())?
+            self.parse_expr_if()?
         } else if self.check(exp!(OpenBrace)) {
             self.parse_simple_block()?
         } else {
@@ -3730,18 +3715,13 @@ impl<'a> Parser<'a> {
     fn parse_gen_block(&mut self) -> PResult<'a, Box<Expr>> {
         let lo = self.token.span;
         let kind = if self.eat_keyword(exp!(Async)) {
-            if self.eat_keyword(exp!(Gen)) { GenBlockKind::AsyncGen } else { GenBlockKind::Async }
+            if self.eat_keyword(exp!(Gen)) { CoroutineKind::AsyncGen } else { CoroutineKind::Async }
         } else {
             assert!(self.eat_keyword(exp!(Gen)));
-            GenBlockKind::Gen
+            CoroutineKind::Gen
         };
-        match kind {
-            GenBlockKind::Async => {
-                // `async` blocks are stable
-            }
-            GenBlockKind::Gen | GenBlockKind::AsyncGen => {
-                self.psess.gated_spans.gate(sym::gen_blocks, lo.to(self.prev_token.span));
-            }
+        if kind.is_gen() {
+            self.psess.gated_spans.gate(sym::gen_blocks, lo.to(self.prev_token.span));
         }
         let capture_clause = self.parse_capture_clause()?;
         let decl_span = lo.to(self.prev_token.span);
@@ -4254,7 +4234,7 @@ impl<'a> Parser<'a> {
                 constness: rustc_ast::Const::No,
                 movability: rustc_ast::Movability::Movable,
                 capture_clause: rustc_ast::CaptureBy::Ref,
-                coroutine_kind: None,
+                coroutine_marker: None,
                 fn_decl: Box::new(rustc_ast::FnDecl {
                     inputs: Default::default(),
                     output: rustc_ast::FnRetTy::Default(span),

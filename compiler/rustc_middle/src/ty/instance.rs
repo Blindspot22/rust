@@ -3,15 +3,15 @@ use std::{assert_matches, fmt};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir as hir;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::{CtorKind, DefKind, Namespace};
 use rustc_hir::def_id::{CrateNum, DefId};
-use rustc_hir::lang_items::LangItem;
 use rustc_macros::{Lift, StableHash, TyDecodable, TyEncodable};
 use rustc_span::def_id::LOCAL_CRATE;
 use rustc_span::{DUMMY_SP, Span};
 use tracing::{debug, instrument};
 
-use crate::error;
+use crate::diagnostics;
 use crate::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use crate::ty::normalize_erasing_regions::NormalizationError;
 use crate::ty::print::{FmtPrinter, Print};
@@ -177,12 +177,19 @@ pub enum ShimKind<'tcx> {
     /// The `DefId` is for `Clone::clone`, the `Ty` is the type `T` with the builtin `Clone` impl.
     Clone(DefId, Ty<'tcx>),
 
-    /// Compiler-generated `<T as FnPtr>::addr` implementation.
+    /// Compiler-generated `<T as FnPtr>::as_ptr` implementation.
     ///
     /// Automatically generated for all potentially higher-ranked `fn(I) -> R` types.
     ///
-    /// The `DefId` is for `FnPtr::addr`, the `Ty` is the type `T`.
-    FnPtrAddr(DefId, Ty<'tcx>),
+    /// The `DefId` is for `FnPtr::as_ptr`, the `Ty` is the type `T`.
+    FnPtrAsPtr(DefId, Ty<'tcx>),
+
+    /// Compiler-generated `<T as FnPtr>::from_ptr` implementation.
+    ///
+    /// Automatically generated for all potentially higher-ranked `fn(I) -> R` types.
+    ///
+    /// The `DefId` is for `FnPtr::from_ptr`, the `Ty` is the type `T`.
+    FnPtrFromPtr(DefId, Ty<'tcx>),
 
     /// `core::future::async_drop::async_drop_in_place::<'_, T>`.
     ///
@@ -344,7 +351,8 @@ impl<'tcx> ShimKind<'tcx> {
             }
             | ShimKind::DropGlue(def_id, _)
             | ShimKind::Clone(def_id, _)
-            | ShimKind::FnPtrAddr(def_id, _)
+            | ShimKind::FnPtrAsPtr(def_id, _)
+            | ShimKind::FnPtrFromPtr(def_id, _)
             | ShimKind::FutureDropPoll(def_id, _, _)
             | ShimKind::AsyncDropGlue(def_id, _)
             | ShimKind::AsyncDropGlueCtor(def_id, _) => def_id,
@@ -366,7 +374,8 @@ impl<'tcx> ShimKind<'tcx> {
             | ShimKind::ConstructCoroutineInClosure { .. }
             | ShimKind::DropGlue(..)
             | ShimKind::Clone(..)
-            | ShimKind::FnPtrAddr(..) => None,
+            | ShimKind::FnPtrAsPtr(..)
+            | ShimKind::FnPtrFromPtr(..) => None,
         }
     }
 
@@ -385,8 +394,9 @@ impl<'tcx> ShimKind<'tcx> {
         match *self {
             ShimKind::Clone(..)
             | ShimKind::ThreadLocal(..)
-            | ShimKind::FnPtrAddr(..)
             | ShimKind::FnPtr(..)
+            | ShimKind::FnPtrAsPtr(..)
+            | ShimKind::FnPtrFromPtr(..)
             | ShimKind::DropGlue(_, Some(_))
             | ShimKind::FutureDropPoll(..)
             | ShimKind::AsyncDropGlue(_, _) => false,
@@ -618,7 +628,7 @@ impl<'tcx> Instance<'tcx> {
             Ok(None) => {
                 let type_length = type_length(args);
                 if !tcx.type_length_limit().value_within_limit(type_length) {
-                    tcx.dcx().emit_fatal(error::TypeLengthLimit {
+                    tcx.dcx().emit_fatal(diagnostics::TypeLengthLimit {
                         // We don't use `def_span(def_id)` so that diagnostics point
                         // to the crate root during mono instead of to foreign items.
                         // This is arguably better.
@@ -866,22 +876,22 @@ impl<'tcx> Instance<'tcx> {
                 coroutine_kind,
                 hir::CoroutineKind::Desugared(hir::CoroutineDesugaring::Async, _)
             );
-            hir::LangItem::FuturePoll
+            LangItem::FuturePoll
         } else if tcx.is_lang_item(trait_id, LangItem::Iterator) {
             assert_matches!(
                 coroutine_kind,
                 hir::CoroutineKind::Desugared(hir::CoroutineDesugaring::Gen, _)
             );
-            hir::LangItem::IteratorNext
+            LangItem::IteratorNext
         } else if tcx.is_lang_item(trait_id, LangItem::AsyncIterator) {
             assert_matches!(
                 coroutine_kind,
                 hir::CoroutineKind::Desugared(hir::CoroutineDesugaring::AsyncGen, _)
             );
-            hir::LangItem::AsyncIteratorPollNext
+            LangItem::AsyncIteratorPollNext
         } else if tcx.is_lang_item(trait_id, LangItem::Coroutine) {
             assert_matches!(coroutine_kind, hir::CoroutineKind::Coroutine(_));
-            hir::LangItem::CoroutineResume
+            LangItem::CoroutineResume
         } else {
             return None;
         };

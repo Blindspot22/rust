@@ -362,7 +362,8 @@ macro_rules! make_mir_visitor {
                         ty::InstanceKind::Shim(ty::ShimKind::FnPtr(_def_id, ty))
                         | ty::InstanceKind::Shim(ty::ShimKind::DropGlue(_def_id, Some(ty)))
                         | ty::InstanceKind::Shim(ty::ShimKind::Clone(_def_id, ty))
-                        | ty::InstanceKind::Shim(ty::ShimKind::FnPtrAddr(_def_id, ty))
+                        | ty::InstanceKind::Shim(ty::ShimKind::FnPtrAsPtr(_def_id, ty))
+                        | ty::InstanceKind::Shim(ty::ShimKind::FnPtrFromPtr(_def_id, ty))
                         | ty::InstanceKind::Shim(ty::ShimKind::AsyncDropGlue(_def_id, ty))
                         | ty::InstanceKind::Shim(ty::ShimKind::AsyncDropGlueCtor(_def_id, ty)) => {
                             // FIXME(eddyb) use a better `TyContext` here.
@@ -1354,8 +1355,6 @@ pub enum MutatingUseContext {
     /// f(&mut x.y);
     /// ```
     Projection,
-    /// Retagging, a "Stacked Borrows" shadow state operation
-    Retag,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

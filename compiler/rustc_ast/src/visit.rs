@@ -15,13 +15,14 @@
 
 pub use rustc_ast_ir::visit::VisitorResult;
 pub use rustc_ast_ir::{try_visit, visit_opt, walk_list, walk_visitable_list};
+use rustc_macros::StableHash;
 use rustc_span::{Ident, Span, Spanned, Symbol};
 use thin_vec::ThinVec;
 
 use crate::ast::*;
 use crate::tokenstream::DelimSpan;
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, StableHash)]
 pub enum AssocCtxt {
     Trait,
     Impl { of_trait: bool },
@@ -320,7 +321,12 @@ macro_rules! common_visitor_and_walkers {
             Fn(FnCtxt, &'a $($mut)? Visibility, &'a $($mut)? Fn),
 
             /// E.g., `|x, y| body`.
-            Closure(&'a $($mut)? ClosureBinder, &'a $($mut)? Option<CoroutineKind>, &'a $($mut)? Box<FnDecl>, &'a $($mut)? Box<Expr>),
+            Closure(
+                &'a $($mut)? ClosureBinder,
+                &'a $($mut)? Option<CoroutineMarker>,
+                &'a $($mut)? Box<FnDecl>,
+                &'a $($mut)? Box<Expr>
+            ),
         }
 
         impl<'a> FnKind<'_> {
@@ -393,6 +399,9 @@ macro_rules! common_visitor_and_walkers {
             ThinVec<PathSegment>,
             ThinVec<PreciseCapturingArg>,
             ThinVec<Pat>,
+            ThinVec<TestBinderConstraint>,
+            ThinVec<TestBinderExists>,
+            ThinVec<TestBinderForall>,
             ThinVec<Box<Ty>>,
             ThinVec<TyPat>,
             ThinVec<EiiImpl>,
@@ -413,7 +422,7 @@ macro_rules! common_visitor_and_walkers {
             AttrStyle,
             FnPtrTy,
             BindingMode,
-            GenBlockKind,
+            CoroutineKind,
             RangeLimits,
             UnsafeBinderCastKind,
             BinOpKind,
@@ -564,7 +573,7 @@ macro_rules! common_visitor_and_walkers {
                 fn visit_capture_by(CaptureBy);
                 fn visit_closure_binder(ClosureBinder);
                 fn visit_contract(FnContract);
-                fn visit_coroutine_kind(CoroutineKind);
+                fn visit_coroutine_marker(CoroutineMarker);
                 fn visit_crate(Crate);
                 fn visit_expr(Expr);
                 fn visit_expr_field(ExprField);
@@ -599,6 +608,11 @@ macro_rules! common_visitor_and_walkers {
                 fn visit_poly_trait_ref(PolyTraitRef);
                 fn visit_precise_capturing_arg(PreciseCapturingArg);
                 fn visit_qself(QSelf);
+                fn visit_test_binder_body(TestBinderBody);
+                fn visit_test_binder_constraint(TestBinderConstraint);
+                fn visit_test_binder_constraints(TestBinderConstraints);
+                fn visit_test_binder_exists(TestBinderExists);
+                fn visit_test_binder_forall(TestBinderForall);
                 fn visit_trait_ref(TraitRef);
                 fn visit_ty_pat(TyPat);
                 fn visit_ty(Ty);
@@ -864,6 +878,8 @@ macro_rules! common_visitor_and_walkers {
                         visit_visitable!($($mut)? vis, delegation),
                     ItemKind::DelegationMac(dm) =>
                         visit_visitable!($($mut)? vis, dm),
+                    ItemKind::TestBinderConstraints(item) =>
+                        visit_visitable!($($mut)? vis, item),
                 }
                 V::Result::output()
             }
@@ -941,8 +957,8 @@ macro_rules! common_visitor_and_walkers {
                         contract, body, span, define_opaque, eii_impl
                     );
                 }
-                FnKind::Closure(binder, coroutine_kind, decl, body) =>
-                    visit_visitable!($($mut)? vis, binder, coroutine_kind, decl, body),
+                FnKind::Closure(binder, coroutine_marker, decl, body) =>
+                    visit_visitable!($($mut)? vis, binder, coroutine_marker, decl, body),
             }
             V::Result::output()
         }
@@ -1008,7 +1024,7 @@ macro_rules! common_visitor_and_walkers {
                 ExprKind::Closure(Closure {
                     binder,
                     capture_clause,
-                    coroutine_kind,
+                    coroutine_marker,
                     constness,
                     movability,
                     fn_decl,
@@ -1017,7 +1033,7 @@ macro_rules! common_visitor_and_walkers {
                     fn_arg_span,
                 }) => {
                     visit_visitable!($($mut)? vis, constness, movability, capture_clause);
-                    let kind = FnKind::Closure(binder, coroutine_kind, fn_decl, body);
+                    let kind = FnKind::Closure(binder, coroutine_marker, fn_decl, body);
                     try_visit!(vis.visit_fn(kind, attrs, *span, *id));
                     visit_visitable!($($mut)? vis, fn_decl_span, fn_arg_span);
                 }
@@ -1092,7 +1108,7 @@ macro_rules! common_visitor_and_walkers {
             pub fn walk_capture_by(CaptureBy);
             pub fn walk_closure_binder(ClosureBinder);
             pub fn walk_contract(FnContract);
-            pub fn walk_coroutine_kind(CoroutineKind);
+            pub fn walk_coroutine_marker(CoroutineMarker);
             pub fn walk_crate(Crate);
             pub fn walk_expr(Expr);
             pub fn walk_expr_field(ExprField);
@@ -1127,6 +1143,10 @@ macro_rules! common_visitor_and_walkers {
             pub fn walk_poly_trait_ref(PolyTraitRef);
             pub fn walk_precise_capturing_arg(PreciseCapturingArg);
             pub fn walk_qself(QSelf);
+            pub fn walk_test_binder_body(TestBinderBody);
+            pub fn walk_test_binder_constraint(TestBinderConstraint);
+            pub fn walk_test_binder_exists(TestBinderExists);
+            pub fn walk_test_binder_forall(TestBinderForall);
             pub fn walk_trait_ref(TraitRef);
             pub fn walk_ty_pat(TyPat);
             pub fn walk_ty(Ty);

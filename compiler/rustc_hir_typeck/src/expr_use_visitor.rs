@@ -451,7 +451,7 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
             }
 
             hir::ExprKind::Let(hir::LetExpr { pat, init, .. }) => {
-                self.walk_local(init, pat, None, || self.borrow_expr(init, BorrowKind::Immutable))?;
+                self.walk_local(init, pat, None)?;
             }
 
             hir::ExprKind::Match(discr, arms, _) => {
@@ -577,7 +577,7 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
     fn walk_stmt(&self, stmt: &hir::Stmt<'_>) -> Result<(), Cx::Error> {
         match stmt.kind {
             hir::StmtKind::Let(hir::LetStmt { pat, init: Some(expr), els, .. }) => {
-                self.walk_local(expr, pat, *els, || Ok(()))?;
+                self.walk_local(expr, pat, *els)?;
             }
 
             hir::StmtKind::Let(_) => {}
@@ -617,19 +617,14 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
         Ok(())
     }
 
-    fn walk_local<F>(
+    fn walk_local(
         &self,
         expr: &hir::Expr<'_>,
         pat: &hir::Pat<'_>,
         els: Option<&hir::Block<'_>>,
-        mut f: F,
-    ) -> Result<(), Cx::Error>
-    where
-        F: FnMut() -> Result<(), Cx::Error>,
-    {
+    ) -> Result<(), Cx::Error> {
         self.walk_expr(expr)?;
         let expr_place = self.cat_expr(expr)?;
-        f()?;
         self.fake_read_scrutinee(&expr_place, els.is_some())?;
         self.walk_pat(&expr_place, pat, false)?;
         if let Some(els) = els {
@@ -958,7 +953,6 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
                     }
                 }
                 PatKind::Or(_)
-                | PatKind::Box(_)
                 | PatKind::Ref(..)
                 | PatKind::Guard(..)
                 | PatKind::Tuple(..)
@@ -1768,8 +1762,8 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
                 self.cat_pattern(place_with_id, subpat, op)?;
             }
 
-            PatKind::Box(subpat) | PatKind::Ref(subpat, _, _) => {
-                // box p1, &p1, &mut p1. we can ignore the mutability of
+            PatKind::Ref(subpat, _, _) => {
+                // &p1, &mut p1. we can ignore the mutability of
                 // PatKind::Ref since that information is already contained
                 // in the type.
                 let subplace = self.cat_deref(pat.hir_id, place_with_id)?;

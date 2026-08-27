@@ -188,6 +188,7 @@ symbols! {
         Clone,
         CoercePointee,
         CoercePointeeValidated,
+        CoerceShared,
         CoerceUnsized,
         Const,
         ConstParamTy,
@@ -256,7 +257,6 @@ symbols! {
         Mutex,
         MutexGuard,
         Named,
-        NonNull,
         NonZero,
         None,
         Normal,
@@ -634,6 +634,7 @@ symbols! {
         cmp_partialord_lt,
         cmpxchg16b_target_feature,
         cmse_nonsecure_entry,
+        code,
         coerce_pointee_validated,
         coerce_shared,
         coerce_shared_target,
@@ -653,6 +654,7 @@ symbols! {
         compiler_copy,
         compiler_fence,
         compiler_move,
+        complex,
         concat,
         concat_bytes,
         conservative_impl_trait,
@@ -905,6 +907,7 @@ symbols! {
         exhaustive_integer_patterns,
         exhaustive_patterns,
         existential_type,
+        exists,
         exp2f16,
         exp2f32,
         exp2f64,
@@ -1003,8 +1006,11 @@ symbols! {
         fn_mut,
         fn_once,
         fn_once_output,
-        fn_ptr_addr,
+        fn_ptr_as_ptr,
+        fn_ptr_from_ptr,
         fn_ptr_trait,
+        fn_static,
+        forall,
         forbid,
         force_target_feature,
         forget,
@@ -1388,6 +1394,7 @@ symbols! {
         naked_functions_rustic_abi,
         naked_functions_target_feature,
         name,
+        named_fn_trait_parameters,
         names,
         native_link_modifiers,
         native_link_modifiers_as_needed,
@@ -1446,6 +1453,7 @@ symbols! {
         non_exhaustive_omitted_patterns_lint,
         non_lifetime_binders,
         non_modrs_mods,
+        non_null,
         nonblocking,
         none,
         nontemporal_store,
@@ -1465,6 +1473,7 @@ symbols! {
         of,
         off,
         offload,
+        offload_get_num_devices,
         offload_kernel,
         offset,
         offset_of,
@@ -1630,6 +1639,8 @@ symbols! {
         ptr_const_is_null,
         ptr_copy,
         ptr_copy_nonoverlapping,
+        ptr_drop_in_place,
+        ptr_drop_in_place_self,
         ptr_from_ref,
         ptr_guaranteed_cmp,
         ptr_is_null,
@@ -1794,6 +1805,7 @@ symbols! {
         rustc_doc_primitive,
         rustc_driver,
         rustc_dummy,
+        rustc_dump_clauses,
         rustc_dump_def_parents,
         rustc_dump_def_path,
         rustc_dump_generics,
@@ -1802,7 +1814,6 @@ symbols! {
         rustc_dump_item_bounds,
         rustc_dump_layout,
         rustc_dump_object_lifetime_defaults,
-        rustc_dump_predicates,
         rustc_dump_symbol_name,
         rustc_dump_user_args,
         rustc_dump_variances,
@@ -1860,7 +1871,6 @@ symbols! {
         rustc_pub_transparent,
         rustc_reallocator,
         rustc_regions,
-        rustc_reservation_impl,
         rustc_scalable_vector,
         rustc_should_not_be_called_on_const_items,
         rustc_simd_monomorphize_lane_limit,
@@ -2115,6 +2125,7 @@ symbols! {
         test,
         test_2018_feature,
         test_accepted_feature,
+        test_binder_constraints,
         test_case,
         test_incomplete_feature,
         test_removed_feature,
@@ -2177,6 +2188,7 @@ symbols! {
         type_id_field_representing_type,
         type_id_fields,
         type_id_generics,
+        type_id_is_signed,
         type_id_variants,
         type_id_vtable,
         type_info,
@@ -2304,6 +2316,7 @@ symbols! {
         usize_legacy_mod,
         v1,
         v8plus,
+        v9,
         va_arg,
         va_arg_safe,
         va_copy,
@@ -2316,6 +2329,8 @@ symbols! {
         var,
         variadic,
         variant_count,
+        variant_name,
+        variant_non_exhaustive,
         variants,
         vec,
         vector,
@@ -2925,9 +2940,13 @@ pub mod kw {
 ///
 /// Given that `sym` is imported, use them like `sym::symbol_name`.
 /// For example `sym::rustfmt` or `sym::u8`.
+#[diagnostic::on_unknown(
+    label = "`{Unresolved}` is not a pre-interned symbol",
+    note = "consider adding `{Unresolved}` to the `symbols!` invocation in compiler/rustc_span/src/symbol.rs"
+)]
 pub mod sym {
-    // Used from a macro in `librustc_feature/accepted.rs`
     use super::Symbol;
+    // Used from a macro in `librustc_feature/accepted.rs`
     pub use super::kw::MacroRules as macro_rules;
     #[doc(inline)]
     pub use super::sym_generated::*;

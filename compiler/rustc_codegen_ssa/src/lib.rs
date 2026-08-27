@@ -7,7 +7,6 @@
 #![feature(try_blocks)]
 #![recursion_limit = "256"]
 // tidy-alphabetical-end
-#![cfg_attr(bootstrap, feature(string_from_utf8_lossy_owned))]
 
 //! This crate contains codegen code that is used by all codegen backends (LLVM and others).
 //! The backend-agnostic functions of this crate use functions defined in various traits that
@@ -19,12 +18,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rustc_abi::Size;
+use rustc_crate_store::{self as cstore, CrateSource};
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_hir::CRATE_HIR_ID;
-use rustc_hir::attrs::{CfgEntry, NativeLibKind, WindowsSubsystemKind};
+use rustc_hir::attrs::{CfgEntry, WindowsSubsystemKind};
 use rustc_hir::def_id::CrateNum;
-use rustc_lint_defs::builtin::LINKER_INFO;
+use rustc_lint_defs::builtin::{LINKER_INFO, LINKER_MESSAGES};
 use rustc_macros::{Decodable, Encodable};
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::dep_graph::WorkProduct;
@@ -37,10 +37,9 @@ use rustc_middle::util::Providers;
 use rustc_serialize::opaque::{FileEncoder, MemDecoder};
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use rustc_session::Session;
-use rustc_session::config::{CrateType, OutputFilenames, OutputType};
-use rustc_session::cstore::{self, CrateSource};
-use rustc_session::lint::builtin::LINKER_MESSAGES;
+use rustc_session::config::{OutputFilenames, OutputType};
 use rustc_span::{Span, Symbol};
+use rustc_structures::{CrateType, NativeLibKind};
 
 pub mod assert_module_sources;
 pub mod back;
@@ -207,7 +206,7 @@ bitflags::bitflags! {
     }
 }
 
-// This is the same as `rustc_session::cstore::NativeLib`, except:
+// This is the same as `rustc_crate_store::NativeLib`, except:
 // - (important) the `foreign_module` field is missing, because it contains a `DefId`, which can't
 //   be encoded with `FileEncoder`.
 // - (less important) the `verbatim` field is a `bool` rather than an `Option<bool>`, because here

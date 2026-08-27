@@ -1,9 +1,9 @@
 use std::io;
 use std::path::Path;
 
-use rustc_hir::attrs::CrateType;
 use rustc_macros::Diagnostic;
 use rustc_span::{Span, Symbol};
+use rustc_structures::CrateType;
 use rustc_target::spec::TargetTuple;
 
 #[derive(Diagnostic)]
@@ -52,6 +52,10 @@ pub(crate) struct MixedBinCrate;
 #[derive(Diagnostic)]
 #[diag("cannot mix `proc-macro` crate type with others")]
 pub(crate) struct MixedProcMacroCrate;
+
+#[derive(Diagnostic)]
+#[diag("cannot compile `proc-macro` crate to wasm targets without -Zwasm-proc-macros")]
+pub(crate) struct UnstableWasmProcMacro;
 
 #[derive(Diagnostic)]
 #[diag("error writing dependencies to `{$path}`: {$error}")]

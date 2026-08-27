@@ -8,7 +8,7 @@ use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_span::{Ident, Span, Spanned, Symbol};
 
 use crate::Res;
-use crate::late::{PatternSource, ResolvingRestrictionKind};
+use crate::late::PatternSource;
 
 pub(crate) mod impls;
 
@@ -386,6 +386,10 @@ pub(crate) struct SelfInGenericParamDefault {
 pub(crate) struct SelfInConstGenericTy {
     #[primary_span]
     pub(crate) span: Span,
+    #[help(
+        "add `#![feature(min_adt_const_params)]` to the crate attributes to enable `Self` as a const parameter type"
+    )]
+    pub(crate) enable_feature: bool,
 }
 
 #[derive(Diagnostic)]
@@ -546,19 +550,6 @@ pub(crate) struct ExpectedModuleFound {
 #[derive(Diagnostic)]
 #[diag("cannot determine resolution for the visibility", code = E0578)]
 pub(crate) struct Indeterminate(#[primary_span] pub(crate) Span);
-
-#[derive(Diagnostic)]
-#[diag(
-    "{$kind ->
-    [impl] trait implementation
-    *[mut] field mutation
-} can only be restricted to ancestor modules"
-)]
-pub(crate) struct RestrictionAncestorOnly {
-    #[primary_span]
-    pub(crate) span: Span,
-    pub(crate) kind: ResolvingRestrictionKind,
-}
 
 #[derive(Diagnostic)]
 #[diag("cannot use a tool module through an import")]
@@ -1232,14 +1223,14 @@ pub(crate) struct CannotFindBuiltinMacroWithName {
 
 #[derive(Subdiagnostic)]
 pub(crate) enum DefinedHere {
-    #[label("similarly named {$candidate_descr} `{$candidate}` defined here")]
+    #[note("similarly named {$candidate_descr} `{$candidate}` defined here")]
     SimilarlyNamed {
         #[primary_span]
         span: Span,
         candidate_descr: &'static str,
         candidate: Symbol,
     },
-    #[label("{$candidate_descr} `{$candidate}` defined here")]
+    #[note("{$candidate_descr} `{$candidate}` defined here")]
     SingleItem {
         #[primary_span]
         span: Span,

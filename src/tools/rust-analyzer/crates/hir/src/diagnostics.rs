@@ -32,7 +32,7 @@ use syntax::{
 };
 use triomphe::Arc;
 
-use crate::{AssocItem, Field, Function, GenericDef, Local, Trait, Type, TypeOwnerId, Variant};
+use crate::{AssocItem, Field, Function, GenericDef, Trait, Type, TypeOwnerId, Variant};
 
 pub use hir_def::VariantId;
 pub use hir_ty::{
@@ -105,6 +105,7 @@ diagnostics![AnyDiagnostic<'db> ->
     AwaitOutsideOfAsync,
     BreakOutsideOfLoop,
     CannotBeDereferenced<'db>,
+    UnaryOperatorCannotBeApplied<'db>,
     CannotImplicitlyDerefTraitObject<'db>,
     CannotIndexInto<'db>,
     CastToUnsized<'db>,
@@ -134,10 +135,8 @@ diagnostics![AnyDiagnostic<'db> ->
     MissingFields,
     MissingMatchArms,
     MissingUnsafe,
-    MovedOutOfRef<'db>,
     MutRefInImmRefPat,
     MutableRefBinding,
-    NeedMut<'db>,
     NonExhaustiveLet,
     NonExhaustiveRecordExpr,
     NonExhaustiveRecordPat,
@@ -168,8 +167,6 @@ diagnostics![AnyDiagnostic<'db> ->
     UnresolvedMethodCall<'db>,
     UnresolvedModule,
     UnresolvedIdent,
-    UnusedMut<'db>,
-    UnusedVariable<'db>,
     GenericArgsProhibited,
     ParenthesizedGenericArgsWithoutFnTrait,
     BadRtn,
@@ -309,8 +306,8 @@ pub struct MismatchedTupleStructPatArgCount {
 #[derive(Debug)]
 pub struct MismatchedArrayPatLen {
     pub pat: InFile<ExprOrPatPtr>,
-    pub expected: u128,
-    pub found: u128,
+    pub expected: u64,
+    pub found: u64,
     pub has_rest: bool,
 }
 
@@ -339,6 +336,13 @@ pub struct ExpectedFunction<'db> {
 #[derive(Debug)]
 pub struct CannotBeDereferenced<'db> {
     pub expr: InFile<ExprOrPatPtr>,
+    pub found: Type<'db>,
+}
+
+#[derive(Debug)]
+pub struct UnaryOperatorCannotBeApplied<'db> {
+    pub expr: InFile<ExprOrPatPtr>,
+    pub op: ast::UnaryOp,
     pub found: Type<'db>,
 }
 
@@ -474,28 +478,6 @@ pub struct TypeMismatch<'db> {
     pub expr_or_pat: InFile<ExprOrPatPtr>,
     pub expected: Type<'db>,
     pub actual: Type<'db>,
-}
-
-#[derive(Debug)]
-pub struct NeedMut<'db> {
-    pub local: Local<'db>,
-    pub span: InFile<SyntaxNodePtr>,
-}
-
-#[derive(Debug)]
-pub struct UnusedMut<'db> {
-    pub local: Local<'db>,
-}
-
-#[derive(Debug)]
-pub struct UnusedVariable<'db> {
-    pub local: Local<'db>,
-}
-
-#[derive(Debug)]
-pub struct MovedOutOfRef<'db> {
-    pub ty: Type<'db>,
-    pub span: InFile<SyntaxNodePtr>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1010,6 +992,10 @@ impl<'db> AnyDiagnostic<'db> {
             InferenceDiagnostic::CannotBeDereferenced { expr, found } => {
                 let expr = expr_syntax(*expr)?;
                 CannotBeDereferenced { expr, found: new_ty(found.as_ref()) }.into()
+            }
+            InferenceDiagnostic::UnaryOperatorCannotBeApplied { expr, op, found } => {
+                let expr = expr_syntax(*expr)?;
+                UnaryOperatorCannotBeApplied { expr, op: *op, found: new_ty(found.as_ref()) }.into()
             }
             InferenceDiagnostic::MutRefInImmRefPat { pat } => {
                 let pat = pat_syntax(*pat)?.map(Into::into);

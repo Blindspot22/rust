@@ -1,17 +1,20 @@
 use std::borrow::Cow;
 
 use rustc_ast::{AttrStyle, Safety};
+use rustc_attr_ir::target::{AssocCtxt, MethodKind, Target};
+use rustc_attr_ir::{AttrItem, Attribute, AttributeKind};
 use rustc_errors::{DiagArgValue, MultiSpan, StashKey};
 use rustc_feature::Features;
-use rustc_hir::attrs::AttributeKind;
-use rustc_hir::{AttrItem, Attribute, MethodKind, Target};
+use rustc_lint_defs::builtin::{
+    MISPLACED_DIAGNOSTIC_ATTRIBUTES, UNUSED_ATTRIBUTES, USELESS_DEPRECATED,
+};
 use rustc_span::{BytePos, FileName, RemapPathScopeComponents, Span, Symbol, sym};
 
 use crate::context::AcceptContext;
 use crate::diagnostics::{
-    InvalidAttrAtCrateLevel, ItemFollowingInnerAttr, UnsupportedAttributesInWhere,
+    InvalidAttrAtCrateLevel, InvalidTarget, InvalidTargetHelp, ItemFollowingInnerAttr,
+    UnsupportedAttributesInWhere,
 };
-use crate::session_diagnostics::{InvalidTarget, InvalidTargetHelp};
 use crate::target_checking::Policy::Allow;
 use crate::{AttributeParser, ShouldEmit};
 
@@ -166,11 +169,11 @@ impl<'sess> AttributeParser<'sess> {
                     ]
                     .contains(&cx.target)
                 {
-                    rustc_session::lint::builtin::USELESS_DEPRECATED
+                    USELESS_DEPRECATED
                 } else if is_diagnostic_attr {
-                    rustc_session::lint::builtin::MISPLACED_DIAGNOSTIC_ATTRIBUTES
+                    MISPLACED_DIAGNOSTIC_ATTRIBUTES
                 } else {
-                    rustc_session::lint::builtin::UNUSED_ATTRIBUTES
+                    UNUSED_ATTRIBUTES
                 };
 
                 let attr_span = cx.attr_span;
@@ -243,7 +246,7 @@ impl<'sess> AttributeParser<'sess> {
             span: attr_span,
         };
         if warn {
-            cx.emit_lint(rustc_session::lint::builtin::UNUSED_ATTRIBUTES, diag, attr_span);
+            cx.emit_lint(UNUSED_ATTRIBUTES, diag, attr_span);
         } else {
             cx.emit_err(diag);
         }
@@ -507,12 +510,16 @@ pub(crate) const ALL_TARGETS: &[Policy] = {
         Allow(Target::Expression),
         Allow(Target::Statement),
         Allow(Target::Arm),
-        Allow(Target::AssocConst),
+        Allow(Target::AssocConst(AssocCtxt::Impl { of_trait: false })),
+        Allow(Target::AssocConst(AssocCtxt::Trait)),
+        Allow(Target::AssocConst(AssocCtxt::Impl { of_trait: true })),
         Allow(Target::Method(MethodKind::Inherent)),
         Allow(Target::Method(MethodKind::Trait { body: false })),
         Allow(Target::Method(MethodKind::Trait { body: true })),
         Allow(Target::Method(MethodKind::TraitImpl)),
-        Allow(Target::AssocTy),
+        Allow(Target::AssocTy(AssocCtxt::Impl { of_trait: false })),
+        Allow(Target::AssocTy(AssocCtxt::Trait)),
+        Allow(Target::AssocTy(AssocCtxt::Impl { of_trait: true })),
         Allow(Target::ForeignFn),
         Allow(Target::ForeignStatic),
         Allow(Target::ForeignTy),
@@ -526,27 +533,27 @@ pub(crate) const ALL_TARGETS: &[Policy] = {
         Allow(Target::Delegation { mac: false }),
         Allow(Target::Delegation { mac: true }),
         Allow(Target::GenericParam {
-            kind: rustc_hir::target::GenericParamKind::Const,
+            kind: rustc_attr_ir::target::GenericParamKind::Const,
             has_default: false,
         }),
         Allow(Target::GenericParam {
-            kind: rustc_hir::target::GenericParamKind::Const,
+            kind: rustc_attr_ir::target::GenericParamKind::Const,
             has_default: true,
         }),
         Allow(Target::GenericParam {
-            kind: rustc_hir::target::GenericParamKind::Lifetime,
+            kind: rustc_attr_ir::target::GenericParamKind::Lifetime,
             has_default: false,
         }),
         Allow(Target::GenericParam {
-            kind: rustc_hir::target::GenericParamKind::Lifetime,
+            kind: rustc_attr_ir::target::GenericParamKind::Lifetime,
             has_default: true,
         }),
         Allow(Target::GenericParam {
-            kind: rustc_hir::target::GenericParamKind::Type,
+            kind: rustc_attr_ir::target::GenericParamKind::Type,
             has_default: false,
         }),
         Allow(Target::GenericParam {
-            kind: rustc_hir::target::GenericParamKind::Type,
+            kind: rustc_attr_ir::target::GenericParamKind::Type,
             has_default: true,
         }),
         Allow(Target::Loop),

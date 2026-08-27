@@ -9,11 +9,11 @@ use clippy_utils::visitors::is_const_evaluatable;
 use clippy_utils::{is_in_const_context, is_mutable, sym};
 use rustc_ast::Mutability;
 use rustc_errors::Applicability;
-use rustc_hir::{Expr, ExprKind, HirId, LangItem};
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_hir::attrs::lang_items::LangItem;
+use rustc_hir::{Expr, ExprKind, HirId};
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 use rustc_middle::ty;
 use rustc_middle::ty::adjustment::{Adjust, DerefAdjustKind, OverloadedDeref};
-use rustc_session::impl_lint_pass;
 use rustc_span::Symbol;
 
 use crate::methods::is_clone_like;

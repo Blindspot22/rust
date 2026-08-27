@@ -64,12 +64,6 @@ impl<'tcx> fmt::Debug for ty::adjustment::PatAdjustment<'tcx> {
     }
 }
 
-impl fmt::Debug for ty::LateParamRegion {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ReLateParam({:?}, {:?})", self.scope, self.kind)
-    }
-}
-
 impl fmt::Debug for ty::LateParamRegionKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
@@ -192,7 +186,7 @@ TrivialLiftImpls! {
     rustc_middle::mir::ConstValue,
     rustc_span::Symbol,
     rustc_type_ir::BoundConstness,
-    rustc_type_ir::PredicatePolarity,
+    rustc_type_ir::ClausePolarity,
     // tidy-alphabetical-end
 }
 
@@ -265,7 +259,6 @@ TrivialTypeTraversalAndLiftImpls! {
 TrivialLiftImpls! {
     rustc_span::ErrorGuaranteed,
     ty::EarlyParamRegion,
-    ty::LateParamRegion,
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -275,7 +268,7 @@ impl<'a, 'tcx> Lift<TyCtxt<'tcx>> for ty::ParamEnv<'a> {
     type Lifted = ty::ParamEnv<'tcx>;
 
     fn lift_to_interner(self, tcx: TyCtxt<'tcx>) -> Self::Lifted {
-        ty::ParamEnv::new(tcx.lift(self.caller_bounds()))
+        ty::ParamEnv { caller_bounds: tcx.lift(self.caller_bounds) }
     }
 }
 

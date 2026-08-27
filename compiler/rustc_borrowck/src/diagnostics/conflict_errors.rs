@@ -10,11 +10,10 @@ use rustc_errors::codes::*;
 use rustc_errors::{Applicability, Diag, MultiSpan, struct_span_code_err};
 use rustc_hir as hir;
 use rustc_hir::attrs::diagnostic::{CustomDiagnostic, FormatArgs};
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::intravisit::{Visitor, walk_block, walk_expr};
-use rustc_hir::{
-    CoroutineDesugaring, CoroutineKind, CoroutineSource, LangItem, PatField, find_attr,
-};
+use rustc_hir::{CoroutineDesugaring, CoroutineKind, CoroutineSource, PatField, find_attr};
 use rustc_index::bit_set::DenseBitSet;
 use rustc_infer::traits::TraitErrors;
 use rustc_middle::bug;
@@ -286,7 +285,7 @@ impl<'diag, 'tcx> MirBorrowckCtxt<'_, 'diag, 'tcx> {
             let place = &self.move_data.move_paths[mpi].place;
             let ty = place.ty(self.body, self.infcx.tcx).ty;
 
-            if self.infcx.param_env.caller_bounds().iter().any(|c| {
+            if self.infcx.param_env.caller_bounds().any(|c| {
                 c.as_trait_clause().is_some_and(|pred| {
                     pred.skip_binder().self_ty() == ty && self.infcx.tcx.is_fn_trait(pred.def_id())
                 })
@@ -692,7 +691,7 @@ impl<'diag, 'tcx> MirBorrowckCtxt<'_, 'diag, 'tcx> {
         if !clauses.instantiate_identity(tcx).clauses.iter().any(|clause| {
             clause.as_trait_clause().is_some_and(|tc| {
                 tc.self_ty().skip_binder().is_param(param.index)
-                    && tc.polarity() == ty::PredicatePolarity::Positive
+                    && tc.polarity() == ty::ClausePolarity::Positive
                     && supertrait_def_ids(tcx, tc.def_id())
                         .flat_map(|trait_did| tcx.associated_items(trait_did).in_definition_order())
                         .any(|item| item.is_method())

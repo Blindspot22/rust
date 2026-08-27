@@ -7,8 +7,9 @@
 use std::ops::ControlFlow;
 
 use rustc_errors::FatalError;
+use rustc_hir as hir;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def_id::DefId;
-use rustc_hir::{self as hir, LangItem};
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{
     self, EarlyBinder, GenericArgs, Ty, TyCtxt, TypeFoldable, TypeFolder, TypeSuperFoldable,
@@ -563,9 +564,9 @@ fn virtual_call_violations_for_method<'tcx>(
         // only if the autotrait is one of the trait object's trait bounds, like
         // in `dyn Trait + AutoTrait`. This guarantees that trait objects only
         // implement auto traits if the underlying type does as well.
-        if let ty::ClauseKind::Trait(ty::TraitPredicate {
+        if let ty::ClauseKind::Trait(ty::TraitClause {
             trait_ref: pred_trait_ref,
-            polarity: ty::PredicatePolarity::Positive,
+            polarity: ty::ClausePolarity::Positive,
         }) = clause.kind().skip_binder()
             && pred_trait_ref.self_ty() == tcx.types.self_param
             && tcx.trait_is_auto(pred_trait_ref.def_id)
@@ -732,7 +733,7 @@ fn receiver_is_dispatchable<'tcx>(
 
         normalize_param_env_or_error(
             tcx,
-            ty::ParamEnv::new(tcx.mk_clauses(&clauses)),
+            ty::ParamEnv::new(tcx, clauses),
             ObligationCause::dummy_with_span(tcx.def_span(method.def_id)),
         )
     };

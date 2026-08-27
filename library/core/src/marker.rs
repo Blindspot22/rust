@@ -480,7 +480,7 @@ marker_impls! {
 
 }
 
-#[unstable(feature = "never_type", issue = "35121")]
+#[stable(feature = "never_type", since = "CURRENT_RUSTC_VERSION")]
 impl Copy for ! {}
 
 /// Shared references can be copied, but mutable references *cannot*!
@@ -1136,25 +1136,6 @@ marker_impls! {
         {T: ConstParamTy_ + ?Sized} &T,
 }
 
-/// A common trait implemented by all function pointers.
-//
-// Note that while the trait is internal and unstable it is nevertheless
-// exposed as a public bound of the stable `core::ptr::fn_addr_eq` function.
-#[unstable(
-    feature = "fn_ptr_trait",
-    issue = "none",
-    reason = "internal trait for implementing various traits for all function pointers"
-)]
-#[lang = "fn_ptr_trait"]
-#[fundamental]
-#[rustc_deny_explicit_impl]
-#[rustc_dyn_incompatible_trait]
-pub trait FnPtr: Copy + Clone {
-    /// Returns the address of the function pointer.
-    #[lang = "fn_ptr_addr"]
-    fn addr(self) -> *const ();
-}
-
 /// Derive macro that makes a smart pointer usable with trait objects.
 ///
 /// # What this macro does
@@ -1373,10 +1354,28 @@ pub trait Reborrow {
     /* compiler built-in */
 }
 
+/// Derive macro generating an impl of the trait `Reborrow`.
+#[rustc_builtin_macro(Reborrow)]
+#[allow_internal_unstable(reborrow)]
+#[unstable(feature = "reborrow", issue = "145612")]
+pub macro Reborrow($item:item) {
+    /* compiler built-in */
+}
+
 /// Allows reborrowable value to be reborrowed as shared, creating a copy
 /// that disables the source for writes for the lifetime of the copy.
 #[lang = "coerce_shared"]
 #[unstable(feature = "reborrow", issue = "145612")]
 pub trait CoerceShared<Target: Copy>: Reborrow {
+    /* compiler built-in */
+}
+
+/// Derive macro generating an impl of the trait `CoerceShared`.
+///
+/// The shared target type must be specified with `#[coerce_shared(Target)]`.
+#[rustc_builtin_macro(CoerceShared, attributes(coerce_shared))]
+#[allow_internal_unstable(reborrow)]
+#[unstable(feature = "reborrow", issue = "145612")]
+pub macro CoerceShared($item:item) {
     /* compiler built-in */
 }

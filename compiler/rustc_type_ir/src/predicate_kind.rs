@@ -19,7 +19,7 @@ pub enum ClauseKind<I: Interner> {
     /// Corresponds to `where Foo: Bar<A, B, C>`. `Foo` here would be
     /// the `Self` type of the trait reference and `A`, `B`, and `C`
     /// would be the type parameters.
-    Trait(ty::TraitPredicate<I>),
+    Trait(ty::TraitClause<I>),
 
     /// `where 'a: 'r`
     RegionOutlives(ty::OutlivesClause<I, Region<I>>),
@@ -28,8 +28,8 @@ pub enum ClauseKind<I: Interner> {
     TypeOutlives(ty::OutlivesClause<I, I::Ty>),
 
     /// `where <T as TraitRef>::Name == X`, approximately.
-    /// See the `ProjectionPredicate` struct for details.
-    Projection(ty::ProjectionPredicate<I>),
+    /// See the `ProjectionClause` struct for details.
+    Projection(ty::ProjectionClause<I>),
 
     /// Ensures that a const generic argument to a parameter `const N: u8`
     /// is of type `u8`.
@@ -41,11 +41,11 @@ pub enum ClauseKind<I: Interner> {
     /// Constant initializer must evaluate successfully.
     ConstEvaluatable(I::Const),
 
-    /// Enforces the constness of the predicate we're calling. Like a projection
+    /// Enforces the constness of the clause we're calling. Like a projection
     /// goal from a where clause, it's always going to be paired with a
     /// corresponding trait clause; this just enforces the *constness* of that
     /// implementation.
-    HostEffect(ty::HostEffectPredicate<I>),
+    HostEffect(ty::HostEffectClause<I>),
 
     /// Support marking impl as unstable.
     UnstableFeature(

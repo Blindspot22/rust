@@ -6,16 +6,16 @@ use rustc_abi::{
     PointerKind, Primitive, ReprFlags, ReprOptions, Scalar, Size, TagEncoding, TargetDataLayout,
     TyAbiInterface, VariantIdx, Variants,
 };
-use rustc_data_structures::Limit;
 use rustc_errors::{
     Diag, DiagArgValue, DiagCtxtHandle, Diagnostic, EmissionGuarantee, IntoDiagArg, Level,
 };
 use rustc_hir as hir;
-use rustc_hir::LangItem;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def_id::DefId;
 use rustc_macros::{StableHash, TyDecodable, TyEncodable, extension};
 use rustc_session::config::OptLevel;
 use rustc_span::{DUMMY_SP, ErrorGuaranteed, Span, Symbol, sym};
+use rustc_structures::Limit;
 use rustc_target::callconv::FnAbi;
 use rustc_target::spec::{HasTargetSpec, HasX86AbiOpt, Target, X86Abi};
 use tracing::debug;
@@ -366,11 +366,12 @@ impl<'tcx> SizeSkeleton<'tcx> {
                 Limit(0) => Limit(2),
                 limit => limit * 2,
             };
-            let reported = tcx.dcx().emit_err(crate::error::RecursionLimitReachedSizeSkeleton {
-                span,
-                ty,
-                suggested_limit,
-            });
+            let reported =
+                tcx.dcx().emit_err(crate::diagnostics::RecursionLimitReachedSizeSkeleton {
+                    span,
+                    ty,
+                    suggested_limit,
+                });
             return Err(tcx.arena.alloc(LayoutError::ReferencesError(reported)));
         }
 
@@ -1210,6 +1211,12 @@ where
 
     fn is_transparent(this: TyAndLayout<'tcx>) -> bool {
         matches!(this.ty.kind(), ty::Adt(def, _) if def.repr().transparent())
+    }
+
+    /// Is this type `core::num::Complex<T>`?
+    fn is_complex_number_lang_item(this: TyAndLayout<'tcx>, cx: &C) -> bool {
+        let Some(def) = this.ty.ty_adt_def() else { return false };
+        cx.tcx().is_lang_item(def.did(), LangItem::Complex)
     }
 
     fn is_scalable_vector(this: TyAndLayout<'tcx>) -> bool {

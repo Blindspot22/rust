@@ -5,16 +5,17 @@ use std::ops::ControlFlow;
 
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_errors::{Applicability, Diag, DiagArgValue, IntoDiagArg, listify, pluralize};
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::{DefKind, Namespace};
 use rustc_hir::def_id::DefId;
-use rustc_hir::{self as hir, AmbigArg, LangItem, PredicateOrigin, WherePredicateKind};
+use rustc_hir::{self as hir, AmbigArg, PredicateOrigin, WherePredicateKind};
 use rustc_span::{BytePos, Span};
 use rustc_type_ir::TyKind::*;
 
 use crate::ty::{
     self, AliasTy, Const, ConstKind, FallibleTypeFolder, InferConst, InferTy, Instance, Opaque,
-    PolyTraitPredicate, Projection, Ty, TyCtxt, TypeFoldable, TypeSuperFoldable,
-    TypeSuperVisitable, TypeVisitable, TypeVisitor,
+    PolyTraitClause, Projection, Ty, TyCtxt, TypeFoldable, TypeSuperFoldable, TypeSuperVisitable,
+    TypeVisitable, TypeVisitor,
 };
 
 impl IntoDiagArg for Ty<'_> {
@@ -132,7 +133,7 @@ pub fn suggest_arbitrary_trait_bound<'tcx>(
     tcx: TyCtxt<'tcx>,
     generics: &hir::Generics<'_>,
     err: &mut Diag<'_>,
-    trait_pred: PolyTraitPredicate<'tcx>,
+    trait_pred: PolyTraitClause<'tcx>,
     associated_ty: Option<(&'static str, Ty<'tcx>)>,
 ) -> bool {
     if !trait_pred.is_suggestable(tcx, false) {

@@ -9,12 +9,13 @@ use rustc_ast as ast;
 use rustc_attr_parsing::{AttributeParser, ShouldEmit};
 use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_codegen_ssa::{CompiledModules, CrateInfo};
+use rustc_crate_store::Untracked;
 use rustc_data_structures::indexmap::IndexMap;
 use rustc_data_structures::steal::Steal;
 use rustc_data_structures::sync::{
     AppendOnlyIndexVec, DynSend, DynSync, FreezeLock, WorkerLocal, par_fns,
 };
-use rustc_data_structures::{Limit, thousands};
+use rustc_data_structures::thousands;
 use rustc_errors::timings::TimingSection;
 use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, Level};
 use rustc_expand::base::{ExtCtxt, LintStoreExpand};
@@ -35,8 +36,7 @@ use rustc_parse::lexer::StripTokens;
 use rustc_parse::{new_parser_from_file, new_parser_from_source_str, unwrap_or_emit_fatal};
 use rustc_passes::{abi_test, input_stats, layout_test};
 use rustc_resolve::{Resolver, ResolverOutputs};
-use rustc_session::config::{CrateType, Input, OutFileName, OutputFilenames, OutputType};
-use rustc_session::cstore::Untracked;
+use rustc_session::config::{Input, OutFileName, OutputFilenames, OutputType};
 use rustc_session::diagnostics::feature_err;
 use rustc_session::output::{filename_for_input, invalid_output_for_target};
 use rustc_session::search_paths::PathKind;
@@ -44,6 +44,7 @@ use rustc_session::{IncrCompSession, Session};
 use rustc_span::{
     DUMMY_SP, ErrorGuaranteed, ExpnKind, SourceFileHash, SourceFileHashAlgorithm, Span, Symbol, sym,
 };
+use rustc_structures::{CrateType, Limit};
 use rustc_trait_selection::{solve, traits};
 use tracing::{info, instrument};
 
@@ -275,6 +276,12 @@ fn configure_and_expand(
             sess.dcx().emit_err(diagnostics::MixedProcMacroCrate);
         }
     }
+
+    if is_proc_macro_crate && sess.target.is_like_wasm && !sess.opts.unstable_opts.wasm_proc_macros
+    {
+        sess.dcx().emit_err(diagnostics::UnstableWasmProcMacro);
+    }
+
     if crate_types.contains(&CrateType::Sdylib) && !tcx.features().export_stable() {
         feature_err(sess, sym::export_stable, DUMMY_SP, "`sdylib` crate type is unstable").emit();
     }
@@ -654,7 +661,7 @@ fn write_out_deps(tcx: TyCtxt<'_>, outputs: &OutputFilenames, out_filenames: &[P
                 checksum_hash_algo,
             ));
         }
-        if let Some(ref profile_sample) = sess.opts.unstable_opts.profile_sample_use {
+        if let Some(ref profile_sample) = sess.opts.cg.profile_sample_use {
             files.extend(hash_iter_files(
                 iter::once(normalize_path(profile_sample.as_path().to_path_buf())),
                 checksum_hash_algo,
@@ -869,7 +876,7 @@ pub fn write_dep_info(tcx: TyCtxt<'_>) {
 }
 
 pub fn write_interface<'tcx>(tcx: TyCtxt<'tcx>) {
-    if !tcx.crate_types().contains(&rustc_session::config::CrateType::Sdylib) {
+    if !tcx.crate_types().contains(&rustc_structures::CrateType::Sdylib) {
         return;
     }
     let _timer = tcx.sess.timer("write_interface");
@@ -1005,8 +1012,8 @@ pub fn create_and_enter_global_ctxt<T, F: for<'tcx> FnOnce(TyCtxt<'tcx>) -> T>(
         untracked,
         incr_comp_session.as_ref(),
         dep_graph,
-        rustc_query_impl::make_dep_kind_vtables(&arena),
         rustc_query_impl::query_system(
+            &arena,
             providers.queries,
             providers.extern_queries,
             query_result_on_disk_cache,
@@ -1307,12 +1314,26 @@ pub(crate) fn start_codegen<'tcx>(
 
     let metadata = rustc_metadata::fs::encode_and_write_metadata(tcx);
 
+    let is_host_metadata = tcx
+        .sess
+        .opts
+        .unstable_opts
+        .offload
+        .iter()
+        .any(|o| matches!(o, rustc_session::config::Offload::HostMetadata(_)));
+
     let codegen = tcx.sess.time("codegen_crate", || {
-        if tcx.sess.opts.unstable_opts.no_codegen || !tcx.sess.opts.output_types.should_codegen() {
-            // Skip crate items and just output metadata in -Z no-codegen mode.
+        if tcx.sess.opts.unstable_opts.no_codegen
+            || !tcx.sess.opts.output_types.should_codegen()
+            || is_host_metadata
+        {
             tcx.sess.dcx().abort_if_errors();
 
-            // Linker::link will skip join_codegen in case of a CodegenResults Any value.
+            if is_host_metadata {
+                rustc_monomorphize::write_host_metadata_offload_manifest(tcx);
+            }
+
+            // Linker::link will skip join_codegen in case of a `CompiledModules` Any value.
             Box::new(CompiledModules { modules: vec![], allocator_module: None })
         } else {
             codegen_backend.codegen_crate(tcx)

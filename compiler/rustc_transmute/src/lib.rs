@@ -1,6 +1,6 @@
 // tidy-alphabetical-start
+#![cfg_attr(bootstrap, feature(never_type))]
 #![cfg_attr(test, feature(test))]
-#![feature(never_type)]
 #![feature(option_into_flat_iter)]
 // tidy-alphabetical-end
 
@@ -89,7 +89,7 @@ pub enum Reason<T> {
 
 #[cfg(feature = "rustc")]
 mod rustc {
-    use rustc_hir::lang_items::LangItem;
+    use rustc_hir::attrs::lang_items::LangItem;
     use rustc_middle::ty::{Const, Region, Ty, TyCtxt};
 
     use super::*;

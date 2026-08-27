@@ -11,7 +11,6 @@ use rustc_errors::{
     Level, Subdiagnostic, SuggestionStyle, msg,
 };
 use rustc_macros::{Diagnostic, Subdiagnostic};
-use rustc_session::diagnostics::ExprParenthesesNeeded;
 use rustc_span::edition::{Edition, LATEST_STABLE_EDITION};
 use rustc_span::{Ident, Span, Symbol};
 
@@ -923,6 +922,24 @@ pub(crate) struct FoundExprWouldBeStmt {
     pub suggestion: ExprParenthesesNeeded,
 }
 
+#[derive(Subdiagnostic)]
+#[multipart_suggestion(
+    "parentheses are required to parse this as an expression",
+    applicability = "machine-applicable"
+)]
+pub(crate) struct ExprParenthesesNeeded {
+    #[suggestion_part(code = "(")]
+    left: Span,
+    #[suggestion_part(code = ")")]
+    right: Span,
+}
+
+impl ExprParenthesesNeeded {
+    pub(crate) fn surrounding(s: Span) -> Self {
+        ExprParenthesesNeeded { left: s.shrink_to_lo(), right: s.shrink_to_hi() }
+    }
+}
+
 #[derive(Diagnostic)]
 #[diag("extra characters after frontmatter close are not allowed")]
 pub(crate) struct FrontmatterExtraCharactersAfterClose {
@@ -1099,6 +1116,27 @@ pub(crate) struct ArrayBracketsInsteadOfBracesSugg {
     pub left: Span,
     #[suggestion_part(code = "]")]
     pub right: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("attributes are not allowed inside imports")]
+pub(crate) struct AttrInUseTree {
+    #[primary_span]
+    pub attr_span: Span,
+    #[subdiagnostic]
+    pub sub: Option<AttrInUseTreeSugg>,
+}
+
+#[derive(Subdiagnostic)]
+#[multipart_suggestion("move the import to its own item", style = "verbose")]
+pub(crate) struct AttrInUseTreeSugg {
+    #[suggestion_part(code = "{code}")]
+    pub use_lo: Span,
+    #[suggestion_part(code = "")]
+    pub attr_span: Span,
+    #[suggestion_part(code = "")]
+    pub tree_span: Span,
+    pub code: String,
 }
 
 #[derive(Diagnostic)]
@@ -2074,14 +2112,6 @@ pub(crate) struct ExpectedFnPathFoundFnKeyword {
         style = "verbose"
     )]
     pub fn_token_span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("`Trait(...)` syntax does not support named parameters")]
-pub(crate) struct FnPathFoundNamedParams {
-    #[primary_span]
-    #[suggestion("remove the parameter name", applicability = "machine-applicable", code = "")]
-    pub named_param_span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -3717,6 +3747,13 @@ pub(crate) struct AddBoxNew {
     pub box_kw_and_lo: Span,
     #[suggestion_part(code = ")")]
     pub hi: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("`box_patterns` has been removed")]
+pub(crate) struct BoxPatternsRemoved {
+    #[primary_span]
+    pub span: Span,
 }
 
 #[derive(Diagnostic)]

@@ -1,6 +1,6 @@
 use std::ops::ControlFlow;
 
-use rustc_hir::LangItem;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_infer::infer::InferCtxt;
 use rustc_infer::traits::solve::{CandidateSource, GoalSource, MaybeCause};
 use rustc_infer::traits::{
@@ -66,6 +66,9 @@ pub(super) fn fulfillment_error_for_no_solution<'tcx>(
             let expected_found = ExpectedFound::new(b, a);
             FulfillmentErrorCode::Subtype(expected_found, TypeError::Sorts(expected_found))
         }
+        ty::PredicateKind::Clause(
+            ty::ClauseKind::RegionOutlives(_) | ty::ClauseKind::TypeOutlives(_),
+        ) if infcx.tcx.assumptions_on_binders() => FulfillmentErrorCode::Outlives,
         ty::PredicateKind::Clause(_)
         | ty::PredicateKind::DynCompatible(_)
         | ty::PredicateKind::Ambiguous => {
@@ -302,7 +305,7 @@ impl<'tcx> BestObligation<'tcx> {
         if let ty::Alias(_, alias) = *self_ty.kind() {
             let infer_term = goal.infcx().next_ty_var(self.obligation.cause.span);
             let pred =
-                ty::ProjectionPredicate { projection_term: alias.into(), term: infer_term.into() };
+                ty::ProjectionClause { projection_term: alias.into(), term: infer_term.into() };
             let obligation =
                 Obligation::new(tcx, self.obligation.cause.clone(), goal.goal().param_env, pred);
             self.with_derived_obligation(obligation, |this| {
@@ -453,15 +456,15 @@ impl<'tcx> ProofTreeVisitor<'tcx> for BestObligation<'tcx> {
             ty::PredicateKind::Clause(ty::ClauseKind::Trait(trait_pred)) => {
                 ChildMode::Trait(pred.kind().rebind(trait_pred))
             }
-            ty::PredicateKind::Clause(ty::ClauseKind::HostEffect(host_pred)) => {
-                ChildMode::Host(pred.kind().rebind(host_pred))
+            ty::PredicateKind::Clause(ty::ClauseKind::HostEffect(host_clause)) => {
+                ChildMode::Host(pred.kind().rebind(host_clause))
             }
             ty::PredicateKind::Clause(ty::ClauseKind::Projection(projection))
                 if projection.projection_term.kind.is_trait_projection() =>
             {
-                ChildMode::Trait(pred.kind().rebind(ty::TraitPredicate {
+                ChildMode::Trait(pred.kind().rebind(ty::TraitClause {
                     trait_ref: projection.projection_term.trait_ref(tcx),
-                    polarity: ty::PredicatePolarity::Positive,
+                    polarity: ty::ClausePolarity::Positive,
                 }))
             }
             ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(term)) => {
@@ -520,7 +523,7 @@ impl<'tcx> ProofTreeVisitor<'tcx> for BestObligation<'tcx> {
                     impl_where_bound_count += 1;
                 }
                 (
-                    ChildMode::Host(parent_host_pred),
+                    ChildMode::Host(parent_host_clause),
                     GoalSource::ImplWhereBound | GoalSource::AliasBoundConstCondition,
                 ) => {
                     obligation = make_obligation(derive_host_cause(
@@ -528,7 +531,7 @@ impl<'tcx> ProofTreeVisitor<'tcx> for BestObligation<'tcx> {
                         candidate.kind(),
                         self.obligation.cause.clone(),
                         impl_where_bound_count,
-                        parent_host_pred,
+                        parent_host_clause,
                     ));
                     impl_where_bound_count += 1;
                 }
@@ -552,11 +555,11 @@ enum ChildMode<'tcx> {
     // Try to derive an `ObligationCause::{ImplDerived,BuiltinDerived}`,
     // and skip all `GoalSource::Misc`, which represent useless obligations
     // such as alias-eq which may not hold.
-    Trait(ty::PolyTraitPredicate<'tcx>),
+    Trait(ty::PolyTraitClause<'tcx>),
     // Try to derive an `ObligationCause::{ImplDerived,BuiltinDerived}`,
     // and skip all `GoalSource::Misc`, which represent useless obligations
     // such as alias-eq which may not hold.
-    Host(ty::Binder<'tcx, ty::HostEffectPredicate<'tcx>>),
+    Host(ty::Binder<'tcx, ty::HostEffectClause<'tcx>>),
     // Skip trying to derive an `ObligationCause` from this obligation, and
     // report *all* sub-obligations as if they came directly from the parent
     // obligation.
@@ -568,7 +571,7 @@ fn derive_cause<'tcx>(
     candidate_kind: inspect::ProbeKind<TyCtxt<'tcx>>,
     mut cause: ObligationCause<'tcx>,
     idx: usize,
-    parent_trait_pred: ty::PolyTraitPredicate<'tcx>,
+    parent_trait_pred: ty::PolyTraitClause<'tcx>,
 ) -> ObligationCause<'tcx> {
     match candidate_kind {
         inspect::ProbeKind::TraitCandidate {
@@ -604,7 +607,7 @@ fn derive_host_cause<'tcx>(
     candidate_kind: inspect::ProbeKind<TyCtxt<'tcx>>,
     mut cause: ObligationCause<'tcx>,
     idx: usize,
-    parent_host_pred: ty::Binder<'tcx, ty::HostEffectPredicate<'tcx>>,
+    parent_host_clause: ty::Binder<'tcx, ty::HostEffectClause<'tcx>>,
 ) -> ObligationCause<'tcx> {
     match candidate_kind {
         inspect::ProbeKind::TraitCandidate {
@@ -620,7 +623,7 @@ fn derive_host_cause<'tcx>(
                         (
                             trait_ref.to_host_effect_clause(
                                 tcx,
-                                parent_host_pred.skip_binder().constness,
+                                parent_host_clause.skip_binder().constness,
                             ),
                             span,
                         )
@@ -629,7 +632,7 @@ fn derive_host_cause<'tcx>(
                 .nth(idx)
             {
                 cause =
-                    cause.derived_host_cause(parent_host_pred, |derived| {
+                    cause.derived_host_cause(parent_host_clause, |derived| {
                         ObligationCauseCode::ImplDerivedHost(Box::new(
                             traits::ImplDerivedHostCause { derived, impl_def_id, span },
                         ))
@@ -640,8 +643,8 @@ fn derive_host_cause<'tcx>(
             source: CandidateSource::BuiltinImpl(..),
             result: _,
         } => {
-            cause =
-                cause.derived_host_cause(parent_host_pred, ObligationCauseCode::BuiltinDerivedHost);
+            cause = cause
+                .derived_host_cause(parent_host_clause, ObligationCauseCode::BuiltinDerivedHost);
         }
         _ => {}
     };

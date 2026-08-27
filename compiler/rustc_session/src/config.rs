@@ -26,6 +26,7 @@ use rustc_span::source_map::FilePathMapping;
 use rustc_span::{
     FileName, RealFileName, RemapPathScopeComponents, SourceFileHashAlgorithm, Symbol, sym,
 };
+use rustc_structures::CrateType;
 use rustc_target::spec::{
     FramePointer, LinkSelfContainedComponents, LinkerFeatures, PanicStrategy, SplitDebuginfo,
     Target, TargetTuple,
@@ -196,12 +197,20 @@ pub enum CoverageLevel {
 // The different settings that the `-Z offload` flag can have.
 #[derive(Clone, PartialEq, Hash, Debug, Encodable, Decodable)]
 pub enum Offload {
-    /// Entry point for `std::offload`, enables kernel compilation for a gpu device
-    Device,
-    /// Second step in the offload pipeline, generates the host code to call kernels.
+    /// Second step in the offload pipeline, enables kernel compilation for a gpu device
+    /// Reads a manifest of required generic kernel instantiations
+    /// produced by a previous `HostMetadata` pass. An empty manifest
+    /// means there are no generic kernels at all, or that generic kernels are only
+    /// called from non-generic device entry points and never from the host, so we
+    /// don't need to track their instantiations.
+    Device(String),
+    /// Third step in the offload pipeline, generates the host code to call kernels.
     Host(String),
     /// Test is similar to Host, but allows testing without a device artifact.
     Test,
+    /// First step in the offload pipeline: compile for the host but only emit a manifest of
+    /// kernel instantiations required by the host code.
+    HostMetadata(String),
 }
 
 /// The different settings that the `-Z codegen-emit-retag` flag can have.
@@ -1011,13 +1020,25 @@ impl ExternEntry {
     }
 }
 
-#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Default)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct NextSolverConfig {
     /// Whether the new trait solver should be enabled in coherence.
     pub coherence: bool = true,
     /// Whether the new trait solver should be enabled everywhere.
     /// This is only `true` if `coherence` is also enabled.
     pub globally: bool = false,
+}
+
+// FIXME(#160895): Using -Znext-solver as default on nightly
+// See https://github.com/rust-lang/compiler-team/issues/1014
+impl Default for NextSolverConfig {
+    fn default() -> Self {
+        if option_env!("CFG_DEFAULT_NEXT_SOLVER_GLOBALLY").is_some() {
+            Self { coherence: true, globally: true }
+        } else {
+            Self { coherence: true, globally: false }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1570,8 +1591,6 @@ pub enum EntryFnType {
         sigpipe: u8,
     },
 }
-
-pub use rustc_hir::attrs::CrateType;
 
 #[derive(Clone, Hash, Debug, PartialEq, Eq, Encodable, Decodable)]
 pub enum Passes {
@@ -2755,11 +2774,11 @@ pub fn build_session_options(early_dcx: &mut EarlyDiagCtxt, matches: &getopts::M
         early_dcx.early_fatal("options `-C profile-generate` and `-C profile-use` are exclusive");
     }
 
-    if unstable_opts.profile_sample_use.is_some()
+    if cg.profile_sample_use.is_some()
         && (cg.profile_generate.enabled() || cg.profile_use.is_some())
     {
         early_dcx.early_fatal(
-            "option `-Z profile-sample-use` cannot be used with `-C profile-generate` or `-C profile-use`",
+            "option `-C profile-sample-use` cannot be used with `-C profile-generate` or `-C profile-use`",
         );
     }
 
@@ -3315,9 +3334,9 @@ pub(crate) mod dep_tracking {
     use rustc_errors::LanguageIdentifier;
     use rustc_feature::UnstableFeatures;
     use rustc_hashes::Hash64;
-    use rustc_hir::attrs::CollapseMacroDebuginfo;
     use rustc_span::edition::Edition;
     use rustc_span::{RealFileName, RemapPathScopeComponents};
+    use rustc_structures::CollapseMacroDebuginfo;
     use rustc_target::spec::{
         CodeModel, FramePointer, MergeFunctions, OnBrokenPipe, PanicStrategy, RelocModel,
         RelroLevel, SanitizerSet, SplitDebuginfo, StackProtector, SymbolVisibility, TargetTuple,

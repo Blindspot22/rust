@@ -24,24 +24,21 @@ pub(crate) fn expand_deriving_debug(
         path: path_std!(fmt::Debug),
         skip_path_as_bound: false,
         needs_copy_as_bound_if_packed: true,
-        additional_bounds: Vec::new(),
+        additional_bounds: SmallVec::new(),
         supports_unions: false,
-        methods: vec![MethodDef {
+        methods: smallvec![MethodDef {
             name: sym::fmt,
             generics: Bounds::empty(),
             explicit_self: true,
-            nonself_args: vec![(fmtr, sym::character('f'))],
+            nonself_args: smallvec![(fmtr, sym::character('f'))],
             ret_ty: Path(path_std!(fmt::Result)),
             attributes: thin_vec![cx.attr_word(sym::inline, span)],
             fieldless_variants_strategy:
                 FieldlessVariantsStrategy::SpecializeIfAllVariantsFieldless,
-            combine_substructure: combine_substructure(Box::new(|a, b, c| {
-                show_substructure(a, b, c)
-            })),
+            combine_substructure: combine_substructure(show_substructure),
         }],
-        associated_types: Vec::new(),
+        associated_types: SmallVec::new(),
         is_const,
-        is_staged_api_crate: cx.ecfg.features.staged_api(),
         safety: Safety::Default,
         document: true,
     };
@@ -261,8 +258,8 @@ fn show_fieldless_enum(
 /// ```text
 /// impl ::core::fmt::Debug for A {
 ///     fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
-///         const __NAMES: &str = "ABBBCC";
-///         const __OFFSET: [usize; 4] =[0, 1, 4, 6];
+///         static __NAMES: &str = "ABBBCC";
+///         static __OFFSET: [usize; 4] =[0, 1, 4, 6];
 ///         let __d = ::core::intrinsics::discriminant_value(self) as usize;
 ///         ::core::fmt::Formatter::debug_c_like_enums_write_str(f, __NAMES, &__OFFSET, __d)
 ///     }
@@ -314,8 +311,8 @@ fn show_fieldless_enum_concat_str(
         ),
     );
     let names_str_body = cx.expr_str(span, Symbol::intern(&concatenated_names));
-    let names_const_item =
-        cx.item_const(span, names_ident, str_ty, Some(names_str_body), ast::ConstItemKind::Body);
+    let names_static_item =
+        cx.item_static(span, names_ident, str_ty, ast::Mutability::Not, names_str_body);
 
     // Create the constant offset array
     let offset_ident = Ident::from_str_and_span("__OFFSET", span);
@@ -332,12 +329,12 @@ fn show_fieldless_enum_concat_str(
             None,
         )),
     );
-    let offset_const_item = cx.item_const(
+    let offset_static_item = cx.item_static(
         span,
         offset_ident,
         cx.ty(span, TyKind::Array(usize_ty, offset_array_len_expr)),
-        Some(starts_array_body),
-        ast::ConstItemKind::Body,
+        ast::Mutability::Not,
+        starts_array_body,
     );
 
     // let __d = ::core::intrinsics::discriminant_value(self) as usize;
@@ -372,8 +369,8 @@ fn show_fieldless_enum_concat_str(
 
     Some((
         thin_vec![
-            cx.stmt_item(span, names_const_item),
-            cx.stmt_item(span, offset_const_item),
+            cx.stmt_item(span, names_static_item),
+            cx.stmt_item(span, offset_static_item),
             discriminant_let_stmt,
         ],
         call_expr,

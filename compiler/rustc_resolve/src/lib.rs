@@ -60,6 +60,7 @@ use rustc_hir::def_id::{CRATE_DEF_ID, CrateNum, DefId, LOCAL_CRATE, LocalDefId, 
 use rustc_hir::definitions::{PerParentDisambiguatorState, PerParentDisambiguatorsMap};
 use rustc_hir::{PrimTy, TraitCandidate, find_attr};
 use rustc_index::bit_set::DenseBitSet;
+use rustc_lint_defs::builtin::PRIVATE_MACRO_USE;
 use rustc_metadata::creader::CStore;
 use rustc_middle::metadata::{AmbigModChild, ModChild, Reexport};
 use rustc_middle::middle::privacy::EffectiveVisibilities;
@@ -69,11 +70,10 @@ use rustc_middle::ty::{
     ResolverAstLowering, ResolverGlobalCtxt, TyCtxt, TyCtxtFeed, Visibility,
 };
 use rustc_middle::{bug, span_bug};
-use rustc_session::config::CrateType;
-use rustc_session::lint::builtin::PRIVATE_MACRO_USE;
 use rustc_span::def_id::{LocalModId, ModId};
 use rustc_span::hygiene::{ExpnId, LocalExpnId, MacroKind, SyntaxContext, Transparency};
 use rustc_span::{DUMMY_SP, Ident, Span, Symbol, kw, sym};
+use rustc_structures::CrateType;
 use smallvec::{SmallVec, smallvec};
 use tracing::{debug, instrument};
 
@@ -272,6 +272,7 @@ enum ResolutionError<'ra> {
         segment: Symbol,
         label: String,
         suggestion: Option<Suggestion>,
+        help: Option<String>,
         module: Option<ModuleOrUniformRoot<'ra>>,
         message: String,
     },
@@ -299,6 +300,8 @@ enum ResolutionError<'ra> {
     // problematic to use *forward declared* parameters when the feature is enabled.
     /// ERROR E0770: the type of const parameters must not depend on other generic parameters.
     ParamInTyOfConstParam { name: Symbol },
+    /// cannot use self in const param
+    SelfInConstParam,
     /// generic parameters must not be used inside const evaluations.
     ///
     /// This error is only emitted when using `min_const_generics`.
@@ -337,7 +340,14 @@ enum ResolutionError<'ra> {
 enum VisResolutionError {
     Relative2018(Span, ast::Path),
     AncestorOnly(Span),
-    FailedToResolve(Span, Symbol, String, Option<Suggestion>, String),
+    FailedToResolve {
+        span: Span,
+        segment: Symbol,
+        label: String,
+        suggestion: Option<Suggestion>,
+        help: Option<String>,
+        message: String,
+    },
     ExpectedFound(Span, String, Res),
     Indeterminate(Span),
     ModuleOnly(Span),
@@ -457,6 +467,7 @@ enum PathResult<'ra> {
         span: Span,
         label: String,
         suggestion: Option<Suggestion>,
+        help: Option<String>,
         is_error_from_last_segment: bool,
         /// The final module being resolved, for instance:
         ///
@@ -492,19 +503,21 @@ impl<'ra> PathResult<'ra> {
             String,
             Option<Suggestion>,
             Option<String>,
+            Option<String>,
         ),
     ) -> PathResult<'ra> {
-        let (message, label, suggestion, note) = if finalize {
+        let (message, label, suggestion, note, help) = if finalize {
             label_and_suggestion_and_note()
         } else {
             // FIXME: this output isn't actually present in the test suite.
-            (format!("cannot find `{ident}` in this scope"), String::new(), None, None)
+            (format!("cannot find `{ident}` in this scope"), String::new(), None, None, None)
         };
         PathResult::Failed {
             span: ident.span,
             segment: ident,
             label,
             suggestion,
+            help,
             is_error_from_last_segment,
             module,
             error_implied_by_parse_error,
@@ -769,7 +782,7 @@ impl<'ra> ModuleData<'ra> {
     }
 
     fn has_unexpanded_invocations<'tcx>(&self, r: &Resolver<'ra, 'tcx>) -> bool {
-        !self.unexpanded_invocations.borrow(r).is_empty()
+        !self.unexpanded_invocations.borrow_checked(r).is_empty()
     }
 
     fn res(&self) -> Option<Res> {
@@ -794,7 +807,7 @@ impl<'ra> Module<'ra> {
         mut f: impl FnMut(&R, IdentKey, Span, Namespace, Decl<'ra>),
     ) {
         for (key, name_resolution) in resolver.as_ref().resolutions(self).iter() {
-            let name_resolution = name_resolution.borrow(resolver.as_ref());
+            let name_resolution = name_resolution.borrow_checked(resolver.as_ref());
             if let Some(decl) = name_resolution.best_decl() {
                 f(resolver, key.ident, name_resolution.orig_ident_span, key.ns, decl);
             }
@@ -816,7 +829,7 @@ impl<'ra> Module<'ra> {
 
     /// This modifies `self` in place. The traits will be stored in `self.traits`.
     fn ensure_traits<'tcx>(self, resolver: &Resolver<'ra, 'tcx>) {
-        let mut traits = self.traits.borrow_mut(resolver.as_ref());
+        let mut traits = self.traits.borrow_mut_checked(resolver);
         if traits.is_none() {
             let mut collected_traits = Vec::new();
             self.for_each_child(resolver, |r, ident, _, ns, mut decl| {
@@ -2184,7 +2197,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
 
     fn resolutions(&self, module: Module<'ra>) -> CmRef<'ra, ResolutionTable<'ra>> {
         match &module.0.0.lazy_resolutions {
-            Resolutions::Local(local_res) => local_res.borrow(self),
+            Resolutions::Local(local_res) => local_res.borrow_checked(self),
             Resolutions::Extern(extern_res) => {
                 // It is fine to return a `CmRef::Untracked`, we never give out a `&mut`
                 // to an external table.
@@ -2197,7 +2210,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         }
     }
 
-    fn resolutions_mut(&self, module: Module<'ra>) -> RefMut<'ra, ResolutionTable<'ra>> {
+    fn resolutions_mut(&mut self, module: Module<'ra>) -> RefMut<'ra, ResolutionTable<'ra>> {
         match &module.0.0.lazy_resolutions {
             Resolutions::Local(local_res) => local_res.borrow_mut(self),
             Resolutions::Extern(_) => {
@@ -2213,12 +2226,12 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         module: Module<'ra>,
         key: BindingKey,
     ) -> Option<CmRef<'ra, NameResolution<'ra>>> {
-        self.resolutions(module).get(&key).map(|resolution| resolution.0.borrow(self))
+        self.resolutions(module).get(&key).map(|resolution| resolution.0.borrow_checked(self))
     }
 
     #[track_caller]
     fn resolution_or_default(
-        &self,
+        &mut self,
         module: Module<'ra>,
         key: BindingKey,
         orig_ident_span: Span,
@@ -2908,10 +2921,11 @@ mod ref_mut {
             self.0.get()
         }
 
-        pub(crate) fn update<'ra, 'tcx>(&self, r: &Resolver<'ra, 'tcx>, f: impl FnOnce(T) -> T)
-        where
-            T: Copy,
-        {
+        pub(crate) fn update<'ra, 'tcx>(
+            &self,
+            r: &mut Resolver<'ra, 'tcx>,
+            f: impl FnOnce(T) -> T,
+        ) {
             let old = self.get();
             self.set(f(old), r);
         }
@@ -2922,10 +2936,15 @@ mod ref_mut {
             CmCell(Cell::new(value))
         }
 
-        pub(crate) fn set<'ra, 'tcx>(&self, val: T, r: &Resolver<'ra, 'tcx>) {
-            if r.speculative_flag.is_speculative() {
-                panic!("not allowed to mutate a `CmCell` during speculative resolution")
-            }
+        pub(crate) fn set<'ra, 'tcx>(&self, val: T, _: &mut Resolver<'ra, 'tcx>) {
+            self.0.set(val);
+        }
+
+        pub(crate) fn set_checked<'ra, 'tcx>(&self, val: T, r: &Resolver<'ra, 'tcx>) {
+            assert!(
+                !r.speculative_flag.is_speculative(),
+                "Cannot mutate `CmCell` during speculative resolution"
+            );
             self.0.set(val);
         }
 
@@ -2983,23 +3002,43 @@ mod ref_mut {
         }
 
         #[track_caller]
-        pub(crate) fn borrow_mut<'ra, 'tcx>(&self, r: &Resolver<'ra, 'tcx>) -> RefMut<'_, T> {
+        pub(crate) fn borrow_mut<'ra, 'tcx>(&self, r: &mut Resolver<'ra, 'tcx>) -> RefMut<'_, T> {
             self.try_borrow_mut(r).unwrap()
+        }
+
+        #[track_caller]
+        pub(crate) fn borrow_mut_checked<'ra, 'tcx>(
+            &self,
+            r: &Resolver<'ra, 'tcx>,
+        ) -> RefMut<'_, T> {
+            self.try_borrow_mut_checked(r).unwrap()
+        }
+
+        #[track_caller]
+        pub(crate) fn try_borrow_mut_checked<'ra, 'tcx>(
+            &self,
+            r: &Resolver<'ra, 'tcx>,
+        ) -> Result<RefMut<'_, T>, BorrowMutError> {
+            assert!(
+                !r.speculative_flag.is_speculative(),
+                "Cannot mutate `CmRefCell` state/value during speculative resolution"
+            );
+            self.0.try_borrow_mut()
         }
 
         #[track_caller]
         pub(crate) fn try_borrow_mut<'ra, 'tcx>(
             &self,
-            r: &Resolver<'ra, 'tcx>,
+            _: &mut Resolver<'ra, 'tcx>,
         ) -> Result<RefMut<'_, T>, BorrowMutError> {
-            if r.speculative_flag.is_speculative() {
-                panic!("not allowed to mutably borrow a `CmRefCell` during speculative resolution");
-            }
             self.0.try_borrow_mut()
         }
 
-        #[track_caller]
-        pub(crate) fn borrow<'ra, 'tcx>(&self, r: &Resolver<'ra, 'tcx>) -> CmRef<'_, T> {
+        pub(crate) fn borrow<'ra, 'tcx>(&self, _: &mut Resolver<'ra, 'tcx>) -> Ref<'_, T> {
+            self.0.borrow()
+        }
+
+        pub(crate) fn borrow_checked<'ra, 'tcx>(&self, r: &Resolver<'ra, 'tcx>) -> CmRef<'_, T> {
             if r.speculative_flag.is_speculative() {
                 // `try_borrow_unguarded` is unsafe because it returns a `&T` instead
                 // of `Ref<'_, T>`. It does provides an extra check to make sure no live

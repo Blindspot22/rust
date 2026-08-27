@@ -338,12 +338,14 @@ impl<'hir> LoweringContext<'_, 'hir> {
                         } else {
                             None
                         };
-                        self.dcx().emit_err(GenericTypeWithParentheses { span: data.span, sub });
+                        let guar = self
+                            .dcx()
+                            .emit_err(GenericTypeWithParentheses { span: data.span, sub });
                         (
                             self.lower_angle_bracketed_parameter_data(
                                 &data.as_angle_bracketed_args(),
                                 param_mode,
-                                itctx,
+                                ImplTraitContext::AlreadyErrored(guar),
                             )
                             .0,
                             false,
@@ -512,8 +514,8 @@ impl<'hir> LoweringContext<'_, 'hir> {
         // compatibility, even in contexts like an impl header where
         // we generally don't permit such things (see #51008).
         let ParenthesizedArgs { span, inputs, inputs_span, output } = data;
-        let inputs = self.arena.alloc_from_iter(inputs.iter().map(|ty| {
-            self.lower_ty(ty, ImplTraitContext::Disallowed(ImplTraitPosition::FnTraitParam))
+        let inputs = self.arena.alloc_from_iter(inputs.iter().map(|param| {
+            self.lower_ty(&param.ty, ImplTraitContext::Disallowed(ImplTraitPosition::FnTraitParam))
         }));
         let output_ty = match output {
             // Only allow `impl Trait` in return position. i.e.:

@@ -5,6 +5,7 @@ use std::{debug_assert_matches, iter};
 
 use rustc_abi::{ExternAbi, FieldIdx};
 use rustc_data_structures::thin_vec::ThinVec;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::attrs::{InlineAttr, OptimizeAttr};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
@@ -342,11 +343,7 @@ impl<'tcx> Inliner<'tcx> for NormalInliner<'tcx> {
         // Avoid inlining into coroutines, since their `optimized_mir` is used for layout computation,
         // which can create a cycle, even when no attempt is made to inline the function in the other
         // direction.
-        if body.coroutine.is_some() {
-            return false;
-        }
-
-        true
+        body.coroutine.is_none()
     }
 
     #[instrument(level = "debug", skip(self, callee_body))]
@@ -764,7 +761,8 @@ fn check_mir_is_available<'tcx, I: Inliner<'tcx>>(
         | InstanceKind::Shim(ShimKind::DropGlue(..))
         | InstanceKind::Shim(ShimKind::Clone(..))
         | InstanceKind::Shim(ShimKind::ThreadLocal(..))
-        | InstanceKind::Shim(ShimKind::FnPtrAddr(..)) => return Ok(()),
+        | InstanceKind::Shim(ShimKind::FnPtrAsPtr(..))
+        | InstanceKind::Shim(ShimKind::FnPtrFromPtr(..)) => return Ok(()),
     }
 
     if inliner.tcx().is_constructor(callee_def_id) {
@@ -774,9 +772,7 @@ fn check_mir_is_available<'tcx, I: Inliner<'tcx>>(
     }
 
     if let Some(callee_def_id) = callee_def_id.as_local()
-        && !inliner
-            .tcx()
-            .is_lang_item(inliner.tcx().parent(caller_def_id), rustc_hir::LangItem::FnOnce)
+        && !inliner.tcx().is_lang_item(inliner.tcx().parent(caller_def_id), LangItem::FnOnce)
     {
         // If we know for sure that the function we're calling will itself try to
         // call us, then we avoid inlining that function.

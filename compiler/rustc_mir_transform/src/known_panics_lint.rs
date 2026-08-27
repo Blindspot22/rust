@@ -12,6 +12,7 @@ use rustc_hir::def::DefKind;
 use rustc_hir::{HirId, find_attr};
 use rustc_index::IndexVec;
 use rustc_index::bit_set::DenseBitSet;
+use rustc_lint_defs::builtin::UNCONDITIONAL_PANIC;
 use rustc_middle::bug;
 use rustc_middle::mir::visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
@@ -20,7 +21,6 @@ use rustc_middle::ty::{
     self, ConstInt, GenericArgKind, GenericParamDefKind, ScalarInt, Ty, TyCtxt, TypeVisitableExt,
     Unnormalized,
 };
-use rustc_session::lint::builtin::UNCONDITIONAL_PANIC;
 use rustc_span::Span;
 use tracing::{debug, instrument, trace};
 
@@ -975,7 +975,6 @@ impl<'tcx> Visitor<'tcx> for CanConstProp {
             // whether they'd be fine right now.
             MutatingUse(MutatingUseContext::Yield)
             | MutatingUse(MutatingUseContext::Drop)
-            | MutatingUse(MutatingUseContext::Retag)
             // These can't ever be propagated under any scheme, as we can't reason about indirect
             // mutation.
             | NonMutatingUse(NonMutatingUseContext::SharedBorrow)

@@ -97,9 +97,17 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 } else if adt_def.repr().c() {
                     interp_ok(false)
                 } else {
-                    // Must be repr(Rust).
+                    // Can't be SIMD or Scalable (since this is a 1-ZST); only Rust is left.
+                    assert!(adt_def.repr().rust());
                     interp_ok(true)
                 }
+            }
+            // Types that are considered transparent in `unfold_transparent` should also act
+            // like transparent types here.
+            ty::Pat(base, _) => self.has_trivial_abi(self.layout_of(base)?),
+            ty::UnsafeBinder(bound_ty) => {
+                let ty = self.tcx.instantiate_bound_regions_with_erased(bound_ty.into());
+                self.has_trivial_abi(self.layout_of(ty)?)
             }
 
             ty::Alias(..) => panic!("non-normalized type"),
@@ -116,8 +124,8 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         layout: TyAndLayout<'tcx>,
         may_unfold: impl Fn(AdtDef<'tcx>) -> bool,
     ) -> InterpResult<'tcx, TyAndLayout<'tcx>> {
-        match layout.ty.kind() {
-            ty::Adt(adt_def, _) if adt_def.repr().transparent() && may_unfold(*adt_def) => {
+        match *layout.ty.kind() {
+            ty::Adt(adt_def, _) if adt_def.repr().transparent() && may_unfold(adt_def) => {
                 assert_matches!(layout.variants, rustc_abi::Variants::Single { .. });
                 // Look for non-trivial-ABI field(s).
                 let mut found = None;
@@ -142,7 +150,11 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 // Recurse.
                 self.unfold_transparent(field, may_unfold)
             }
-            ty::Pat(base, _) => interp_ok(self.layout_of(*base)?),
+            ty::Pat(base, _) => self.unfold_transparent(self.layout_of(base)?, may_unfold),
+            ty::UnsafeBinder(bound_ty) => {
+                let ty = self.tcx.instantiate_bound_regions_with_erased(bound_ty.into());
+                self.unfold_transparent(self.layout_of(ty)?, may_unfold)
+            }
             // Not a transparent type, no further unfolding.
             _ => interp_ok(layout),
         }
@@ -443,8 +455,10 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         // compile time.
         M::check_fn_target_features(self, instance)?;
 
+        // If the signature says this cannot unwind, reflect this in the unwind destination so that
+        // we don't have to check this later. (`init_fn_call` already did this for the caller so
+        // here we only have to check the callee.)
         if !callee_fn_abi.can_unwind {
-            // The callee cannot unwind, so force the `Unreachable` unwind handling.
             match &mut cont {
                 ReturnContinuation::Stop { .. } => {}
                 ReturnContinuation::Goto { unwind, .. } => {
@@ -660,20 +674,28 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     pub(super) fn init_fn_call(
         &mut self,
         fn_val: FnVal<'tcx, M::ExtraFnVal>,
-        (caller_abi, caller_fn_abi): (ExternAbi, &FnAbi<'tcx, Ty<'tcx>>),
+        (caller_abi, caller_fn_abi): (ExternAbi, Option<&FnAbi<'tcx, Ty<'tcx>>>),
         args: &[FnArg<'tcx, M::Provenance>],
         with_caller_location: bool,
         destination: &PlaceTy<'tcx, M::Provenance>,
         target: Option<mir::BasicBlock>,
-        unwind: mir::UnwindAction,
+        mut unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx> {
         let _trace =
             enter_trace_span!(M, step::init_fn_call, tracing_separate_thread = Empty, ?fn_val)
                 .or_if_tracing_disabled(|| trace!("init_fn_call: {:#?}", fn_val));
 
+        // If the signature says this cannot unwind, reflect this in the unwind destination
+        // so that we don't have to check this later.
+        if caller_fn_abi.is_some_and(|abi| !abi.can_unwind) {
+            unwind = mir::UnwindAction::Unreachable;
+        }
+
         let instance = match fn_val {
             FnVal::Instance(instance) => instance,
             FnVal::Other(extra) => {
+                let caller_fn_abi =
+                    caller_fn_abi.expect("FnAbi should have been computed for this call");
                 return M::call_extra_fn(
                     self,
                     extra,
@@ -730,7 +752,8 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             | ty::InstanceKind::Shim(ty::ShimKind::FnPtr(..))
             | ty::InstanceKind::Shim(ty::ShimKind::DropGlue(..))
             | ty::InstanceKind::Shim(ty::ShimKind::Clone(..))
-            | ty::InstanceKind::Shim(ty::ShimKind::FnPtrAddr(..))
+            | ty::InstanceKind::Shim(ty::ShimKind::FnPtrAsPtr(..))
+            | ty::InstanceKind::Shim(ty::ShimKind::FnPtrFromPtr(..))
             | ty::InstanceKind::Shim(ty::ShimKind::ThreadLocal(..))
             | ty::InstanceKind::Shim(ty::ShimKind::AsyncDropGlueCtor(..))
             | ty::InstanceKind::Shim(ty::ShimKind::AsyncDropGlue(..))
@@ -738,6 +761,8 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             | ty::InstanceKind::Item(_) => {
                 // We need MIR for this fn.
                 // Note that this can be an intrinsic, if we are executing its fallback body.
+                let caller_fn_abi =
+                    caller_fn_abi.expect("FnAbi should have been computed for this call");
                 let Some((body, instance)) = M::find_mir_or_eval_fn(
                     self,
                     instance,
@@ -789,6 +814,8 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             // `InstanceKind::Virtual` does not have callable MIR. Calls to `Virtual` instances must be
             // codegen'd / interpreted as virtual calls through the vtable.
             ty::InstanceKind::Virtual(def_id, idx) => {
+                let caller_fn_abi =
+                    caller_fn_abi.expect("FnAbi should have been computed for this call");
                 let mut args = args.to_vec();
                 // We have to implement all "dyn-compatible receivers". So we have to go search for a
                 // pointer or `dyn Trait` type, but it could be wrapped in newtypes. So recursively
@@ -831,7 +858,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 assert!(receiver_place.layout.is_unsized());
 
                 // Get the required information from the vtable.
-                let vptr = receiver_place.meta().unwrap_meta().to_pointer(self)?;
+                let vptr = receiver_place.meta().unwrap_meta().to_pointer(self);
                 let dyn_ty = self.get_ptr_vtable_ty(vptr, Some(receiver_trait))?;
                 let adjusted_recv = receiver_place.ptr();
 
@@ -867,7 +894,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 // recurse with concrete function
                 self.init_fn_call(
                     FnVal::Instance(fn_inst),
-                    (caller_abi, &caller_fn_abi),
+                    (caller_abi, Some(&caller_fn_abi)),
                     &args,
                     with_caller_location,
                     destination,
@@ -910,7 +937,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     pub(super) fn init_fn_tail_call(
         &mut self,
         fn_val: FnVal<'tcx, M::ExtraFnVal>,
-        (caller_abi, caller_fn_abi): (ExternAbi, &FnAbi<'tcx, Ty<'tcx>>),
+        (caller_abi, caller_fn_abi): (ExternAbi, Option<&FnAbi<'tcx, Ty<'tcx>>>),
         args: &[FnArg<'tcx, M::Provenance>],
         with_caller_location: bool,
     ) -> InterpResult<'tcx> {
@@ -1007,7 +1034,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
 
         self.init_fn_call(
             FnVal::Instance(instance),
-            (ExternAbi::Rust, fn_abi),
+            (ExternAbi::Rust, Some(fn_abi)),
             &[FnArg::Copy(arg.into())],
             false,
             &ret.into(),

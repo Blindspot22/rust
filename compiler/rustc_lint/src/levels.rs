@@ -11,6 +11,13 @@ use rustc_hir as hir;
 use rustc_hir::HirId;
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_index::IndexVec;
+use rustc_lint_defs::builtin::{
+    self, FORBIDDEN_LINT_GROUPS, RENAMED_AND_REMOVED_LINTS, SINGLE_USE_LIFETIMES,
+    UNFULFILLED_LINT_EXPECTATIONS, UNKNOWN_LINTS, UNUSED_ATTRIBUTES,
+};
+use rustc_lint_defs::{
+    Level, Lint, LintExpectationId, LintId, StableLintExpectationId, UnstableLintExpectationId,
+};
 use rustc_middle::hir::nested_filter;
 use rustc_middle::lint::{
     LevelSpec, LintExpectation, LintLevelSource, ShallowLintLevelMap, StableLevelSpec,
@@ -19,29 +26,19 @@ use rustc_middle::lint::{
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{RegisteredTools, TyCtxt};
 use rustc_session::Session;
-use rustc_session::lint::builtin::{
-    self, FORBIDDEN_LINT_GROUPS, RENAMED_AND_REMOVED_LINTS, SINGLE_USE_LIFETIMES,
-    UNFULFILLED_LINT_EXPECTATIONS, UNKNOWN_LINTS, UNUSED_ATTRIBUTES,
-};
-use rustc_session::lint::{
-    Level, Lint, LintExpectationId, LintId, StableLintExpectationId, UnstableLintExpectationId,
-};
 use rustc_span::{AttrId, DUMMY_SP, Span, Symbol, sym};
 use tracing::{debug, instrument};
 
 use crate::builtin::MISSING_DOCS;
 use crate::context::{CheckLintNameResult, LintStore};
 use crate::diagnostics::{
-    CheckNameUnknownTool, MalformedAttribute, MalformedAttributeSub, OverruledAttribute,
-    OverruledAttributeSub, RequestedLevel, UnknownToolInScopedLint, UnsupportedGroup,
+    CheckNameUnknownTool, DeprecatedLintName, DeprecatedLintNameFromCommandLine,
+    IgnoredUnlessCrateSpecified, MalformedAttribute, MalformedAttributeSub, OverruledAttribute,
+    OverruledAttributeLint, OverruledAttributeSub, RemovedLint, RemovedLintFromCommandLine,
+    RenamedLint, RenamedLintFromCommandLine, RenamedLintSuggestion, RequestedLevel, UnknownLint,
+    UnknownLintFromCommandLine, UnknownLintSuggestion, UnknownToolInScopedLint, UnsupportedGroup,
 };
 use crate::late::unerased_lint_store;
-use crate::lints::{
-    DeprecatedLintName, DeprecatedLintNameFromCommandLine, IgnoredUnlessCrateSpecified,
-    OverruledAttributeLint, RemovedLint, RemovedLintFromCommandLine, RenamedLint,
-    RenamedLintFromCommandLine, RenamedLintSuggestion, UnknownLint, UnknownLintFromCommandLine,
-    UnknownLintSuggestion,
-};
 
 /// Collection of lint levels for the whole crate.
 /// This is used by AST-based lints, which do not

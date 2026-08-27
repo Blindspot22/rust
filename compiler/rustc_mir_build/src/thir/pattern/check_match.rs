@@ -1,13 +1,15 @@
 use rustc_arena::{DroplessArena, TypedArena};
 use rustc_ast::Mutability;
 use rustc_data_structures::fx::FxIndexSet;
-use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_errors::codes::*;
 use rustc_errors::{Applicability, ErrorGuaranteed, MultiSpan, msg, struct_span_code_err};
 use rustc_hir::def::*;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::{self as hir, BindingMode, ByRef, HirId, MatchSource};
 use rustc_infer::infer::TyCtxtInferExt;
+use rustc_lint_defs::builtin::{
+    BINDINGS_WITH_VARIANT_NAME, IRREFUTABLE_LET_PATTERNS, UNREACHABLE_PATTERNS,
+};
 use rustc_middle::bug;
 use rustc_middle::thir::visit::Visitor;
 use rustc_middle::thir::*;
@@ -17,9 +19,6 @@ use rustc_pattern_analysis::diagnostics::Uncovered;
 use rustc_pattern_analysis::rustc::{
     Constructor, DeconstructedPat, MatchArm, RedundancyExplanation, RevealedTy,
     RustcPatCtxt as PatCtxt, Usefulness, UsefulnessReport, WitnessPat,
-};
-use rustc_session::lint::builtin::{
-    BINDINGS_WITH_VARIANT_NAME, IRREFUTABLE_LET_PATTERNS, UNREACHABLE_PATTERNS,
 };
 use rustc_span::edit_distance::find_best_match_for_name;
 use rustc_span::hygiene::DesugaringKind;
@@ -200,7 +199,7 @@ impl<'p, 'tcx> MatchVisitor<'p, 'tcx> {
     fn with_let_source(&mut self, let_source: LetSource, f: impl FnOnce(&mut Self)) {
         let old_let_source = self.let_source;
         self.let_source = let_source;
-        ensure_sufficient_stack(|| f(self));
+        f(self);
         self.let_source = old_let_source;
     }
 

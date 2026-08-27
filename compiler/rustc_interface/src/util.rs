@@ -22,12 +22,13 @@ use rustc_middle::dep_graph::WorkProductMap;
 use rustc_middle::ty::{CurrentGcx, TyCtxt};
 use rustc_query_impl::{CollectActiveJobsKind, collect_active_query_jobs};
 use rustc_session::config::{
-    Cfg, CrateType, Jobs, OutFileName, OutputFilenames, OutputTypes, Sysroot, host_tuple,
+    Cfg, Jobs, OutFileName, OutputFilenames, OutputTypes, Sysroot, host_tuple,
 };
 use rustc_session::{EarlyDiagCtxt, IncrCompSession, Session, filesearch};
 use rustc_span::edition::Edition;
 use rustc_span::source_map::SourceMapInputs;
 use rustc_span::{SessionGlobals, Symbol, sym};
+use rustc_structures::CrateType;
 use rustc_target::spec::Target;
 use tracing::info;
 
@@ -41,52 +42,47 @@ type MakeBackendFn = fn() -> Box<dyn CodegenBackend>;
 /// specific features (SSE, NEON etc.).
 ///
 /// This is performed by checking whether a set of permitted features
-/// is available on the target machine, by querying the codegen backend.
+/// is available on the target machine, by querying the `TargetConfig` from the codegen backend.
 pub(crate) fn add_configuration(
     cfg: &mut Cfg,
-    sess: &mut Session,
-    codegen_backend: &dyn CodegenBackend,
+    target_config: &TargetConfig,
+    target: &Target,
+    is_nightly_build: bool,
+    is_crt_static: bool,
 ) {
-    let tf = sym::target_feature;
-    let tf_cfg = codegen_backend.target_config(sess);
-
     // Add some of the target features to `cfg`.
     cfg.extend(
-        sess.target
+        target
             .rust_target_features()
             .iter()
             .filter_map(|(feature, gate, _)| {
                 if gate.in_cfg()
-                    && (sess.is_nightly_build()
-                        || gate.requires_nightly(/* in_cfg */ true).is_none())
+                    && (is_nightly_build || gate.requires_nightly(/* in_cfg */ true).is_none())
                 {
                     Some(Symbol::intern(feature))
                 } else {
                     None
                 }
             })
-            .filter(|feature| tf_cfg.internal_target_features.contains(&feature))
+            .filter(|feature| target_config.internal_target_features.contains(&feature))
             .map(|feature| (sym::target_feature, Some(feature))),
     );
 
-    // Store all of them in the session.
-    sess.internal_target_features.extend(tf_cfg.internal_target_features.into_sorted_stable_ord());
-
-    if tf_cfg.has_reliable_f16 {
+    if target_config.has_reliable_f16 {
         cfg.insert((sym::target_has_reliable_f16, None));
     }
-    if tf_cfg.has_reliable_f16_math {
+    if target_config.has_reliable_f16_math {
         cfg.insert((sym::target_has_reliable_f16_math, None));
     }
-    if tf_cfg.has_reliable_f128 {
+    if target_config.has_reliable_f128 {
         cfg.insert((sym::target_has_reliable_f128, None));
     }
-    if tf_cfg.has_reliable_f128_math {
+    if target_config.has_reliable_f128_math {
         cfg.insert((sym::target_has_reliable_f128_math, None));
     }
 
-    if sess.crt_static(None) {
-        cfg.insert((tf, Some(sym::crt_dash_static)));
+    if is_crt_static {
+        cfg.insert((sym::target_feature, Some(sym::crt_dash_static)));
     }
 }
 
@@ -121,7 +117,7 @@ pub(crate) fn check_abi_required_features(sess: &Session) {
 }
 
 pub static STACK_SIZE: OnceLock<usize> = OnceLock::new();
-pub const DEFAULT_STACK_SIZE: usize = 8 * 1024 * 1024;
+pub const DEFAULT_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 fn init_stack_size(early_dcx: &EarlyDiagCtxt) -> usize {
     // Obey the environment setting or default
@@ -363,7 +359,7 @@ pub fn get_codegen_backend(
             filename if filename.contains('.') => {
                 load_backend_from_dylib(early_dcx, filename.as_ref())
             }
-            "dummy" => || Box::new(DummyCodegenBackend { target_config_override: None }),
+            "dummy" => || Box::new(DummyCodegenBackend),
             #[cfg(feature = "llvm")]
             "llvm" => rustc_codegen_llvm::LlvmCodegenBackend::new,
             backend_name => get_codegen_sysroot(early_dcx, sysroot, backend_name),
@@ -376,9 +372,7 @@ pub fn get_codegen_backend(
     unsafe { load() }
 }
 
-pub struct DummyCodegenBackend {
-    pub target_config_override: Option<Box<dyn Fn(&Session) -> TargetConfig>>,
-}
+pub struct DummyCodegenBackend;
 
 impl CodegenBackend for DummyCodegenBackend {
     fn name(&self) -> &'static str {
@@ -386,10 +380,6 @@ impl CodegenBackend for DummyCodegenBackend {
     }
 
     fn target_config(&self, sess: &Session) -> TargetConfig {
-        if let Some(target_config_override) = &self.target_config_override {
-            return target_config_override(sess);
-        }
-
         let abi_required_features = sess.target.abi_required_features();
         let internal_target_features = internal_target_features::<0>(
             sess,

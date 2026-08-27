@@ -17,6 +17,8 @@ use std::{fmt, iter, mem};
 
 use rustc_abi::{ExternAbi, FieldIdx, Layout, LayoutData, TargetDataLayout, VariantIdx};
 use rustc_ast as ast;
+use rustc_crate_store::{CrateStoreDyn, Untracked};
+use rustc_data_structures::defer;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::intern::Interned;
 use rustc_data_structures::profiling::SelfProfilerRef;
@@ -26,22 +28,21 @@ use rustc_data_structures::steal::Steal;
 use rustc_data_structures::sync::{
     self, DynSend, DynSync, FreezeReadGuard, Lock, RwLock, WorkerLocal,
 };
-use rustc_data_structures::{Limit, defer};
 use rustc_errors::{Applicability, Diag, DiagCtxtHandle, Diagnostic, MultiSpan};
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{CrateNum, DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::definitions::{DefPathData, Definitions, PerParentDisambiguatorState};
 use rustc_hir::intravisit::VisitorExt;
-use rustc_hir::lang_items::LangItem;
 use rustc_hir::{self as hir, CRATE_HIR_ID, HirId, Node, TraitCandidate, find_attr};
 use rustc_index::IndexVec;
+use rustc_lint_defs::Lint;
+use rustc_lint_defs::builtin::UNUSED_FEATURES;
 use rustc_macros::Diagnostic;
-use rustc_session::config::CrateType;
-use rustc_session::cstore::{CrateStoreDyn, Untracked};
-use rustc_session::lint::Lint;
 use rustc_session::{IncrCompSession, Session};
 use rustc_span::def_id::{CRATE_DEF_ID, DefPathHash, StableCrateId};
 use rustc_span::{DUMMY_SP, Ident, Span, Symbol, kw, sym};
+use rustc_structures::{CrateType, Limit};
 use rustc_type_ir::TyKind::*;
 pub use rustc_type_ir::lift::Lift;
 use rustc_type_ir::{CollectAndApply, WithCachedTypeInfo, elaborate, search_graph};
@@ -49,7 +50,7 @@ use tracing::{debug, instrument};
 
 use crate::arena::Arena;
 use crate::dep_graph::dep_node::make_metadata;
-use crate::dep_graph::{DepGraph, DepKindVTable, DepNodeIndex};
+use crate::dep_graph::{DepGraph, DepNodeIndex};
 use crate::hir::{ProjectedMaybeOwner, ProjectedOwnerInfo};
 use crate::ich::StableHashState;
 use crate::infer::canonical::{CanonicalParamEnvCache, CanonicalVarKind};
@@ -66,11 +67,11 @@ use crate::traits::solve::{ExternalConstraints, ExternalConstraintsData, Predefi
 use crate::ty::predicate::ExistentialPredicateStableCmpExt as _;
 use crate::ty::region::RegionExt;
 use crate::ty::{
-    self, AdtDef, AdtDefData, AdtKind, Binder, Clause, Clauses, Const, FnSigKind, GenericArg,
-    GenericArgs, GenericArgsRef, GenericParamDefKind, List, ListWithCachedTypeInfo, ParamConst,
-    Pattern, PatternKind, PolyExistentialPredicate, PolyFnSig, Predicate, PredicateKind,
-    PredicatePolarity, Region, RegionKind, ReprOptions, TraitObjectVisitor, Ty, TyKind, TyVid,
-    ValTree, ValTreeKind, Visibility,
+    self, AdtDef, AdtDefData, AdtKind, Binder, Clause, ClausePolarity, Clauses, Const, FnSigKind,
+    GenericArg, GenericArgs, GenericArgsRef, GenericParamDefKind, List, ListWithCachedTypeInfo,
+    ParamConst, Pattern, PatternKind, PolyExistentialPredicate, PolyFnSig, Predicate,
+    PredicateKind, Region, RegionKind, ReprOptions, TraitObjectVisitor, Ty, TyKind, TyVid, ValTree,
+    ValTreeKind, Visibility,
 };
 
 impl<'tcx> rustc_type_ir::inherent::DefId<TyCtxt<'tcx>> for DefId {
@@ -654,6 +655,38 @@ impl<'tcx> TyCtxtFeed<'tcx, LocalDefId> {
     }
 }
 
+/// An assortment of global caches used by various parts of the compiler.
+///
+/// The individual fields are mostly unrelated to each other, but have been grouped together to
+/// reduce the number of top-level fields in [`GlobalCtxt`].
+#[derive(Default)]
+pub struct GlobalCaches<'tcx> {
+    // Internal caches for metadata decoding. No need to track deps on this.
+    pub ty_rcache: Lock<FxHashMap<ty::CReaderCacheKey, Ty<'tcx>>>,
+
+    /// Caches the results of trait selection. This cache is used
+    /// for things that do not have to do with the parameters in scope.
+    pub selection_cache: traits::SelectionCache<'tcx, ty::TypingEnv<'tcx>>,
+
+    /// Caches the results of trait evaluation. This cache is used
+    /// for things that do not have to do with the parameters in scope.
+    /// Merge this with `selection_cache`?
+    pub evaluation_cache: traits::EvaluationCache<'tcx, ty::TypingEnv<'tcx>>,
+
+    /// Caches the results of goal evaluation in the new solver.
+    new_solver_evaluation_cache: Lock<search_graph::GlobalCache<TyCtxt<'tcx>>>,
+    new_solver_canonical_param_env_cache: Lock<ty::CanonicalParamEnvCache<TyCtxt<'tcx>>>,
+
+    pub canonical_param_env_cache: CanonicalParamEnvCache<'tcx>,
+
+    /// Caches the index of the highest bound var in clauses in a canonical binder.
+    pub highest_var_in_clauses_cache: Lock<FxHashMap<ty::Clauses<'tcx>, usize>>,
+
+    /// Caches the instantiation of a canonical binder given a set of args.
+    pub clauses_cache:
+        Lock<FxHashMap<(ty::Clauses<'tcx>, &'tcx [ty::GenericArg<'tcx>]), ty::Clauses<'tcx>>>,
+}
+
 /// The central data structure of the compiler. It stores references
 /// to the various **arenas** and also houses the results of the
 /// various **compiler queries** that have been performed. See the
@@ -715,6 +748,8 @@ pub struct GlobalCtxt<'tcx> {
     pub incr_comp_session: Option<&'tcx IncrCompSession>,
     pub dep_graph: DepGraph,
 
+    /// This duplicates `Session::prof` because this field is hot enough that accessing it via
+    /// `self.sess.prof` is a measurable slowdown (see #161332).
     pub prof: SelfProfilerRef,
 
     /// Common types, pre-interned for your convenience.
@@ -733,31 +768,8 @@ pub struct GlobalCtxt<'tcx> {
     untracked: Untracked,
 
     pub query_system: QuerySystem<'tcx>,
-    pub(crate) dep_kind_vtables: &'tcx [DepKindVTable<'tcx>],
 
-    // Internal caches for metadata decoding. No need to track deps on this.
-    pub ty_rcache: Lock<FxHashMap<ty::CReaderCacheKey, Ty<'tcx>>>,
-
-    /// Caches the results of trait selection. This cache is used
-    /// for things that do not have to do with the parameters in scope.
-    pub selection_cache: traits::SelectionCache<'tcx, ty::TypingEnv<'tcx>>,
-
-    /// Caches the results of trait evaluation. This cache is used
-    /// for things that do not have to do with the parameters in scope.
-    /// Merge this with `selection_cache`?
-    pub evaluation_cache: traits::EvaluationCache<'tcx, ty::TypingEnv<'tcx>>,
-
-    /// Caches the results of goal evaluation in the new solver.
-    pub new_solver_evaluation_cache: Lock<search_graph::GlobalCache<TyCtxt<'tcx>>>,
-    pub new_solver_canonical_param_env_cache: Lock<ty::CanonicalParamEnvCache<TyCtxt<'tcx>>>,
-
-    pub canonical_param_env_cache: CanonicalParamEnvCache<'tcx>,
-
-    /// Caches the index of the highest bound var in clauses in a canonical binder.
-    pub highest_var_in_clauses_cache: Lock<FxHashMap<ty::Clauses<'tcx>, usize>>,
-    /// Caches the instantiation of a canonical binder given a set of args.
-    pub clauses_cache:
-        Lock<FxHashMap<(ty::Clauses<'tcx>, &'tcx [ty::GenericArg<'tcx>]), ty::Clauses<'tcx>>>,
+    pub caches: GlobalCaches<'tcx>,
 
     /// Data layout specification for the current target.
     pub data_layout: TargetDataLayout,
@@ -896,7 +908,7 @@ impl<'tcx> TyCtxt<'tcx> {
     }
 
     /// Traits added on all bounds by default, excluding `Sized` which is treated separately.
-    pub fn default_traits(self) -> &'static [rustc_hir::LangItem] {
+    pub fn default_traits(self) -> &'static [LangItem] {
         if self.sess.opts.unstable_opts.experimental_default_bounds {
             &[
                 LangItem::DefaultTrait1,
@@ -937,7 +949,6 @@ impl<'tcx> TyCtxt<'tcx> {
         untracked: Untracked,
         incr_comp_session: Option<&'tcx IncrCompSession>,
         dep_graph: DepGraph,
-        dep_kind_vtables: &'tcx [DepKindVTable<'tcx>],
         query_system: QuerySystem<'tcx>,
         hooks: crate::hooks::Providers,
         current_gcx: CurrentGcx,
@@ -967,15 +978,7 @@ impl<'tcx> TyCtxt<'tcx> {
             consts: common_consts,
             untracked,
             query_system,
-            dep_kind_vtables,
-            ty_rcache: Default::default(),
-            selection_cache: Default::default(),
-            evaluation_cache: Default::default(),
-            new_solver_evaluation_cache: Default::default(),
-            new_solver_canonical_param_env_cache: Default::default(),
-            canonical_param_env_cache: Default::default(),
-            highest_var_in_clauses_cache: Default::default(),
-            clauses_cache: Default::default(),
+            caches: Default::default(),
             data_layout,
             alloc_map: interpret::AllocMap::new(),
             current_gcx,
@@ -986,14 +989,14 @@ impl<'tcx> TyCtxt<'tcx> {
     }
 
     /// Obtain all lang items of this crate and all dependencies (recursively)
-    pub fn lang_items(self) -> &'tcx rustc_hir::lang_items::LanguageItems {
+    pub fn lang_items(self) -> &'tcx rustc_hir::attrs::lang_items::LanguageItems {
         self.get_lang_items(())
     }
 
     /// Gets a `Ty` representing the [`LangItem::OrderingEnum`]
     #[track_caller]
     pub fn ty_ordering_enum(self, span: Span) -> Ty<'tcx> {
-        let ordering_enum = self.require_lang_item(hir::LangItem::OrderingEnum, span);
+        let ordering_enum = self.require_lang_item(LangItem::OrderingEnum, span);
         self.type_of(ordering_enum).no_bound_vars().unwrap()
     }
 
@@ -1598,7 +1601,9 @@ impl<'tcx> TyCtxt<'tcx> {
         self.verify_query_key_hashes();
 
         if let Err((path, error)) = self.dep_graph.finish_encoding() {
-            self.sess.dcx().emit_fatal(crate::error::FailedWritingFile { path: &path, error });
+            self.sess
+                .dcx()
+                .emit_fatal(crate::diagnostics::FailedWritingFile { path: &path, error });
         }
     }
 
@@ -1610,7 +1615,7 @@ impl<'tcx> TyCtxt<'tcx> {
         }
 
         // Collect first to avoid holding the lock while linting.
-        let used_features = self.sess.used_features.lock();
+        let used_features = self.query_system.used_features.lock();
         let unused_features = self
             .features()
             .enabled_features_iter_stable_order()
@@ -1632,7 +1637,7 @@ impl<'tcx> TyCtxt<'tcx> {
 
         for (feature, span) in unused_features {
             self.emit_node_span_lint(
-                rustc_session::lint::builtin::UNUSED_FEATURES,
+                UNUSED_FEATURES,
                 CRATE_HIR_ID,
                 span,
                 UnusedFeature { feature },
@@ -2071,7 +2076,7 @@ impl<'tcx> TyCtxt<'tcx> {
                 return false;
             };
             trait_predicate.trait_ref.def_id == future_trait
-                && trait_predicate.polarity == PredicatePolarity::Positive
+                && trait_predicate.polarity == ClausePolarity::Positive
         })
     }
 
@@ -2684,7 +2689,7 @@ impl<'tcx> TyCtxt<'tcx> {
     }
 
     pub fn next_trait_solver_globally(self) -> bool {
-        self.sess.opts.unstable_opts.next_solver.globally
+        self.sess.opts.unstable_opts.next_solver.globally && !self.features().generic_const_exprs()
     }
 
     pub fn next_trait_solver_in_coherence(self) -> bool {

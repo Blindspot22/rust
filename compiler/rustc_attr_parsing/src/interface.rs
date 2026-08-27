@@ -6,14 +6,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rustc_ast as ast;
 use rustc_ast::token::DocFragmentKind;
 use rustc_ast::{AttrStyle, CRATE_NODE_ID, NodeId, Safety};
+use rustc_attr_ir::target::Target;
+use rustc_attr_ir::{AttrArgs, AttrItem, AttrPath, Attribute, AttributeKind, HashIgnoredAttrId};
 use rustc_data_structures::sync::{DynSend, DynSync};
 use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, Level, MultiSpan};
 use rustc_feature::{BUILTIN_ATTRIBUTE_MAP, Features};
-use rustc_hir::attrs::AttributeKind;
-use rustc_hir::{AttrArgs, AttrItem, AttrPath, Attribute, HashIgnoredAttrId, Target};
-use rustc_lint_defs::RegisteredTools;
+use rustc_lint_defs::{LintId, RegisteredTools};
 use rustc_session::Session;
-use rustc_session::lint::LintId;
 use rustc_span::{DUMMY_SP, ErrorGuaranteed, Span, Symbol, sym};
 
 use crate::attributes::AttributeSafety;
@@ -21,8 +20,8 @@ use crate::context::{
     ATTRIBUTE_PARSERS, AcceptContext, FinalizeCheckContext, FinalizeCheckFn, FinalizeContext,
     FinalizeFn, FinalizeOutput, SharedContext,
 };
+use crate::diagnostics::ParsedDescription;
 use crate::parser::{AllowExprMetavar, ArgParser, PathParser, RefPathParser};
-use crate::session_diagnostics::ParsedDescription;
 use crate::synthetic::SyntheticAttrState;
 use crate::{AttributeTemplate, OmitDoc, ShouldEmit};
 

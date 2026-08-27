@@ -9,8 +9,7 @@ use rustc_infer::traits::{
 use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt, TypingMode};
 use rustc_next_trait_solver::solve::fast_path::compute_goal_fast_path;
 use rustc_next_trait_solver::solve::{
-    GoalEvaluation, GoalStalledOn, HasChanged, MaybeInfo, SolverDelegateEvalExt as _,
-    StalledOnCoroutines,
+    GoalEvaluation, GoalStalledOn, HasChanged, SolverDelegateEvalExt as _, StalledOnCoroutines,
 };
 use thin_vec::ThinVec;
 use tracing::instrument;
@@ -22,7 +21,11 @@ use crate::traits::{FulfillmentError, ScrubbedTraitError};
 
 mod derive_errors;
 
-// FIXME: Do we need to use a `ThinVec` here?
+// `ThinVec` is important for performance, but not for the usual memory layout reasons.
+// `try_evaluate_obligations` is extremely hot and uses `retain_mut`. `ThinVec::retain_mut` is
+// simple and sub-optimal in terms of how it moves elements, but it can be inlined.
+// `Vec::retain_mut` is more sophisticated and minimizes element moves, but also contains more code
+// and doesn't get inlined in `try_evaluate_obligations`, giving worse performance overall.
 type PendingObligations<'tcx> =
     ThinVec<(PredicateObligation<'tcx>, Option<GoalStalledOn<TyCtxt<'tcx>>>)>;
 
@@ -208,8 +211,7 @@ where
                 // Common case: still stalled; keep the obligation. This path is extremely hot in
                 // some cases; there can be thousands of pending obligations.
                 if let Some(stalled_on) = opt_stalled_on
-                    && let Some(certainty) = delegate.goal_remains_stalled(stalled_on)
-                    && matches!(certainty, Certainty::Maybe(_))
+                    && delegate.goal_remains_stalled(stalled_on)
                 {
                     return true;
                 }
@@ -326,7 +328,7 @@ where
             // Conservative here: if a stalled var no longer resolves to an
             // infer var, some unification happened, so the goal is no longer
             // stalled. Include it to be re-evaluated downstream.
-            stalled_on.stalled_vars.iter().filter_map(|arg| arg.as_type()).any(|ty| {
+            stalled_on.stalled_vars.iter().filter_map(|arg| arg.as_type(infcx.tcx)).any(|ty| {
                 match *infcx.shallow_resolve(ty).kind() {
                     ty::Infer(ty::TyVar(tv)) => infcx.sub_unification_table_root_var(tv) == vid,
                     _ => true,
@@ -351,7 +353,7 @@ where
             stalled_on
                 .stalled_vars
                 .iter()
-                .filter_map(|arg| arg.as_type())
+                .filter_map(|arg| arg.as_type(infcx.tcx))
                 .any(|ty| matches!(infcx.shallow_resolve(ty).kind(), ty::Infer(ty::FloatVar(_))))
         })
     }
@@ -378,13 +380,11 @@ where
 
         self.obligations
             .drain_pending(|_, stalled_on| {
-                stalled_on.as_ref().is_some_and(|s| match s.stalled_certainty {
-                    Certainty::Maybe(MaybeInfo {
-                        cause: _,
-                        opaque_types_jank: _,
-                        stalled_on_coroutines: StalledOnCoroutines::Yes,
-                    }) => true,
-                    Certainty::Maybe(_) | Certainty::Yes => false,
+                stalled_on.as_ref().is_some_and(|s| {
+                    match s.stalled_maybe_info.stalled_on_coroutines {
+                        StalledOnCoroutines::Yes => true,
+                        StalledOnCoroutines::No => false,
+                    }
                 })
             })
             .into_iter()
@@ -457,7 +457,9 @@ mod size_asserts {
     use super::*;
     // tidy-alphabetical-start
     // Before #160005 this pair was greater than 128 bytes, which triggered the use of (slow)
-    // `memcpy` for moving elements of `PendingObligations`.
+    // `memcpy` for moving elements of `PendingObligations`. Then #160479 greatly reduced the
+    // number of `memcpy` operations in `try_evaluate_obligations`. So the size of this pair is
+    // much less important than it was, but still shouldn't be changed without some thought.
     static_assert_size!((PredicateObligation<'_>, Option<GoalStalledOn<TyCtxt<'_>>>), 104);
     // tidy-alphabetical-end
 }

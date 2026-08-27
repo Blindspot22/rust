@@ -16,10 +16,11 @@ use crate::{
     db::HirDatabase,
     layout::{Layout, LayoutCx, LayoutError, field_ty},
     next_solver::StoredGenericArgs,
+    representability::{Representability, representability},
     traits::StoredParamEnvAndCrate,
 };
 
-#[salsa::tracked(cycle_result = layout_of_adt_cycle_result)]
+#[salsa::tracked(cycle_result = layout_of_adt_cycle_result, returns(clone))]
 pub fn layout_of_adt_query(
     db: &dyn HirDatabase,
     def: AdtId,
@@ -30,6 +31,9 @@ pub fn layout_of_adt_query(
     let Ok(target) = db.target_data_layout(krate) else {
         return Err(LayoutError::TargetLayoutNotAvailable);
     };
+    if representability(db, def) == Representability::Infinite {
+        return Err(LayoutError::RecursiveTypeWithoutIndirection);
+    }
     let dl = target;
     let cx = LayoutCx::new(dl);
     let handle_variant = |def: VariantId, var: &VariantFields| {

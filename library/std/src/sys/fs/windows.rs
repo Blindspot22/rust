@@ -301,7 +301,7 @@ impl OpenOptions {
                 if self.truncate && !self.create_new {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        "creating or truncating a file requires write or append access",
+                        "append and truncate cannot both be enabled",
                     ));
                 }
             }
@@ -339,7 +339,7 @@ impl File {
         let path = maybe_verbatim(path)?;
         // SAFETY: maybe_verbatim returns null-terminated strings
         let path = unsafe { WCStr::from_wchars_with_null_unchecked(&path) };
-        Self::open_native(&path, opts)
+        Self::open_native(path, opts)
     }
 
     fn open_native(path: &WCStr, opts: &OpenOptions) -> io::Result<File> {
@@ -784,9 +784,9 @@ impl File {
 
     pub fn set_times(&self, times: FileTimes) -> io::Result<()> {
         let is_zero = |t: c::FILETIME| t.dwLowDateTime == 0 && t.dwHighDateTime == 0;
-        if times.accessed.map_or(false, is_zero)
-            || times.modified.map_or(false, is_zero)
-            || times.created.map_or(false, is_zero)
+        if times.accessed.is_some_and(is_zero)
+            || times.modified.is_some_and(is_zero)
+            || times.created.is_some_and(is_zero)
         {
             return Err(io::const_error!(
                 io::ErrorKind::InvalidInput,
@@ -794,9 +794,9 @@ impl File {
             ));
         }
         let is_max = |t: c::FILETIME| t.dwLowDateTime == u32::MAX && t.dwHighDateTime == u32::MAX;
-        if times.accessed.map_or(false, is_max)
-            || times.modified.map_or(false, is_max)
-            || times.created.map_or(false, is_max)
+        if times.accessed.is_some_and(is_max)
+            || times.modified.is_some_and(is_max)
+            || times.created.is_some_and(is_max)
         {
             return Err(io::const_error!(
                 io::ErrorKind::InvalidInput,
@@ -1114,7 +1114,7 @@ impl FileAttr {
     }
 
     pub fn changed_u64(&self) -> Option<u64> {
-        self.change_time.as_ref().map(|c| to_u64(c))
+        self.change_time.as_ref().map(to_u64)
     }
 
     pub fn volume_serial_number(&self) -> Option<u32> {
@@ -1305,7 +1305,7 @@ pub fn unlink(path: &WCStr) -> io::Result<()> {
             let mut opts = OpenOptions::new();
             opts.access_mode(c::DELETE);
             opts.custom_flags(c::FILE_FLAG_OPEN_REPARSE_POINT);
-            if let Ok(f) = File::open_native(&path, &opts) {
+            if let Ok(f) = File::open_native(path, &opts) {
                 if f.posix_delete().is_ok() {
                     return Ok(());
                 }
@@ -1328,7 +1328,7 @@ pub fn rename(old: &WCStr, new: &WCStr) -> io::Result<()> {
             let mut opts = OpenOptions::new();
             opts.access_mode(c::DELETE);
             opts.custom_flags(c::FILE_FLAG_OPEN_REPARSE_POINT | c::FILE_FLAG_BACKUP_SEMANTICS);
-            let Ok(f) = File::open_native(&old, &opts) else { return Err(err).io_result() };
+            let Ok(f) = File::open_native(old, &opts) else { return Err(err).io_result() };
 
             // Calculate the layout of the `FILE_RENAME_INFO` we pass to `SetFileInformation`
             // This is a dynamically sized struct so we need to get the position of the last field to calculate the actual size.
@@ -1419,7 +1419,7 @@ pub fn readlink(path: &WCStr) -> io::Result<PathBuf> {
     let mut opts = OpenOptions::new();
     opts.access_mode(0);
     opts.custom_flags(c::FILE_FLAG_OPEN_REPARSE_POINT | c::FILE_FLAG_BACKUP_SEMANTICS);
-    let file = File::open_native(&path, &opts)?;
+    let file = File::open_native(path, &opts)?;
     file.readlink()
 }
 
@@ -1506,7 +1506,7 @@ fn metadata(path: &WCStr, reparse: ReparsePoint) -> io::Result<FileAttr> {
     // Attempt to open the file normally.
     // If that fails with `ERROR_SHARING_VIOLATION` then retry using `FindFirstFileExW`.
     // If the fallback fails for any reason we return the original error.
-    match File::open_native(&path, &opts) {
+    match File::open_native(path, &opts) {
         Ok(file) => file.file_attr(),
         Err(e)
             if [Some(c::ERROR_SHARING_VIOLATION as _), Some(c::ERROR_ACCESS_DENIED as _)]
@@ -1662,7 +1662,7 @@ pub fn junction_point(original: &Path, link: &Path) -> io::Result<()> {
     } else {
         // Get an absolute path and then convert the prefix to `\??\`
         let abs_path = crate::path::absolute(original)?.into_os_string().into_encoded_bytes();
-        if abs_path.len() > 0 && abs_path[1..].starts_with(br":\") {
+        if !abs_path.is_empty() && abs_path[1..].starts_with(br":\") {
             let bytes = unsafe { OsStr::from_encoded_bytes_unchecked(&abs_path) };
             r"\??\".encode_utf16().chain(bytes.encode_wide()).collect()
         } else if abs_path.starts_with(br"\\.\") {

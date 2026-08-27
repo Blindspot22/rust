@@ -47,7 +47,7 @@ use hir_def::{
     TupleFieldId, TupleId, VariantId,
     attrs::AttrFlags,
     expr_store::{Body, ExpressionStore, HygieneId, body::Param, path::Path},
-    hir::{BindingId, ExprId, ExprOrPatId, ExprOrPatIdPacked, LabelId, PatId},
+    hir::{BindingId, ExprId, ExprOrPatId, ExprOrPatIdPacked, LabelId, PatId, UnaryOp},
     lang_item::LangItems,
     layout::Integer,
     resolver::{HasResolver, ResolveValueResult, Resolver, TypeNs, ValueNs},
@@ -59,13 +59,14 @@ use hir_expand::{mod_path::ModPath, name::Name};
 use indexmap::IndexSet;
 use la_arena::ArenaMap;
 use macros::{TypeFoldable, TypeVisitable};
+use rustc_abi::TargetDataLayout;
 use rustc_ast_ir::Mutability;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     AliasTyKind, TypeFoldable, TypeVisitableExt,
     inherent::{GenericArgs as _, IntoKind, Ty as _},
 };
-use salsa::Update;
+use salsa::SalsaValue;
 use smallvec::SmallVec;
 use span::Edition;
 use stdx::never;
@@ -307,9 +308,9 @@ pub enum InferenceDiagnostic {
         #[type_visitable(ignore)]
         pat: PatId,
         #[type_visitable(ignore)]
-        expected: u128,
+        expected: u64,
         #[type_visitable(ignore)]
-        found: u128,
+        found: u64,
         #[type_visitable(ignore)]
         has_rest: bool,
     },
@@ -432,6 +433,13 @@ pub enum InferenceDiagnostic {
     CannotBeDereferenced {
         #[type_visitable(ignore)]
         expr: ExprId,
+        found: StoredTy,
+    },
+    UnaryOperatorCannotBeApplied {
+        #[type_visitable(ignore)]
+        expr: ExprId,
+        #[type_visitable(ignore)]
+        op: UnaryOp,
         found: StoredTy,
     },
     MutRefInImmRefPat {
@@ -757,7 +765,7 @@ pub enum PatAdjust {
 /// When you add a field that stores types (including `Substitution` and the like), don't forget
 /// `resolve_completely()`'ing  them in `InferenceContext::resolve_all()`. Inference variables must
 /// not appear in the final inference result.
-#[derive(Clone, PartialEq, Eq, Debug, Update)]
+#[derive(Clone, PartialEq, Eq, Debug, SalsaValue)]
 pub struct InferenceResult<'db> {
     /// For each method call expr, records the function it resolves to.
     method_resolutions: FxHashMap<ExprId, (FunctionId, StoredGenericArgs)>,
@@ -1340,6 +1348,7 @@ pub(crate) struct InferenceContext<'db> {
     /// and resolve the path via its methods. This will ensure proper error reporting.
     pub(crate) resolver: Resolver<'db>,
     target_features: OnceCell<(TargetFeatures<'db>, TargetFeatureIsSafeInTarget)>,
+    data_layout: OnceCell<&'db TargetDataLayout>,
     pub(crate) edition: Edition,
     allow_using_generic_params: bool,
     generics: OnceCell<Generics<'db>>,
@@ -1367,9 +1376,6 @@ pub(crate) struct InferenceContext<'db> {
     diverges: Diverges,
     breakables: Vec<BreakableContext<'db>>,
     types: &'db crate::next_solver::DefaultAny<'db>,
-
-    /// Whether we are inside the pattern of a destructuring assignment.
-    inside_assignment: bool,
 
     deferred_cast_checks: Vec<CastCheck<'db>>,
 
@@ -1402,28 +1408,22 @@ enum BreakableKind {
     Border,
 }
 
-fn find_breakable<'a, 'db>(
-    ctxs: &'a mut [BreakableContext<'db>],
-    label: Option<LabelId>,
-) -> Option<&'a mut BreakableContext<'db>> {
+fn find_breakable(ctxs: &[BreakableContext<'_>], label: Option<LabelId>) -> Option<usize> {
     let mut ctxs = ctxs
-        .iter_mut()
+        .iter()
+        .enumerate()
         .rev()
-        .take_while(|it| matches!(it.kind, BreakableKind::Block | BreakableKind::Loop));
-    match label {
-        Some(_) => ctxs.find(|ctx| ctx.label == label),
-        None => ctxs.find(|ctx| matches!(ctx.kind, BreakableKind::Loop)),
-    }
+        .take_while(|(_, it)| matches!(it.kind, BreakableKind::Block | BreakableKind::Loop));
+    let result = match label {
+        Some(_) => ctxs.find(|(_, ctx)| ctx.label == label),
+        None => ctxs.find(|(_, ctx)| matches!(ctx.kind, BreakableKind::Loop)),
+    };
+    result.map(|(idx, _)| idx)
 }
 
-fn find_continuable<'a, 'db>(
-    ctxs: &'a mut [BreakableContext<'db>],
-    label: Option<LabelId>,
-) -> Option<&'a mut BreakableContext<'db>> {
-    match label {
-        Some(_) => find_breakable(ctxs, label).filter(|it| matches!(it.kind, BreakableKind::Loop)),
-        None => find_breakable(ctxs, label),
-    }
+fn find_continuable(ctxs: &[BreakableContext<'_>], label: Option<LabelId>) -> Option<usize> {
+    find_breakable(ctxs, label)
+        .filter(|&idx| label.is_none() || matches!(ctxs[idx].kind, BreakableKind::Loop))
 }
 
 impl<'db> InferenceContext<'db> {
@@ -1445,6 +1445,7 @@ impl<'db> InferenceContext<'db> {
             return_ty: types.types.error, // set in collect_* calls
             types,
             target_features: OnceCell::new(),
+            data_layout: OnceCell::new(),
             lang_items: table.interner().lang_items(),
             features: resolver.top_level_def_map().features(),
             edition: resolver.krate().data(db).edition,
@@ -1465,7 +1466,6 @@ impl<'db> InferenceContext<'db> {
             diverges: Diverges::Maybe,
             breakables: Vec::new(),
             deferred_cast_checks: Vec::new(),
-            inside_assignment: false,
             diagnostics: Diagnostics::default(),
             vars_emitted_type_must_be_known_for: FxHashSet::default(),
             deferred_call_resolutions: FxHashMap::default(),
@@ -1584,6 +1584,10 @@ impl<'db> InferenceContext<'db> {
             (target_features, target_feature_is_safe)
         });
         (target_features, *target_feature_is_safe)
+    }
+
+    fn data_layout(&self) -> &'db TargetDataLayout {
+        self.data_layout.get_or_init(|| self.db.target_data_layout_or_default(self.krate()))
     }
 
     /// How should a deref pattern find the place for its inner pattern to match on?
@@ -2675,56 +2679,6 @@ impl<'db> InferenceContext<'db> {
                 (self.err_ty(), None)
             }
         }
-    }
-
-    fn resolve_range_full(&self) -> Option<AdtId> {
-        let struct_ = self.lang_items.RangeFull?;
-        Some(struct_.into())
-    }
-
-    fn has_new_range_feature(&self) -> bool {
-        self.features.new_range
-    }
-
-    fn resolve_range(&self) -> Option<AdtId> {
-        let struct_ = if self.has_new_range_feature() {
-            self.lang_items.RangeCopy?
-        } else {
-            self.lang_items.Range?
-        };
-        Some(struct_.into())
-    }
-
-    fn resolve_range_inclusive(&self) -> Option<AdtId> {
-        let struct_ = if self.has_new_range_feature() {
-            self.lang_items.RangeInclusiveCopy?
-        } else {
-            self.lang_items.RangeInclusiveStruct?
-        };
-        Some(struct_.into())
-    }
-
-    fn resolve_range_from(&self) -> Option<AdtId> {
-        let struct_ = if self.has_new_range_feature() {
-            self.lang_items.RangeFromCopy?
-        } else {
-            self.lang_items.RangeFrom?
-        };
-        Some(struct_.into())
-    }
-
-    fn resolve_range_to(&self) -> Option<AdtId> {
-        let struct_ = self.lang_items.RangeTo?;
-        Some(struct_.into())
-    }
-
-    fn resolve_range_to_inclusive(&self) -> Option<AdtId> {
-        let struct_ = if self.has_new_range_feature() {
-            self.lang_items.RangeToInclusiveCopy?
-        } else {
-            self.lang_items.RangeToInclusive?
-        };
-        Some(struct_.into())
     }
 
     fn resolve_va_list(&self) -> Option<AdtId> {

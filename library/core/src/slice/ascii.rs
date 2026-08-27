@@ -91,7 +91,7 @@ impl [u8] {
         let mut b = other;
 
         while let ([first_a, rest_a @ ..], [first_b, rest_b @ ..]) = (a, b) {
-            if first_a.eq_ignore_ascii_case(&first_b) {
+            if first_a.eq_ignore_ascii_case(first_b) {
                 a = rest_a;
                 b = rest_b;
             } else {
@@ -392,7 +392,7 @@ impl<'a> fmt::Display for EscapeAscii<'a> {
             b > 0x7E || b < 0x20 || b == b'\\' || b == b'\'' || b == b'"'
         }
 
-        while bytes.len() > 0 {
+        while !bytes.is_empty() {
             // fast path for the printable, non-escaped subset of ascii
             let prefix = bytes.iter().take_while(|&&b| !needs_escape(b)).count();
             // SAFETY: prefix length was derived by counting bytes in the same splice, so it's in-bounds
@@ -666,10 +666,9 @@ const fn is_ascii(bytes: &[u8]) -> bool {
         } else {
             // For small inputs, use usize-at-a-time processing to avoid SSE2 call overhead.
             if bytes.len() < SIMD_MIN_LEN {
-                let chunks = bytes.chunks_exact(USIZE_SIZE);
-                let remainder = chunks.remainder();
+                let (chunks, remainder) = bytes.as_chunks::<USIZE_SIZE>();
                 for chunk in chunks {
-                    let word = usize::from_ne_bytes(chunk.try_into().unwrap());
+                    let word = usize::from_ne_bytes(*chunk);
                     if (word & NONASCII_MASK) != 0 {
                         return false;
                     }

@@ -130,6 +130,7 @@ impl AttributeKind {
             RustcDoNotConstCheck => Yes,
             RustcDocPrimitive(..) => Yes,
             RustcDummy => No,
+            RustcDumpClauses => No,
             RustcDumpDefParents => No,
             RustcDumpDefPath(..) => No,
             RustcDumpGenerics => No,
@@ -138,7 +139,6 @@ impl AttributeKind {
             RustcDumpItemBounds => No,
             RustcDumpLayout(..) => No,
             RustcDumpObjectLifetimeDefaults => No,
-            RustcDumpPredicates => No,
             RustcDumpSymbolName(..) => Yes,
             RustcDumpUserArgs => No,
             RustcDumpVariances => No,
@@ -185,7 +185,6 @@ impl AttributeKind {
             RustcPubTransparent(..) => Yes,
             RustcReallocator => No,
             RustcRegions => No,
-            RustcReservationImpl(..) => Yes,
             RustcScalableVector { .. } => Yes,
             RustcShouldNotBeCalledOnConstItems => Yes,
             RustcSimdMonomorphizeLaneLimit(..) => Yes, // Affects layout computation, which needs to work cross-crate

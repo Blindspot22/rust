@@ -8,13 +8,13 @@ use itertools::Itertools as _;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap, IndexEntry};
 use rustc_data_structures::unhash::UnhashMap;
 use rustc_errors::Applicability;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def::Res;
 use rustc_hir::{
-    AmbigArg, BoundPolarity, GenericBound, Generics, Item, ItemKind, LangItem, Node, Path, PathSegment,
-    PredicateOrigin, QPath, TraitBoundModifiers, TraitItem, TraitRef, Ty, TyKind, WherePredicateKind,
+    AmbigArg, BoundPolarity, GenericBound, Generics, Item, ItemKind, Node, Path, PathSegment, PredicateOrigin, QPath,
+    TraitBoundModifiers, TraitItem, TraitRef, Ty, TyKind, WherePredicateKind,
 };
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::impl_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 use rustc_span::{Span, SyntaxContext};
 
 declare_clippy_lint! {

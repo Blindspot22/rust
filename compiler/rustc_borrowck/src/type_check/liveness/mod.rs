@@ -32,6 +32,7 @@ pub(super) fn generate<'tcx>(
     move_data: &MoveData<'tcx>,
 ) {
     debug!("liveness::generate");
+    let _timer = typeck.tcx().prof.generic_activity("borrowck_liveness");
 
     let mut free_regions = regions_that_outlive_free_regions(
         typeck.infcx.num_region_vars(),
@@ -45,7 +46,13 @@ pub(super) fn generate<'tcx>(
     // unlike NLLs.
     // We do record these regions in the polonius context, since they're used to differentiate
     // relevant and boring locals, which is a key distinction used later in diagnostics.
-    if typeck.tcx().sess.opts.unstable_opts.polonius.is_next_enabled() {
+    // This additional liveness information is ultimately used for *loan* liveness,
+    // so we don't need to compute it when there are no loans.
+    // FIXME: this NLL optimization idea, to reduce work to relevant locals only, still makes sense
+    // for polonius, and should be investigated to improve liveness performance.
+    if typeck.tcx().sess.opts.unstable_opts.polonius.is_next_enabled()
+        && typeck.borrow_set.len() > 0
+    {
         let (_, boring_locals) =
             compute_relevant_live_locals(typeck.tcx(), &free_regions, typeck.body);
         typeck.polonius_context.as_mut().unwrap().boring_nll_locals =

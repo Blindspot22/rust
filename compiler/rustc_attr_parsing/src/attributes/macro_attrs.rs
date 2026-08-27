@@ -1,10 +1,10 @@
+use rustc_attr_ir::{MacroUseArgs, find_attr};
 use rustc_feature::AttributeStability;
-use rustc_hir::attrs::{CollapseMacroDebuginfo, MacroUseArgs};
-use rustc_hir::find_attr;
-use rustc_session::lint::builtin::INVALID_MACRO_EXPORT_ARGUMENTS;
+use rustc_lint_defs::builtin::INVALID_MACRO_EXPORT_ARGUMENTS;
+use rustc_structures::CollapseMacroDebuginfo;
 
 use super::prelude::*;
-use crate::session_diagnostics::MacroOnlyAttribute;
+use crate::diagnostics::MacroOnlyAttribute;
 
 pub(crate) struct MacroEscapeParser;
 impl NoArgsAttributeParser for MacroEscapeParser {

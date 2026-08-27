@@ -6,7 +6,7 @@ use std::ops::ControlFlow;
 use rustc_abi::ExternAbi;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir as hir;
-use rustc_hir::lang_items::LangItem;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir_analysis::hir_ty_lowering::HirTyLowerer;
 use rustc_infer::infer::{BoundRegionConversionTime, DefineOpaqueTypes, InferOk, InferResult};
 use rustc_infer::traits::{ObligationCauseCode, PredicateObligations};
@@ -136,12 +136,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
                         Ty::new_adt(
                             tcx,
-                            tcx.adt_def(tcx.require_lang_item(hir::LangItem::Poll, expr_span)),
+                            tcx.adt_def(tcx.require_lang_item(LangItem::Poll, expr_span)),
                             tcx.mk_args(&[Ty::new_adt(
                                 tcx,
-                                tcx.adt_def(
-                                    tcx.require_lang_item(hir::LangItem::Option, expr_span),
-                                ),
+                                tcx.adt_def(tcx.require_lang_item(LangItem::Option, expr_span)),
                                 tcx.mk_args(&[yield_ty.into()]),
                             )
                             .into()]),
@@ -485,7 +483,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         &self,
         cause_span: Option<Span>,
         closure_kind: hir::ClosureKind,
-        projection: ty::PolyProjectionPredicate<'tcx>,
+        projection: ty::PolyProjectionClause<'tcx>,
     ) -> Option<ExpectedSig<'tcx>> {
         let def_id = projection.item_def_id();
 
@@ -517,7 +515,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     fn extract_sig_from_projection(
         &self,
         cause_span: Option<Span>,
-        projection: ty::PolyProjectionPredicate<'tcx>,
+        projection: ty::PolyProjectionClause<'tcx>,
     ) -> Option<ExpectedSig<'tcx>> {
         let projection = self.resolve_vars_if_possible(projection);
 
@@ -562,7 +560,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     fn extract_sig_from_projection_and_future_bound(
         &self,
         cause_span: Option<Span>,
-        projection: ty::PolyProjectionPredicate<'tcx>,
+        projection: ty::PolyProjectionClause<'tcx>,
     ) -> Option<ExpectedSig<'tcx>> {
         let projection = self.resolve_vars_if_possible(projection);
 
@@ -1033,7 +1031,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     fn deduce_future_output_from_projection(
         &self,
         cause_span: Span,
-        predicate: ty::PolyProjectionPredicate<'tcx>,
+        predicate: ty::PolyProjectionClause<'tcx>,
     ) -> Option<Ty<'tcx>> {
         debug!("deduce_future_output_from_projection(predicate={:?})", predicate);
 

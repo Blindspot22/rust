@@ -23,6 +23,7 @@ use tracing::{debug, instrument};
 use super::trait_goals::TraitGoalProvenVia;
 use super::{has_only_region_constraints, inspect};
 use crate::delegate::SolverDelegate;
+use crate::solve::assembly::structural_traits::AmbiguousOrRerunNonErased;
 use crate::solve::inspect::ProbeKind;
 use crate::solve::{
     BuiltinImplSource, CandidateSource, CanonicalResponse, Certainty, EvalCtxt, Goal, GoalSource,
@@ -116,9 +117,10 @@ where
                     ecx.add_goals(GoalSource::ImplWhereBound, requirements)?;
                     ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
                 }
-                Err(_) => {
+                Err(AmbiguousOrRerunNonErased::Ambiguous) => {
                     ecx.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS)
                 }
+                Err(AmbiguousOrRerunNonErased::RerunNonErased(rerun)) => Err(rerun.into()),
             }
         })
     }
@@ -209,11 +211,15 @@ where
         then: impl FnOnce(&mut EvalCtxt<'_, D>) -> QueryResultOrRerunNonErased<I>,
     ) -> QueryResultOrRerunNonErased<I>;
 
+    /// Note: `goal_trait_ref` is derived from `goal`. Nonetheless, because
+    /// `consider_impl_candidate` is always called in a loop, we precompute `goal_trait_ref` once
+    /// and pass it in next to `goal` because the computation is expensive and loop-invariant.
     fn consider_impl_candidate(
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
+        goal_trait_ref: ty::TraitRef<I>,
         impl_def_id: I::ImplId,
-        then: impl FnOnce(&mut EvalCtxt<'_, D>, Certainty) -> QueryResultOrRerunNonErased<I>,
+        then: impl FnOnce(&mut EvalCtxt<'_, D>) -> QueryResultOrRerunNonErased<I>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased>;
 
     /// If the predicate contained an error, we want to avoid emitting unnecessary trait
@@ -545,15 +551,10 @@ where
         candidates: &mut Vec<Candidate<I>>,
     ) -> Result<(), RerunNonErased> {
         let cx = self.cx();
-        cx.for_each_relevant_impl(goal.predicate.trait_ref(cx), |impl_def_id| -> Result<_, _> {
-            // For every `default impl`, there's always a non-default `impl`
-            // that will *also* apply. There's no reason to register a candidate
-            // for this impl, since it is *not* proof that the trait goal holds.
-            if cx.impl_is_default(impl_def_id) {
-                return Ok(());
-            }
-            match G::consider_impl_candidate(self, goal, impl_def_id, |ecx, certainty| {
-                ecx.evaluate_added_goals_and_make_canonical_response(certainty)
+        let goal_trait_ref = goal.predicate.trait_ref(cx);
+        cx.for_each_relevant_impl(goal_trait_ref, |impl_def_id| -> Result<_, _> {
+            match G::consider_impl_candidate(self, goal, goal_trait_ref, impl_def_id, |ecx| {
+                ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
             })
             .map_err_to_rerun()?
             {
@@ -700,7 +701,7 @@ where
         candidates: &mut Vec<Candidate<I>>,
         failed_candidate_info: &mut FailedCandidateInfo,
     ) -> Result<(), RerunNonErased> {
-        for assumption in goal.param_env.caller_bounds().iter() {
+        for assumption in goal.param_env.caller_bounds() {
             match G::probe_and_consider_param_env_candidate(self, goal, assumption)? {
                 Ok(candidate) => candidates.push(candidate),
                 Err(head_usages) => {
@@ -1165,19 +1166,13 @@ where
         // See tests/ui/impl-trait/non-defining-uses/use-blanket-impl.rs for an example.
         if assemble_from.should_assemble_impl_candidates() {
             let cx = self.cx();
-            cx.for_each_blanket_impl(goal.predicate.trait_def_id(cx), |impl_def_id| {
-                // For every `default impl`, there's always a non-default `impl`
-                // that will *also* apply. There's no reason to register a candidate
-                // for this impl, since it is *not* proof that the trait goal holds.
-                if cx.impl_is_default(impl_def_id) {
-                    return Ok(());
-                }
+            let goal_trait_ref = goal.predicate.trait_ref(cx);
 
-                match G::consider_impl_candidate(self, goal, impl_def_id, |ecx, certainty| {
+            cx.for_each_blanket_impl(goal.predicate.trait_def_id(cx), |impl_def_id| {
+                match G::consider_impl_candidate(self, goal, goal_trait_ref, impl_def_id, |ecx| {
                     if ecx.shallow_resolve(self_ty).is_ty_var() {
                         // We force the certainty of impl candidates to be `Maybe`.
-                        let certainty = certainty.and(Certainty::AMBIGUOUS);
-                        ecx.evaluate_added_goals_and_make_canonical_response(certainty)
+                        ecx.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS)
                     } else {
                         // We don't want to use impls if they constrain the opaque.
                         //

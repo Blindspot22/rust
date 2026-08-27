@@ -159,10 +159,10 @@
 //!
 //! Allocations typically have a fixed size that cannot change. However, allocations created by
 //! directly invoking page table operations of the operating system, e.g. via `mmap`, are allowed to
-//! grow by adding more pages to them at the end. Unmapping parts of an allocation (i.e., shrinking
-//! it or punching holes into it) is currently not supported. Allocations created via
-//! "compiler-recognized" operations, such as `std::alloc` methods or `libc::malloc`, can never
-//! change their size, even if they use `mmap` under the hood.
+//! grow by adding more pages to them at the end. Adding more pages before the beginning, or
+//! unmapping parts of an allocation (i.e., shrinking it or punching holes into it), is currently
+//! not supported. Allocations created via "compiler-recognized" operations, such as `std::alloc`
+//! methods or `libc::malloc`, can never change their size, even if they use `mmap` under the hood.
 //!
 //! [`null()`]: null
 //!
@@ -428,9 +428,10 @@
 
 use crate::cmp::Ordering;
 use crate::intrinsics::const_eval_select;
-use crate::marker::{Destruct, FnPtr, PointeeSized};
+use crate::marker::{Destruct, PointeeSized};
 use crate::mem::{self, MaybeUninit, SizedTypeProperties};
 use crate::num::NonZero;
+use crate::ops::FnPtr;
 use crate::{fmt, hash, intrinsics, ub_checks};
 
 #[unstable(feature = "ptr_alignment_type", issue = "102070")]
@@ -1331,7 +1332,7 @@ pub const fn slice_from_raw_parts_mut<T>(data: *mut T, len: usize) -> *mut [T] {
 ///     assert_eq!([1, 0, 1, 2], array);
 /// }
 /// ```
-#[inline]
+#[inline(always)]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_const_stable(feature = "const_swap", since = "1.85.0")]
 #[rustc_diagnostic_item = "ptr_swap"]
@@ -1573,7 +1574,7 @@ unsafe fn swap_nonoverlapping_bytes(x: *mut u8, y: *mut u8, bytes: NonZero<usize
 /// assert_eq!(b, 'b');
 /// assert_eq!(rust, &['r', 'u', 's', 't']);
 /// ```
-#[inline]
+#[inline(always)]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_const_stable(feature = "const_replace", since = "1.83.0")]
 #[rustc_diagnostic_item = "ptr_replace"]
@@ -1708,7 +1709,7 @@ pub const unsafe fn replace<T>(dst: *mut T, src: T) -> T {
 /// ```
 ///
 /// [valid]: self#safety
-#[inline]
+#[inline(always)]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_const_stable(feature = "const_ptr_read", since = "1.71.0")]
 #[track_caller]
@@ -1826,7 +1827,7 @@ pub const unsafe fn read<T>(src: *const T) -> T {
 ///     unsafe { ptr.read_unaligned() }
 /// }
 /// ```
-#[inline]
+#[inline(always)]
 #[stable(feature = "ptr_unaligned", since = "1.17.0")]
 #[rustc_const_stable(feature = "const_ptr_read", since = "1.71.0")]
 #[track_caller]
@@ -1932,7 +1933,7 @@ pub const unsafe fn read_unaligned<T>(src: *const T) -> T {
 /// assert_eq!(foo, "bar");
 /// assert_eq!(bar, "foo");
 /// ```
-#[inline]
+#[inline(always)]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_const_stable(feature = "const_ptr_write", since = "1.83.0")]
 #[rustc_diagnostic_item = "ptr_write"]
@@ -2036,7 +2037,7 @@ pub const unsafe fn write<T>(dst: *mut T, src: T) {
 ///     unsafe { ptr.write_unaligned(val) }
 /// }
 /// ```
-#[inline]
+#[inline(always)]
 #[stable(feature = "ptr_unaligned", since = "1.17.0")]
 #[rustc_const_stable(feature = "const_ptr_write", since = "1.83.0")]
 #[rustc_diagnostic_item = "ptr_write_unaligned"]
@@ -2141,7 +2142,7 @@ pub const unsafe fn write_unaligned<T>(dst: *mut T, src: T) {
 ///     assert_eq!(std::ptr::read_volatile(y), 12);
 /// }
 /// ```
-#[inline]
+#[inline(always)]
 #[stable(feature = "volatile", since = "1.9.0")]
 #[rustc_const_unstable(feature = "const_volatile", issue = "159094")]
 #[track_caller]
@@ -2247,7 +2248,7 @@ pub const unsafe fn read_volatile<T>(src: *const T) -> T {
 ///     assert_eq!(std::ptr::read_volatile(y), 12);
 /// }
 /// ```
-#[inline]
+#[inline(always)]
 #[stable(feature = "volatile", since = "1.9.0")]
 #[rustc_const_unstable(feature = "const_volatile", issue = "159094")]
 #[rustc_diagnostic_item = "ptr_write_volatile"]
@@ -2660,21 +2661,21 @@ impl<F: FnPtr> Ord for F {
 #[stable(feature = "fnptr_impls", since = "1.4.0")]
 impl<F: FnPtr> hash::Hash for F {
     fn hash<HH: hash::Hasher>(&self, state: &mut HH) {
-        state.write_usize(self.addr().addr())
+        state.write_usize(self.addr())
     }
 }
 
 #[stable(feature = "fnptr_impls", since = "1.4.0")]
 impl<F: FnPtr> fmt::Pointer for F {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::pointer_fmt_inner(self.addr().addr(), f)
+        fmt::pointer_fmt_inner(self.addr(), f)
     }
 }
 
 #[stable(feature = "fnptr_impls", since = "1.4.0")]
 impl<F: FnPtr> fmt::Debug for F {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::pointer_fmt_inner(self.addr().addr(), f)
+        fmt::pointer_fmt_inner(self.addr(), f)
     }
 }
 

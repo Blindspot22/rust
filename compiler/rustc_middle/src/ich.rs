@@ -1,11 +1,12 @@
 use std::hash::Hash;
 
+use rustc_crate_store::Untracked;
+use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::stable_hash::{
-    RawDefId, RawDefPathHash, RawSpan, StableHash, StableHashControls, StableHashCtxt, StableHasher,
+    RawDefId, RawSpan, StableHash, StableHashControls, StableHashCtxt, StableHasher,
 };
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_session::Session;
-use rustc_session::cstore::Untracked;
 use rustc_span::source_map::SourceMap;
 use rustc_span::{CachingSourceMapView, DUMMY_SP, Pos, Span};
 
@@ -159,14 +160,14 @@ impl<'a> StableHashCtxt for StableHashState<'a> {
     }
 
     #[inline]
-    fn def_path_hash(&self, raw_def_id: RawDefId) -> RawDefPathHash {
+    fn def_path_hash(&self, raw_def_id: RawDefId) -> Fingerprint {
         let def_id = DefId::from_raw_def_id(raw_def_id);
         if let Some(def_id) = def_id.as_local() {
             self.untracked.definitions.read().def_path_hash(def_id)
         } else {
             self.untracked.cstore.read().def_path_hash(def_id)
         }
-        .to_raw_def_path_hash()
+        .0
     }
 
     /// Assert that the provided `StableHashCtxt` is configured with the default

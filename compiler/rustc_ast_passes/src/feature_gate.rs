@@ -1,13 +1,12 @@
 use rustc_ast::visit::{self, AssocCtxt, FnKind, Visitor};
 use rustc_ast::{self as ast, AttrVec, GenericBound, NodeId, PatKind, attr, token};
+use rustc_attr_ir::{Attribute, AttributeKind};
 use rustc_attr_parsing::AttributeParser;
 use rustc_errors::msg;
 use rustc_feature::Features;
-use rustc_hir::Attribute;
-use rustc_hir::attrs::AttributeKind;
 use rustc_session::Session;
 use rustc_session::diagnostics::{feature_err, feature_warn};
-use rustc_span::{Span, Spanned, Symbol, sym};
+use rustc_span::{Span, Spanned, sym};
 
 use crate::diagnostics;
 
@@ -262,9 +261,6 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
                 // Function pointers cannot be `const`
                 self.check_late_bound_lifetime_defs(&fn_ptr_ty.generic_params);
             }
-            ast::TyKind::Never => {
-                gate!(self, never_type, ty.span, "the `!` type is experimental");
-            }
             ast::TyKind::Pat(..) => {
                 gate!(self, pattern_types, ty.span, "pattern types are unstable");
             }
@@ -295,15 +291,6 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
     }
 
     fn visit_generic_args(&mut self, args: &'a ast::GenericArgs) {
-        // This check needs to happen here because the never type can be returned from a function,
-        // but cannot be used in any other context. If this check was in `visit_fn_ret_ty`, it
-        // include both functions and generics like `impl Fn() -> !`.
-        if let ast::GenericArgs::Parenthesized(generic_args) = args
-            && let ast::FnRetTy::Ty(ref ty) = generic_args.output
-            && matches!(ty.kind, ast::TyKind::Never)
-        {
-            gate!(self, never_type, ty.span, "the `!` type is experimental");
-        }
         visit::walk_generic_args(self, args);
     }
 
@@ -351,9 +338,6 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
                         );
                     }
                 }
-            }
-            PatKind::Box(..) => {
-                gate!(self, box_patterns, pattern.span, "box pattern syntax is experimental");
             }
             _ => {}
         }
@@ -429,6 +413,16 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
         }
         visit::walk_assoc_item(self, i, ctxt)
     }
+
+    fn visit_test_binder_forall(&mut self, forall: &'a ast::TestBinderForall) {
+        self.check_late_bound_lifetime_defs(&forall.generics.params);
+        visit::walk_test_binder_forall(self, forall)
+    }
+
+    fn visit_test_binder_exists(&mut self, exists: &'a ast::TestBinderExists) {
+        self.check_late_bound_lifetime_defs(&exists.params);
+        visit::walk_test_binder_exists(self, exists)
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -437,7 +431,7 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session, features: &Features) {
     maybe_stage_features(sess, features, krate);
     check_incompatible_features(sess, features);
     check_dependent_features(sess, features);
-    check_new_solver_banned_features(sess, features);
+    warn_next_solver_and_gce(sess, features);
     check_features_requiring_new_solver(sess, features);
 
     let mut visitor = PostExpansionVisitor { sess, features };
@@ -506,11 +500,16 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session, features: &Features) {
     gate_all!(
         closure_lifetime_binder,
         "`for<...>` binders for closures are experimental",
-        "consider removing `for<...>`"
+        "consider using a type annotation instead: \
+         `let closure: for<...> fn(...) -> ... = /* closure */;`"
     );
     gate_all!(
         half_open_range_patterns_in_slices,
         "half-open range patterns in slices are unstable"
+    );
+    gate_all!(
+        named_fn_trait_parameters,
+        "named parameters in parenthesized generic argument lists are experimental"
     );
 
     // `associated_const_equality` will be stabilized as part of `min_generic_const_args`.
@@ -604,7 +603,6 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session, features: &Features) {
 
     // tidy-alphabetical-start
     soft_gate_all_legacy_dont_use!(auto_traits, "`auto` traits are unstable");
-    soft_gate_all_legacy_dont_use!(box_patterns, "box pattern syntax is experimental");
     soft_gate_all_legacy_dont_use!(decl_macro, "`macro` is experimental");
     soft_gate_all_legacy_dont_use!(negative_impls, "negative impls are experimental");
     soft_gate_all_legacy_dont_use!(specialization, "specialization is experimental");
@@ -718,26 +716,21 @@ fn check_dependent_features(sess: &Session, features: &Features) {
     }
 }
 
-fn check_new_solver_banned_features(sess: &Session, features: &Features) {
+fn warn_next_solver_and_gce(sess: &Session, features: &Features) {
     if !sess.opts.unstable_opts.next_solver.globally {
         return;
     }
 
-    // Ban GCE with the new solver, because it does not implement GCE correctly.
+    // Warn people who uses GCE and -Znext-solver=globally
+    // that their trait solver was downgraded to -Znext-solver=no
     if let Some(gce_span) = features
         .enabled_lang_features()
         .iter()
         .find(|feat| feat.gate_name == sym::generic_const_exprs)
         .map(|feat| feat.attr_sp)
     {
-        // Abort immediately, otherwise GCE can lower to `ConstKind::Expr`,
-        // which the new solver intentionally does not support.
-        #[allow(rustc::symbol_intern_string_literal)]
-        sess.dcx().emit_fatal(diagnostics::IncompatibleFeatures {
-            spans: vec![gce_span],
-            f1: Symbol::intern("-Znext-solver=globally"),
-            f2: sym::generic_const_exprs,
-        });
+        sess.dcx()
+            .emit_warn(diagnostics::NextSolverDisabledForGenericConstExprs { span: gce_span });
     }
 }
 

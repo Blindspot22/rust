@@ -2,7 +2,7 @@
 
 use std::{borrow::Cow, cell::RefCell, fmt::Write, iter, mem, ops::Range};
 
-use base_db::{Crate, salsa::update_fallback_db, target::TargetLoadError};
+use base_db::{Crate, target::TargetLoadError};
 use either::Either;
 use hir_def::{
     AdtId, DefWithBodyId, EnumVariantId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId,
@@ -31,7 +31,7 @@ use rustc_type_ir::{
     AliasTyKind,
     inherent::{GenericArgs as _, IntoKind, Region as _, SliceLike, Ty as _},
 };
-use salsa::Update;
+use salsa::SalsaValue;
 use span::FileId;
 use stdx::never;
 use syntax::{SyntaxNodePtr, TextRange};
@@ -349,7 +349,7 @@ impl Address {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Update)]
+#[derive(Clone, PartialEq, Eq, SalsaValue)]
 pub enum MirEvalError<'db> {
     ConstEvalError(String, Box<ConstEvalError<'db>>),
     LayoutError(LayoutError, StoredTy),
@@ -366,8 +366,7 @@ pub enum MirEvalError<'db> {
     InvalidConst,
     InFunction(
         Box<MirEvalError<'db>>,
-        #[update(bounds(InternedClosureId<'db>: Update), unsafe(with(update_fallback_db::<'db, _>)))]
-         Vec<(Either<FunctionId, InternedClosureId<'db>>, MirSpan, InferBodyId<'db>)>,
+        Vec<(Either<FunctionId, InternedClosureId<'db>>, MirSpan, InferBodyId<'db>)>,
     ),
     ExecutionLimitExceeded,
     StackOverflow,
@@ -1047,7 +1046,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                         TerminatorKind::SwitchInt { discr, targets } => {
                             let val = u128::from_le_bytes(pad16(
                                 self.eval_operand(discr, locals)?.get(self)?,
-                                false,
+                                IsSigned::No,
                             ));
                             current_block_idx = targets.target_for_value(val);
                         }
@@ -1570,7 +1569,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 | CastKind::PointerExposeAddress
                 | CastKind::PointerFromExposedAddress => {
                     let current_ty = self.operand_ty(operand, locals)?;
-                    let is_signed = matches!(current_ty.kind(), TyKind::Int(_));
+                    let is_signed = matches!(current_ty.kind(), TyKind::Int(_)).into();
                     let current = pad16(self.eval_operand(operand, locals)?.get(self)?, is_signed);
                     let dest_size = self.size_of_sized(
                         target_ty.as_ref(),
@@ -1649,7 +1648,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
                 }
                 CastKind::IntToFloat => {
                     let current_ty = self.operand_ty(operand, locals)?;
-                    let is_signed = matches!(current_ty.kind(), TyKind::Int(_));
+                    let is_signed = matches!(current_ty.kind(), TyKind::Int(_)).into();
                     let value = pad16(self.eval_operand(operand, locals)?.get(self)?, is_signed);
                     let value = i128::from_le_bytes(value);
                     let TyKind::Float(target_ty) = target_ty.as_ref().kind() else {
@@ -1690,7 +1689,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
             Variants::Multiple { tag, tag_encoding, variants, .. } => {
                 let size = tag.size(self.target_data_layout).bytes_usize();
                 let offset = layout.fields.offset(0).bytes_usize(); // The only field on enum variants is the tag field
-                let is_signed = tag.is_signed();
+                let is_signed = tag.is_signed().into();
                 match tag_encoding {
                     TagEncoding::Direct => {
                         let tag = &bytes[offset..offset + size];
@@ -2151,7 +2150,7 @@ impl<'a, 'db> Evaluator<'a, 'db> {
         let v: Cow<'_, [u8]> = if size != v.len() {
             // Handle self enum
             if size == 16 && v.len() < 16 {
-                Cow::Owned(pad16(v, false).to_vec())
+                Cow::Owned(pad16(v, IsSigned::No).to_vec())
             } else if size < 16 && v.len() == 16 {
                 Cow::Borrowed(&v[0..size])
             } else {
@@ -3294,8 +3293,20 @@ pub fn render_const_using_debug_impl<'db>(
     Ok(std::string::String::from_utf8_lossy(evaluator.read_memory(addr, size)?).into_owned())
 }
 
-pub fn pad16(it: &[u8], is_signed: bool) -> [u8; 16] {
-    let is_negative = is_signed && it.last().unwrap_or(&0) > &127;
+#[derive(PartialEq, Eq)]
+pub enum IsSigned {
+    Yes,
+    No,
+}
+
+impl From<bool> for IsSigned {
+    fn from(value: bool) -> Self {
+        if value { Self::Yes } else { Self::No }
+    }
+}
+
+pub fn pad16(it: &[u8], is_signed: IsSigned) -> [u8; 16] {
+    let is_negative = is_signed == IsSigned::Yes && it.last().unwrap_or(&0) > &127;
     let mut res = [if is_negative { 255 } else { 0 }; 16];
     res[..it.len()].copy_from_slice(it);
     res

@@ -3,6 +3,7 @@ use std::ops::Deref;
 
 use rustc_hir as hir;
 use rustc_hir::GenericArg;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def_id::DefId;
 use rustc_hir_analysis::hir_ty_lowering::generics::{
     check_generic_arg_count_for_value_path, lower_generic_args,
@@ -13,7 +14,7 @@ use rustc_hir_analysis::hir_ty_lowering::{
 use rustc_infer::infer::{
     BoundRegionConversionTime, DefineOpaqueTypes, InferOk, RegionVariableOrigin,
 };
-use rustc_lint::builtin::{
+use rustc_lint_defs::builtin::{
     AMBIGUOUS_GLOB_IMPORTED_TRAITS, RESOLVING_TO_ITEMS_SHADOWING_SUPERTRAIT_ITEMS,
 };
 use rustc_middle::traits::ObligationCauseCode;
@@ -257,7 +258,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
                 let region = self.next_region_var(RegionVariableOrigin::Autoref(self.span));
 
                 target = match target.kind() {
-                    ty::Adt(pin, args) if self.tcx.is_lang_item(pin.did(), hir::LangItem::Pin) => {
+                    ty::Adt(pin, args) if self.tcx.is_lang_item(pin.did(), LangItem::Pin) => {
                         let inner_ty = match args[0].expect_ty().kind() {
                             ty::Ref(_, ty, _) => *ty,
                             _ => bug!("Expected a reference type for argument to Pin"),
@@ -450,7 +451,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
                 &mut self,
                 preceding_args: &[ty::GenericArg<'tcx>],
                 param: &ty::GenericParamDef,
-                arg: &GenericArg<'tcx>,
+                arg: &GenericArg<'_>,
             ) -> ty::GenericArg<'tcx> {
                 match (&param.kind, arg) {
                     (GenericParamDefKind::Lifetime, GenericArg::Lifetime(lt)) => self

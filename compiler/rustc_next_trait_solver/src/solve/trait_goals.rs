@@ -10,9 +10,9 @@ use rustc_type_ir::solve::{
     RerunReason, RerunResultExt, SizedTraitKind,
 };
 use rustc_type_ir::{
-    self as ty, ExistentialPredicate, FieldInfo, Interner, MayBeErased, Movability,
-    PredicatePolarity, Region, TraitPredicate, TraitRef, TypeVisitableExt as _, TypingMode,
-    Unnormalized, Upcast as _, elaborate,
+    self as ty, ClausePolarity, ExistentialPredicate, FieldInfo, Interner, MayBeErased, Movability,
+    Region, TraitClause, TraitRef, TypeVisitableExt as _, TypingMode, Unnormalized, Upcast as _,
+    elaborate,
 };
 use tracing::{debug, instrument, trace, warn};
 
@@ -28,7 +28,7 @@ use crate::solve::{
     has_only_region_constraints,
 };
 
-impl<D, I> assembly::GoalKind<D> for TraitPredicate<I>
+impl<D, I> assembly::GoalKind<D> for TraitClause<I>
 where
     D: SolverDelegate<Interner = I>,
     I: Interner,
@@ -59,57 +59,49 @@ where
 
     fn consider_impl_candidate(
         ecx: &mut EvalCtxt<'_, D>,
-        goal: Goal<I, TraitPredicate<I>>,
+        goal: Goal<I, TraitClause<I>>,
+        goal_trait_ref: TraitRef<I>,
         impl_def_id: I::ImplId,
-        then: impl FnOnce(&mut EvalCtxt<'_, D>, Certainty) -> QueryResultOrRerunNonErased<I>,
+        then: impl FnOnce(&mut EvalCtxt<'_, D>) -> QueryResultOrRerunNonErased<I>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
         let cx = ecx.cx();
 
         let impl_trait_ref = cx.impl_trait_ref(impl_def_id);
         if !DeepRejectCtxt::relate_rigid_infer(ecx.cx())
-            .args_may_unify(goal.predicate.trait_ref.args, impl_trait_ref.skip_binder().args)
+            .args_may_unify(goal_trait_ref.args, impl_trait_ref.skip_binder().args)
         {
             return Err(NoSolution.into());
         }
 
-        // An upper bound of the certainty of this goal, used to lower the certainty
-        // of reservation impl to ambiguous during coherence.
-        let impl_polarity = cx.impl_polarity(impl_def_id);
-        let maximal_certainty = match (impl_polarity, goal.predicate.polarity) {
-            // In coherence mode, this is ambiguous. But outside of coherence, it's not a real impl.
-            (ty::ImplPolarity::Reservation, _) => {
-                if ecx.typing_mode().is_coherence() {
-                    Certainty::AMBIGUOUS
-                } else {
-                    return Err(NoSolution.into());
-                }
-            }
+        // For every `default impl`, there's always a non-default `impl` that will *also* apply.
+        // There's no reason to register a candidate for this impl, since it is *not* proof that
+        // the trait goal holds.
+        if cx.impl_is_default(impl_def_id) {
+            return Err(NoSolution.into());
+        }
 
+        match (cx.impl_polarity(impl_def_id), goal.predicate.polarity) {
             // Impl matches polarity
-            (ty::ImplPolarity::Positive, ty::PredicatePolarity::Positive)
-            | (ty::ImplPolarity::Negative, ty::PredicatePolarity::Negative) => {
-                if ecx.typing_mode().is_reflection()
-                    && !cx.is_fully_generic_for_reflection(impl_def_id)
-                {
-                    return Err(NoSolution.into());
-                } else {
-                    Certainty::Yes
-                }
-            }
+            (ty::ImplPolarity::Positive, ty::ClausePolarity::Positive)
+            | (ty::ImplPolarity::Negative, ty::ClausePolarity::Negative) => {}
 
             // Impl doesn't match polarity
-            (ty::ImplPolarity::Positive, ty::PredicatePolarity::Negative)
-            | (ty::ImplPolarity::Negative, ty::PredicatePolarity::Positive) => {
+            (ty::ImplPolarity::Positive, ty::ClausePolarity::Negative)
+            | (ty::ImplPolarity::Negative, ty::ClausePolarity::Positive) => {
                 return Err(NoSolution.into());
             }
-        };
+        }
+
+        if ecx.typing_mode().is_reflection() && !cx.is_fully_generic_for_reflection(impl_def_id) {
+            return Err(NoSolution.into());
+        }
 
         ecx.probe_trait_candidate(CandidateSource::Impl(impl_def_id)).enter(|ecx| {
             let impl_args = ecx.fresh_args_for_item(impl_def_id.into());
             ecx.record_impl_args(impl_args);
             let impl_trait_ref = impl_trait_ref.instantiate(cx, impl_args).skip_norm_wip();
 
-            ecx.eq(goal.param_env, goal.predicate.trait_ref, impl_trait_ref)?;
+            ecx.eq(goal.param_env, goal_trait_ref, impl_trait_ref)?;
             let where_clause_bounds = cx
                 .clauses_of(impl_def_id.into())
                 .iter_instantiated(cx, impl_args)
@@ -128,7 +120,7 @@ where
                     .map(|pred| goal.with(cx, pred)),
             )?;
 
-            then(ecx, maximal_certainty)
+            then(ecx)
         })
     }
 
@@ -150,14 +142,14 @@ where
             cx: I,
             clause_def_id: I::TraitId,
             goal_def_id: I::TraitId,
-            polarity: PredicatePolarity,
+            polarity: ClausePolarity,
         ) -> bool {
             clause_def_id == goal_def_id
             // PERF(sized-hierarchy): Sizedness supertraits aren't elaborated to improve perf, so
             // check for a `MetaSized` supertrait being matched against a `Sized` assumption.
             //
             // `PointeeSized` bounds are syntactic sugar for a lack of bounds so don't need this.
-                || (polarity == PredicatePolarity::Positive
+                || (polarity == ClausePolarity::Positive
                     && cx.is_trait_lang_item(clause_def_id, SolverTraitLangItem::Sized)
                     && cx.is_trait_lang_item(goal_def_id, SolverTraitLangItem::MetaSized))
         }
@@ -213,7 +205,7 @@ where
         goal: Goal<I, Self>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
         let cx = ecx.cx();
-        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
             return Err(NoSolution.into());
         }
 
@@ -249,8 +241,7 @@ where
         {
             debug_assert!(is_rigid == ty::IsRigid::Yes);
             if ecx.opaque_accesses.might_rerun() {
-                ecx.opaque_accesses.rerun_always(RerunReason::AutoTraitLeakage)?;
-                return Err(NoSolution.into());
+                match ecx.opaque_accesses.rerun_always(RerunReason::AutoTraitLeakage)? {}
             }
 
             for item_bound in cx.item_self_bounds(def_id.into()).skip_binder() {
@@ -279,7 +270,7 @@ where
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
-        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
             return Err(NoSolution.into());
         }
 
@@ -306,7 +297,7 @@ where
         goal: Goal<I, Self>,
         sizedness: SizedTraitKind,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
-        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
             return Err(NoSolution.into());
         }
 
@@ -325,7 +316,7 @@ where
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
-        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
             return Err(NoSolution.into());
         }
 
@@ -348,7 +339,7 @@ where
         let self_ty = goal.predicate.self_ty();
         match goal.predicate.polarity {
             // impl FnPtr for FnPtr {}
-            ty::PredicatePolarity::Positive => {
+            ty::ClausePolarity::Positive => {
                 if self_ty.is_fn_ptr() {
                     ecx.probe_builtin_trait_candidate(BuiltinImplSource::Misc).enter(|ecx| {
                         ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
@@ -358,7 +349,7 @@ where
                 }
             }
             //  impl !FnPtr for T where T != FnPtr && T is rigid {}
-            ty::PredicatePolarity::Negative => {
+            ty::ClausePolarity::Negative => {
                 // If a type is rigid and not a fn ptr, then we know for certain
                 // that it does *not* implement `FnPtr`.
                 if !self_ty.is_fn_ptr() && self_ty.is_known_rigid() {
@@ -377,7 +368,7 @@ where
         goal: Goal<I, Self>,
         goal_kind: ty::ClosureKind,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
-        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
             return Err(NoSolution.into());
         }
 
@@ -415,7 +406,7 @@ where
         goal: Goal<I, Self>,
         goal_kind: ty::ClosureKind,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
-        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
             return Err(NoSolution.into());
         }
 
@@ -491,7 +482,7 @@ where
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
-        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
             return Err(NoSolution.into());
         }
 
@@ -507,7 +498,7 @@ where
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
-        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
             return Err(NoSolution.into());
         }
 
@@ -519,7 +510,7 @@ where
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
-        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
             return Err(NoSolution.into());
         }
 
@@ -544,7 +535,7 @@ where
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
-        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
             return Err(NoSolution.into());
         }
 
@@ -569,7 +560,7 @@ where
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
-        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
             return Err(NoSolution.into());
         }
 
@@ -592,7 +583,7 @@ where
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
-        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
             return Err(NoSolution.into());
         }
 
@@ -617,7 +608,7 @@ where
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
-        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
             return Err(NoSolution.into());
         }
 
@@ -649,7 +640,7 @@ where
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
-        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
             return Err(NoSolution.into());
         }
 
@@ -662,7 +653,7 @@ where
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
-        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
             return Err(NoSolution.into());
         }
 
@@ -676,7 +667,7 @@ where
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
-        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
             return Err(NoSolution.into());
         }
 
@@ -724,7 +715,7 @@ where
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
-        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
             return Err(NoSolution.into());
         }
 
@@ -817,7 +808,7 @@ where
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
     ) -> Result<Vec<Candidate<I>>, RerunNonErased> {
-        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
             return Ok(vec![]);
         }
 
@@ -877,7 +868,7 @@ where
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
-        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
             return Err(NoSolution.into());
         }
         let cx = ecx.cx();
@@ -920,7 +911,7 @@ where
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
-        if goal.predicate.polarity != ty::PredicatePolarity::Positive {
+        if goal.predicate.polarity != ty::ClausePolarity::Positive {
             return Err(NoSolution.into());
         }
         if let ty::Adt(def, args) = goal.predicate.self_ty().kind()
@@ -975,11 +966,11 @@ where
 #[inline(always)]
 fn trait_predicate_with_def_id<I: Interner>(
     cx: I,
-    clause: ty::Binder<I, ty::TraitPredicate<I>>,
+    clause: ty::Binder<I, ty::TraitClause<I>>,
     did: I::TraitId,
 ) -> I::Clause {
     clause
-        .map_bound(|c| TraitPredicate {
+        .map_bound(|c| TraitClause {
             trait_ref: TraitRef::new_from_args(cx, did, c.trait_ref.args),
             polarity: c.polarity,
         })
@@ -1120,23 +1111,28 @@ where
         let projection_may_match =
             |ecx: &mut EvalCtxt<'_, D>,
              source_projection: ty::Binder<I, ty::ExistentialProjection<I>>,
-             target_projection: ty::Binder<I, ty::ExistentialProjection<I>>| {
-                source_projection.item_def_id() == target_projection.item_def_id()
-                    && ecx
-                        .probe(|_| ProbeKind::ProjectionCompatibility)
-                        .enter(|ecx| {
-                            ecx.enter_forall_with_assumptions(
-                                target_projection,
-                                param_env,
-                                |ecx, target_projection| {
-                                    let source_projection =
-                                        ecx.instantiate_binder_with_infer(source_projection);
-                                    ecx.eq(param_env, source_projection, target_projection)?;
-                                    ecx.try_evaluate_added_goals()
-                                },
-                            )
-                        })
-                        .is_ok()
+             target_projection: ty::Binder<I, ty::ExistentialProjection<I>>|
+             -> Result<bool, RerunNonErased> {
+                if source_projection.item_def_id() != target_projection.item_def_id() {
+                    return Ok(false);
+                }
+                match ecx.probe(|_| ProbeKind::ProjectionCompatibility).enter(|ecx| {
+                    let target_projection = ecx.resolve_vars_if_possible(target_projection);
+                    ecx.enter_forall_with_assumptions(
+                        target_projection,
+                        param_env,
+                        |ecx, target_projection| {
+                            let source_projection =
+                                ecx.instantiate_binder_with_infer(source_projection);
+                            ecx.eq(param_env, source_projection, target_projection)?;
+                            ecx.try_evaluate_added_goals()
+                        },
+                    )
+                }) {
+                    Ok(_) => Ok(true),
+                    Err(NoSolutionOrRerunNonErased::NoSolution(_)) => Ok(false),
+                    Err(NoSolutionOrRerunNonErased::RerunNonErased(rerun)) => Err(rerun),
+                }
             };
 
         self.probe_trait_candidate(source).enter(|ecx| {
@@ -1147,6 +1143,8 @@ where
                     ty::ExistentialPredicate::Trait(target_principal) => {
                         let source_principal = upcast_principal.unwrap();
                         let target_principal = bound.rebind(target_principal);
+                        // We might unify infer vars in previous iterations.
+                        let target_principal = ecx.resolve_vars_if_possible(target_principal);
                         ecx.enter_forall_with_assumptions(
                             target_principal,
                             param_env,
@@ -1165,24 +1163,28 @@ where
                     // it with b_ty's projection.
                     ty::ExistentialPredicate::Projection(target_projection) => {
                         let target_projection = bound.rebind(target_projection);
-                        let mut matching_projections =
-                            a_data.projection_bounds().into_iter().filter(|source_projection| {
-                                projection_may_match(ecx, *source_projection, target_projection)
-                            });
-                        let Some(source_projection) = matching_projections.next() else {
+                        let mut matching_projection = None;
+                        for source_projection in a_data.projection_bounds() {
+                            if projection_may_match(ecx, source_projection, target_projection)? {
+                                if matching_projection.is_some() {
+                                    return ecx.evaluate_added_goals_and_make_canonical_response(
+                                        Certainty::AMBIGUOUS,
+                                    );
+                                }
+                                matching_projection = Some(source_projection);
+                            }
+                        }
+                        let Some(matching) = matching_projection else {
                             return Err(NoSolution.into());
                         };
-                        if matching_projections.next().is_some() {
-                            return ecx.evaluate_added_goals_and_make_canonical_response(
-                                Certainty::AMBIGUOUS,
-                            );
-                        }
+
+                        // We might unify infer vars in previous iterations.
+                        let target_projection = ecx.resolve_vars_if_possible(target_projection);
                         ecx.enter_forall_with_assumptions(
                             target_projection,
                             param_env,
                             |ecx, target_projection| {
-                                let source_projection =
-                                    ecx.instantiate_binder_with_infer(source_projection);
+                                let source_projection = ecx.instantiate_binder_with_infer(matching);
                                 ecx.eq(param_env, source_projection, target_projection)?;
                                 ecx.try_evaluate_added_goals()
                             },
@@ -1293,7 +1295,7 @@ where
     // the type's constituent types.
     fn disqualify_auto_trait_candidate_due_to_possible_impl(
         &mut self,
-        goal: Goal<I, TraitPredicate<I>>,
+        goal: Goal<I, TraitClause<I>>,
     ) -> Option<Result<Candidate<I>, NoSolutionOrRerunNonErased>> {
         let self_ty = goal.predicate.self_ty();
         let check_impls = || {
@@ -1405,7 +1407,7 @@ where
     fn probe_and_evaluate_goal_for_constituent_tys(
         &mut self,
         source: CandidateSource<I>,
-        goal: Goal<I, TraitPredicate<I>>,
+        goal: Goal<I, TraitClause<I>>,
         constituent_tys: impl Fn(
             &EvalCtxt<'_, D>,
             I::Ty,
@@ -1621,7 +1623,7 @@ where
     #[instrument(level = "trace", skip(self))]
     pub(super) fn compute_trait_goal(
         &mut self,
-        goal: Goal<I, TraitPredicate<I>>,
+        goal: Goal<I, TraitClause<I>>,
     ) -> Result<(CanonicalResponse<I>, Option<TraitGoalProvenVia>), NoSolutionOrRerunNonErased>
     {
         let (candidates, failed_candidate_info) =

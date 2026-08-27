@@ -23,7 +23,6 @@
 //! considering here as at that point, everything is monomorphic.
 
 use hir::def_id::LocalDefIdSet;
-use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_hir as hir;
 use rustc_hir::Node;
 use rustc_hir::def::{DefKind, Res};
@@ -36,7 +35,7 @@ use rustc_middle::mir::interpret::{ConstAllocation, ErrorHandled, GlobalAlloc};
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{self, ExistentialTraitRef, TyCtxt};
 use rustc_privacy::DefIdVisitor;
-use rustc_session::config::CrateType;
+use rustc_structures::CrateType;
 use tracing::debug;
 
 /// Determines whether this item is recursive for reachability. See `is_recursively_reachable_local`
@@ -261,7 +260,8 @@ impl<'tcx> ReachableContext<'tcx> {
                     | hir::ItemKind::Struct(..)
                     | hir::ItemKind::Enum(..)
                     | hir::ItemKind::Union(..)
-                    | hir::ItemKind::GlobalAsm { .. } => {}
+                    | hir::ItemKind::GlobalAsm { .. }
+                    | rustc_hir::ItemKind::TestBinderConstraints { .. } => {}
                 }
             }
             Node::TraitItem(trait_method) => {
@@ -362,7 +362,7 @@ impl<'tcx> ReachableContext<'tcx> {
                         // become recursive, are also not infinitely recursing, because of the
                         // `reachable_symbols` check above.
                         // We still need to protect against stack overflow due to deeply nested statics.
-                        ensure_sufficient_stack(|| self.propagate_from_alloc(alloc));
+                        self.propagate_from_alloc(alloc);
                     }
                 }
             }

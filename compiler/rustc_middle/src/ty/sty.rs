@@ -10,7 +10,7 @@ use hir::def::{CtorKind, DefKind};
 use rustc_abi::{FIRST_VARIANT, FieldIdx, NumScalableVectors, ScalableElt, VariantIdx};
 use rustc_errors::{ErrorGuaranteed, MultiSpan};
 use rustc_hir as hir;
-use rustc_hir::LangItem;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::def_id::DefId;
 use rustc_macros::{StableHash, TyDecodable, TyEncodable, TypeFoldable, extension};
 use rustc_span::{DUMMY_SP, Span, Symbol, kw, sym};
@@ -333,7 +333,7 @@ impl ParamConst {
 
     #[instrument(level = "debug")]
     pub fn find_const_ty_from_env<'tcx>(self, env: ParamEnv<'tcx>) -> Ty<'tcx> {
-        let mut candidates = env.caller_bounds().iter().filter_map(|clause| {
+        let mut candidates = env.caller_bounds().filter_map(|clause| {
             // `ConstArgHasType` are never desugared to be higher ranked.
             match clause.kind().skip_binder() {
                 ty::ClauseKind::ConstArgHasType(param_ct, ty) => {
@@ -679,7 +679,8 @@ impl<'tcx> Ty<'tcx> {
                 | DefKind::GlobalAsm
                 | DefKind::Impl { .. }
                 | DefKind::Closure
-                | DefKind::SyntheticCoroutineBody => {
+                | DefKind::SyntheticCoroutineBody
+                | DefKind::TestBinderConstraints => {
                     bug!("not an adt: {def:?} ({:?})", tcx.def_kind(def.did()))
                 }
             }
@@ -1734,7 +1735,7 @@ impl<'tcx> Ty<'tcx> {
 
             ty::Param(_) | ty::Alias(..) | ty::Infer(ty::TyVar(_)) => {
                 let assoc_items = tcx.associated_item_def_ids(
-                    tcx.require_lang_item(hir::LangItem::DiscriminantKind, DUMMY_SP),
+                    tcx.require_lang_item(LangItem::DiscriminantKind, DUMMY_SP),
                 );
                 Ty::new_projection_from_args(
                     tcx,

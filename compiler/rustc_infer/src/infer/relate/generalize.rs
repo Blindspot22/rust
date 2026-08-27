@@ -1,7 +1,6 @@
 use std::mem;
 
 use rustc_data_structures::sso::SsoHashMap;
-use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_hir::def_id::DefId;
 use rustc_middle::bug;
 use rustc_middle::ty::error::TypeError;
@@ -172,7 +171,7 @@ impl<'tcx> InferCtxt<'tcx> {
                     // instead create a new inference variable `?normalized_source`, emitting
                     // `Projection(normalized_source, ?ty_normalized)` and
                     // `?normalized_source <: generalized_term`.
-                    relation.register_predicates([ty::ProjectionPredicate {
+                    relation.register_predicates([ty::ProjectionClause {
                         projection_term: source_alias,
                         term: generalized_term,
                     }]);
@@ -476,7 +475,7 @@ impl<'tcx> TypeRelation<TyCtxt<'tcx>> for Generalizer<'_, 'tcx> {
         debug!(?self.ambient_variance, "new ambient variance");
         // Recursive calls to `relate` can overflow the stack. For example a deeper version of
         // `ui/associated-consts/issue-93775.rs`.
-        let r = ensure_sufficient_stack(|| self.relate(a, b));
+        let r = self.relate(a, b);
         self.ambient_variance = old_ambient_variance;
         r
     }

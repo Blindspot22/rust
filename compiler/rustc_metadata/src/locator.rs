@@ -218,6 +218,7 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::{cmp, fmt};
 
+use rustc_crate_store::CrateSource;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
 use rustc_data_structures::memmap::Mmap;
 use rustc_data_structures::owned_slice::{OwnedSlice, slice_owned};
@@ -225,7 +226,6 @@ use rustc_data_structures::svh::Svh;
 use rustc_errors::{DiagArgValue, IntoDiagArg};
 use rustc_fs_util::try_canonicalize;
 use rustc_proc_macro::bridge::client::Client as ProcMacroClient;
-use rustc_session::cstore::CrateSource;
 use rustc_session::filesearch::FileSearch;
 use rustc_session::search_paths::PathKind;
 use rustc_session::utils::CanonicalizedPath;
@@ -357,6 +357,14 @@ impl<'a> CrateLocator<'a> {
         self.target = &sess.target;
         self.tuple = sess.opts.target_triple.clone();
         self.filesearch = sess.target_filesearch();
+        self.path_kind = path_kind;
+    }
+
+    pub(crate) fn for_wasm_proc_macro(&mut self, sess: &'a Session, path_kind: PathKind) {
+        self.is_proc_macro = true;
+        self.target = &sess.wasm_proc_macro_target;
+        self.tuple = sess.wasm_proc_macro_tuple.clone();
+        self.filesearch = sess.wasm_proc_macro_filesearch();
         self.path_kind = path_kind;
     }
 
@@ -734,6 +742,8 @@ impl<'a> CrateLocator<'a> {
         &self,
         crate_rejections: &mut CrateRejections,
     ) -> Result<Option<Library>, CrateError> {
+        debug!("find_commandline_library {}", self.crate_name);
+
         // First, filter out all libraries that look suspicious. We only accept
         // files which actually exist that have the correct naming scheme for
         // rlibs/dylibs.
@@ -970,17 +980,19 @@ fn get_flavor_from_path(path: &Path) -> CrateFlavor {
     }
 }
 
-/// A function to fetch about all macros inside a proc-macro crate.
+/// A function to fetch all macros inside a proc-macro crate.
 ///
 /// Used by rust-analyzer-proc-macro-srv.
 pub fn get_proc_macros(
-    target: &Target,
     path: &Path,
     metadata_loader: &dyn MetadataLoader,
     cfg_version: &'static str,
 ) -> IoResult<Vec<(ProcMacroClient, ProcMacroKind)>> {
+    let host_tuple = TargetTuple::from_tuple(config::host_tuple());
+    let (host, _) = Target::search(&host_tuple, Path::new(""), false).unwrap();
+
     let metadata =
-        get_metadata_section(target, CrateFlavor::Dylib, path, metadata_loader, cfg_version, None)
+        get_metadata_section(&host, CrateFlavor::Dylib, path, metadata_loader, cfg_version, None)
             .map_err(|err| io::Error::other(err.to_string()))?;
     let stable_crate_id = metadata.get_root().stable_crate_id();
 

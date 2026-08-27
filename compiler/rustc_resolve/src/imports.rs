@@ -10,15 +10,15 @@ use rustc_errors::{Applicability, BufferedEarlyLint, Diagnostic};
 use rustc_expand::base::SyntaxExtensionKind;
 use rustc_hir::def::{self, DefKind, PartialRes};
 use rustc_hir::def_id::{DefId, LocalDefId, LocalDefIdMap};
+use rustc_lint_defs::LintId;
+use rustc_lint_defs::builtin::{
+    AMBIGUOUS_GLOB_REEXPORTS, EXPORTED_PRIVATE_DEPENDENCIES, HIDDEN_GLOB_REEXPORTS,
+    PUB_USE_OF_PRIVATE_EXTERN_CRATE, REDUNDANT_IMPORTS, UNUSED_IMPORTS,
+};
 use rustc_middle::metadata::{AmbigModChild, ModChild, Reexport};
 use rustc_middle::span_bug;
 use rustc_middle::ty::Visibility;
 use rustc_session::diagnostics::feature_err;
-use rustc_session::lint::LintId;
-use rustc_session::lint::builtin::{
-    AMBIGUOUS_GLOB_REEXPORTS, EXPORTED_PRIVATE_DEPENDENCIES, HIDDEN_GLOB_REEXPORTS,
-    PUB_USE_OF_PRIVATE_EXTERN_CRATE, REDUNDANT_IMPORTS, UNUSED_IMPORTS,
-};
 use rustc_span::edit_distance::find_best_match_for_name;
 use rustc_span::hygiene::LocalExpnId;
 use rustc_span::{Ident, Span, Symbol, kw, sym};
@@ -373,6 +373,7 @@ pub(crate) struct UnresolvedImportError {
     pub(crate) label: Option<String>,
     pub(crate) note: Option<String>,
     pub(crate) suggestion: Option<Suggestion>,
+    pub(crate) help: Option<String>,
     pub(crate) candidates: Option<Vec<ImportSuggestion>>,
     pub(crate) segment: Option<Ident>,
     /// comes from `PathRes::Failed { module }`
@@ -468,7 +469,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 || max_vis.get().is_none_or(|max_vis| vis.greater_than(max_vis, self.tcx)))
         {
             // `set` can't fail because this can only happen during "write_import_resolutions"
-            max_vis.set(Some(vis), self)
+            max_vis.set_checked(Some(vis), self)
         }
 
         self.arenas.alloc_decl(DeclData {
@@ -585,7 +586,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 && glob_decl.ambiguity.get().is_none()
             {
                 // Do not lose glob ambiguities when re-fetching the glob.
-                glob_decl.ambiguity.set(Some((old_ambig, true)), self);
+                glob_decl.ambiguity.set_checked(Some((old_ambig, true)), self);
             }
             glob_decl
         } else if glob_decl.res() != old_glob_decl.res() {
@@ -593,7 +594,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 || self.is_rustybuzz_0_4_0(old_glob_decl, glob_decl)
                 || self.is_pdf_0_9_0(old_glob_decl, glob_decl)
                 || self.is_net2_0_2_39(old_glob_decl, glob_decl);
-            old_glob_decl.ambiguity.set(Some((glob_decl, warning)), self);
+            old_glob_decl.ambiguity.set_checked(Some((glob_decl, warning)), self);
             old_glob_decl
         } else if let old_vis = old_glob_decl.vis()
             && let vis = glob_decl.vis()
@@ -602,17 +603,17 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             // We are glob-importing the same item but with a different visibility.
             // All visibilities here are ordered because all of them are ancestors of `module`.
             if vis.greater_than(old_vis, self.tcx) {
-                old_glob_decl.ambiguity_vis_max.set(Some(glob_decl), self);
+                old_glob_decl.ambiguity_vis_max.set_checked(Some(glob_decl), self);
             } else if let old_min_vis = old_glob_decl.min_vis()
                 && old_min_vis != vis
                 && old_min_vis.greater_than(vis, self.tcx)
             {
-                old_glob_decl.ambiguity_vis_min.set(Some(glob_decl), self);
+                old_glob_decl.ambiguity_vis_min.set_checked(Some(glob_decl), self);
             }
             old_glob_decl
         } else if glob_decl.is_ambiguity_recursive() && !old_glob_decl.is_ambiguity_recursive() {
             // Overwriting a non-ambiguous glob import with an ambiguous glob import.
-            old_glob_decl.ambiguity.set(Some((glob_decl, true)), self);
+            old_glob_decl.ambiguity.set_checked(Some((glob_decl, true)), self);
             old_glob_decl
         } else {
             old_glob_decl
@@ -994,6 +995,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                     label: None,
                     note: None,
                     suggestion: None,
+                    help: None,
                     candidates: None,
                     segment: None,
                     module: None,
@@ -1011,7 +1013,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
     pub(crate) fn lint_reexports(&mut self, exported_ambiguities: FxHashSet<Decl<'ra>>) {
         for module in &self.local_modules {
             for (key, resolution) in self.resolutions(module.to_module()).iter() {
-                let resolution = resolution.borrow(self);
+                let resolution = resolution.borrow_checked(self);
                 let Some(binding) = resolution.best_decl() else { continue };
 
                 // Report "cannot reexport" errors for exotic cases involving macros 2.0
@@ -1237,6 +1239,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 segment,
                 label,
                 suggestion,
+                help,
                 module,
                 error_implied_by_parse_error: _,
                 message,
@@ -1252,6 +1255,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                             segment: segment.name,
                             label,
                             suggestion,
+                            help,
                             module,
                             message,
                         },
@@ -1264,6 +1268,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 span,
                 label,
                 suggestion,
+                help,
                 module,
                 segment,
                 note,
@@ -1290,6 +1295,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                                 String::from("a similar path exists"),
                                 Applicability::MaybeIncorrect,
                             )),
+                            help: None,
                             candidates: None,
                             segment: Some(segment),
                             module,
@@ -1300,6 +1306,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                             label: Some(label),
                             note,
                             suggestion,
+                            help,
                             candidates: None,
                             segment: Some(segment),
                             module,
@@ -1341,6 +1348,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                         label: Some(String::from("cannot glob-import a module into itself")),
                         note: None,
                         suggestion: None,
+                        help: None,
                         candidates: None,
                         segment: None,
                         module: None,
@@ -1579,6 +1587,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                     label: Some(label),
                     note,
                     suggestion,
+                    help: None,
                     candidates: if !parent_suggestion.is_empty() {
                         Some(parent_suggestion)
                     } else {
@@ -1808,7 +1817,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 .resolutions(module)
                 .iter()
                 .filter_map(|(key, resolution)| {
-                    let res = resolution.borrow(self);
+                    let res = resolution.borrow_checked(self);
                     let decl = res.determined_decl()?;
                     let mut key = *key;
                     let scope = match key.ident.ctxt.update_unchecked(|ctxt| {
@@ -1874,7 +1883,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         ambig_module_children: &mut LocalDefIdMap<Vec<AmbigModChild>>,
     ) {
         // Since import resolution is finished, globs will not define any more names.
-        *module.globs.borrow_mut(self) = Vec::new();
+        *module.globs.borrow_mut_checked(self) = Vec::new();
 
         let Some(def_id) = module.opt_def_id() else { return };
 

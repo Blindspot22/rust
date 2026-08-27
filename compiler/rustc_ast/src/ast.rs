@@ -26,7 +26,6 @@ pub use UnsafeSource::*;
 pub use rustc_ast_ir::{FloatTy, IntTy, Movability, Mutability, Pinnedness, UintTy};
 use rustc_data_structures::packed::Pu128;
 use rustc_data_structures::stable_hash::{StableHash, StableHashCtxt, StableHasher};
-use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_data_structures::tagged_ptr::Tag;
 use rustc_macros::{Decodable, Encodable, StableHash, Walkable};
 pub use rustc_span::AttrId;
@@ -141,14 +140,15 @@ impl Path {
         self.segments.first().is_some_and(|segment| segment.ident.name == kw::PathRoot)
     }
 
-    /// Check if this path is potentially a trivial const arg, i.e., one that can _potentially_
-    /// be represented without an anon const in the HIR.
-    ///
-    /// Returns true iff the path has exactly one segment, and it has no generic args
-    /// (i.e., it is _potentially_ a const parameter).
-    #[tracing::instrument(level = "debug", ret)]
-    pub fn is_potential_trivial_const_arg(&self) -> bool {
-        self.segments.len() == 1 && self.segments.iter().all(|seg| seg.args.is_none())
+    /// Checks if this path is just a simple one-word `PATH` - i.e. the inverse of
+    /// [`Path::from_ident`]
+    pub fn is_single_argless_ident(&self) -> bool {
+        self.segments.len() == 1 && self.segments[0].args.is_none()
+    }
+
+    /// The inverse of [`Path::from_ident`] - if this path is just a simple one-word `PATH`
+    pub fn as_single_argless_ident(&self) -> Option<Ident> {
+        self.is_single_argless_ident().then(|| self.segments[0].ident)
     }
 }
 
@@ -346,7 +346,7 @@ pub struct ParenthesizedArgs {
     pub span: Span,
 
     /// `(A, B)`
-    pub inputs: ThinVec<Box<Ty>>,
+    pub inputs: ThinVec<Param>,
 
     /// ```text
     /// Foo(A, B) -> C
@@ -364,7 +364,7 @@ impl ParenthesizedArgs {
             .inputs
             .iter()
             .cloned()
-            .map(|input| AngleBracketedArg::Arg(GenericArg::Type(input)))
+            .map(|input| AngleBracketedArg::Arg(GenericArg::Type(input.ty)))
             .collect();
         AngleBracketedArgs { span: self.inputs_span, args }
     }
@@ -686,8 +686,7 @@ impl Pat {
             | PatKind::Or(s) => s.iter().for_each(|p| p.walk(it)),
 
             // Trivial wrappers over inner patterns.
-            PatKind::Box(s)
-            | PatKind::Deref(s)
+            PatKind::Deref(s)
             | PatKind::Ref(s, _, _)
             | PatKind::Paren(s)
             | PatKind::Guard(s, _) => s.walk(it),
@@ -900,9 +899,6 @@ pub enum PatKind {
 
     /// A tuple pattern (`(a, b)`).
     Tuple(ThinVec<Pat>),
-
-    /// A `box` pattern.
-    Box(Box<Pat>),
 
     /// A `deref` pattern (currently `deref!()` macro-based syntax).
     Deref(Box<Pat>),
@@ -1407,7 +1403,7 @@ impl Expr {
     /// be represented without an anon const in the HIR.
     ///
     /// This will unwrap at most one block level (curly braces). After that, if the expression
-    /// is a path, it mostly dispatches to [`Path::is_potential_trivial_const_arg`].
+    /// is a path, it mostly dispatches to [`Path::is_single_argless_ident`].
     ///
     /// This function will only allow paths with no qself, before dispatching to the `Path`
     /// function of the same name.
@@ -1417,7 +1413,7 @@ impl Expr {
     pub fn is_potential_trivial_const_arg(&self) -> bool {
         let this = self.maybe_unwrap_block();
         if let ExprKind::Path(None, path) = &this.kind
-            && path.is_potential_trivial_const_arg()
+            && path.is_single_argless_ident()
         {
             true
         } else {
@@ -1675,7 +1671,7 @@ pub struct Closure {
     pub binder: ClosureBinder,
     pub capture_clause: CaptureBy,
     pub constness: Const,
-    pub coroutine_kind: Option<CoroutineKind>,
+    pub coroutine_marker: Option<CoroutineMarker>,
     pub movability: Movability,
     pub fn_decl: Box<FnDecl>,
     pub body: Box<Expr>,
@@ -1811,7 +1807,7 @@ pub enum ExprKind {
     ///
     /// The span is the "decl", which is the header before the body `{ }`
     /// including the `async`/`gen` keywords and possibly `move`.
-    Gen(CaptureBy, Box<Block>, GenBlockKind, Span),
+    Gen(CaptureBy, Box<Block>, CoroutineKind, Span),
     /// An await expression (`my_future.await`). Span is of await keyword.
     Await(Box<Expr>, Span),
     /// A use expression (`x.use`). Span is of use keyword.
@@ -1934,26 +1930,33 @@ pub enum ForLoopKind {
     ForAwait,
 }
 
-/// Used to differentiate between `async {}` blocks and `gen {}` blocks.
 #[derive(Clone, Copy, Encodable, Decodable, Debug, PartialEq, Eq, Walkable)]
-pub enum GenBlockKind {
+pub enum CoroutineKind {
     Async,
     Gen,
     AsyncGen,
 }
 
-impl fmt::Display for GenBlockKind {
+impl fmt::Display for CoroutineKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.modifier().fmt(f)
+        self.as_str().fmt(f)
     }
 }
 
-impl GenBlockKind {
-    pub fn modifier(&self) -> &'static str {
+impl CoroutineKind {
+    /// Matches `Gen` and `AsyncGen`.
+    pub fn is_gen(&self) -> bool {
         match self {
-            GenBlockKind::Async => "async",
-            GenBlockKind::Gen => "gen",
-            GenBlockKind::AsyncGen => "async gen",
+            CoroutineKind::Async => false,
+            CoroutineKind::Gen | CoroutineKind::AsyncGen => true,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CoroutineKind::Async => "async",
+            CoroutineKind::Gen => "gen",
+            CoroutineKind::AsyncGen => "async gen",
         }
     }
 }
@@ -2354,7 +2357,7 @@ impl FnSig {
         match self.header.safety {
             Safety::Unsafe(span) | Safety::Safe(span) => span,
             Safety::Default => {
-                // Insert after the `coroutine_kind` if available.
+                // Insert after the `coroutine_marker` if available.
                 if let Some(extern_span) = self.header.ext.span() {
                     return extern_span.shrink_to_lo();
                 }
@@ -2447,7 +2450,7 @@ pub struct Ty {
 
 impl Clone for Ty {
     fn clone(&self) -> Self {
-        ensure_sufficient_stack(|| Self { id: self.id, kind: self.kind.clone(), span: self.span })
+        Self { id: self.id, kind: self.kind.clone(), span: self.span }
     }
 }
 
@@ -2489,7 +2492,12 @@ pub struct FnPtrTy {
 
 impl FnPtrTy {
     pub fn header(&self) -> FnHeader {
-        FnHeader { constness: Const::No, coroutine_kind: None, safety: self.safety, ext: self.ext }
+        FnHeader {
+            constness: Const::No,
+            coroutine_marker: None,
+            safety: self.safety,
+            ext: self.ext,
+        }
     }
 
     pub fn as_borrowed_fn_sig<'a>(&'a self) -> BorrowedFnSig<'a> {
@@ -3098,56 +3106,23 @@ pub enum Safety {
     Default,
 }
 
-/// Describes what kind of coroutine markers, if any, a function has.
+/// Describes the coroutine markers a function/closure has.
 ///
 /// Coroutine markers are things that cause the function to generate a coroutine, such as `async`,
 /// which makes the function return `impl Future`, or `gen`, which makes the function return `impl
 /// Iterator`.
 #[derive(Copy, Clone, Encodable, Decodable, Debug, Walkable)]
-pub enum CoroutineKind {
-    /// `async`, which returns an `impl Future`.
-    Async { span: Span, closure_id: NodeId, return_impl_trait_id: NodeId },
-    /// `gen`, which returns an `impl Iterator`.
-    Gen { span: Span, closure_id: NodeId, return_impl_trait_id: NodeId },
-    /// `async gen`, which returns an `impl AsyncIterator`.
-    AsyncGen { span: Span, closure_id: NodeId, return_impl_trait_id: NodeId },
+pub struct CoroutineMarker {
+    pub kind: CoroutineKind,
+    pub span: Span,
+    pub closure_id: NodeId,
+    /// The `NodeId` for the generated `impl Trait` item.
+    pub return_impl_trait_id: NodeId,
 }
 
-impl CoroutineKind {
-    pub fn span(self) -> Span {
-        match self {
-            CoroutineKind::Async { span, .. } => span,
-            CoroutineKind::Gen { span, .. } => span,
-            CoroutineKind::AsyncGen { span, .. } => span,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CoroutineKind::Async { .. } => "async",
-            CoroutineKind::Gen { .. } => "gen",
-            CoroutineKind::AsyncGen { .. } => "async gen",
-        }
-    }
-
-    pub fn closure_id(self) -> NodeId {
-        match self {
-            CoroutineKind::Async { closure_id, .. }
-            | CoroutineKind::Gen { closure_id, .. }
-            | CoroutineKind::AsyncGen { closure_id, .. } => closure_id,
-        }
-    }
-
-    /// In this case this is an `async` or `gen` return, the `NodeId` for the generated `impl Trait`
-    /// item.
-    pub fn return_id(self) -> (NodeId, Span) {
-        match self {
-            CoroutineKind::Async { return_impl_trait_id, span, .. }
-            | CoroutineKind::Gen { return_impl_trait_id, span, .. }
-            | CoroutineKind::AsyncGen { return_impl_trait_id, span, .. } => {
-                (return_impl_trait_id, span)
-            }
-        }
+impl CoroutineMarker {
+    pub fn new(kind: CoroutineKind, span: Span) -> Self {
+        Self { kind, span, closure_id: DUMMY_NODE_ID, return_impl_trait_id: DUMMY_NODE_ID }
     }
 }
 
@@ -3758,29 +3733,7 @@ impl Item {
     }
 
     pub fn opt_generics(&self) -> Option<&Generics> {
-        match &self.kind {
-            ItemKind::ExternCrate(..)
-            | ItemKind::ConstBlock(_)
-            | ItemKind::Use(_)
-            | ItemKind::Mod(..)
-            | ItemKind::ForeignMod(_)
-            | ItemKind::GlobalAsm(_)
-            | ItemKind::MacCall(_)
-            | ItemKind::Delegation(_)
-            | ItemKind::DelegationMac(_)
-            | ItemKind::MacroDef(..) => None,
-            ItemKind::Static(_) => None,
-            ItemKind::Const(i) => Some(&i.generics),
-            ItemKind::Fn(i) => Some(&i.generics),
-            ItemKind::TyAlias(i) => Some(&i.generics),
-            ItemKind::TraitAlias(i) => Some(&i.generics),
-
-            ItemKind::Enum(_, generics, _)
-            | ItemKind::Struct(_, generics, _)
-            | ItemKind::Union(_, generics, _) => Some(&generics),
-            ItemKind::Trait(i) => Some(&i.generics),
-            ItemKind::Impl(i) => Some(&i.generics),
-        }
+        self.kind.generics()
     }
 }
 
@@ -3840,8 +3793,8 @@ impl Extern {
 pub struct FnHeader {
     /// The `const` keyword, if any
     pub constness: Const,
-    /// Whether this is `async`, `gen`, or nothing.
-    pub coroutine_kind: Option<CoroutineKind>,
+    /// The `async`/`gen`/`gen asyn` marker, if there is one.
+    pub coroutine_marker: Option<CoroutineMarker>,
     /// Whether this is `unsafe`, or has a default safety.
     pub safety: Safety,
     /// The `extern` keyword and corresponding ABI string, if any.
@@ -3851,9 +3804,9 @@ pub struct FnHeader {
 impl FnHeader {
     /// Does this function header have any qualifiers or is it empty?
     pub fn has_qualifiers(&self) -> bool {
-        let Self { safety, coroutine_kind, constness, ext } = self;
+        let Self { safety, coroutine_marker, constness, ext } = self;
         matches!(safety, Safety::Unsafe(_))
-            || coroutine_kind.is_some()
+            || coroutine_marker.is_some()
             || matches!(constness, Const::Yes(_))
             || !matches!(ext, Extern::None)
     }
@@ -3871,8 +3824,8 @@ impl FnHeader {
             Safety::Default => {}
         };
 
-        if let Some(coroutine_kind) = self.coroutine_kind {
-            spans.push(coroutine_kind.span());
+        if let Some(coroutine_marker) = self.coroutine_marker {
+            spans.push(coroutine_marker.span);
         }
 
         if let Const::Yes(span) = self.constness {
@@ -3887,7 +3840,7 @@ impl Default for FnHeader {
     fn default() -> FnHeader {
         FnHeader {
             safety: Safety::Default,
-            coroutine_kind: None,
+            coroutine_marker: None,
             constness: Const::No,
             ext: Extern::None,
         }
@@ -4117,6 +4070,57 @@ impl Guard {
     }
 }
 
+#[derive(Clone, Encodable, Decodable, Debug, Walkable)]
+pub struct TestBinderConstraints {
+    pub generics: Generics,
+    pub body: Box<TestBinderBody>,
+}
+
+#[derive(Clone, Encodable, Decodable, Debug, Walkable)]
+pub struct TestBinderBody {
+    pub foralls: ThinVec<TestBinderForall>,
+    pub exists: ThinVec<TestBinderExists>,
+    pub constraints: Vec<TestBinderConstraint>,
+}
+
+#[derive(Clone, Encodable, Decodable, Debug, Walkable)]
+pub struct TestBinderForall {
+    pub span: Span,
+    pub node_id: NodeId,
+    pub generics: Generics,
+    pub body: TestBinderBody,
+    pub assert_on_exit: Option<ThinVec<TestBinderConstraint>>,
+}
+
+#[derive(Clone, Encodable, Decodable, Debug, Walkable)]
+pub struct TestBinderExists {
+    pub span: Span,
+    pub node_id: NodeId,
+    pub params: ThinVec<GenericParam>,
+    pub body: TestBinderBody,
+}
+
+#[derive(Clone, Encodable, Decodable, Debug, Walkable)]
+pub enum TestBinderConstraint {
+    And {
+        items: ThinVec<TestBinderConstraint>,
+    },
+    Or {
+        items: ThinVec<TestBinderConstraint>,
+    },
+    Lifetime {
+        #[visitable(extra = LifetimeCtxt::Bound)]
+        lhs: Lifetime,
+        #[visitable(extra = LifetimeCtxt::Bound)]
+        rhs: Lifetime,
+    },
+    Type {
+        lhs: Box<Ty>,
+        #[visitable(extra = LifetimeCtxt::Bound)]
+        rhs: Lifetime,
+    },
+}
+
 // Adding a new variant? Please update `test_item` in `tests/ui/macros/stringify.rs`.
 #[derive(Clone, Encodable, Decodable, Debug)]
 pub enum ItemKind {
@@ -4198,6 +4202,8 @@ pub enum ItemKind {
     /// A list or glob delegation item (`reuse prefix::{a, b, c}`, `reuse prefix::*`).
     /// Treated similarly to a macro call and expanded early.
     DelegationMac(Box<DelegationMac>),
+    /// A `test_binder_constraints!()`. Perma-unstable, used only for rustc tests.
+    TestBinderConstraints(Box<TestBinderConstraints>),
 }
 
 impl ItemKind {
@@ -4224,7 +4230,8 @@ impl ItemKind {
             | ItemKind::GlobalAsm(_)
             | ItemKind::Impl(_)
             | ItemKind::MacCall(_)
-            | ItemKind::DelegationMac(_) => None,
+            | ItemKind::DelegationMac(_)
+            | ItemKind::TestBinderConstraints(_) => None,
         }
     }
 
@@ -4232,9 +4239,22 @@ impl ItemKind {
     pub fn article(&self) -> &'static str {
         use ItemKind::*;
         match self {
-            Use(..) | Static(..) | Const(..) | ConstBlock(..) | Fn(..) | Mod(..)
-            | GlobalAsm(..) | TyAlias(..) | Struct(..) | Union(..) | Trait(..) | TraitAlias(..)
-            | MacroDef(..) | Delegation(..) | DelegationMac(..) => "a",
+            Use(..)
+            | Static(..)
+            | Const(..)
+            | ConstBlock(..)
+            | Fn(..)
+            | Mod(..)
+            | GlobalAsm(..)
+            | TyAlias(..)
+            | Struct(..)
+            | Union(..)
+            | Trait(..)
+            | TraitAlias(..)
+            | MacroDef(..)
+            | Delegation(..)
+            | DelegationMac(..)
+            | TestBinderConstraints(..) => "a",
             ExternCrate(..) | ForeignMod(..) | MacCall(..) | Enum(..) | Impl { .. } => "an",
         }
     }
@@ -4261,6 +4281,7 @@ impl ItemKind {
             ItemKind::Impl { .. } => "implementation",
             ItemKind::Delegation(..) => "delegated function",
             ItemKind::DelegationMac(..) => "delegation",
+            ItemKind::TestBinderConstraints(..) => "test_binder_constraints!",
         }
     }
 
@@ -4274,7 +4295,8 @@ impl ItemKind {
             | Self::Union(_, generics, _)
             | Self::Trait(Trait { generics, .. })
             | Self::TraitAlias(TraitAlias { generics, .. })
-            | Self::Impl(Impl { generics, .. }) => Some(generics),
+            | Self::Impl(Impl { generics, .. })
+            | Self::TestBinderConstraints(TestBinderConstraints { generics, .. }) => Some(generics),
 
             Self::ExternCrate(..)
             | Self::Use(..)

@@ -102,7 +102,7 @@ use rustc_data_structures::either::Either;
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_data_structures::sync::par_join;
 use rustc_data_structures::unord::{UnordMap, UnordSet};
-use rustc_hir::LangItem;
+use rustc_hir::attrs::lang_items::LangItem;
 use rustc_hir::attrs::{InlineAttr, Linkage};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, DefIdSet, LOCAL_CRATE};
@@ -655,7 +655,8 @@ fn characteristic_def_id_of_mono_item<'tcx>(
                 | ty::InstanceKind::Shim(ty::ShimKind::DropGlue(..))
                 | ty::InstanceKind::Shim(ty::ShimKind::Clone(..))
                 | ty::InstanceKind::Shim(ty::ShimKind::ThreadLocal(..))
-                | ty::InstanceKind::Shim(ty::ShimKind::FnPtrAddr(..))
+                | ty::InstanceKind::Shim(ty::ShimKind::FnPtrAsPtr(..))
+                | ty::InstanceKind::Shim(ty::ShimKind::FnPtrFromPtr(..))
                 | ty::InstanceKind::Shim(ty::ShimKind::FutureDropPoll(..))
                 | ty::InstanceKind::Shim(ty::ShimKind::AsyncDropGlue(..))
                 | ty::InstanceKind::Shim(ty::ShimKind::AsyncDropGlueCtor(..)) => return None,
@@ -841,8 +842,19 @@ fn mono_item_visibility<'tcx>(
         | InstanceKind::Shim(ShimKind::ConstructCoroutineInClosure { .. })
         | InstanceKind::Shim(ShimKind::DropGlue(..))
         | InstanceKind::Shim(ShimKind::Clone(..))
-        | InstanceKind::Shim(ShimKind::FnPtrAddr(..)) => return Visibility::Hidden,
+        | InstanceKind::Shim(ShimKind::FnPtrAsPtr(..))
+        | InstanceKind::Shim(ShimKind::FnPtrFromPtr(..)) => return Visibility::Hidden,
     };
+
+    let attrs = tcx.codegen_fn_attrs(def_id);
+    if attrs.flags.intersects(CodegenFnAttrFlags::OFFLOAD_KERNEL) {
+        *can_be_internalized = false;
+        return default_visibility(
+            tcx,
+            def_id,
+            instance.args.non_erasable_generics().next().is_some(),
+        );
+    }
 
     // Both the `start_fn` lang item and `main` itself should not be exported,
     // so we give them with `Hidden` visibility but these symbols are

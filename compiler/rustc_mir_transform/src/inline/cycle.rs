@@ -1,11 +1,10 @@
-use rustc_data_structures::Limit;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexSet};
-use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_data_structures::unord::UnordSet;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_middle::mir::TerminatorKind;
 use rustc_middle::ty::{self, GenericArgsRef, InstanceKind, ShimKind, TyCtxt, TypeVisitableExt};
 use rustc_span::sym;
+use rustc_structures::Limit;
 use tracing::{instrument, trace};
 
 #[instrument(level = "debug", skip(tcx), ret)]
@@ -37,7 +36,7 @@ fn should_recurse<'tcx>(tcx: TyCtxt<'tcx>, callee: ty::Instance<'tcx>) -> bool {
         | InstanceKind::Shim(ShimKind::Clone(..)) => {}
 
         // This shim does not call any other functions, thus there can be no recursion.
-        InstanceKind::Shim(ShimKind::FnPtrAddr(..)) => return false,
+        InstanceKind::Shim(ShimKind::FnPtrAsPtr(..) | ShimKind::FnPtrFromPtr(..)) => return false,
 
         // FIXME: A not fully instantiated drop shim can cause ICEs if one attempts to
         // have its MIR built. Likely oli-obk just screwed up the `ParamEnv`s, so this
@@ -118,18 +117,17 @@ fn process<'tcx>(
             trace!(?callee, recursion = *recursion);
             let callee_reaches_root = if recursion_limit.value_within_limit(*recursion) {
                 *recursion += 1;
-                ensure_sufficient_stack(|| {
-                    process(
-                        tcx,
-                        typing_env,
-                        callee,
-                        target,
-                        seen,
-                        involved,
-                        recursion_limiter,
-                        recursion_limit,
-                    )
-                })?
+
+                process(
+                    tcx,
+                    typing_env,
+                    callee,
+                    target,
+                    seen,
+                    involved,
+                    recursion_limiter,
+                    recursion_limit,
+                )?
             } else {
                 return None;
             };

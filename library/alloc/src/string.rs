@@ -54,7 +54,7 @@ use core::ops::Add;
 use core::ops::AddAssign;
 use core::ops::{self, Range, RangeBounds};
 use core::str::pattern::{Pattern, Utf8Pattern};
-use core::{fmt, hash, ptr, slice};
+use core::{fmt, hash, hint, ptr, slice};
 
 #[cfg(not(no_global_oom_handling))]
 use crate::alloc::Allocator;
@@ -583,7 +583,7 @@ impl String {
     /// [`U+FFFD REPLACEMENT CHARACTER`][U+FFFD], which looks like this: �
     ///
     /// [byteslice]: prim@slice
-    /// [U+FFFD]: core::char::REPLACEMENT_CHARACTER
+    /// [U+FFFD]: char::REPLACEMENT_CHARACTER
     ///
     /// If you are sure that the byte slice is valid UTF-8, and you don't want
     /// to incur the overhead of the conversion, there is an unsafe version
@@ -687,7 +687,7 @@ impl String {
     /// ```
     #[must_use]
     #[cfg(not(no_global_oom_handling))]
-    #[stable(feature = "string_from_utf8_lossy_owned", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "string_from_utf8_lossy_owned", since = "1.99.0")]
     pub fn from_utf8_lossy_owned(v: Vec<u8>) -> String {
         if let Cow::Owned(string) = String::from_utf8_lossy(&v) {
             string
@@ -721,10 +721,22 @@ impl String {
     #[cfg(not(no_global_oom_handling))]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn from_utf16(v: &[u16]) -> Result<String, FromUtf16Error> {
-        // This isn't done via collect::<Result<_, _>>() for performance reasons.
-        // FIXME: the function can be simplified again when #48994 is closed.
-        let mut ret = String::with_capacity(v.len());
-        for c in char::decode_utf16(v.iter().cloned()) {
+        Self::from_utf16_units(v.iter().cloned(), v.len())
+    }
+
+    /// Decodes an iterator of UTF-16 code units into a `String`, returning
+    /// [`Err`] on the first lone surrogate. `capacity` should be the number of
+    /// code units, which is used to preallocate the output buffer.
+    // This isn't done via collect::<Result<_, _>>() for performance reasons.
+    // FIXME: the function can be simplified again when #48994 is closed.
+    #[cfg(not(no_global_oom_handling))]
+    #[inline]
+    fn from_utf16_units(
+        units: impl Iterator<Item = u16>,
+        capacity: usize,
+    ) -> Result<String, FromUtf16Error> {
+        let mut ret = String::with_capacity(capacity);
+        for c in char::decode_utf16(units) {
             let Ok(c) = c else {
                 return Err(FromUtf16Error { kind: FromUtf16ErrorKind::LoneSurrogate });
             };
@@ -742,7 +754,7 @@ impl String {
     ///
     /// [`from_utf8_lossy`]: String::from_utf8_lossy
     /// [`Cow<'a, str>`]: crate::borrow::Cow "borrow::Cow"
-    /// [U+FFFD]: core::char::REPLACEMENT_CHARACTER
+    /// [U+FFFD]: char::REPLACEMENT_CHARACTER
     ///
     /// # Examples
     ///
@@ -792,9 +804,9 @@ impl String {
         };
         match (cfg!(target_endian = "little"), unsafe { v.align_to::<u16>() }) {
             (true, ([], v, [])) => Self::from_utf16(v),
-            _ => char::decode_utf16(chunks.iter().copied().map(u16::from_le_bytes))
-                .collect::<Result<_, _>>()
-                .map_err(|_| FromUtf16Error { kind: FromUtf16ErrorKind::LoneSurrogate }),
+            _ => {
+                Self::from_utf16_units(chunks.iter().copied().map(u16::from_le_bytes), chunks.len())
+            }
         }
     }
 
@@ -807,7 +819,7 @@ impl String {
     ///
     /// [`from_utf8_lossy`]: String::from_utf8_lossy
     /// [`Cow<'a, str>`]: crate::borrow::Cow "borrow::Cow"
-    /// [U+FFFD]: core::char::REPLACEMENT_CHARACTER
+    /// [U+FFFD]: char::REPLACEMENT_CHARACTER
     ///
     /// # Examples
     ///
@@ -865,9 +877,9 @@ impl String {
         };
         match (cfg!(target_endian = "big"), unsafe { v.align_to::<u16>() }) {
             (true, ([], v, [])) => Self::from_utf16(v),
-            _ => char::decode_utf16(chunks.iter().copied().map(u16::from_be_bytes))
-                .collect::<Result<_, _>>()
-                .map_err(|_| FromUtf16Error { kind: FromUtf16ErrorKind::LoneSurrogate }),
+            _ => {
+                Self::from_utf16_units(chunks.iter().copied().map(u16::from_be_bytes), chunks.len())
+            }
         }
     }
 
@@ -880,7 +892,7 @@ impl String {
     ///
     /// [`from_utf8_lossy`]: String::from_utf8_lossy
     /// [`Cow<'a, str>`]: crate::borrow::Cow "borrow::Cow"
-    /// [U+FFFD]: core::char::REPLACEMENT_CHARACTER
+    /// [U+FFFD]: char::REPLACEMENT_CHARACTER
     ///
     /// # Examples
     ///
@@ -938,6 +950,7 @@ impl String {
     /// ```
     #[must_use = "losing the pointer will leak memory"]
     #[stable(feature = "vec_into_raw_parts", since = "1.93.0")]
+    #[inline]
     pub fn into_raw_parts(self) -> (*mut u8, usize, usize) {
         self.vec.into_raw_parts()
     }
@@ -1661,53 +1674,57 @@ impl String {
     where
         F: FnMut(char) -> bool,
     {
-        struct SetLenOnDrop<'a> {
-            s: &'a mut String,
-            idx: usize,
-            del_bytes: usize,
-        }
-
-        impl<'a> Drop for SetLenOnDrop<'a> {
-            fn drop(&mut self) {
-                let new_len = self.idx - self.del_bytes;
-                debug_assert!(new_len <= self.s.len());
-                unsafe { self.s.vec.set_len(new_len) };
-            }
-        }
-
         let len = self.len();
-        let mut guard = SetLenOnDrop { s: self, idx: 0, del_bytes: 0 };
-
-        while guard.idx < len {
-            let ch =
-                // SAFETY: `guard.idx` is positive-or-zero and less that len so the `get_unchecked`
-                // is in bound. `self` is valid UTF-8 like string and the returned slice starts at
-                // a unicode code point so the `Chars` always return one character.
-                unsafe { guard.s.get_unchecked(guard.idx..len).chars().next().unwrap_unchecked() };
-            let ch_len = ch.len_utf8();
-
-            if !f(ch) {
-                guard.del_bytes += ch_len;
-            } else if guard.del_bytes > 0 {
-                // SAFETY: `guard.idx` is in bound and `guard.del_bytes` represent the number of
-                // bytes that are erased from the string so the resulting `guard.idx -
-                // guard.del_bytes` always represent a valid unicode code point.
-                //
-                // `guard.del_bytes` >= `ch.len_utf8()`, so taking a slice with `ch.len_utf8()` len
-                // is safe.
-                ch.encode_utf8(unsafe {
-                    crate::slice::from_raw_parts_mut(
-                        guard.s.as_mut_ptr().add(guard.idx - guard.del_bytes),
-                        ch.len_utf8(),
-                    )
-                });
-            }
-
-            // Point idx to the next char
-            guard.idx += ch_len;
+        if len == 0 {
+            // Explicit check results in better optimization
+            return;
         }
 
-        drop(guard);
+        struct PanicGuard<'a> {
+            s: &'a mut String,
+            write: usize,
+        }
+
+        impl Drop for PanicGuard<'_> {
+            fn drop(&mut self) {
+                debug_assert!(self.write <= self.s.len());
+                debug_assert!(str::from_utf8(&self.s.vec[..self.write]).is_ok());
+                // SAFETY: Restore the string length to the number of bytes written so far.
+                unsafe { self.s.vec.set_len(self.write) }
+            }
+        }
+
+        // Fast path: find the first character that should be removed or return early.
+        let mut chars = self.char_indices();
+        let (mut read, write) = loop {
+            let Some((idx, ch)) = chars.next() else { return };
+            if hint::unlikely(!f(ch)) {
+                break (idx + ch.len_utf8(), idx);
+            }
+        };
+        drop(chars);
+
+        // Slow path: at least one character is going to be removed.
+        let mut g = PanicGuard { s: self, write };
+        while read < len {
+            // SAFETY: `read` is within bound because `read` < `len`, so taking
+            // a slice with `len` is safe.
+            let ch = unsafe { g.s.get_unchecked(read..len).chars().next().unwrap_unchecked() };
+            let ch_len = ch.len_utf8();
+            if f(ch) {
+                // SAFETY: `read` is on a char boundary, as guaranteed above; `g.write` is
+                // within bounds because it is always behind `read`.
+                unsafe {
+                    let ptr = g.s.vec.as_mut_ptr();
+                    ptr::copy(ptr.add(read), ptr.add(g.write), ch_len);
+                }
+                g.write += ch_len;
+            }
+            read += ch_len;
+        }
+
+        // All bytes processed; commit the final length by dropping the guard.
+        drop(g);
     }
 
     /// Inserts a character into this `String` at byte position `idx`.
@@ -2279,7 +2296,7 @@ impl FromUtf8Error {
     /// ```
     #[must_use]
     #[cfg(not(no_global_oom_handling))]
-    #[stable(feature = "string_from_utf8_lossy_owned", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "string_from_utf8_lossy_owned", since = "1.99.0")]
     pub fn into_utf8_lossy(self) -> String {
         const REPLACEMENT: &str = "\u{FFFD}";
 

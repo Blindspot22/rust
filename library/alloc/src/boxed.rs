@@ -200,16 +200,16 @@ use core::ops::{
 };
 #[cfg(not(no_global_oom_handling))]
 use core::ops::{Residual, Try};
-use core::pin::{Pin, PinCoerceUnsized};
+use core::pin::{Pin, PinSafePointer};
 use core::ptr::{self, NonNull, Unique};
 use core::task::{Context, Poll};
 
 #[cfg(not(no_global_oom_handling))]
 use crate::alloc::handle_alloc_error;
-use crate::alloc::{AllocError, Allocator, Global, Layout};
+use crate::alloc::{AllocError, Allocator, Global, Layout, StaticAllocator};
 use crate::raw_vec::RawVec;
 #[cfg(not(no_global_oom_handling))]
-use crate::str::from_boxed_utf8_unchecked;
+use crate::str::from_boxed_utf8_unchecked_in;
 
 /// Conversion related impls for `Box<_>` (`From`, `downcast`, etc)
 mod convert;
@@ -218,7 +218,7 @@ mod iter;
 /// [`ThinBox`] implementation.
 mod thin;
 
-#[stable(feature = "boxed_array_value_iter", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "boxed_array_value_iter", since = "1.99.0")]
 pub use iter::BoxedArrayIntoIter;
 #[unstable(feature = "thin_box", issue = "92791")]
 pub use thin::ThinBox;
@@ -425,82 +425,6 @@ impl<T> Box<T> {
     #[inline]
     pub fn try_new_zeroed() -> Result<Box<mem::MaybeUninit<T>>, AllocError> {
         Box::try_new_zeroed_in(Global)
-    }
-
-    /// Maps the value in a box, reusing the allocation if possible.
-    ///
-    /// `f` is called on the value in the box, and the result is returned, also boxed.
-    ///
-    /// Note: this is an associated function, which means that you have
-    /// to call it as `Box::map(b, f)` instead of `b.map(f)`. This
-    /// is so that there is no conflict with a method on the inner type.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// #![feature(smart_pointer_try_map)]
-    ///
-    /// let b = Box::new(7);
-    /// let new = Box::map(b, |i| i + 7);
-    /// assert_eq!(*new, 14);
-    /// ```
-    #[cfg(not(no_global_oom_handling))]
-    #[unstable(feature = "smart_pointer_try_map", issue = "144419")]
-    pub fn map<U>(this: Self, f: impl FnOnce(T) -> U) -> Box<U> {
-        if size_of::<T>() == size_of::<U>() && align_of::<T>() == align_of::<U>() {
-            let (value, allocation) = Box::take(this);
-            Box::write(
-                unsafe { mem::transmute::<Box<MaybeUninit<T>>, Box<MaybeUninit<U>>>(allocation) },
-                f(value),
-            )
-        } else {
-            Box::new(f(*this))
-        }
-    }
-
-    /// Attempts to map the value in a box, reusing the allocation if possible.
-    ///
-    /// `f` is called on the value in the box, and if the operation succeeds, the result is
-    /// returned, also boxed.
-    ///
-    /// Note: this is an associated function, which means that you have
-    /// to call it as `Box::try_map(b, f)` instead of `b.try_map(f)`. This
-    /// is so that there is no conflict with a method on the inner type.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// #![feature(smart_pointer_try_map)]
-    ///
-    /// let b = Box::new(7);
-    /// let new = Box::try_map(b, u32::try_from).unwrap();
-    /// assert_eq!(*new, 7);
-    /// ```
-    #[cfg(not(no_global_oom_handling))]
-    #[unstable(feature = "smart_pointer_try_map", issue = "144419")]
-    pub fn try_map<R>(
-        this: Self,
-        f: impl FnOnce(T) -> R,
-    ) -> <R::Residual as Residual<Box<R::Output>>>::TryType
-    where
-        R: Try,
-        R::Residual: Residual<Box<R::Output>>,
-    {
-        if size_of::<T>() == size_of::<R::Output>() && align_of::<T>() == align_of::<R::Output>() {
-            let (value, allocation) = Box::take(this);
-            try {
-                Box::write(
-                    unsafe {
-                        mem::transmute::<Box<MaybeUninit<T>>, Box<MaybeUninit<R::Output>>>(
-                            allocation,
-                        )
-                    },
-                    f(value)?,
-                )
-            }
-        } else {
-            try { Box::new(f(*this)?) }
-        }
     }
 }
 
@@ -715,7 +639,7 @@ impl<T, A: Allocator> Box<T, A> {
     #[inline(always)]
     pub fn pin_in(x: T, alloc: A) -> Pin<Self>
     where
-        A: 'static + Allocator,
+        A: StaticAllocator,
     {
         Self::into_pin(Self::new_in(x, alloc))
     }
@@ -776,6 +700,77 @@ impl<T, A: Allocator> Box<T, A> {
             (value, uninit)
         }
     }
+
+    /// Maps the value in a box, reusing the allocation if possible.
+    ///
+    /// `f` is called on the value in the box, and the result is returned, also boxed.
+    ///
+    /// Note: this is an associated function, which means that you have
+    /// to call it as `Box::map(b, f)` instead of `b.map(f)`. This
+    /// is so that there is no conflict with a method on the inner type.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(smart_pointer_try_map)]
+    ///
+    /// let b = Box::new(7);
+    /// let new = Box::map(b, |i| i + 7);
+    /// assert_eq!(*new, 14);
+    /// ```
+    #[cfg(not(no_global_oom_handling))]
+    #[unstable(feature = "smart_pointer_try_map", issue = "144419")]
+    pub fn map<U>(this: Self, f: impl FnOnce(T) -> U) -> Box<U, A> {
+        let (value, allocation) = Box::take(this);
+        let (raw, alloc) = Box::into_non_null_with_allocator(allocation);
+        if size_of::<T>() == size_of::<U>() && align_of::<T>() == align_of::<U>() {
+            let allocation = unsafe { Box::from_non_null_in(raw.cast::<MaybeUninit<U>>(), alloc) };
+            Box::write(allocation, f(value))
+        } else {
+            unsafe { alloc.deallocate(raw.cast(), Layout::for_value(&value)) }
+            Box::new_in(f(value), alloc)
+        }
+    }
+
+    /// Attempts to map the value in a box, reusing the allocation if possible.
+    ///
+    /// `f` is called on the value in the box, and if the operation succeeds, the result is
+    /// returned, also boxed.
+    ///
+    /// Note: this is an associated function, which means that you have
+    /// to call it as `Box::try_map(b, f)` instead of `b.try_map(f)`. This
+    /// is so that there is no conflict with a method on the inner type.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(smart_pointer_try_map)]
+    ///
+    /// let b = Box::new(7);
+    /// let new = Box::try_map(b, u32::try_from).unwrap();
+    /// assert_eq!(*new, 7);
+    /// ```
+    #[cfg(not(no_global_oom_handling))]
+    #[unstable(feature = "smart_pointer_try_map", issue = "144419")]
+    pub fn try_map<R>(
+        this: Self,
+        f: impl FnOnce(T) -> R,
+    ) -> <R::Residual as Residual<Box<R::Output, A>>>::TryType
+    where
+        R: Try,
+        R::Residual: Residual<Box<R::Output, A>>,
+    {
+        let (value, allocation) = Box::take(this);
+        let (raw, alloc) = Box::into_non_null_with_allocator(allocation);
+        if size_of::<T>() == size_of::<R::Output>() && align_of::<T>() == align_of::<R::Output>() {
+            let allocation =
+                unsafe { Box::from_non_null_in(raw.cast::<MaybeUninit<R::Output>>(), alloc) };
+            try { Box::write(allocation, f(value)?) }
+        } else {
+            unsafe { alloc.deallocate(raw.cast(), Layout::for_value(&value)) }
+            try { Box::new_in(f(value)?, alloc) }
+        }
+    }
 }
 
 impl<T: ?Sized + CloneToUninit> Box<T> {
@@ -813,7 +808,6 @@ impl<T: ?Sized + CloneToUninit> Box<T> {
     /// ```
     #[unstable(feature = "clone_from_ref", issue = "149075")]
     //#[unstable(feature = "allocator_api", issue = "32838")]
-    #[must_use]
     #[inline]
     pub fn try_clone_from_ref(src: &T) -> Result<Box<T>, AllocError> {
         Box::try_clone_from_ref_in(src, Global)
@@ -865,7 +859,6 @@ impl<T: ?Sized + CloneToUninit, A: Allocator> Box<T, A> {
     /// ```
     #[unstable(feature = "clone_from_ref", issue = "149075")]
     //#[unstable(feature = "allocator_api", issue = "32838")]
-    #[must_use]
     #[inline]
     pub fn try_clone_from_ref_in(src: &T, alloc: A) -> Result<Box<T, A>, AllocError> {
         struct DeallocDropGuard<'a, A: Allocator>(Layout, &'a A, NonNull<u8>);
@@ -1161,7 +1154,6 @@ impl<T, A: Allocator> Box<[T], A> {
     /// ```
     #[unstable(feature = "alloc_slice_into_array", issue = "148082")]
     #[inline]
-    #[must_use]
     pub fn into_array<const N: usize>(self) -> Result<Box<[T; N], A>, Self> {
         if self.len() == N {
             let (ptr, alloc) = Self::into_raw_with_allocator(self);
@@ -1374,7 +1366,7 @@ impl<T: ?Sized> Box<T> {
     ///
     /// [memory layout]: self#memory-layout
     /// [considerations for unsafe code]: self#considerations-for-unsafe-code
-    #[stable(feature = "box_vec_non_null", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "box_vec_non_null", since = "1.99.0")]
     #[inline]
     #[must_use = "call `drop(Box::from_non_null(ptr))` if you intend to drop the `Box`"]
     pub unsafe fn from_non_null(ptr: NonNull<T>) -> Self {
@@ -1490,7 +1482,7 @@ impl<T: ?Sized> Box<T> {
     ///
     /// [memory layout]: self#memory-layout
     #[must_use = "losing the pointer will leak memory"]
-    #[stable(feature = "box_vec_non_null", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "box_vec_non_null", since = "1.99.0")]
     #[inline]
     pub fn into_non_null(b: Self) -> NonNull<T> {
         // As of August 2026, we cannot utilize `Box::leak`
@@ -1897,11 +1889,12 @@ impl<T: ?Sized, A: Allocator> Box<T, A> {
     /// `'static`.
     ///
     /// This function is mainly useful for data that lives for the remainder of the program's life,
-    /// i.e., memory that is meant to leak. Reconstructing ("unleaking") a `Box` from the mutable
-    /// reference returned here (e.g. via [`Box::from_raw`]) is a grey area (meaning it is possible
-    /// under specific circumstances but many seemingly harmless ways of doing it are undefined
-    /// behavior) and should be avoided. If the memory should eventually be freed, prefer to use
-    /// [`Box::into_raw`] or [`Box::into_non_null`] instead.
+    /// i.e., memory that is meant to leak. If the memory should eventually be freed, prefer to use
+    /// [`Box::into_raw`] or [`Box::into_non_null`] instead. Reconstructing ("unleaking") a `Box` from
+    /// the mutable reference returned here (e.g. via [`Box::from_raw`]) is only possible if the
+    /// allocator is `Global`, and even then it is a grey area (meaning it is possible under specific
+    /// circumstances but many seemingly harmless ways of doing it are undefined behavior) and should
+    /// be avoided.
     ///
     /// Note: this is an associated function, which means that you have
     /// to call it as `Box::leak(b)` instead of `b.leak()`. This
@@ -1976,7 +1969,7 @@ impl<T: ?Sized, A: Allocator> Box<T, A> {
     #[stable(feature = "box_into_pin", since = "1.63.0")]
     pub fn into_pin(boxed: Self) -> Pin<Self>
     where
-        A: 'static,
+        A: StaticAllocator,
     {
         // It's not possible to move or replace the insides of a `Pin<Box<T>>`
         // when `T: !Unpin`, so it's safe to pin it directly without any
@@ -2065,6 +2058,8 @@ where
 
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
+// NB: This is not `AllocatorClone` since we don't care about allocator
+// equivalence when cloning boxes.
 impl<T: Clone, A: Allocator + Clone> Clone for Box<T, A> {
     /// Returns a new box with a `clone()` of this box's contents.
     ///
@@ -2141,7 +2136,7 @@ impl<T: Clone, A: Allocator + Clone> Clone for Box<[T], A> {
     /// ```
     fn clone_from(&mut self, source: &Self) {
         if self.len() == source.len() {
-            self.clone_from_slice(&source);
+            self.clone_from_slice(source);
         } else {
             *self = source.clone();
         }
@@ -2150,11 +2145,10 @@ impl<T: Clone, A: Allocator + Clone> Clone for Box<[T], A> {
 
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "box_slice_clone", since = "1.3.0")]
-impl Clone for Box<str> {
+impl<A: Allocator + Clone> Clone for Box<str, A> {
     fn clone(&self) -> Self {
-        // this makes a copy of the data
-        let buf: Box<[u8]> = self.as_bytes().into();
-        unsafe { from_boxed_utf8_unchecked(buf) }
+        let buf = Box::clone_from_ref_in(self.as_bytes(), self.1.clone());
+        unsafe { from_boxed_utf8_unchecked_in(buf) }
     }
 }
 
@@ -2293,14 +2287,14 @@ impl<T: ?Sized, A: Allocator> Deref for Box<T, A> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        &**self
+        self
     }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: ?Sized, A: Allocator> DerefMut for Box<T, A> {
     fn deref_mut(&mut self) -> &mut T {
-        &mut **self
+        self
     }
 }
 
@@ -2365,8 +2359,27 @@ impl<Args: Tuple, F: AsyncFn<Args> + ?Sized, A: Allocator> AsyncFn<Args> for Box
 #[unstable(feature = "coerce_unsized", issue = "18598")]
 impl<T: ?Sized + Unsize<U>, U: ?Sized, A: Allocator> CoerceUnsized<Box<U, A>> for Box<T, A> {}
 
+// A pointer can only be pin safe if it does not implement certain safe traits
+// maliciously. Since `Box` is fundamental, downstream crates may be able to
+// implement those traits for `Box<LocalType>`, so we must carefully check that
+// this is not a problem for each trait.
+//
+// The `Box` type always implements `Deref` and `DerefMut`, so despite being
+// fundamental, downstream crates cannot implement these traits for
+// `Box<LocalType>`.
+//
+// Conversely, downstream crates are able to implement `Clone`, `Debug`, and
+// `Display` for `Box<LocalType>` as long as `LocalType` does not implement
+// said trait. However, the `Box<T>` type does not treat the existence of an
+// `&Box<T>` as evidence that the `T` is not pinned, so this is not
+// problematic.
+//
+// Finally, even if downstream crates provide their own implementation of
+// `Clone` for `Box<LocalType>`, it is not problematic for the cloned box to be
+// wrapped in `Pin`, since the same conversion could have been carried out
+// safely as `Box::pin((*p).clone())`.
 #[unstable(feature = "pin_coerce_unsized_trait", issue = "150112")]
-unsafe impl<T: ?Sized, A: Allocator> PinCoerceUnsized for Box<T, A> {}
+unsafe impl<T: ?Sized, A: StaticAllocator> PinSafePointer for Box<T, A> {}
 
 // It is quite crucial that we only allow the `Global` allocator here.
 // Handling arbitrary custom allocators (which can affect the `Box` layout heavily!)
@@ -2377,28 +2390,28 @@ impl<T: ?Sized + Unsize<U>, U: ?Sized> DispatchFromDyn<Box<U>> for Box<T, Global
 #[stable(feature = "box_borrow", since = "1.1.0")]
 impl<T: ?Sized, A: Allocator> Borrow<T> for Box<T, A> {
     fn borrow(&self) -> &T {
-        &**self
+        self
     }
 }
 
 #[stable(feature = "box_borrow", since = "1.1.0")]
 impl<T: ?Sized, A: Allocator> BorrowMut<T> for Box<T, A> {
     fn borrow_mut(&mut self) -> &mut T {
-        &mut **self
+        self
     }
 }
 
 #[stable(since = "1.5.0", feature = "smart_ptr_as_ref")]
 impl<T: ?Sized, A: Allocator> AsRef<T> for Box<T, A> {
     fn as_ref(&self) -> &T {
-        &**self
+        self
     }
 }
 
 #[stable(since = "1.5.0", feature = "smart_ptr_as_ref")]
 impl<T: ?Sized, A: Allocator> AsMut<T> for Box<T, A> {
     fn as_mut(&mut self) -> &mut T {
-        &mut **self
+        self
     }
 }
 
